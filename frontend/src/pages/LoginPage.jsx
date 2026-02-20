@@ -67,6 +67,7 @@ export default function LoginPage() {
         if (role === 'customer') navigate('/customer/dashboard');
         else if (role === 'manager') navigate('/manager/dashboard');
         else if (role === 'admin') navigate('/admin/dashboard');
+        else if (role === 'human_agent') navigate('/agent/dashboard');
         else navigate('/cto/dashboard');
       }
     } catch {

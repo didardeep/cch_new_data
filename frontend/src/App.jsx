@@ -21,6 +21,10 @@ import UserManagement from './pages/admin/UserManagement';
 import AdminFeedback from './pages/admin/AdminFeedback';
 import ReportsPage from './pages/admin/ReportsPage';
 import AgentIssues from './pages/admin/AgentIssues';
+import AgentLayout from './pages/agent/AgentLayout';
+import AgentDashboard from './pages/agent/AgentDashboard';
+import AgentTicketBucket from './pages/agent/AgentTicketBucket';
+import AgentChatView from './pages/agent/AgentChatView';
 
 function ProtectedRoute({ children, roles }) {
   const { user, loading } = useAuth();
@@ -39,6 +43,7 @@ export default function App() {
     if (user.role === 'manager') return '/manager/dashboard';
     if (user.role === 'cto') return '/cto/dashboard';
     if (user.role === 'admin') return '/admin/dashboard';
+    if (user.role === 'human_agent') return '/agent/dashboard';
     return '/login';
   };
 
@@ -83,6 +88,13 @@ export default function App() {
         <Route path="agent-issues" element={<AgentIssues />} />
         <Route path="feedback" element={<AdminFeedback />} />
         <Route path="reports" element={<ReportsPage />} />
+      </Route>
+
+      {/* Human Agent Routes */}
+      <Route path="/agent" element={<ProtectedRoute roles={['human_agent']}><AgentLayout /></ProtectedRoute>}>
+        <Route path="dashboard" element={<AgentDashboard />} />
+        <Route path="tickets" element={<AgentTicketBucket />} />
+        <Route path="chat/:sessionId" element={<AgentChatView />} />
       </Route>
 
       <Route path="*" element={<Navigate to="/" />} />

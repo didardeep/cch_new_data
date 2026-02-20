@@ -7,7 +7,7 @@ export default function UserManagement() {
   const [roleFilter, setRoleFilter] = useState('');
   const [search, setSearch] = useState('');
   const [showAdd, setShowAdd] = useState(false);
-  const [addForm, setAddForm] = useState({ name: '', email: '', password: '', role: 'human_agent' });
+  const [addForm, setAddForm] = useState({ name: '', email: '', password: '', role: 'human_agent', phone_number: '' });
   const [addError, setAddError] = useState('');
   const [addLoading, setAddLoading] = useState(false);
   const [editingId, setEditingId] = useState(null);
@@ -54,7 +54,7 @@ export default function UserManagement() {
         setAddError(res.error);
       } else {
         setShowAdd(false);
-        setAddForm({ name: '', email: '', password: '', role: 'human_agent' });
+        setAddForm({ name: '', email: '', password: '', role: 'human_agent', phone_number: '' });
         loadUsers();
       }
     } catch {
@@ -230,6 +230,11 @@ export default function UserManagement() {
                   <option value="admin">Admin</option>
                 </select>
               </div>
+              <div className="form-group" style={{ margin: 0 }}>
+                <label style={{ fontSize: 12, fontWeight: 600 }}>Phone Number <span style={{ color: '#94a3b8', fontWeight: 400 }}>(optional)</span></label>
+                <input type="tel" className="form-input" placeholder="+923001234567"
+                  value={addForm.phone_number} onChange={e => setAddForm(f => ({ ...f, phone_number: e.target.value }))} />
+              </div>
               <div style={{ gridColumn: '1 / -1' }}>
                 <button type="submit" className="btn btn-primary btn-sm" disabled={addLoading}>
                   {addLoading ? 'Adding...' : 'Add User'}
@@ -254,6 +259,7 @@ export default function UserManagement() {
                   <th>Employee ID</th>
                   <th>Name</th>
                   <th>Email</th>
+                  <th>Phone</th>
                   <th>Role</th>
                   <th>Created</th>
                   <th>Actions</th>
@@ -278,6 +284,9 @@ export default function UserManagement() {
                       ) : (
                         <span style={{ fontSize: 13, color: '#64748b' }}>{u.email}</span>
                       )}
+                    </td>
+                    <td style={{ fontSize: 12, color: '#475569', whiteSpace: 'nowrap' }}>
+                      {u.phone_number || '—'}
                     </td>
                     <td>
                       {editingId === u.id ? (

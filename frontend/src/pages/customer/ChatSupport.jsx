@@ -43,6 +43,10 @@ export default function ChatSupport() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
 
+  // ── Agent-resolved polling state ──
+  const [handoffActive, setHandoffActive] = useState(false);
+  const agentResolvedShownRef = useRef(false);
+
   // ── Init-phase state ──
   const [initPhase, setInitPhase] = useState('loading');
   const [pendingFeedback, setPendingFeedback] = useState([]);
@@ -212,6 +216,61 @@ export default function ChatSupport() {
     );
   }, [addMessage, saveMessage, saveLocationToBackend, disableGroup]);
 
+  // ── Poll for agent messages + resolution after handoff ──────────────────
+  const lastSeenMsgIdRef = useRef(0);
+
+  useEffect(() => {
+    if (!handoffActive) return;
+
+    const poll = async () => {
+      if (!sessionIdRef.current) return;
+      try {
+        const token = getToken();
+        const resp = await fetch(
+          `${API_BASE}/api/chat/session/${sessionIdRef.current}`,
+          { headers: { Authorization: `Bearer ${token}` } }
+        );
+        if (!resp.ok) return;
+        const data = await resp.json();
+        const allMsgs = data.messages || [];
+
+        // Show any new agent messages the customer hasn't seen yet
+        const newAgentMsgs = allMsgs.filter(
+          m => m.sender === 'agent' && m.id > lastSeenMsgIdRef.current
+        );
+        newAgentMsgs.forEach(m => {
+          lastSeenMsgIdRef.current = Math.max(lastSeenMsgIdRef.current, m.id);
+          addMessage({
+            type: 'live-agent-message',
+            text: m.content,
+            timestamp: m.created_at,
+          });
+        });
+
+        // Check for resolution
+        const s = data.session || {};
+        if (
+          (s.status === 'resolved') &&
+          !agentResolvedShownRef.current
+        ) {
+          agentResolvedShownRef.current = true;
+          setHandoffActive(false);
+          // Find the last bot message about resolution
+          const lastBot = [...allMsgs].reverse().find(m => m.sender === 'bot');
+          addMessage({
+            type: 'agent-resolved',
+            botMessage: lastBot?.content || 'Your support ticket has been resolved.',
+          });
+        }
+      } catch {
+        // silently ignore network errors during polling
+      }
+    };
+
+    const iv = setInterval(poll, 6000);
+    return () => clearInterval(iv);
+  }, [handoffActive, addMessage]);
+
   // ── Start Chat (fresh) ──
   const startChat = useCallback(async () => {
     setMessages([]);
@@ -224,6 +283,8 @@ export default function ChatSupport() {
       attempt: 0, previousSolutions: [],
     };
     sessionIdRef.current = null;
+    agentResolvedShownRef.current = false;
+    setHandoffActive(false);
     hideInput();
     setInitPhase('chat');
 
@@ -519,6 +580,8 @@ export default function ChatSupport() {
     saveMessage('user', 'Raise a ticket');
 
     let refNum = '';
+    let assignedAgent = null;
+    let slaHours = null;
     if (sessionIdRef.current) {
       try {
         const token = getToken();
@@ -529,6 +592,10 @@ export default function ChatSupport() {
         const data = await resp.json();
         if (data.ticket) {
           refNum = data.ticket.reference_number;
+          slaHours = data.ticket.sla_hours || null;
+        }
+        if (data.assigned_agent) {
+          assignedAgent = data.assigned_agent;
         }
       } catch {}
     }
@@ -536,8 +603,18 @@ export default function ChatSupport() {
     addMessage({
       type: 'bot',
       html: `Your ticket has been raised successfully!` +
-        (refNum ? `<br><br>Reference number: <strong>${refNum}</strong>` : '') +
-        `<br><br>Our executive will review your issue and contact you shortly. You can also track your ticket status from the dashboard.`,
+        (refNum ? `<br>Reference: <strong>${refNum}</strong>` : '') +
+        (assignedAgent
+          ? `<br><br>We are connecting you to our expert. Your dedicated support agent is:<br>
+             <div style="background:#eff6ff;border:1px solid #93c5fd;border-radius:8px;padding:10px 14px;margin:8px 0;display:inline-block;min-width:220px;">
+               <div style="font-size:13px;font-weight:700;color:#1e40af;">${assignedAgent.name}</div>
+               ${assignedAgent.phone ? `<div style="font-size:12px;color:#0ea5e9;margin-top:4px;">📞 ${assignedAgent.phone}</div>` : ''}
+               ${assignedAgent.employee_id ? `<div style="font-size:11px;color:#64748b;margin-top:2px;">ID: ${assignedAgent.employee_id}</div>` : ''}
+               ${slaHours ? `<div style="font-size:12px;color:#16a34a;margin-top:6px;font-weight:600;">⏱ Your issue will be resolved within ${slaHours} hour${slaHours !== 1 ? 's' : ''}</div>` : ''}
+             </div>`
+          : `<br><br>Our support team will reach out to you shortly.` +
+            (slaHours ? `<br><span style="color:#16a34a;font-weight:600;">⏱ Your issue will be resolved within ${slaHours} hour${slaHours !== 1 ? 's' : ''}</span>` : '')) +
+        `<br>You can track your ticket from the dashboard.`,
     });
 
     setTimeout(() => {
@@ -545,7 +622,9 @@ export default function ChatSupport() {
       addMessage({ type: 'post-feedback-actions', groupId: actionGroupId });
     }, 1000);
     stateRef.current.step = 'escalated';
-  }, [addMessage, disableGroup, saveMessage]);
+    agentResolvedShownRef.current = false;
+    setHandoffActive(true);
+  }, [addMessage, disableGroup, saveMessage, setHandoffActive]);
 
   // ── Back to Menu ──
   const handleBackToMenu = useCallback((groupId) => {
@@ -608,6 +687,8 @@ export default function ChatSupport() {
 
     let refNum = 'TC-' + Date.now().toString(36).toUpperCase() + '-' +
       Math.random().toString(36).substring(2, 6).toUpperCase();
+    let assignedAgent = null;
+    let slaHours = null;
 
     if (sessionIdRef.current) {
       try {
@@ -619,6 +700,10 @@ export default function ChatSupport() {
         const data = await resp.json();
         if (data.ticket) {
           refNum = data.ticket.reference_number;
+          slaHours = data.ticket.sla_hours || null;
+        }
+        if (data.assigned_agent) {
+          assignedAgent = data.assigned_agent;
         }
       } catch {}
     }
@@ -629,14 +714,30 @@ export default function ChatSupport() {
       subprocessName: stateRef.current.subprocessName || 'General',
       queryText: stateRef.current.queryText || 'N/A',
       refNum,
+      assignedAgent,
     });
 
     setTimeout(() => {
+      const slaLine = slaHours
+        ? `<div style="font-size:12px;color:#16a34a;margin-top:6px;font-weight:600;">⏱ Your issue will be resolved within ${slaHours} hour${slaHours !== 1 ? 's' : ''}</div>`
+        : '';
+      const agentCard = assignedAgent
+        ? `<br><br>We are connecting you to your dedicated support expert:<br>
+           <div style="background:#eff6ff;border:1px solid #93c5fd;border-radius:8px;padding:10px 14px;margin:8px 0;display:inline-block;min-width:220px;">
+             <div style="font-size:13px;font-weight:700;color:#1e40af;">${assignedAgent.name}</div>
+             ${assignedAgent.phone ? `<div style="font-size:12px;color:#0ea5e9;margin-top:4px;">📞 ${assignedAgent.phone}</div>` : ''}
+             ${assignedAgent.employee_id ? `<div style="font-size:11px;color:#64748b;margin-top:2px;">ID: ${assignedAgent.employee_id}</div>` : ''}
+             ${slaLine}
+           </div>`
+        : `<br><br>Our support team will contact you shortly.` +
+          (slaHours ? `<br><span style="color:#16a34a;font-weight:600;">⏱ Your issue will be resolved within ${slaHours} hour${slaHours !== 1 ? 's' : ''}</span>` : '');
+
       addMessage({
         type: 'bot',
-        html: `Your request has been submitted. A support ticket has been raised and a customer support executive will contact you shortly.<br><br>` +
-          `Please save your reference number: <strong>${refNum}</strong><br><br>` +
-          `You can track your ticket status from the dashboard.<br><br>` +
+        html: `Your request has been submitted and a support ticket has been raised.` +
+          agentCard +
+          `<br>Reference: <strong>${refNum}</strong><br><br>` +
+          `The agent may send you messages below — please stay in this chat.<br><br>` +
           `What would you like to do next?`,
       });
       setTimeout(() => {
@@ -645,7 +746,9 @@ export default function ChatSupport() {
       }, 400);
     }, 1500);
     stateRef.current.step = 'human_handoff';
-  }, [addMessage, disableGroup, saveMessage]);
+    agentResolvedShownRef.current = false;
+    setHandoffActive(true);
+  }, [addMessage, disableGroup, saveMessage, setHandoffActive]);
 
   // ── Key handler ──
   const handleKeyDown = useCallback((e) => {
@@ -1121,8 +1224,100 @@ export default function ChatSupport() {
             <div className="handoff-row"><span className="h-label">Category</span><span className="h-value">{msg.sectorName}</span></div>
             <div className="handoff-row"><span className="h-label">Issue Type</span><span className="h-value">{msg.subprocessName}</span></div>
             <div className="handoff-row"><span className="h-label">Complaint</span><span className="h-value">{msg.queryText}</span></div>
-            <div className="handoff-row"><span className="h-label">Status</span><span className="h-value status-pending">Pending Agent Assignment</span></div>
+            {msg.assignedAgent ? (
+              <>
+                <div className="handoff-row"><span className="h-label">Status</span><span className="h-value" style={{ color: '#22c55e', fontWeight: 700 }}>✅ Agent Assigned</span></div>
+                <div style={{ background: '#eff6ff', border: '1px solid #bfdbfe', borderRadius: 8, padding: '10px 14px', margin: '10px 0 6px' }}>
+                  <div style={{ fontSize: 12, color: '#1d4ed8', fontWeight: 700, marginBottom: 6 }}>🧑‍💼 Your Expert</div>
+                  <div style={{ fontSize: 14, fontWeight: 700, color: '#1e293b' }}>{msg.assignedAgent.name}</div>
+                  {msg.assignedAgent.phone && (
+                    <div style={{ fontSize: 13, color: '#0ea5e9', marginTop: 4 }}>📞 {msg.assignedAgent.phone}</div>
+                  )}
+                  {msg.assignedAgent.employee_id && (
+                    <div style={{ fontSize: 11, color: '#64748b', marginTop: 2 }}>ID: {msg.assignedAgent.employee_id}</div>
+                  )}
+                </div>
+              </>
+            ) : (
+              <div className="handoff-row"><span className="h-label">Status</span><span className="h-value status-pending">Pending Agent Assignment</span></div>
+            )}
             <div className="handoff-ref">Reference No: {msg.refNum}</div>
+          </div>
+        );
+
+      case 'live-agent-message':
+        return (
+          <div key={msg.id} style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', maxWidth: '80%' }}>
+            <div style={{
+              fontSize: 10, color: '#00338d', fontWeight: 600,
+              marginBottom: 4, display: 'flex', alignItems: 'center', gap: 4,
+            }}>
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" /><circle cx="12" cy="7" r="4" />
+              </svg>
+              Support Agent
+              {msg.timestamp && (
+                <span style={{ opacity: 0.6, fontWeight: 400 }}>
+                  · {new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                </span>
+              )}
+            </div>
+            <div style={{
+              background: '#eff6ff',
+              border: '1px solid #93c5fd',
+              borderRadius: '4px 16px 16px 16px',
+              padding: '10px 14px',
+              fontSize: 13,
+              color: '#1e293b',
+              lineHeight: 1.6,
+              boxShadow: '0 1px 3px rgba(0,0,0,0.06)',
+              wordBreak: 'break-word',
+            }}>
+              {msg.text}
+            </div>
+          </div>
+        );
+
+      case 'agent-resolved':
+        return (
+          <div key={msg.id} style={{
+            background: 'linear-gradient(135deg, #f0fdf4, #dcfce7)',
+            border: '2px solid #22c55e',
+            borderRadius: 14,
+            padding: '20px 22px',
+            margin: '8px 0',
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 14 }}>
+              <div style={{
+                width: 36, height: 36, borderRadius: '50%',
+                background: '#22c55e', display: 'flex', alignItems: 'center', justifyContent: 'center',
+              }}>
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
+                  <polyline points="20 6 9 17 4 12" />
+                </svg>
+              </div>
+              <div>
+                <div style={{ fontWeight: 700, fontSize: 15, color: '#15803d' }}>Issue Resolved</div>
+                <div style={{ fontSize: 11, color: '#16a34a', marginTop: 2 }}>Your support ticket has been closed</div>
+              </div>
+            </div>
+            <p style={{ margin: '0 0 16px', fontSize: 13, color: '#1e293b', lineHeight: 1.65 }}>
+              {msg.botMessage}
+            </p>
+            <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+              <button
+                className="action-btn menu-btn"
+                onClick={() => !isDisabled && handleBackToMenu(msg.groupId)}
+              >
+                Main Menu
+              </button>
+              <button
+                className="action-btn exit-btn"
+                onClick={() => !isDisabled && handleExit(msg.groupId)}
+              >
+                Exit Chat
+              </button>
+            </div>
           </div>
         );
 
