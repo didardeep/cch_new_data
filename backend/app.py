@@ -61,9 +61,9 @@ OTP_COOLDOWN_SECONDS = 60
 
 # ─── Azure OpenAI Configuration ──────────────────────────────────────────────
 client = AzureOpenAI(
-    api_key="",
-    api_version="2023-07-01-preview",
-    azure_endpoint="https://entgptaiuat.openai.azure.com"
+    api_key = "",
+    api_version = "2023-07-01-preview",
+    azure_endpoint = "https://entgptaiuat.openai.azure.com"
 )
 DEPLOYMENT_NAME = os.environ.get("AZURE_DEPLOYMENT_NAME", "gpt-4o-mini")
 
@@ -1778,6 +1778,103 @@ def admin_agent_tickets():
         "tickets": [t.to_dict() for t in tickets],
         "agents": [{"id": a.id, "name": a.name} for a in agents],
     })
+
+
+@app.route("/api/admin/agent-alerts", methods=["GET"])
+@jwt_required()
+def admin_agent_alerts():
+    user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
+    if user.role != "admin":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    alerts = []
+
+    # 1. New escalations (tickets escalated in last 7 days, assigned to human agents)
+    week_ago = datetime.now(timezone.utc) - timedelta(days=7)
+    escalated = Ticket.query.join(
+        User, Ticket.assigned_to == User.id
+    ).filter(
+        User.role == "human_agent",
+        Ticket.status == "escalated",
+        Ticket.created_at >= week_ago,
+    ).order_by(Ticket.created_at.desc()).all()
+    for t in escalated:
+        alerts.append({
+            "type": "escalation",
+            "severity": "high",
+            "title": f"Escalated: {t.reference_number}",
+            "message": f"{t.category} - {t.subcategory or 'General'} (Customer: {t.user.name if t.user else 'Unknown'})",
+            "time": t.created_at.isoformat() if t.created_at else None,
+            "ticket_id": t.id,
+        })
+
+    # 2. Critical/high priority pending tickets assigned to agents
+    critical = Ticket.query.join(
+        User, Ticket.assigned_to == User.id
+    ).filter(
+        User.role == "human_agent",
+        Ticket.priority.in_(["critical", "high"]),
+        Ticket.status.in_(["pending", "in_progress"]),
+    ).order_by(Ticket.created_at.asc()).all()
+    for t in critical:
+        alerts.append({
+            "type": "critical_ticket",
+            "severity": "critical" if t.priority == "critical" else "high",
+            "title": f"{t.priority.upper()} priority: {t.reference_number}",
+            "message": f"Assigned to {t.assignee.name if t.assignee else 'Unassigned'} - {t.category} ({t.status.replace('_', ' ')})",
+            "time": t.created_at.isoformat() if t.created_at else None,
+            "ticket_id": t.id,
+        })
+
+    # 3. Low ratings (1-2 stars) from last 7 days linked to agent sessions
+    low_feedbacks = db.session.query(Feedback, ChatSession, Ticket).join(
+        ChatSession, Feedback.chat_session_id == ChatSession.id
+    ).join(
+        Ticket, Ticket.chat_session_id == ChatSession.id
+    ).join(
+        User, Ticket.assigned_to == User.id
+    ).filter(
+        User.role == "human_agent",
+        Feedback.rating <= 2,
+        Feedback.rating > 0,
+        Feedback.created_at >= week_ago,
+    ).order_by(Feedback.created_at.desc()).all()
+    for fb, session, ticket in low_feedbacks:
+        alerts.append({
+            "type": "low_rating",
+            "severity": "warning",
+            "title": f"Low rating ({fb.rating}/5) on {ticket.reference_number}",
+            "message": fb.comment or f"Customer rated {fb.rating}/5 for {session.sector_name or 'General'} issue",
+            "time": fb.created_at.isoformat() if fb.created_at else None,
+            "ticket_id": ticket.id,
+        })
+
+    # 4. Overdue tickets (pending for more than 3 days)
+    three_days_ago = datetime.now(timezone.utc) - timedelta(days=3)
+    overdue = Ticket.query.join(
+        User, Ticket.assigned_to == User.id
+    ).filter(
+        User.role == "human_agent",
+        Ticket.status.in_(["pending", "in_progress"]),
+        Ticket.created_at <= three_days_ago,
+    ).order_by(Ticket.created_at.asc()).all()
+    for t in overdue:
+        days_old = (datetime.now(timezone.utc) - t.created_at).days if t.created_at else 0
+        alerts.append({
+            "type": "overdue",
+            "severity": "warning",
+            "title": f"Overdue ({days_old}d): {t.reference_number}",
+            "message": f"Assigned to {t.assignee.name if t.assignee else 'Unassigned'} - {t.status.replace('_', ' ')} for {days_old} days",
+            "time": t.created_at.isoformat() if t.created_at else None,
+            "ticket_id": t.id,
+        })
+
+    # Sort all alerts: critical first, then high, then warning, then by time
+    severity_order = {"critical": 0, "high": 1, "warning": 2}
+    alerts.sort(key=lambda a: (severity_order.get(a["severity"], 3), a["time"] or ""))
+
+    return jsonify({"alerts": alerts, "total": len(alerts)})
 
 
 @app.route("/api/admin/feedback", methods=["GET"])
