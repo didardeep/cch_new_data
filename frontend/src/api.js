@@ -20,7 +20,7 @@ export async function apiCall(endpoint, options = {}) {
 
   const resp = await fetch(`${API_BASE}${endpoint}`, { ...options, headers });
 
-  if (resp.status === 401) {
+  if (resp.status === 401 && !endpoint.startsWith('/api/auth/')) {
     clearToken();
     window.location.href = '/login';
     return null;

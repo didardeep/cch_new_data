@@ -1059,42 +1059,51 @@ export default function ChatSupport() {
       case 'location-prompt':
         return (
           <div key={msg.id} style={{
-            background: 'linear-gradient(135deg, #eff6ff, #dbeafe)',
-            border: '2px solid #3b82f6',
-            borderRadius: '14px',
-            padding: '20px 24px',
-            margin: '8px 0',
+            background: '#ffffff',
+            border: '1px solid #d8e0ec',
+            borderLeft: '3px solid #005EB8',
+            borderRadius: '10px',
+            padding: '20px 22px',
+            margin: '6px 0',
             textAlign: 'center',
+            boxShadow: '0 1px 2px rgba(0, 20, 60, 0.04)',
           }}>
-            <div style={{ fontSize: '32px', marginBottom: '10px', color: '#2563eb' }}>&#9906;</div>
-            <div style={{ fontWeight: '700', fontSize: '16px', color: '#1e40af', marginBottom: '8px' }}>
+            <div style={{ fontSize: '28px', color: '#00338D', marginBottom: '6px' }}>
+              <svg width="28" height="28" viewBox="0 0 24 24" fill="#00338D" stroke="none">
+                <path d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zm0 9.5c-1.38 0-2.5-1.12-2.5-2.5S10.62 6.5 12 6.5s2.5 1.12 2.5 2.5S13.38 11.5 12 11.5z"/>
+              </svg>
+            </div>
+            <div style={{ fontWeight: '700', fontSize: '14px', color: '#00338D', marginBottom: '8px' }}>
               Location Access Required
             </div>
-            <div style={{ fontSize: '13px', color: '#374151', marginBottom: '16px', lineHeight: '1.6' }}>
+            <div style={{ fontSize: '13px', color: '#3d5068', marginBottom: '16px', lineHeight: '1.6' }}>
               To diagnose your network issue and check signal coverage in your area,
-              we need your current location. This is <strong>required</strong> to continue.
+              we need your current location. This is <strong style={{ color: '#00338D' }}>required</strong> to continue.
             </div>
             <button
               onClick={() => !isDisabled && msg.onShare && msg.onShare()}
               disabled={isDisabled}
               style={{
-                background: isDisabled ? '#94a3b8' : '#2563eb',
+                background: isDisabled ? '#8596ab' : '#00338D',
                 color: '#fff',
                 border: 'none',
-                borderRadius: '10px',
-                padding: '12px 28px',
-                fontSize: '14px',
+                borderRadius: '8px',
+                padding: '11px 26px',
+                fontSize: '13px',
                 fontWeight: '600',
+                fontFamily: 'inherit',
                 cursor: isDisabled ? 'not-allowed' : 'pointer',
                 display: 'flex',
                 alignItems: 'center',
                 gap: '8px',
                 margin: '0 auto',
+                boxShadow: '0 2px 6px rgba(0, 51, 141, 0.2)',
+                transition: 'all 0.18s ease',
               }}
             >
               Share My Location
             </button>
-            <div style={{ fontSize: '11px', color: '#6b7280', marginTop: '10px' }}>
+            <div style={{ fontSize: '11px', color: '#8596ab', marginTop: '10px' }}>
               Your location is only used for network diagnostics and stored securely.
             </div>
           </div>
@@ -1104,38 +1113,42 @@ export default function ChatSupport() {
       case 'location-required':
         return (
           <div key={msg.id} style={{
-            background: 'linear-gradient(135deg, #fff7ed, #ffedd5)',
-            border: '2px solid #f97316',
-            borderRadius: '14px',
-            padding: '20px 24px',
-            margin: '8px 0',
+            background: '#ffffff',
+            border: '1px solid #d8e0ec',
+            borderLeft: '3px solid #c42b1c',
+            borderRadius: '10px',
+            padding: '20px 22px',
+            margin: '6px 0',
             textAlign: 'center',
+            boxShadow: '0 1px 2px rgba(0, 20, 60, 0.04)',
           }}>
-            <div style={{ fontSize: '32px', marginBottom: '10px', color: '#ea580c' }}>!</div>
-            <div style={{ fontWeight: '700', fontSize: '16px', color: '#c2410c', marginBottom: '8px' }}>
+            <div style={{ fontWeight: '700', fontSize: '14px', color: '#c42b1c', marginBottom: '8px' }}>
               Location Access Denied
             </div>
-            <div style={{ fontSize: '13px', color: '#374151', marginBottom: '8px', lineHeight: '1.6' }}>
-              Location access is <strong>mandatory</strong> to proceed with your network complaint.
+            <div style={{ fontSize: '13px', color: '#3d5068', marginBottom: '8px', lineHeight: '1.6' }}>
+              Location access is <strong style={{ color: '#0f1d33' }}>mandatory</strong> to proceed with your network complaint.
             </div>
-            <div style={{ fontSize: '12px', color: '#6b7280', marginBottom: '16px', lineHeight: '1.5' }}>
-              Please click the <strong>lock/location icon</strong> in your browser address bar
-              and set Location to <strong>"Allow"</strong>, then try again.
+            <div style={{ fontSize: '12px', color: '#8596ab', marginBottom: '16px', lineHeight: '1.55' }}>
+              Please click the <strong style={{ color: '#3d5068' }}>lock/location icon</strong> in your browser address bar
+              and set Location to <strong style={{ color: '#3d5068' }}>"Allow"</strong>, then try again.
             </div>
             <button
               onClick={() => !isDisabled && msg.onRetry && msg.onRetry()}
               disabled={isDisabled}
               style={{
-                background: isDisabled ? '#94a3b8' : '#ea580c',
+                background: isDisabled ? '#8596ab' : '#c42b1c',
                 color: '#fff',
                 border: 'none',
-                borderRadius: '10px',
-                padding: '12px 28px',
-                fontSize: '14px',
+                borderRadius: '8px',
+                padding: '11px 26px',
+                fontSize: '13px',
                 fontWeight: '600',
+                fontFamily: 'inherit',
                 cursor: isDisabled ? 'not-allowed' : 'pointer',
                 margin: '0 auto',
                 display: 'block',
+                boxShadow: '0 2px 6px rgba(196, 43, 28, 0.18)',
+                transition: 'all 0.18s ease',
               }}
             >
               Try Again
@@ -1147,25 +1160,27 @@ export default function ChatSupport() {
       case 'location-success':
         return (
           <div key={msg.id} style={{
-            background: 'linear-gradient(135deg, #f0fdf4, #dcfce7)',
-            border: '2px solid #22c55e',
-            borderRadius: '14px',
-            padding: '16px 20px',
-            margin: '8px 0',
+            background: '#ffffff',
+            border: '1px solid #d8e0ec',
+            borderLeft: '3px solid #00875a',
+            borderRadius: '10px',
+            padding: '14px 18px',
+            margin: '6px 0',
             display: 'flex',
             alignItems: 'center',
             gap: '14px',
+            boxShadow: '0 1px 2px rgba(0, 20, 60, 0.04)',
           }}>
-            <div style={{ fontSize: '24px', color: '#22c55e', fontWeight: 700 }}>&#10003;</div>
+            <div style={{ fontSize: '18px', color: '#00875a', fontWeight: 700 }}>&#10003;</div>
             <div>
-              <div style={{ fontWeight: '700', fontSize: '14px', color: '#15803d' }}>
+              <div style={{ fontWeight: '700', fontSize: '13px', color: '#00875a' }}>
                 Location Captured Successfully
               </div>
-              <div style={{ fontSize: '12px', color: '#374151', marginTop: '4px' }}>
-                Lat: <strong>{msg.latitude?.toFixed(6)}</strong> &nbsp;|&nbsp;
-                Long: <strong>{msg.longitude?.toFixed(6)}</strong>
+              <div style={{ fontSize: '12px', color: '#3d5068', marginTop: '4px' }}>
+                Lat: <strong style={{ color: '#0f1d33' }}>{msg.latitude?.toFixed(6)}</strong> &nbsp;|&nbsp;
+                Long: <strong style={{ color: '#0f1d33' }}>{msg.longitude?.toFixed(6)}</strong>
               </div>
-              <div style={{ fontSize: '11px', color: '#6b7280', marginTop: '2px' }}>
+              <div style={{ fontSize: '11px', color: '#8596ab', marginTop: '2px' }}>
                 Stored securely for network diagnostics
               </div>
             </div>
@@ -1522,7 +1537,12 @@ export default function ChatSupport() {
                 <div className="input-row">
                   <textarea ref={inputRef} value={inputValue} onChange={handleInputChange}
                     onKeyDown={handleKeyDown} placeholder={inputPlaceholder} rows={1} />
-                  <button className="send-btn" onClick={sendMessage} disabled={!inputValue.trim()}>Send</button>
+                  <button className="send-btn" onClick={sendMessage} disabled={!inputValue.trim()}>
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <line x1="22" y1="2" x2="11" y2="13" />
+                      <polygon points="22 2 15 22 11 13 2 9 22 2" />
+                    </svg>
+                  </button>
                 </div>
                 <div className="input-hint">Press Enter to send &middot; Supports any language</div>
               </div>
