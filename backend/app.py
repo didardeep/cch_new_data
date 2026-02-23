@@ -7,6 +7,7 @@ Full backend with auth, chat, tickets, and the original AI chatbot integrated.
 import os
 import json
 import time
+import math
 import random
 import string
 from datetime import datetime, timezone, timedelta
@@ -22,7 +23,7 @@ from dotenv import load_dotenv
 
 from sqlalchemy import case as sql_case
 from sqlalchemy.orm import joinedload
-from models import db, bcrypt, User, ChatSession, ChatMessage, Ticket, Feedback, SystemSetting
+from models import db, bcrypt, User, ChatSession, ChatMessage, Ticket, Feedback, SystemSetting, SlaAlert, TelecomSite, KpiData
 # Add this import after other imports
 from whatsapp_integration import send_whatsapp_message, format_chat_summary_for_whatsapp, format_ticket_alert_for_whatsapp
 load_dotenv()
@@ -1476,6 +1477,88 @@ def cto_overview():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# SLA ALERT DASHBOARD ENDPOINTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.route("/api/manager/sla-alerts", methods=["GET"])
+@jwt_required()
+def manager_sla_alerts():
+    user = User.query.get(int(get_jwt_identity()))
+    if user.role not in ("manager", "admin"):
+        return jsonify({"error": "Unauthorized"}), 403
+    unread_only = request.args.get("unread_only", "false").lower() == "true"
+    q = SlaAlert.query.filter_by(recipient_role="manager")
+    if unread_only:
+        q = q.filter_by(is_read=False)
+    alerts = q.order_by(SlaAlert.created_at.desc()).limit(100).all()
+    return jsonify({"alerts": [a.to_dict() for a in alerts]})
+
+
+@app.route("/api/cto/sla-alerts", methods=["GET"])
+@jwt_required()
+def cto_sla_alerts():
+    user = User.query.get(int(get_jwt_identity()))
+    if user.role != "cto":
+        return jsonify({"error": "Unauthorized"}), 403
+    unread_only = request.args.get("unread_only", "false").lower() == "true"
+    q = SlaAlert.query.filter_by(recipient_role="cto")
+    if unread_only:
+        q = q.filter_by(is_read=False)
+    alerts = q.order_by(SlaAlert.created_at.desc()).limit(100).all()
+    return jsonify({"alerts": [a.to_dict() for a in alerts]})
+
+
+@app.route("/api/manager/sla-alerts/<int:alert_id>/read", methods=["PUT"])
+@jwt_required()
+def manager_mark_alert_read(alert_id):
+    user = User.query.get(int(get_jwt_identity()))
+    if user.role not in ("manager", "admin"):
+        return jsonify({"error": "Unauthorized"}), 403
+    alert = SlaAlert.query.get(alert_id)
+    if not alert or alert.recipient_role != "manager":
+        return jsonify({"error": "Alert not found"}), 404
+    alert.is_read = True
+    db.session.commit()
+    return jsonify({"success": True})
+
+
+@app.route("/api/cto/sla-alerts/<int:alert_id>/read", methods=["PUT"])
+@jwt_required()
+def cto_mark_alert_read(alert_id):
+    user = User.query.get(int(get_jwt_identity()))
+    if user.role != "cto":
+        return jsonify({"error": "Unauthorized"}), 403
+    alert = SlaAlert.query.get(alert_id)
+    if not alert or alert.recipient_role != "cto":
+        return jsonify({"error": "Alert not found"}), 404
+    alert.is_read = True
+    db.session.commit()
+    return jsonify({"success": True})
+
+
+@app.route("/api/manager/sla-alerts/read-all", methods=["PUT"])
+@jwt_required()
+def manager_mark_all_alerts_read():
+    user = User.query.get(int(get_jwt_identity()))
+    if user.role not in ("manager", "admin"):
+        return jsonify({"error": "Unauthorized"}), 403
+    SlaAlert.query.filter_by(recipient_role="manager", is_read=False).update({"is_read": True})
+    db.session.commit()
+    return jsonify({"success": True})
+
+
+@app.route("/api/cto/sla-alerts/read-all", methods=["PUT"])
+@jwt_required()
+def cto_mark_all_alerts_read():
+    user = User.query.get(int(get_jwt_identity()))
+    if user.role != "cto":
+        return jsonify({"error": "Unauthorized"}), 403
+    SlaAlert.query.filter_by(recipient_role="cto", is_read=False).update({"is_read": True})
+    db.session.commit()
+    return jsonify({"success": True})
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # EMPLOYEE ID GENERATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1867,14 +1950,187 @@ def admin_feedback():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# SITE & KPI DATA UPLOAD (Admin)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def haversine(lat1, lon1, lat2, lon2):
+    """Calculate distance in km between two lat/lng points."""
+    R = 6371
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = (math.sin(dlat / 2) ** 2 +
+         math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) *
+         math.sin(dlon / 2) ** 2)
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+@app.route("/api/admin/upload-sites", methods=["POST"])
+@jwt_required()
+def admin_upload_sites():
+    """Upload site data Excel (site_id, latitude, longitude, zone)."""
+    user = User.query.get(int(get_jwt_identity()))
+    if not user or user.role != "admin":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    if "file" not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+
+    file = request.files["file"]
+    if not file.filename.endswith((".xlsx", ".xls")):
+        return jsonify({"error": "Only .xlsx or .xls files accepted"}), 400
+
+    import openpyxl
+    wb = openpyxl.load_workbook(file, data_only=True)
+    ws = wb.active
+
+    headers = [str(c.value).strip().lower() if c.value else "" for c in ws[1]]
+    col_map = {}
+    for i, h in enumerate(headers):
+        if "site" in h and "id" in h:
+            col_map["site_id"] = i
+        elif "lat" in h:
+            col_map["latitude"] = i
+        elif "lon" in h:
+            col_map["longitude"] = i
+        elif "zone" in h:
+            col_map["zone"] = i
+
+    required = ["site_id", "latitude", "longitude"]
+    missing = [k for k in required if k not in col_map]
+    if missing:
+        return jsonify({"error": f"Missing columns: {', '.join(missing)}. Found headers: {headers}"}), 400
+
+    created = 0
+    updated = 0
+    skipped = []
+    for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+        try:
+            sid = str(row[col_map["site_id"]]).strip()
+            lat = float(row[col_map["latitude"]])
+            lon = float(row[col_map["longitude"]])
+            zone = str(row[col_map.get("zone", -1)]).strip() if col_map.get("zone") is not None and col_map.get("zone") < len(row) and row[col_map.get("zone")] else ""
+        except Exception as e:
+            skipped.append(f"Row {row_idx}: {e}")
+            continue
+
+        existing = TelecomSite.query.filter_by(site_id=sid).first()
+        if existing:
+            existing.latitude = lat
+            existing.longitude = lon
+            existing.zone = zone
+            updated += 1
+        else:
+            db.session.add(TelecomSite(site_id=sid, latitude=lat, longitude=lon, zone=zone))
+            created += 1
+
+    db.session.commit()
+    return jsonify({"created": created, "updated": updated, "skipped": skipped, "total": created + updated})
+
+
+@app.route("/api/admin/upload-kpi", methods=["POST"])
+@jwt_required()
+def admin_upload_kpi():
+    """Upload KPI data Excel (Date, Hour, Site_ID, Value) with kpi_name."""
+    user = User.query.get(int(get_jwt_identity()))
+    if not user or user.role != "admin":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    if "file" not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+
+    kpi_name = request.form.get("kpi_name", "").strip()
+    if not kpi_name:
+        return jsonify({"error": "kpi_name is required"}), 400
+
+    file = request.files["file"]
+    if not file.filename.endswith((".xlsx", ".xls")):
+        return jsonify({"error": "Only .xlsx or .xls files accepted"}), 400
+
+    import openpyxl
+    wb = openpyxl.load_workbook(file, data_only=True)
+    ws = wb.active
+
+    headers = [str(c.value).strip().lower() if c.value else "" for c in ws[1]]
+    col_map = {}
+    for i, h in enumerate(headers):
+        if "date" in h and "hour" not in h:
+            col_map["date"] = i
+        elif "hour" in h:
+            col_map["hour"] = i
+        elif "site" in h and "id" in h:
+            col_map["site_id"] = i
+        elif "value" in h or "val" in h:
+            col_map["value"] = i
+
+    required = ["date", "hour", "site_id", "value"]
+    missing = [k for k in required if k not in col_map]
+    if missing:
+        return jsonify({"error": f"Missing columns: {', '.join(missing)}. Found headers: {headers}"}), 400
+
+    # Clear old data for this KPI
+    KpiData.query.filter_by(kpi_name=kpi_name).delete()
+    db.session.flush()
+
+    inserted = 0
+    skipped = []
+    batch = []
+    for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+        try:
+            date_val = row[col_map["date"]]
+            if isinstance(date_val, str):
+                date_val = datetime.strptime(date_val, "%Y-%m-%d").date()
+            elif isinstance(date_val, datetime):
+                date_val = date_val.date()
+
+            hour_val = int(row[col_map["hour"]])
+            sid = str(row[col_map["site_id"]]).strip()
+            val = float(row[col_map["value"]]) if row[col_map["value"]] is not None else None
+        except Exception as e:
+            skipped.append(f"Row {row_idx}: {e}")
+            continue
+
+        batch.append(KpiData(site_id=sid, kpi_name=kpi_name, date=date_val, hour=hour_val, value=val))
+        inserted += 1
+
+        if len(batch) >= 1000:
+            db.session.bulk_save_objects(batch)
+            batch = []
+
+    if batch:
+        db.session.bulk_save_objects(batch)
+    db.session.commit()
+
+    return jsonify({"inserted": inserted, "kpi_name": kpi_name, "skipped": skipped})
+
+
+@app.route("/api/admin/uploaded-kpis", methods=["GET"])
+@jwt_required()
+def admin_uploaded_kpis():
+    """Return list of uploaded KPI names with row counts."""
+    user = User.query.get(int(get_jwt_identity()))
+    if not user or user.role != "admin":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    rows = db.session.query(
+        KpiData.kpi_name, db.func.count(KpiData.id)
+    ).group_by(KpiData.kpi_name).order_by(KpiData.kpi_name).all()
+
+    site_count = TelecomSite.query.count()
+    return jsonify({
+        "kpis": [{"name": r[0], "rows": r[1]} for r in rows],
+        "site_count": site_count,
+    })
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # REPORTS & ANALYTICS ROUTES
 # ═══════════════════════════════════════════════════════════════════════════════
 
 SLA_DEFAULTS = {
-    "sla_critical": {"value": "4", "description": "SLA target hours for Critical priority"},
-    "sla_high": {"value": "12", "description": "SLA target hours for High priority"},
-    "sla_medium": {"value": "48", "description": "SLA target hours for Medium priority"},
-    "sla_low": {"value": "120", "description": "SLA target hours for Low priority"},
+    "sla_critical": {"value": "2", "description": "SLA target hours for Critical priority"},
+    "sla_high": {"value": "4", "description": "SLA target hours for High priority"},
+    "sla_medium": {"value": "8", "description": "SLA target hours for Medium priority"},
+    "sla_low": {"value": "16", "description": "SLA target hours for Low priority"},
 }
 
 
@@ -2780,6 +3036,221 @@ Keep your response concise and actionable."""
     return jsonify({"diagnosis": diagnosis, "ticket_id": ticket_id})
 
 
+# ── Network Diagnosis: Nearest Sites ─────────────────────────────────────────
+
+@app.route("/api/agent/tickets/<int:ticket_id>/nearest-sites", methods=["GET"])
+@jwt_required()
+def agent_nearest_sites(ticket_id):
+    """Find 3 nearest telecom sites to customer's location."""
+    user = User.query.get(int(get_jwt_identity()))
+    if not user or user.role != "human_agent":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    ticket = Ticket.query.get(ticket_id)
+    if not ticket:
+        return jsonify({"error": "Ticket not found"}), 404
+
+    session = ChatSession.query.get(ticket.chat_session_id) if ticket.chat_session_id else None
+    if not session or not session.latitude or not session.longitude:
+        return jsonify({"error": "Customer location not available"}), 400
+
+    cust_lat, cust_lng = session.latitude, session.longitude
+    sites = TelecomSite.query.all()
+    if not sites:
+        return jsonify({"error": "No site data uploaded. Ask admin to upload site data."}), 400
+
+    ranked = []
+    for s in sites:
+        dist = haversine(cust_lat, cust_lng, s.latitude, s.longitude)
+        ranked.append({
+            "site_id": s.site_id,
+            "latitude": s.latitude,
+            "longitude": s.longitude,
+            "zone": s.zone,
+            "distance_km": round(dist, 2),
+        })
+    ranked.sort(key=lambda x: x["distance_km"])
+
+    return jsonify({
+        "customer": {"latitude": cust_lat, "longitude": cust_lng},
+        "nearest_sites": ranked[:3],
+    })
+
+
+@app.route("/api/agent/sites/<site_id>/kpi-trends", methods=["GET"])
+@jwt_required()
+def agent_kpi_trends(site_id):
+    """Get KPI trend data for a site, aggregated by period (month/week/day/hour)."""
+    user = User.query.get(int(get_jwt_identity()))
+    if not user or user.role != "human_agent":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    period = request.args.get("period", "day")
+    kpi_rows = KpiData.query.filter_by(site_id=site_id).all()
+
+    if not kpi_rows:
+        return jsonify({"error": f"No KPI data found for site {site_id}"}), 404
+
+    # Group by kpi_name
+    from collections import defaultdict
+    kpi_groups = defaultdict(list)
+    for r in kpi_rows:
+        kpi_groups[r.kpi_name].append(r)
+
+    result = {}
+    for kpi_name, rows in kpi_groups.items():
+        agg = defaultdict(list)
+        for r in rows:
+            if r.value is None:
+                continue
+            if period == "month":
+                key = r.date.strftime("%Y-%m")
+            elif period == "week":
+                key = f"{r.date.isocalendar()[0]}-W{r.date.isocalendar()[1]:02d}"
+            elif period == "hour":
+                key = f"{r.hour:02d}:00"
+            else:  # day
+                key = r.date.strftime("%Y-%m-%d")
+            agg[key].append(r.value)
+
+        trend = []
+        for key in sorted(agg.keys()):
+            vals = agg[key]
+            trend.append({
+                "label": key,
+                "avg": round(sum(vals) / len(vals), 4),
+                "min": round(min(vals), 4),
+                "max": round(max(vals), 4),
+            })
+        result[kpi_name] = trend
+
+    return jsonify({"site_id": site_id, "period": period, "trends": result})
+
+
+@app.route("/api/agent/tickets/<int:ticket_id>/root-cause", methods=["POST"])
+@jwt_required()
+def agent_root_cause(ticket_id):
+    """AI root cause analysis using KPI trends of the nearest site."""
+    user = User.query.get(int(get_jwt_identity()))
+    if not user or user.role != "human_agent":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    ticket = Ticket.query.get(ticket_id)
+    if not ticket:
+        return jsonify({"error": "Ticket not found"}), 404
+
+    session = ChatSession.query.get(ticket.chat_session_id) if ticket.chat_session_id else None
+    if not session or not session.latitude or not session.longitude:
+        return jsonify({"error": "Customer location not available"}), 400
+
+    # Find nearest site
+    sites = TelecomSite.query.all()
+    if not sites:
+        return jsonify({"error": "No site data"}), 400
+
+    nearest = min(sites, key=lambda s: haversine(session.latitude, session.longitude, s.latitude, s.longitude))
+    dist_km = round(haversine(session.latitude, session.longitude, nearest.latitude, nearest.longitude), 2)
+
+    # Get KPI data for that site (daily averages, last 30 days)
+    from collections import defaultdict
+    kpi_rows = KpiData.query.filter_by(site_id=nearest.site_id).all()
+    kpi_summary = defaultdict(list)
+    for r in kpi_rows:
+        if r.value is not None:
+            kpi_summary[r.kpi_name].append(r.value)
+
+    kpi_text = ""
+    for kpi_name, vals in kpi_summary.items():
+        avg = round(sum(vals) / len(vals), 4)
+        mn = round(min(vals), 4)
+        mx = round(max(vals), 4)
+        kpi_text += f"- {kpi_name}: avg={avg}, min={mn}, max={mx} ({len(vals)} data points)\n"
+
+    prompt = f"""You are an expert telecom network engineer performing root cause analysis.
+
+TICKET: {ticket.reference_number} — {ticket.category} / {ticket.subcategory}
+CUSTOMER ISSUE: {ticket.description}
+NEAREST SITE: {nearest.site_id} (Zone: {nearest.zone}, Distance: {dist_km} km from customer)
+
+KPI SUMMARY FOR SITE {nearest.site_id}:
+{kpi_text if kpi_text else 'No KPI data available.'}
+
+Analyze the KPI data above and provide:
+1. **KPI Assessment** — Which KPIs are performing well and which show degradation?
+2. **Anomaly Detection** — Any unusual patterns or outliers?
+3. **Root Cause Identification** — What is the most likely root cause of the network/signal issue?
+4. **Impact Assessment** — How severe is the issue and what is the scope of impact?
+5. **Correlation Analysis** — Are there related KPI degradations that point to a common cause?
+
+Be specific and reference actual KPI values in your analysis."""
+
+    try:
+        response = client.chat.completions.create(
+            model=DEPLOYMENT_NAME,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=1200,
+        )
+        analysis = response.choices[0].message.content.strip()
+    except Exception as e:
+        analysis = f"Root cause analysis unavailable: {str(e)}"
+
+    return jsonify({
+        "analysis": analysis,
+        "site_id": nearest.site_id,
+        "site_zone": nearest.zone,
+        "distance_km": dist_km,
+    })
+
+
+@app.route("/api/agent/tickets/<int:ticket_id>/recommendation", methods=["POST"])
+@jwt_required()
+def agent_recommendation(ticket_id):
+    """AI recommendation based on root cause analysis."""
+    user = User.query.get(int(get_jwt_identity()))
+    if not user or user.role != "human_agent":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    ticket = Ticket.query.get(ticket_id)
+    if not ticket:
+        return jsonify({"error": "Ticket not found"}), 404
+
+    root_cause = request.json.get("root_cause", "") if request.json else ""
+
+    session = ChatSession.query.get(ticket.chat_session_id) if ticket.chat_session_id else None
+
+    prompt = f"""You are an expert telecom network engineer providing actionable recommendations.
+
+TICKET: {ticket.reference_number} — {ticket.category} / {ticket.subcategory}
+CUSTOMER ISSUE: {ticket.description}
+PRIORITY: {ticket.priority.upper()}
+
+ROOT CAUSE ANALYSIS:
+{root_cause if root_cause else 'No root cause analysis available.'}
+
+Based on the above root cause analysis, provide:
+1. **Immediate Actions** — Steps to take right now to restore service
+2. **Short-term Fixes** — Actions within 24-48 hours
+3. **Long-term Recommendations** — Permanent fixes to prevent recurrence
+4. **Customer Communication** — What to tell the customer about the issue and expected resolution
+5. **Escalation Path** — When and to whom should this be escalated if not resolved
+
+Be specific, actionable, and prioritize by impact."""
+
+    try:
+        response = client.chat.completions.create(
+            model=DEPLOYMENT_NAME,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=1000,
+        )
+        recommendation = response.choices[0].message.content.strip()
+    except Exception as e:
+        recommendation = f"Recommendation unavailable: {str(e)}"
+
+    return jsonify({"recommendation": recommendation})
+
+
 @app.route("/api/agent/customer360/<int:customer_user_id>", methods=["GET"])
 @jwt_required()
 def agent_customer360(customer_user_id):
@@ -2914,10 +3385,28 @@ def agent_send_message(session_id):
 
 def send_sla_alert_email(recipients, subject, ticket, alert_type, time_left_hours):
     """Send SLA alert email to manager(s) or CTO."""
-    ticket_url = f"Ticket #{ticket.reference_number}"
-    time_left_str = f"{round(time_left_hours, 1)} hours" if time_left_hours > 0 else "BREACHED"
-    status_color = "#dc2626" if alert_type == "breach" else "#f59e0b"
-    status_label = "SLA BREACHED" if alert_type == "breach" else f"SLA Alert ({int(float(alert_type.replace('alert_','').replace('_sent',''))/10)}%)"
+    is_breach = alert_type == "breach"
+    status_color = "#dc2626" if is_breach else "#f59e0b"
+
+    # Time-left string for email
+    if is_breach:
+        time_left_str = "SLA Breached — 0 time left"
+    elif time_left_hours >= 1:
+        time_left_str = f"{round(time_left_hours, 1)} hours remaining before SLA breach"
+    else:
+        time_left_str = f"{int(time_left_hours * 60)} minutes remaining before SLA breach"
+
+    # Action-required callout
+    if is_breach:
+        action_msg = "URGENT: SLA has been breached. 0 time left. Immediate escalation required."
+        action_bg = "#fef2f2"
+        action_border = "#fecaca"
+        action_color = "#dc2626"
+    else:
+        action_msg = f"Action Required: {time_left_str} for this ticket. Please take immediate action."
+        action_bg = "#fef3c7"
+        action_border = "#fde68a"
+        action_color = "#b45309"
 
     html_body = f"""
     <div style="font-family: 'Segoe UI', Arial, sans-serif; max-width: 600px; margin: 0 auto; background: #fff; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 20px rgba(0,0,0,0.1);">
@@ -2928,15 +3417,17 @@ def send_sla_alert_email(recipients, subject, ticket, alert_type, time_left_hour
             <table style="width:100%;border-collapse:collapse;font-size:14px;">
                 <tr><td style="padding:8px 0;color:#64748b;width:160px;">Ticket ID</td><td style="padding:8px 0;color:#1e293b;font-weight:600;">{ticket.reference_number}</td></tr>
                 <tr><td style="padding:8px 0;color:#64748b;">Category</td><td style="padding:8px 0;color:#1e293b;">{ticket.category}</td></tr>
+                <tr><td style="padding:8px 0;color:#64748b;">Sub-Category</td><td style="padding:8px 0;color:#1e293b;">{ticket.subcategory or 'N/A'}</td></tr>
                 <tr><td style="padding:8px 0;color:#64748b;">Issue</td><td style="padding:8px 0;color:#1e293b;">{ticket.description[:200]}</td></tr>
                 <tr><td style="padding:8px 0;color:#64748b;">Priority</td><td style="padding:8px 0;color:#1e293b;font-weight:600;">{ticket.priority.upper()}</td></tr>
                 <tr><td style="padding:8px 0;color:#64748b;">Current Status</td><td style="padding:8px 0;color:#1e293b;">{ticket.status}</td></tr>
+                <tr><td style="padding:8px 0;color:#64748b;">SLA Allocated</td><td style="padding:8px 0;color:#1e293b;font-weight:600;">{ticket.sla_hours or 'N/A'} hours</td></tr>
                 <tr><td style="padding:8px 0;color:#64748b;">Time Left</td><td style="padding:8px 0;color:{status_color};font-weight:700;">{time_left_str}</td></tr>
                 <tr><td style="padding:8px 0;color:#64748b;">Assigned To</td><td style="padding:8px 0;color:#1e293b;">{ticket.assignee.name if ticket.assignee else 'Unassigned'}</td></tr>
                 <tr><td style="padding:8px 0;color:#64748b;">SLA Deadline</td><td style="padding:8px 0;color:#1e293b;">{ticket.sla_deadline.strftime('%Y-%m-%d %H:%M UTC') if ticket.sla_deadline else 'N/A'}</td></tr>
             </table>
-            <div style="background:#fef3c7;border:1px solid #fde68a;border-radius:8px;padding:14px 18px;margin-top:20px;">
-                <p style="margin:0;color:#b45309;font-size:14px;font-weight:600;">Action Required: This ticket has not been resolved. Please take immediate action.</p>
+            <div style="background:{action_bg};border:1px solid {action_border};border-radius:8px;padding:14px 18px;margin-top:20px;">
+                <p style="margin:0;color:{action_color};font-size:14px;font-weight:600;">{action_msg}</p>
             </div>
         </div>
         <div style="background:#f8fafc;border-top:1px solid #e2e8f0;padding:14px 30px;text-align:center;">
@@ -2985,46 +3476,73 @@ def run_sla_checks():
                         fraction_elapsed = elapsed / max(total_sla, 1)
 
                         changed = False
+                        # Human-friendly time remaining
+                        if time_left_hours >= 1:
+                            time_left_display = f"{round(time_left_hours, 1)}h"
+                        elif time_left_hours > 0:
+                            time_left_display = f"{int(time_left_hours * 60)}m"
+                        else:
+                            time_left_display = "0"
 
                         # Alert at 62.5%
                         if fraction_elapsed >= 0.625 and not ticket.alert_625_sent and manager_emails:
+                            msg_text = f"{time_left_display} remaining before SLA breach — Ticket {ticket.reference_number} [{ticket.priority.upper()}]"
                             send_sla_alert_email(
                                 manager_emails,
-                                f"⚠️ SLA Warning (62.5%): Ticket {ticket.reference_number}",
+                                f"⚠️ {time_left_display} remaining before SLA breach — {ticket.reference_number}",
                                 ticket, "625", time_left_hours
                             )
+                            db.session.add(SlaAlert(
+                                ticket_id=ticket.id, alert_level="625",
+                                recipient_role="manager", message=msg_text,
+                            ))
                             ticket.alert_625_sent = True
                             changed = True
 
                         # Alert at 75%
                         if fraction_elapsed >= 0.75 and not ticket.alert_750_sent and manager_emails:
+                            msg_text = f"{time_left_display} remaining before SLA breach — Ticket {ticket.reference_number} [{ticket.priority.upper()}]"
                             send_sla_alert_email(
                                 manager_emails,
-                                f"🚨 SLA Warning (75%): Ticket {ticket.reference_number}",
+                                f"🚨 {time_left_display} remaining before SLA breach — {ticket.reference_number}",
                                 ticket, "750", time_left_hours
                             )
+                            db.session.add(SlaAlert(
+                                ticket_id=ticket.id, alert_level="750",
+                                recipient_role="manager", message=msg_text,
+                            ))
                             ticket.alert_750_sent = True
                             changed = True
 
                         # Alert at 87.5%
                         if fraction_elapsed >= 0.875 and not ticket.alert_875_sent and manager_emails:
+                            msg_text = f"{time_left_display} remaining before SLA breach — Ticket {ticket.reference_number} [{ticket.priority.upper()}]"
                             send_sla_alert_email(
                                 manager_emails,
-                                f"🔴 SLA Critical (87.5%): Ticket {ticket.reference_number}",
+                                f"🔴 {time_left_display} remaining before SLA breach — {ticket.reference_number}",
                                 ticket, "875", time_left_hours
                             )
+                            db.session.add(SlaAlert(
+                                ticket_id=ticket.id, alert_level="875",
+                                recipient_role="manager", message=msg_text,
+                            ))
                             ticket.alert_875_sent = True
                             changed = True
 
                         # SLA Breach – send to CTO
                         if now > dl and not ticket.breach_alert_sent:
                             ticket.sla_breached = True
+                            msg_text = f"SLA Breached — 0 time left — Ticket {ticket.reference_number} [{ticket.priority.upper()}]"
                             recipients = cto_emails if cto_emails else manager_emails
                             send_sla_alert_email(
                                 recipients,
-                                f"🚨 SLA BREACHED: Ticket {ticket.reference_number} — Immediate Action Required",
-                                ticket, "breach", time_left_hours
+                                f"🚨 SLA Breached — {ticket.reference_number}",
+                                ticket, "breach", 0
                             )
+                            db.session.add(SlaAlert(
+                                ticket_id=ticket.id, alert_level="breach",
+                                recipient_role="cto", message=msg_text,
+                            ))
                             ticket.breach_alert_sent = True
                             changed = True
 
@@ -3064,11 +3582,14 @@ with app.app_context():
         db.session.commit()
         print(f">>> Backfilled employee_ids for {len(users_without_emp_id)} users")
 
-    # Seed SLA defaults if not present
+    # Seed / update SLA defaults
     for key, info in SLA_DEFAULTS.items():
-        if not SystemSetting.query.filter_by(key=key).first():
-            setting = SystemSetting(key=key, value=info["value"], category="sla", description=info["description"])
-            db.session.add(setting)
+        existing = SystemSetting.query.filter_by(key=key).first()
+        if existing:
+            existing.value = info["value"]
+            existing.description = info["description"]
+        else:
+            db.session.add(SystemSetting(key=key, value=info["value"], category="sla", description=info["description"]))
     db.session.commit()
 
 
