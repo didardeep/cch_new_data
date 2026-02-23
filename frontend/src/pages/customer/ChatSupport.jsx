@@ -402,6 +402,8 @@ export default function ChatSupport() {
     saveMessage('user', 'Raise a ticket');
 
     let refNum = '';
+    let assignedAgent = null;
+    let slaHours = null;
     if (sessionIdRef.current) {
       try {
         const token = getToken();
@@ -412,6 +414,10 @@ export default function ChatSupport() {
         const data = await resp.json();
         if (data.ticket) {
           refNum = data.ticket.reference_number;
+          slaHours = data.ticket.sla_hours || null;
+        }
+        if (data.assigned_agent) {
+          assignedAgent = data.assigned_agent;
         }
       } catch {}
     }
@@ -419,8 +425,19 @@ export default function ChatSupport() {
     addMessage({
       type: 'bot',
       html: `Your ticket has been raised successfully!` +
-        (refNum ? `<br><br>Reference number: <strong>${refNum}</strong>` : '') +
-        `<br><br>Our executive will review your issue and contact you shortly. You can also track your ticket status from the dashboard.`,
+        (refNum ? `<br>Reference: <strong>${refNum}</strong>` : '') +
+        (assignedAgent
+          ? `<br><br>We are connecting you to our expert. Your dedicated support agent is:<br>
+             <div style="background:#eff6ff;border:1px solid #93c5fd;border-radius:8px;padding:10px 14px;margin:8px 0;display:inline-block;min-width:220px;">
+               <div style="font-size:13px;font-weight:700;color:#1e40af;">${assignedAgent.name}</div>
+               ${assignedAgent.phone ? `<div style="font-size:12px;color:#0ea5e9;margin-top:4px;">${assignedAgent.phone}</div>` : ''}
+               ${assignedAgent.email ? `<div style="font-size:12px;color:#0ea5e9;margin-top:4px;">${assignedAgent.email}</div>` : ''}
+               ${assignedAgent.employee_id ? `<div style="font-size:11px;color:#64748b;margin-top:2px;">ID: ${assignedAgent.employee_id}</div>` : ''}
+               ${slaHours ? `<div style="font-size:12px;color:#16a34a;margin-top:6px;font-weight:600;">Your issue will be resolved within ${slaHours} hour${slaHours !== 1 ? 's' : ''}</div>` : ''}
+             </div>`
+          : `<br><br>Our support team will reach out to you shortly.` +
+            (slaHours ? `<br>SLA: Resolve within ${slaHours} hours` : '')) +
+        `<br>You can track your ticket from the dashboard.`,
     });
 
     setTimeout(() => {
@@ -486,6 +503,8 @@ export default function ChatSupport() {
 
     let refNum = 'TC-' + Date.now().toString(36).toUpperCase() + '-' +
       Math.random().toString(36).substring(2, 6).toUpperCase();
+    let assignedAgent = null;
+    let slaHours = null;
 
     if (sessionIdRef.current) {
       try {
@@ -497,6 +516,10 @@ export default function ChatSupport() {
         const data = await resp.json();
         if (data.ticket) {
           refNum = data.ticket.reference_number;
+          slaHours = data.ticket.sla_hours || null;
+        }
+        if (data.assigned_agent) {
+          assignedAgent = data.assigned_agent;
         }
       } catch {}
     }
@@ -509,12 +532,24 @@ export default function ChatSupport() {
       refNum,
     });
 
+    const agentBlock = assignedAgent
+      ? `<br><br>We are connecting you to your dedicated support expert:<br>
+           <div style="background:#eff6ff;border:1px solid #93c5fd;border-radius:8px;padding:10px 14px;margin:8px 0;display:inline-block;min-width:220px;">
+             <div style="font-size:13px;font-weight:700;color:#1e40af;">${assignedAgent.name}</div>
+             ${assignedAgent.phone ? `<div style="font-size:12px;color:#0ea5e9;margin-top:4px;">${assignedAgent.phone}</div>` : ''}
+             ${assignedAgent.email ? `<div style="font-size:12px;color:#0ea5e9;margin-top:4px;">${assignedAgent.email}</div>` : ''}
+             ${assignedAgent.employee_id ? `<div style="font-size:11px;color:#64748b;margin-top:2px;">ID: ${assignedAgent.employee_id}</div>` : ''}
+             ${slaHours ? `<div style="font-size:12px;color:#16a34a;margin-top:6px;font-weight:600;">Your issue will be resolved within ${slaHours} hour${slaHours !== 1 ? 's' : ''}</div>` : ''}
+           </div>`
+      : `<br><br>A customer support executive will contact you shortly.`;
+
     setTimeout(() => {
       addMessage({
         type: 'bot',
-        html: `Your request has been submitted. A support ticket has been raised and a customer support executive will contact you shortly.<br><br>` +
-          `Please save your reference number: <strong>${refNum}</strong><br><br>` +
-          `You can track your ticket status from the dashboard.<br><br>` +
+        html: `Your request has been submitted. A support ticket has been raised successfully.` +
+          `<br>Reference: <strong>${refNum}</strong>` +
+          agentBlock +
+          `<br><br>You can track your ticket status from the dashboard.<br><br>` +
           `What would you like to do next?`,
       });
       setTimeout(() => {

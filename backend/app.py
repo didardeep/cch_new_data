@@ -656,6 +656,61 @@ def resolve_session(session_id):
     return jsonify({"session": session.to_dict(), "summary": session.summary})
 
 
+def send_ticket_assignment_email(agent, ticket, session):
+    """Send a styled HTML email to the assigned agent with ticket details."""
+    if not agent or not agent.email:
+        return
+
+    sla_deadline_str = ticket.sla_deadline.strftime('%B %d, %Y at %I:%M %p UTC') if ticket.sla_deadline else 'N/A'
+    description_preview = (ticket.description[:300] + '...') if ticket.description and len(ticket.description) > 300 else (ticket.description or 'N/A')
+
+    html_body = f"""
+    <div style="font-family:'Segoe UI',Arial,sans-serif;max-width:600px;margin:0 auto;background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 4px 20px rgba(0,0,0,0.08);">
+        <div style="background:linear-gradient(135deg,#00338d 0%,#004fc4 100%);padding:24px 30px;text-align:center;">
+            <h1 style="color:#fff;margin:0;font-size:20px;font-weight:600;">New Ticket Assigned</h1>
+            <p style="color:rgba(255,255,255,0.8);margin:4px 0 0;font-size:13px;">A support ticket has been assigned to you</p>
+        </div>
+        <div style="padding:28px 30px;">
+            <p style="margin:0 0 20px;font-size:15px;color:#1e293b;">Hello <strong>{agent.name}</strong>,</p>
+            <p style="margin:0 0 20px;font-size:14px;color:#475569;line-height:1.6;">
+                A new customer support ticket has been assigned to you. Please review the details below:
+            </p>
+            <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:20px;margin-bottom:20px;">
+                <table style="width:100%;border-collapse:collapse;font-size:14px;">
+                    <tr><td style="padding:8px 0;color:#94a3b8;width:140px;">Reference</td><td style="padding:8px 0;color:#1e293b;font-weight:600;">{ticket.reference_number}</td></tr>
+                    <tr><td style="padding:8px 0;color:#94a3b8;">Category</td><td style="padding:8px 0;color:#1e293b;">{ticket.category or 'N/A'}</td></tr>
+                    <tr><td style="padding:8px 0;color:#94a3b8;">Issue Type</td><td style="padding:8px 0;color:#1e293b;">{ticket.subcategory or 'N/A'}</td></tr>
+                    <tr><td style="padding:8px 0;color:#94a3b8;">Priority</td><td style="padding:8px 0;color:#1e293b;font-weight:700;">{ticket.priority.upper() if ticket.priority else 'N/A'}</td></tr>
+                    <tr><td style="padding:8px 0;color:#94a3b8;">SLA Hours</td><td style="padding:8px 0;color:#1e293b;">{ticket.sla_hours or 'N/A'} hours</td></tr>
+                    <tr><td style="padding:8px 0;color:#94a3b8;">SLA Deadline</td><td style="padding:8px 0;color:#dc2626;font-weight:600;">{sla_deadline_str}</td></tr>
+                </table>
+            </div>
+            <div style="border-left:3px solid #2563eb;background:#eff6ff;border-radius:0 10px 10px 0;padding:16px 20px;margin-bottom:20px;">
+                <h3 style="color:#1e40af;font-size:13px;text-transform:uppercase;letter-spacing:0.08em;margin:0 0 10px;">Customer Description</h3>
+                <p style="color:#1e293b;font-size:14px;line-height:1.7;margin:0;">{description_preview}</p>
+            </div>
+            <div style="background:#eff6ff;border:1px solid #93c5fd;border-radius:8px;padding:14px 18px;">
+                <p style="margin:0;color:#1e40af;font-size:14px;font-weight:600;">Please review this ticket and begin working on it at your earliest convenience.</p>
+            </div>
+        </div>
+        <div style="background:#f8fafc;border-top:1px solid #e2e8f0;padding:14px 30px;text-align:center;">
+            <p style="color:#94a3b8;font-size:12px;margin:0;">Customer Handling &mdash; Automated Ticket Assignment</p>
+        </div>
+    </div>
+    """
+
+    try:
+        msg = Message(
+            subject=f"New Ticket Assigned - {ticket.reference_number}",
+            recipients=[agent.email],
+            html=html_body,
+        )
+        mail.send(msg)
+        print(f"Assignment email sent to agent {agent.name} at {agent.email}")
+    except Exception as e:
+        print(f"Agent assignment email failed: {e}")
+
+
 @app.route("/api/chat/session/<int:session_id>/escalate", methods=["PUT"])
 @jwt_required()
 def escalate_session(session_id):
@@ -670,9 +725,22 @@ def escalate_session(session_id):
     msgs = [{"sender": m.sender, "content": m.content} for m in session.messages]
     session.summary = generate_chat_summary(msgs, session.sector_name, session.subprocess_name)
 
+    # Auto-assign priority
+    priority = auto_assign_priority(session.query_text, session.subprocess_name)
+
+    # Auto-assign to least-occupied human agent
+    assigned_agent = None
+    all_agents = User.query.filter_by(role="human_agent").all()
+    if all_agents:
+        def open_ticket_count(agent):
+            return Ticket.query.filter(
+                Ticket.assigned_to == agent.id,
+                Ticket.status.in_(["pending", "in_progress"])
+            ).count()
+        assigned_agent = min(all_agents, key=open_ticket_count)
+
     # Create ticket
     ref = generate_ref_number()
-    priority = auto_assign_priority(session.query_text, session.subprocess_name)
     ticket = Ticket(
         chat_session_id=session_id,
         user_id=user_id,
@@ -682,10 +750,108 @@ def escalate_session(session_id):
         description=session.query_text,
         status="pending",
         priority=priority,
+        assigned_to=assigned_agent.id if assigned_agent else None,
     )
     db.session.add(ticket)
     db.session.commit()
-    return jsonify({"session": session.to_dict(), "ticket": ticket.to_dict()})
+
+    # Send WhatsApp notification to customer
+    try:
+        user = User.query.get(user_id)
+        if user and user.phone_number:
+            whatsapp_msg = format_ticket_alert_for_whatsapp(ticket, user.name, session)
+            result = send_whatsapp_message(user.phone_number, whatsapp_msg)
+            if result["success"]:
+                print(f"WhatsApp ticket alert sent to {user.phone_number}")
+    except Exception as e:
+        print(f"WhatsApp error: {e}")
+
+    # Send email notification to assigned agent
+    if assigned_agent:
+        send_ticket_assignment_email(assigned_agent, ticket, session)
+
+    agent_info = None
+    if assigned_agent:
+        agent_info = {
+            "name": assigned_agent.name,
+            "email": assigned_agent.email,
+            "phone": assigned_agent.phone_number,
+            "employee_id": assigned_agent.employee_id,
+        }
+
+    return jsonify({
+        "session": session.to_dict(),
+        "ticket": ticket.to_dict(),
+        "assigned_agent": agent_info,
+    })
+
+
+# ─── Human Agent Endpoints ──────────────────────────────────────────────────
+
+@app.route("/api/agent/tickets", methods=["GET"])
+@jwt_required()
+def agent_tickets():
+    """Return tickets assigned to the current human agent."""
+    user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
+    if not user or user.role != "human_agent":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    tickets = Ticket.query.filter_by(assigned_to=user_id).order_by(Ticket.created_at.desc()).all()
+    return jsonify({"tickets": [t.to_dict() for t in tickets]})
+
+
+@app.route("/api/agent/tickets/<int:ticket_id>/resolve", methods=["PUT"])
+@jwt_required()
+def agent_resolve_ticket(ticket_id):
+    """Allow the assigned agent to resolve a ticket."""
+    user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
+    if not user or user.role != "human_agent":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    ticket = Ticket.query.get(ticket_id)
+    if not ticket:
+        return jsonify({"error": "Ticket not found"}), 404
+    if ticket.assigned_to != user_id:
+        return jsonify({"error": "This ticket is not assigned to you"}), 403
+
+    data = request.json or {}
+    ticket.status = "resolved"
+    ticket.resolution_notes = data.get("resolution_notes", "")
+    ticket.resolved_at = datetime.now(timezone.utc)
+    db.session.commit()
+
+    return jsonify({"ticket": ticket.to_dict()})
+
+
+@app.route("/api/agent/tickets/<int:ticket_id>/status", methods=["PUT"])
+@jwt_required()
+def agent_update_ticket_status(ticket_id):
+    """Allow the assigned agent to update ticket status (e.g. pending -> in_progress)."""
+    user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
+    if not user or user.role != "human_agent":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    ticket = Ticket.query.get(ticket_id)
+    if not ticket:
+        return jsonify({"error": "Ticket not found"}), 404
+    if ticket.assigned_to != user_id:
+        return jsonify({"error": "This ticket is not assigned to you"}), 403
+
+    data = request.json or {}
+    new_status = data.get("status", "").strip()
+    if new_status not in ("pending", "in_progress", "resolved"):
+        return jsonify({"error": "Invalid status"}), 400
+
+    ticket.status = new_status
+    if new_status == "resolved":
+        ticket.resolved_at = datetime.now(timezone.utc)
+        ticket.resolution_notes = data.get("resolution_notes", "")
+    db.session.commit()
+
+    return jsonify({"ticket": ticket.to_dict()})
 
 
 @app.route("/api/chat/session/<int:session_id>/send-summary-email", methods=["POST"])
