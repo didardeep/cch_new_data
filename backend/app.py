@@ -55,12 +55,6 @@ bcrypt.init_app(app)
 jwt = JWTManager(app)
 mail = Mail(app)
 
-# ─── OTP Storage (in-memory) ────────────────────────────────────────────────
-otp_store = {}
-OTP_EXPIRY_MINUTES = 5
-OTP_MAX_ATTEMPTS = 5
-OTP_COOLDOWN_SECONDS = 60
-
 
 # ─── Azure OpenAI Configuration ──────────────────────────────────────────────
 client = AzureOpenAI(
@@ -542,54 +536,6 @@ def auto_assign_priority(query_text, subprocess_name):
     return "low"
 
 
-def generate_otp():
-    """Generate a 6-digit numeric OTP."""
-    return ''.join(random.choices(string.digits, k=6))
-
-
-def cleanup_expired_otps():
-    """Remove expired OTPs from the store."""
-    now = datetime.now(timezone.utc)
-    expired = [e for e, d in otp_store.items() if d["expires_at"] < now]
-    for e in expired:
-        del otp_store[e]
-
-
-def send_otp_email(user_email, user_name, otp_code):
-    """Send OTP verification email."""
-    html_body = f"""
-    <div style="font-family: 'Segoe UI', Arial, sans-serif; max-width: 600px; margin: 0 auto; background: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 20px rgba(0,0,0,0.08);">
-        <div style="background: linear-gradient(135deg, #00338d 0%, #004fc4 100%); padding: 24px 30px; text-align: center;">
-            <h1 style="color: #ffffff; margin: 0; font-size: 20px; font-weight: 600;">Customer Handling</h1>
-            <p style="color: rgba(255,255,255,0.8); margin: 4px 0 0; font-size: 13px;">Login Verification Code</p>
-        </div>
-        <div style="padding: 30px;">
-            <p style="color: #1e293b; font-size: 15px; margin: 0 0 20px;">Hello <strong>{user_name}</strong>,</p>
-            <p style="color: #64748b; font-size: 14px; line-height: 1.6; margin: 0 0 24px;">
-                Your one-time verification code for logging in:
-            </p>
-            <div style="background: #f8fafc; border: 2px solid #00338d; border-radius: 10px; padding: 24px; margin-bottom: 24px; text-align: center;">
-                <span style="font-size: 36px; font-weight: 700; color: #00338d; letter-spacing: 8px;">{otp_code}</span>
-            </div>
-            <p style="color: #64748b; font-size: 14px; margin: 0 0 8px;">
-                This code is valid for <strong>{OTP_EXPIRY_MINUTES} minutes</strong>. Do not share it with anyone.
-            </p>
-            <p style="color: #94a3b8; font-size: 13px; margin: 0;">
-                If you did not request this code, please ignore this email.
-            </p>
-        </div>
-        <div style="background: #f8fafc; border-top: 1px solid #e2e8f0; padding: 16px 30px; text-align: center;">
-            <p style="color: #94a3b8; font-size: 12px; margin: 0;">Customer Handling &mdash; AI-Powered Support</p>
-        </div>
-    </div>
-    """
-    msg = Message(
-        subject="Your Login Verification Code - Customer Handling",
-        recipients=[user_email],
-        html=html_body,
-    )
-    mail.send(msg)
-
 
 
 # AUTH ROUTES
@@ -626,87 +572,15 @@ def register():
     return jsonify({"token": token, "user": user.to_dict()}), 201
 
 
-@app.route("/api/auth/send-otp", methods=["POST"])
-def send_otp():
-    """Step 1: check email and send OTP if employee."""
-    data = request.json
-    email = data.get("email", "").strip().lower()
-    if not email:
-        return jsonify({"error": "Email is required"}), 400
-
-    user = User.query.filter_by(email=email).first()
-    if not user:
-        return jsonify({"error": "Invalid email address"}), 404
-
-    # Customers skip OTP
-    if user.role == "customer":
-        return jsonify({"requires_otp": False}), 200
-
-    # Rate limit check
-    cleanup_expired_otps()
-    if email in otp_store:
-        created = otp_store[email].get("created_at", datetime.now(timezone.utc))
-        elapsed = (datetime.now(timezone.utc) - created).total_seconds()
-        if elapsed < OTP_COOLDOWN_SECONDS:
-            remaining = int(OTP_COOLDOWN_SECONDS - elapsed)
-            return jsonify({"error": f"Please wait {remaining} seconds before requesting a new code"}), 429
-
-    # Generate and store OTP
-    otp_code = generate_otp()
-    otp_store[email] = {
-        "code": otp_code,
-        "expires_at": datetime.now(timezone.utc) + timedelta(minutes=OTP_EXPIRY_MINUTES),
-        "attempts": 0,
-        "created_at": datetime.now(timezone.utc),
-    }
-
-    try:
-        send_otp_email(user.email, user.name, otp_code)
-    except Exception as e:
-        print(f"OTP email failed: {e}")
-        del otp_store[email]
-        return jsonify({"error": "Failed to send verification code. Please try again."}), 500
-
-    return jsonify({"requires_otp": True, "message": "Verification code sent to your email"}), 200
-
-
 @app.route("/api/auth/login", methods=["POST"])
 def login():
     data = request.json
     email = data.get("email", "").strip().lower()
     password = data.get("password", "")
-    otp = data.get("otp", "").strip()
 
     user = User.query.filter_by(email=email).first()
     if not user or not user.check_password(password):
         return jsonify({"error": "Invalid email or password"}), 401
-
-    # Employees must provide OTP
-    if user.role != "customer":
-        if not otp:
-            return jsonify({"error": "Verification code is required"}), 400
-
-        cleanup_expired_otps()
-        stored = otp_store.get(email)
-
-        if not stored:
-            return jsonify({"error": "No verification code found. Please request a new one."}), 400
-
-        if datetime.now(timezone.utc) > stored["expires_at"]:
-            del otp_store[email]
-            return jsonify({"error": "Verification code has expired. Please request a new one."}), 400
-
-        if stored["attempts"] >= OTP_MAX_ATTEMPTS:
-            del otp_store[email]
-            return jsonify({"error": "Too many failed attempts. Please request a new code."}), 429
-
-        if stored["code"] != otp:
-            stored["attempts"] += 1
-            remaining = OTP_MAX_ATTEMPTS - stored["attempts"]
-            return jsonify({"error": f"Invalid verification code. {remaining} attempts remaining."}), 401
-
-        # OTP verified — consume it
-        del otp_store[email]
 
     token = create_access_token(identity=str(user.id))
     return jsonify({"token": token, "user": user.to_dict()})
