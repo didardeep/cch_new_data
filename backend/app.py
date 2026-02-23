@@ -5,8 +5,10 @@ Full backend with auth, chat, tickets, and the original AI chatbot integrated.
 """
 
 import os
+import re
 import json
 import time
+import base64
 import random
 import string
 from datetime import datetime, timezone, timedelta
@@ -37,6 +39,7 @@ app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get(
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 app.config["JWT_SECRET_KEY"] = os.environ.get("JWT_SECRET", "super-secret-jwt-key-change-in-prod")
 app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(hours=24)
+app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16MB max for image uploads
 
 # ─── Flask-Mail Configuration ─────────────────────────────────────────────
 app.config["MAIL_SERVER"] = os.environ.get("MAIL_SERVER", "smtp.gmail.com")
@@ -62,7 +65,7 @@ OTP_COOLDOWN_SECONDS = 60
 # ─── Azure OpenAI Configuration ──────────────────────────────────────────────
 client = AzureOpenAI(
     api_key = "",
-    api_version = "2023-07-01-preview",
+    api_version = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-02-15-preview"),
     azure_endpoint = "https://entgptaiuat.openai.azure.com"
 )
 DEPLOYMENT_NAME = os.environ.get("AZURE_DEPLOYMENT_NAME", "gpt-4o-mini")
@@ -415,6 +418,98 @@ def generate_chat_summary(messages_list, sector_name, subprocess_name):
         return response.choices[0].message.content.strip()
     except Exception:
         return f"Chat about {sector_name} - {subprocess_name}. Customer query handled."
+
+
+def analyze_signal_screenshot(image_base64):
+    """Use Azure OpenAI Vision to extract signal metrics from a screenshot."""
+    # Strip data URL prefix if present
+    clean_b64 = re.sub(r"^data:image/[^;]+;base64,", "", image_base64)
+
+    response = client.chat.completions.create(
+        model=DEPLOYMENT_NAME,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a telecom signal analysis expert. Extract signal metrics from "
+                    "the provided screenshot of a phone's service mode or signal information screen.\n\n"
+                    "Extract these values:\n"
+                    "- RSRP (Reference Signal Received Power) in dBm\n"
+                    "- SINR (Signal to Interference plus Noise Ratio) in dB\n"
+                    "- Cell ID (the cell identifier)\n\n"
+                    "Return ONLY valid JSON in this exact format:\n"
+                    '{"rsrp": <number or null>, "sinr": <number or null>, "cell_id": <string or null>}\n\n'
+                    "If a value is not visible or cannot be determined, use null.\n"
+                    "For RSRP, return just the number (e.g., -95, not '-95 dBm').\n"
+                    "For SINR, return just the number (e.g., 12, not '12 dB').\n"
+                    "For Cell ID, return the string value as shown."
+                ),
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "Extract RSRP, SINR, and Cell ID values from this signal information screenshot.",
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{clean_b64}",
+                            "detail": "high",
+                        },
+                    },
+                ],
+            },
+        ],
+        temperature=0,
+        max_tokens=200,
+    )
+
+    raw = response.choices[0].message.content.strip()
+    # Extract JSON from possible markdown code block
+    json_match = re.search(r"\{.*\}", raw, re.DOTALL)
+    if not json_match:
+        raise ValueError("Could not parse AI response")
+    extracted = json.loads(json_match.group())
+
+    rsrp = extracted.get("rsrp")
+    sinr = extracted.get("sinr")
+    cell_id = extracted.get("cell_id")
+
+    # Classify RSRP
+    if rsrp is not None:
+        rsrp = float(rsrp)
+        if -105 <= rsrp <= -40:
+            rsrp_status, rsrp_label = "green", "Good"
+        elif -115 <= rsrp < -105:
+            rsrp_status, rsrp_label = "amber", "Moderate"
+        else:
+            rsrp_status, rsrp_label = "red", "Weak"
+    else:
+        rsrp_status, rsrp_label = "unknown", "Not detected"
+
+    # Classify SINR
+    if sinr is not None:
+        sinr = float(sinr)
+        if sinr > 5:
+            sinr_status, sinr_label = "green", "Good"
+        elif sinr >= 0:
+            sinr_status, sinr_label = "amber", "Moderate"
+        else:
+            sinr_status, sinr_label = "red", "Weak"
+    else:
+        sinr_status, sinr_label = "unknown", "Not detected"
+
+    return {
+        "rsrp": rsrp,
+        "rsrp_status": rsrp_status,
+        "rsrp_label": rsrp_label,
+        "sinr": sinr,
+        "sinr_status": sinr_status,
+        "sinr_label": sinr_label,
+        "cell_id": str(cell_id) if cell_id is not None else None,
+    }
 
 
 def generate_ref_number():
@@ -817,6 +912,47 @@ def save_session_location(session_id):
         "latitude": session.latitude,
         "longitude": session.longitude,
     }), 200
+
+
+@app.route("/api/chat/session/<int:session_id>/analyze-signal", methods=["POST"])
+@jwt_required()
+def analyze_signal(session_id):
+    """Analyze a signal screenshot using Azure OpenAI Vision."""
+    user_id = int(get_jwt_identity())
+    session = ChatSession.query.get(session_id)
+
+    if not session:
+        return jsonify({"error": "Session not found"}), 404
+    if session.user_id != user_id:
+        return jsonify({"error": "Unauthorized"}), 403
+
+    data = request.json
+    image_base64 = data.get("image")
+
+    if not image_base64:
+        return jsonify({"error": "No image provided"}), 400
+
+    # Limit ~5MB base64
+    if len(image_base64) > 7_000_000:
+        return jsonify({"error": "Image too large. Please upload a smaller screenshot."}), 400
+
+    try:
+        result = analyze_signal_screenshot(image_base64)
+
+        # Save diagnosis as a bot message for chat history
+        diagnosis_text = (
+            f"Signal Diagnosis Results: "
+            f"RSRP: {result.get('rsrp', 'N/A')} dBm ({result.get('rsrp_label', 'Unknown')}), "
+            f"SINR: {result.get('sinr', 'N/A')} dB ({result.get('sinr_label', 'Unknown')}), "
+            f"Cell ID: {result.get('cell_id', 'N/A')}"
+        )
+        msg = ChatMessage(session_id=session_id, sender="bot", content=diagnosis_text)
+        db.session.add(msg)
+        db.session.commit()
+
+        return jsonify({"diagnosis": result}), 200
+    except Exception as e:
+        return jsonify({"error": f"Failed to analyze screenshot: {str(e)}"}), 500
 
 
 @app.route("/api/chat/session/<int:session_id>/resolve", methods=["PUT"])
