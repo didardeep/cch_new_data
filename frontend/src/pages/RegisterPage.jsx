@@ -6,19 +6,32 @@ import { apiPost } from '../api';
 export default function RegisterPage() {
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
+  const [phone, setPhone] = useState('');  // ← NEW
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const navigate = useNavigate();
   const { login } = useAuth();
 
+  const validatePassword = (pw) => {
+    if (pw.length < 7) return 'Password must be at least 7 characters long';
+    if (!/[A-Z]/.test(pw)) return 'Password must contain at least 1 uppercase letter';
+    if (!/[!@#$%^&*()_+\-=[\]{};':"\\|,.<>/?`~]/.test(pw)) return 'Password must contain at least 1 special character';
+    return null;
+  };
+
   const handleSubmit = async (e) => {
     e.preventDefault();
     setError('');
+
+    const pwErr = validatePassword(password);
+    if (pwErr) { setError(pwErr); return; }
+
     setLoading(true);
 
     try {
-      const data = await apiPost('/api/auth/register', { name, email, password });
+      // ← UPDATED: Now sends phone_number
+      const data = await apiPost('/api/auth/register', { name, email, phone_number: phone, password });
       if (data.error) {
         setError(data.error);
       } else {
@@ -35,7 +48,7 @@ export default function RegisterPage() {
     <div className="auth-page">
       <div className="auth-card">
         <div className="auth-header">
-          <div className="auth-logo" style={{ fontSize: 32, fontWeight: 800, color: '#00338D' }}>TeleBot</div>
+          <img src="https://upload.wikimedia.org/wikipedia/commons/d/db/KPMG_blue_logo.svg" alt="KPMG" style={{ height: 40 }} />
           <h2>Create Account</h2>
           <p>Register as a customer to get started</p>
         </div>
@@ -65,17 +78,39 @@ export default function RegisterPage() {
               required
             />
           </div>
+
+          {/* ← NEW: Phone Number Field */}
+          <div className="form-group">
+            <label>Phone Number (WhatsApp)</label>
+            <input
+              type="tel"
+              className="form-input"
+              placeholder="+919876543210"
+              value={phone}
+              onChange={e => setPhone(e.target.value)}
+              required
+              pattern="^\+?[1-9]\d{1,14}$"
+              title="Enter phone number with country code (e.g., +919876543210)"
+            />
+            <small style={{ color: '#6b7280', fontSize: '12px' }}>
+              Include country code (e.g., +91 for India)
+            </small>
+          </div>
+
           <div className="form-group">
             <label>Password</label>
             <input
               type="password"
               className="form-input"
-              placeholder="Min 6 characters"
+              placeholder="Min 7 chars, 1 uppercase, 1 special"
               value={password}
               onChange={e => setPassword(e.target.value)}
-              minLength={6}
+              minLength={7}
               required
             />
+            <small style={{ color: '#6b7280', fontSize: '12px' }}>
+              Min 7 characters, 1 uppercase letter, 1 special character
+            </small>
           </div>
           <button
             type="submit"

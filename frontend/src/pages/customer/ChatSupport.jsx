@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
-import { useSearchParams } from 'react-router-dom';
+import { useSearchParams, useNavigate } from 'react-router-dom';
 import { getToken, apiGet, apiPost } from '../../api';
 import { useAuth } from '../../AuthContext';
 import '../../styles/chatbot.css';
@@ -24,6 +24,13 @@ function formatResolution(text) {
     .replace(/\n/g, '<br>');
 }
 
+// ── Check if subprocess is network/signal related ──
+function isNetworkIssue(subprocessName) {
+  if (!subprocessName) return false;
+  const name = subprocessName.toLowerCase();
+  return name.includes('network') || name.includes('signal');
+}
+
 function limitSubprocesses(subprocesses) {
   const entries = Object.entries(subprocesses);
   const others = entries.filter(([, v]) => v === 'Others' || v.toLowerCase().includes('other'));
@@ -33,10 +40,15 @@ function limitSubprocesses(subprocesses) {
 
 export default function ChatSupport() {
   const { user } = useAuth();
+  const navigate = useNavigate();
   const [searchParams] = useSearchParams();
 
+  // ── Agent-resolved polling state ──
+  const [handoffActive, setHandoffActive] = useState(false);
+  const agentResolvedShownRef = useRef(false);
+
   // ── Init-phase state ──
-  const [initPhase, setInitPhase] = useState('loading'); // loading | feedback-gate | resume-prompt | chat
+  const [initPhase, setInitPhase] = useState('loading');
   const [pendingFeedback, setPendingFeedback] = useState([]);
   const [currentFbIdx, setCurrentFbIdx] = useState(0);
   const [activeSessionData, setActiveSessionData] = useState(null);
@@ -52,6 +64,15 @@ export default function ChatSupport() {
   const [inputValue, setInputValue] = useState('');
   const [isTyping, setIsTyping] = useState(false);
   const [disabledGroups, setDisabledGroups] = useState(new Set());
+
+  // ── Location state ──
+  const [locationStatus, setLocationStatus] = useState('idle'); // idle | requesting | granted | denied | blocked
+  const locationRetryRef = useRef(null);
+
+  // ── Screenshot upload state ──
+  const [screenshotUploading, setScreenshotUploading] = useState(false);
+  const fileInputRef = useRef(null);
+
   const chatAreaRef = useRef(null);
   const inputRef = useRef(null);
   const sessionIdRef = useRef(null);
@@ -110,9 +131,7 @@ export default function ChatSupport() {
         content,
         ...meta,
       });
-    } catch (e) {
-      // silently fail
-    }
+    } catch (e) {}
   }, []);
 
   // ── Create a new session on backend ──
@@ -122,15 +141,145 @@ export default function ChatSupport() {
       if (data.session) {
         sessionIdRef.current = data.session.id;
       }
-    } catch (e) {
-      // silently fail
-    }
+    } catch (e) {}
   }, []);
+
+  // ══════════════════════════════════════════════════════════════════
+  // LOCATION FUNCTIONS
+  // ══════════════════════════════════════════════════════════════════
+
+  // ── Save location to backend ──
+  const saveLocationToBackend = useCallback(async (latitude, longitude) => {
+    if (!sessionIdRef.current) return;
+    try {
+      const token = getToken();
+      await fetch(`${API_BASE}/api/chat/session/${sessionIdRef.current}/location`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+        },
+        body: JSON.stringify({ latitude, longitude }),
+      });
+    } catch (e) {}
+  }, []);
+
+  // ── Request Location — forced, no skip option ──
+  const requestLocation = useCallback((onSuccess) => {
+    setLocationStatus('requesting');
+
+    if (!navigator.geolocation) {
+      // Browser doesn't support geolocation — very rare
+      addMessage({
+        type: 'system',
+        text: 'Your browser does not support location services. Please use a modern browser.',
+      });
+      return;
+    }
+
+    navigator.geolocation.getCurrentPosition(
+      // SUCCESS
+      (position) => {
+        const { latitude, longitude } = position.coords;
+        setLocationStatus('granted');
+
+        // Save to backend
+        saveLocationToBackend(latitude, longitude);
+
+        // Show success message in chat
+        addMessage({
+          type: 'location-success',
+          latitude,
+          longitude,
+        });
+        saveMessage('system', `Customer location shared: ${latitude.toFixed(6)}, ${longitude.toFixed(6)}`);
+
+        // Continue the chat flow
+        if (onSuccess) onSuccess();
+      },
+      // ERROR — user denied or error
+      (error) => {
+        setLocationStatus('denied');
+
+        // Show location required message — user MUST allow
+        const locGroupId = nextId();
+        addMessage({
+          type: 'location-required',
+          groupId: locGroupId,
+          onRetry: () => {
+            disableGroup(locGroupId);
+            requestLocation(onSuccess);
+          },
+        });
+      },
+      {
+        enableHighAccuracy: true,
+        timeout: 15000,
+        maximumAge: 0,
+      }
+    );
+  }, [addMessage, saveMessage, saveLocationToBackend, disableGroup]);
+
+  // ── Poll for agent messages + resolution after handoff ──────────────────
+  const lastSeenMsgIdRef = useRef(0);
+
+  useEffect(() => {
+    if (!handoffActive) return;
+
+    const poll = async () => {
+      if (!sessionIdRef.current) return;
+      try {
+        const token = getToken();
+        const resp = await fetch(
+          `${API_BASE}/api/chat/session/${sessionIdRef.current}`,
+          { headers: { Authorization: `Bearer ${token}` } }
+        );
+        if (!resp.ok) return;
+        const data = await resp.json();
+        const allMsgs = data.messages || [];
+
+        // Show any new agent messages the customer hasn't seen yet
+        const newAgentMsgs = allMsgs.filter(
+          m => m.sender === 'agent' && m.id > lastSeenMsgIdRef.current
+        );
+        newAgentMsgs.forEach(m => {
+          lastSeenMsgIdRef.current = Math.max(lastSeenMsgIdRef.current, m.id);
+          addMessage({
+            type: 'live-agent-message',
+            text: m.content,
+            timestamp: m.created_at,
+          });
+        });
+
+        // Check for resolution
+        const s = data.session || {};
+        if (
+          (s.status === 'resolved') &&
+          !agentResolvedShownRef.current
+        ) {
+          agentResolvedShownRef.current = true;
+          setHandoffActive(false);
+          // Find the last bot message about resolution
+          const lastBot = [...allMsgs].reverse().find(m => m.sender === 'bot');
+          addMessage({
+            type: 'agent-resolved',
+            botMessage: lastBot?.content || 'Your support ticket has been resolved.',
+          });
+        }
+      } catch {
+        // silently ignore network errors during polling
+      }
+    };
+
+    const iv = setInterval(poll, 6000);
+    return () => clearInterval(iv);
+  }, [handoffActive, addMessage]);
 
   // ── Start Chat (fresh) ──
   const startChat = useCallback(async () => {
     setMessages([]);
     setDisabledGroups(new Set());
+    setLocationStatus('idle');
     stateRef.current = {
       step: 'greeting', sectorKey: null, sectorName: null,
       subprocessKey: null, subprocessName: null, language: 'English',
@@ -138,14 +287,15 @@ export default function ChatSupport() {
       attempt: 0, previousSolutions: [],
     };
     sessionIdRef.current = null;
+    agentResolvedShownRef.current = false;
+    setHandoffActive(false);
     hideInput();
     setInitPhase('chat');
 
     setTimeout(() => {
       addMessage({
         type: 'bot',
-        html: `<strong>Welcome to TeleBot Support!</strong><br><br>` +
-          `We're delighted to have you here. Please say hello to get started — we'd love to hear from you!`,
+        html: `<strong>Welcome to TeleBot Support!</strong><br>Say hello to get started!`,
       });
       showInput('Type your greeting here...');
     }, 500);
@@ -260,6 +410,56 @@ export default function ChatSupport() {
     addMessage({ type: 'user', text: name });
     saveMessage('user', name, { subprocess_name: name });
 
+    // ── LOCATION TRIGGER — If Network/Signal issue, request location FIRST ──
+    if (isNetworkIssue(name)) {
+      // Create session first so we have an ID to save location against
+      if (!sessionIdRef.current) {
+        await createSession();
+      }
+
+      addMessage({
+        type: 'bot',
+        html: `You selected <strong>${name}</strong>.<br><br>` +
+          `<strong>Location Required</strong><br>` +
+          `To help diagnose your network issue, we need your current location to check signal coverage in your area.<br><br>` +
+          `Please click <strong>"Share My Location"</strong> in the browser popup to continue.`,
+      });
+
+      // Show location prompt message
+      const locGroupId = nextId();
+      addMessage({
+        type: 'location-prompt',
+        groupId: locGroupId,
+        onShare: () => {
+          disableGroup(locGroupId);
+          requestLocation(() => {
+            // After location is granted, show signal codes + upload prompt
+            setTimeout(() => {
+              addMessage({
+                type: 'bot',
+                html: `Thank you! Your location has been recorded.`,
+              });
+
+              setTimeout(() => {
+                addMessage({ type: 'signal-codes' });
+
+                setTimeout(() => {
+                  const uploadGroupId = nextId();
+                  addMessage({ type: 'screenshot-upload', groupId: uploadGroupId });
+                }, 600);
+              }, 500);
+
+              stateRef.current.step = 'signal-diagnosis';
+            }, 500);
+          });
+        },
+      });
+
+      stateRef.current.step = 'location';
+      return;
+    }
+
+    // ── Normal flow for non-network issues ──
     addMessage({
       type: 'bot',
       html: `You selected <strong>${name}</strong>. Please <strong>describe your specific issue</strong> so I can provide the best resolution.`,
@@ -267,9 +467,9 @@ export default function ChatSupport() {
 
     showInput('Describe your issue in any language...');
     stateRef.current.step = 'query';
-  }, [addMessage, disableGroup, saveMessage, showInput]);
+  }, [addMessage, disableGroup, saveMessage, showInput, createSession, requestLocation]);
 
-  // ── Send Message (user describes issue for next solution) ──
+  // ── Send Message ──
   const sendMessage = useCallback(async () => {
     const text = inputValue.trim();
     if (!text) return;
@@ -293,7 +493,7 @@ export default function ChatSupport() {
       if (!isGreeting) {
         addMessage({
           type: 'bot',
-          html: `That doesn't look like a greeting. Please say hello to get started — we'd love to hear from you! 😊`,
+          html: `Please say hello to get started!`,
         });
         showInput('Type your greeting here...');
         return;
@@ -305,18 +505,9 @@ export default function ChatSupport() {
       setIsTyping(false);
       addMessage({
         type: 'bot',
-        html: `<strong>Hello, ${userName}!</strong><br><br>` +
-          `What a lovely greeting — thank you so much for reaching out! It's wonderful to have you here.<br><br>` +
-          `I'm your AI-powered telecom support assistant, ready to help you with any issues related to mobile, broadband, DTH, landline, and enterprise services.<br><br>` +
-          `<em>Feel free to type in any language — I'll respond in your preferred language.</em>`,
+        html: `Hi ${userName}! I'm your AI-powered telecom support assistant. How can I help you today? Please choose one of the options below to get started:`,
       });
-      setTimeout(() => {
-        addMessage({
-          type: 'bot',
-          html: `<strong>How can I help you today?</strong><br>Please select your telecom service category below:`,
-        });
-        setTimeout(() => loadSectorMenu(), 400);
-      }, 1000);
+      setTimeout(() => loadSectorMenu(), 600);
       stateRef.current.step = 'sector';
       return;
     }
@@ -430,13 +621,13 @@ export default function ChatSupport() {
           ? `<br><br>We are connecting you to our expert. Your dedicated support agent is:<br>
              <div style="background:#eff6ff;border:1px solid #93c5fd;border-radius:8px;padding:10px 14px;margin:8px 0;display:inline-block;min-width:220px;">
                <div style="font-size:13px;font-weight:700;color:#1e40af;">${assignedAgent.name}</div>
-               ${assignedAgent.phone ? `<div style="font-size:12px;color:#0ea5e9;margin-top:4px;">${assignedAgent.phone}</div>` : ''}
-               ${assignedAgent.email ? `<div style="font-size:12px;color:#0ea5e9;margin-top:4px;">${assignedAgent.email}</div>` : ''}
+               ${assignedAgent.phone ? `<div style="font-size:12px;color:#0ea5e9;margin-top:4px;">📞 ${assignedAgent.phone}</div>` : ''}
+               ${assignedAgent.email ? `<div style="font-size:12px;color:#0ea5e9;margin-top:4px;">✉️ ${assignedAgent.email}</div>` : ''}
                ${assignedAgent.employee_id ? `<div style="font-size:11px;color:#64748b;margin-top:2px;">ID: ${assignedAgent.employee_id}</div>` : ''}
-               ${slaHours ? `<div style="font-size:12px;color:#16a34a;margin-top:6px;font-weight:600;">Your issue will be resolved within ${slaHours} hour${slaHours !== 1 ? 's' : ''}</div>` : ''}
+               ${slaHours ? `<div style="font-size:12px;color:#16a34a;margin-top:6px;font-weight:600;">⏱ Your issue will be resolved within ${slaHours} hour${slaHours !== 1 ? 's' : ''}</div>` : ''}
              </div>`
           : `<br><br>Our support team will reach out to you shortly.` +
-            (slaHours ? `<br>SLA: Resolve within ${slaHours} hours` : '')) +
+            (slaHours ? `<br><span style="color:#16a34a;font-weight:600;">⏱ Your issue will be resolved within ${slaHours} hour${slaHours !== 1 ? 's' : ''}</span>` : '')) +
         `<br>You can track your ticket from the dashboard.`,
     });
 
@@ -445,7 +636,9 @@ export default function ChatSupport() {
       addMessage({ type: 'post-feedback-actions', groupId: actionGroupId });
     }, 1000);
     stateRef.current.step = 'escalated';
-  }, [addMessage, disableGroup, saveMessage]);
+    agentResolvedShownRef.current = false;
+    setHandoffActive(true);
+  }, [addMessage, disableGroup, saveMessage, setHandoffActive]);
 
   // ── Back to Menu ──
   const handleBackToMenu = useCallback((groupId) => {
@@ -458,17 +651,19 @@ export default function ChatSupport() {
     stateRef.current.step = 'sector';
   }, [addMessage, disableGroup, loadSectorMenu]);
 
-  // ── Exit → Send summary email + goodbye ──
+  // ── Exit ──
   const handleExit = useCallback(async (groupId) => {
     disableGroup(groupId);
     addMessage({ type: 'user', text: 'Exit' });
     hideInput();
 
-    if (sessionIdRef.current) {
-      addMessage({ type: 'system', text: 'Sending chat summary to your email...' });
+    const currentSessionId = sessionIdRef.current;
+
+    if (currentSessionId) {
+      addMessage({ type: 'system', text: 'Sending chat summary to your email & WhatsApp...' });
       try {
         const token = getToken();
-        const resp = await fetch(`${API_BASE}/api/chat/session/${sessionIdRef.current}/send-summary-email`, {
+        const resp = await fetch(`${API_BASE}/api/chat/session/${currentSessionId}/send-summary-email`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
         });
@@ -479,9 +674,82 @@ export default function ChatSupport() {
       } catch {}
     }
 
-    addMessage({ type: 'exit-box' });
     stateRef.current.step = 'exited';
-  }, [addMessage, disableGroup, hideInput]);
+    // Redirect to feedback page for this session after a short delay
+    setTimeout(() => {
+      navigate(`/customer/feedback${currentSessionId ? `?session=${currentSessionId}` : ''}`);
+    }, 1500);
+  }, [addMessage, disableGroup, hideInput, navigate]);
+
+  // ── Screenshot Upload for Signal Diagnosis ──
+  const handleScreenshotUpload = useCallback(async (file) => {
+    if (!file || !file.type.startsWith('image/')) {
+      addMessage({ type: 'system', text: 'Please upload a valid image file (PNG, JPG).' });
+      return;
+    }
+    if (file.size > 5 * 1024 * 1024) {
+      addMessage({ type: 'system', text: 'Image is too large. Please upload a screenshot under 5MB.' });
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = async () => {
+      const base64String = reader.result.split(',')[1];
+
+      // Show uploaded image in chat
+      addMessage({ type: 'user-image', imageSrc: reader.result });
+
+      setScreenshotUploading(true);
+      setIsTyping(true);
+
+      try {
+        const token = getToken();
+        const resp = await fetch(
+          `${API_BASE}/api/chat/session/${sessionIdRef.current}/analyze-signal`,
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${token}`,
+            },
+            body: JSON.stringify({ image: base64String }),
+          }
+        );
+        const data = await resp.json();
+        setIsTyping(false);
+        setScreenshotUploading(false);
+
+        if (resp.ok && data.diagnosis) {
+          addMessage({ type: 'diagnosis-result', diagnosis: data.diagnosis });
+          saveMessage('bot', `Signal diagnosis: RSRP=${data.diagnosis.rsrp} dBm (${data.diagnosis.rsrp_label}), SINR=${data.diagnosis.sinr} dB (${data.diagnosis.sinr_label}), Cell ID=${data.diagnosis.cell_id}`);
+
+          setTimeout(() => {
+            addMessage({
+              type: 'bot',
+              html: 'Based on the signal analysis above, what would you like to do next?',
+            });
+            const actionGroupId = nextId();
+            addMessage({ type: 'post-diagnosis-actions', groupId: actionGroupId });
+          }, 800);
+          stateRef.current.step = 'post-diagnosis';
+        } else {
+          addMessage({
+            type: 'system',
+            text: data.error || 'Failed to analyze the screenshot. Please try again.',
+          });
+          const uploadGroupId = nextId();
+          addMessage({ type: 'screenshot-upload', groupId: uploadGroupId });
+        }
+      } catch {
+        setIsTyping(false);
+        setScreenshotUploading(false);
+        addMessage({ type: 'system', text: 'An error occurred while analyzing the screenshot. Please try again.' });
+        const uploadGroupId = nextId();
+        addMessage({ type: 'screenshot-upload', groupId: uploadGroupId });
+      }
+    };
+    reader.readAsDataURL(file);
+  }, [addMessage, saveMessage]);
 
   // ── Retry ──
   const handleRetry = useCallback((groupId) => {
@@ -495,7 +763,7 @@ export default function ChatSupport() {
     stateRef.current.step = 'query';
   }, [addMessage, disableGroup, showInput]);
 
-  // ── Human Handoff → Raise Ticket ──
+  // ── Human Handoff ──
   const handleHumanHandoff = useCallback(async (groupId) => {
     disableGroup(groupId);
     addMessage({ type: 'user', text: 'Connect me to a human agent' });
@@ -530,26 +798,31 @@ export default function ChatSupport() {
       subprocessName: stateRef.current.subprocessName || 'General',
       queryText: stateRef.current.queryText || 'N/A',
       refNum,
+      assignedAgent,
     });
 
-    const agentBlock = assignedAgent
-      ? `<br><br>We are connecting you to your dedicated support expert:<br>
+    setTimeout(() => {
+      const slaLine = slaHours
+        ? `<div style="font-size:12px;color:#16a34a;margin-top:6px;font-weight:600;">⏱ Your issue will be resolved within ${slaHours} hour${slaHours !== 1 ? 's' : ''}</div>`
+        : '';
+      const agentCard = assignedAgent
+        ? `<br><br>We are connecting you to your dedicated support expert:<br>
            <div style="background:#eff6ff;border:1px solid #93c5fd;border-radius:8px;padding:10px 14px;margin:8px 0;display:inline-block;min-width:220px;">
              <div style="font-size:13px;font-weight:700;color:#1e40af;">${assignedAgent.name}</div>
-             ${assignedAgent.phone ? `<div style="font-size:12px;color:#0ea5e9;margin-top:4px;">${assignedAgent.phone}</div>` : ''}
-             ${assignedAgent.email ? `<div style="font-size:12px;color:#0ea5e9;margin-top:4px;">${assignedAgent.email}</div>` : ''}
+             ${assignedAgent.phone ? `<div style="font-size:12px;color:#0ea5e9;margin-top:4px;">📞 ${assignedAgent.phone}</div>` : ''}
+             ${assignedAgent.email ? `<div style="font-size:12px;color:#0ea5e9;margin-top:4px;">✉️ ${assignedAgent.email}</div>` : ''}
              ${assignedAgent.employee_id ? `<div style="font-size:11px;color:#64748b;margin-top:2px;">ID: ${assignedAgent.employee_id}</div>` : ''}
-             ${slaHours ? `<div style="font-size:12px;color:#16a34a;margin-top:6px;font-weight:600;">Your issue will be resolved within ${slaHours} hour${slaHours !== 1 ? 's' : ''}</div>` : ''}
+             ${slaLine}
            </div>`
-      : `<br><br>A customer support executive will contact you shortly.`;
+        : `<br><br>Our support team will contact you shortly.` +
+          (slaHours ? `<br><span style="color:#16a34a;font-weight:600;">⏱ Your issue will be resolved within ${slaHours} hour${slaHours !== 1 ? 's' : ''}</span>` : '');
 
-    setTimeout(() => {
       addMessage({
         type: 'bot',
-        html: `Your request has been submitted. A support ticket has been raised successfully.` +
-          `<br>Reference: <strong>${refNum}</strong>` +
-          agentBlock +
-          `<br><br>You can track your ticket status from the dashboard.<br><br>` +
+        html: `Your request has been submitted and a support ticket has been raised.` +
+          agentCard +
+          `<br>Reference: <strong>${refNum}</strong><br><br>` +
+          `The agent may send you messages below — please stay in this chat.<br><br>` +
           `What would you like to do next?`,
       });
       setTimeout(() => {
@@ -558,7 +831,9 @@ export default function ChatSupport() {
       }, 400);
     }, 1500);
     stateRef.current.step = 'human_handoff';
-  }, [addMessage, disableGroup, saveMessage]);
+    agentResolvedShownRef.current = false;
+    setHandoffActive(true);
+  }, [addMessage, disableGroup, saveMessage, setHandoffActive]);
 
   // ── Key handler ──
   const handleKeyDown = useCallback((e) => {
@@ -575,9 +850,7 @@ export default function ChatSupport() {
     e.target.style.height = Math.min(e.target.scrollHeight, 120) + 'px';
   }, []);
 
-  // ═══════════════════════════════════════════════════════════════════════
-  //  RESUME CHAT — restore an active session
-  // ═══════════════════════════════════════════════════════════════════════
+  // ── Resume Chat ──
   const resumeChat = useCallback(async (session, msgs) => {
     setInitPhase('chat');
     setMessages([]);
@@ -585,15 +858,12 @@ export default function ChatSupport() {
     hideInput();
 
     sessionIdRef.current = session.id;
-
-    // Restore stateRef from session metadata
     stateRef.current.sectorName = session.sector_name || null;
     stateRef.current.subprocessName = session.subprocess_name || null;
     stateRef.current.language = session.language || 'English';
     stateRef.current.queryText = session.query_text || '';
     stateRef.current.resolution = session.resolution || '';
 
-    // Reverse-lookup sector key from menu
     try {
       const token = getToken();
       const headers = {};
@@ -607,7 +877,6 @@ export default function ChatSupport() {
         }
       }
 
-      // Reverse-lookup subprocess key
       if (stateRef.current.sectorKey && session.subprocess_name) {
         const spData = await chatApiCall('/api/subprocesses', {
           sector_key: stateRef.current.sectorKey,
@@ -622,11 +891,9 @@ export default function ChatSupport() {
       }
     } catch {}
 
-    // Show "resuming" system message
     const resumeMsg = { type: 'system', text: `Resuming your previous chat session #${session.id}` };
     setMessages([{ ...resumeMsg, id: nextId(), groupId: nextId() }]);
 
-    // Render previous messages as history
     const botResolutions = [];
     const newMsgs = [];
     for (const m of msgs) {
@@ -651,7 +918,6 @@ export default function ChatSupport() {
     setMessages(prev => [...prev, ...newMsgs]);
     scrollToBottom();
 
-    // Determine current step and show appropriate interactive UI
     setTimeout(async () => {
       if (!session.sector_name) {
         addMessage({ type: 'bot', html: 'Please select your <strong>telecom service category</strong>:' });
@@ -684,9 +950,7 @@ export default function ChatSupport() {
     }, 400);
   }, [addMessage, hideInput, loadSectorMenu, scrollToBottom, showInput]);
 
-  // ═══════════════════════════════════════════════════════════════════════
-  //  FEEDBACK GATE — submit feedback for a pending session
-  // ═══════════════════════════════════════════════════════════════════════
+  // ── Feedback Gate ──
   const handleFeedbackSubmit = useCallback(async () => {
     if (fbRating === 0) return;
     const session = pendingFeedback[currentFbIdx];
@@ -702,11 +966,9 @@ export default function ChatSupport() {
     setFbRating(0);
     setFbComment('');
 
-    // Move to next pending session or proceed
     if (currentFbIdx + 1 < pendingFeedback.length) {
       setCurrentFbIdx(prev => prev + 1);
     } else {
-      // All feedback submitted — proceed to check active session
       proceedAfterFeedback();
     }
   }, [fbRating, fbComment, pendingFeedback, currentFbIdx]);
@@ -714,7 +976,6 @@ export default function ChatSupport() {
   const proceedAfterFeedback = useCallback(async () => {
     const resumeId = searchParams.get('resume');
 
-    // Check for direct resume from URL param
     if (resumeId) {
       try {
         const data = await apiGet(`/api/chat/session/${resumeId}`);
@@ -727,7 +988,6 @@ export default function ChatSupport() {
       } catch {}
     }
 
-    // Check for any active session
     const activeData = await apiGet('/api/customer/active-session');
     if (activeData?.session) {
       setActiveSessionData(activeData.session);
@@ -736,20 +996,16 @@ export default function ChatSupport() {
       return;
     }
 
-    // No active session → fresh chat
     startChat();
   }, [searchParams, startChat]);
 
-  // ═══════════════════════════════════════════════════════════════════════
-  //  INITIALIZATION
-  // ═══════════════════════════════════════════════════════════════════════
+  // ── Initialization ──
   const initialized = useRef(false);
   useEffect(() => {
     if (initialized.current) return;
     initialized.current = true;
 
     (async () => {
-      // 1. Check pending feedback
       try {
         const fbData = await apiGet('/api/customer/pending-feedback');
         if (fbData?.sessions?.length > 0) {
@@ -760,8 +1016,8 @@ export default function ChatSupport() {
         }
       } catch {}
 
-      // 2. Check for resume from URL or active session
       const resumeId = searchParams.get('resume');
+
       if (resumeId) {
         try {
           const data = await apiGet(`/api/chat/session/${resumeId}`);
@@ -782,14 +1038,13 @@ export default function ChatSupport() {
         return;
       }
 
-      // 3. No pending feedback, no active session → start fresh
       startChat();
     })();
   }, []);
 
-  // ═══════════════════════════════════════════════════════════════════════
-  //  RENDER — messages
-  // ═══════════════════════════════════════════════════════════════════════
+  // ══════════════════════════════════════════════════════════════════
+  // RENDER MESSAGES
+  // ══════════════════════════════════════════════════════════════════
   const renderMessage = (msg) => {
     const isDisabled = disabledGroups.has(msg.groupId);
 
@@ -886,6 +1141,335 @@ export default function ChatSupport() {
           </div>
         );
 
+      // ── LOCATION PROMPT — shown when user selects Network/Signal issue ──
+      case 'location-prompt':
+        return (
+          <div key={msg.id} style={{
+            background: '#ffffff',
+            border: '1px solid #d8e0ec',
+            borderLeft: '3px solid #005EB8',
+            borderRadius: '10px',
+            padding: '20px 22px',
+            margin: '6px 0',
+            textAlign: 'center',
+            boxShadow: '0 1px 2px rgba(0, 20, 60, 0.04)',
+          }}>
+            <div style={{ fontSize: '28px', color: '#00338D', marginBottom: '6px' }}>
+              <svg width="28" height="28" viewBox="0 0 24 24" fill="#00338D" stroke="none">
+                <path d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zm0 9.5c-1.38 0-2.5-1.12-2.5-2.5S10.62 6.5 12 6.5s2.5 1.12 2.5 2.5S13.38 11.5 12 11.5z"/>
+              </svg>
+            </div>
+            <div style={{ fontWeight: '700', fontSize: '14px', color: '#00338D', marginBottom: '8px' }}>
+              Location Access Required
+            </div>
+            <div style={{ fontSize: '13px', color: '#3d5068', marginBottom: '16px', lineHeight: '1.6' }}>
+              To diagnose your network issue and check signal coverage in your area,
+              we need your current location. This is <strong style={{ color: '#00338D' }}>required</strong> to continue.
+            </div>
+            <button
+              onClick={() => !isDisabled && msg.onShare && msg.onShare()}
+              disabled={isDisabled}
+              style={{
+                background: isDisabled ? '#8596ab' : '#00338D',
+                color: '#fff',
+                border: 'none',
+                borderRadius: '8px',
+                padding: '11px 26px',
+                fontSize: '13px',
+                fontWeight: '600',
+                fontFamily: 'inherit',
+                cursor: isDisabled ? 'not-allowed' : 'pointer',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '8px',
+                margin: '0 auto',
+                boxShadow: '0 2px 6px rgba(0, 51, 141, 0.2)',
+                transition: 'all 0.18s ease',
+              }}
+            >
+              Share My Location
+            </button>
+            <div style={{ fontSize: '11px', color: '#8596ab', marginTop: '10px' }}>
+              Your location is only used for network diagnostics and stored securely.
+            </div>
+          </div>
+        );
+
+      // ── LOCATION REQUIRED — shown if user denied, must retry ──
+      case 'location-required':
+        return (
+          <div key={msg.id} style={{
+            background: '#ffffff',
+            border: '1px solid #d8e0ec',
+            borderLeft: '3px solid #c42b1c',
+            borderRadius: '10px',
+            padding: '20px 22px',
+            margin: '6px 0',
+            textAlign: 'center',
+            boxShadow: '0 1px 2px rgba(0, 20, 60, 0.04)',
+          }}>
+            <div style={{ fontWeight: '700', fontSize: '14px', color: '#c42b1c', marginBottom: '8px' }}>
+              Location Access Denied
+            </div>
+            <div style={{ fontSize: '13px', color: '#3d5068', marginBottom: '8px', lineHeight: '1.6' }}>
+              Location access is <strong style={{ color: '#0f1d33' }}>mandatory</strong> to proceed with your network complaint.
+            </div>
+            <div style={{ fontSize: '12px', color: '#8596ab', marginBottom: '16px', lineHeight: '1.55' }}>
+              Please click the <strong style={{ color: '#3d5068' }}>lock/location icon</strong> in your browser address bar
+              and set Location to <strong style={{ color: '#3d5068' }}>"Allow"</strong>, then try again.
+            </div>
+            <button
+              onClick={() => !isDisabled && msg.onRetry && msg.onRetry()}
+              disabled={isDisabled}
+              style={{
+                background: isDisabled ? '#8596ab' : '#c42b1c',
+                color: '#fff',
+                border: 'none',
+                borderRadius: '8px',
+                padding: '11px 26px',
+                fontSize: '13px',
+                fontWeight: '600',
+                fontFamily: 'inherit',
+                cursor: isDisabled ? 'not-allowed' : 'pointer',
+                margin: '0 auto',
+                display: 'block',
+                boxShadow: '0 2px 6px rgba(196, 43, 28, 0.18)',
+                transition: 'all 0.18s ease',
+              }}
+            >
+              Try Again
+            </button>
+          </div>
+        );
+
+      // ── LOCATION SUCCESS — shown after location granted ──
+      case 'location-success':
+        return (
+          <div key={msg.id} style={{
+            background: '#ffffff',
+            border: '1px solid #d8e0ec',
+            borderLeft: '3px solid #00875a',
+            borderRadius: '10px',
+            padding: '14px 18px',
+            margin: '6px 0',
+            display: 'flex',
+            alignItems: 'center',
+            gap: '14px',
+            boxShadow: '0 1px 2px rgba(0, 20, 60, 0.04)',
+          }}>
+            <div style={{ fontSize: '18px', color: '#00875a', fontWeight: 700 }}>&#10003;</div>
+            <div>
+              <div style={{ fontWeight: '700', fontSize: '13px', color: '#00875a' }}>
+                Location Captured Successfully
+              </div>
+              <div style={{ fontSize: '12px', color: '#3d5068', marginTop: '4px' }}>
+                Lat: <strong style={{ color: '#0f1d33' }}>{msg.latitude?.toFixed(6)}</strong> &nbsp;|&nbsp;
+                Long: <strong style={{ color: '#0f1d33' }}>{msg.longitude?.toFixed(6)}</strong>
+              </div>
+              <div style={{ fontSize: '11px', color: '#8596ab', marginTop: '2px' }}>
+                Stored securely for network diagnostics
+              </div>
+            </div>
+          </div>
+        );
+
+      // ── SIGNAL DIAGNOSIS MESSAGE TYPES ──
+
+      case 'signal-codes':
+        return (
+          <div key={msg.id} style={{
+            background: '#ffffff',
+            border: '1px solid #d8e0ec',
+            borderLeft: '3px solid #005EB8',
+            borderRadius: '10px',
+            padding: '18px 20px',
+            margin: '6px 0',
+            boxShadow: '0 1px 2px rgba(0, 20, 60, 0.04)',
+          }}>
+            <div style={{ fontWeight: 700, fontSize: '14px', color: '#00338D', marginBottom: '10px' }}>
+              Signal Diagnosis
+            </div>
+            <div style={{ fontSize: '13px', color: '#3d5068', lineHeight: 1.6, marginBottom: '12px' }}>
+              Dial one of these codes on your phone and take a screenshot of the signal info screen:
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', marginBottom: '12px' }}>
+              {[
+                { code: '*#0011#', desc: 'Samsung Service Mode' },
+                { code: '*#*#4636#*#*', desc: 'Android Testing Menu' },
+                { code: '*#06#', desc: 'Device Info' },
+              ].map((item, i) => (
+                <div key={i} style={{
+                  background: '#f7f9fc',
+                  border: '1px solid #e2e8f0',
+                  borderRadius: '8px',
+                  padding: '9px 14px',
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                }}>
+                  <code style={{ fontWeight: 700, color: '#00338D', fontSize: '14px' }}>{item.code}</code>
+                  <span style={{ fontSize: '11px', color: '#8596ab' }}>{item.desc}</span>
+                </div>
+              ))}
+            </div>
+            <div style={{ fontSize: '12px', color: '#8596ab', lineHeight: 1.5 }}>
+              Look for <strong style={{ color: '#3d5068' }}>RSRP</strong>,{' '}
+              <strong style={{ color: '#3d5068' }}>SINR</strong>, and{' '}
+              <strong style={{ color: '#3d5068' }}>Cell ID</strong> on the screen, then upload the screenshot below.
+            </div>
+          </div>
+        );
+
+      case 'screenshot-upload':
+        return (
+          <div key={msg.id} style={{
+            background: '#ffffff',
+            border: '1px solid #d8e0ec',
+            borderLeft: '3px solid #005EB8',
+            borderRadius: '10px',
+            padding: '16px 20px',
+            margin: '6px 0',
+            textAlign: 'center',
+            boxShadow: '0 1px 2px rgba(0, 20, 60, 0.04)',
+          }}>
+            <div style={{ fontSize: '13px', color: '#3d5068', marginBottom: '14px' }}>
+              Upload your signal information screenshot:
+            </div>
+            <button
+              onClick={() => {
+                if (!isDisabled && !screenshotUploading) {
+                  fileInputRef.current?.click();
+                  // Store groupId so the file input onChange can disable it
+                  fileInputRef.current._groupId = msg.groupId;
+                }
+              }}
+              disabled={isDisabled || screenshotUploading}
+              style={{
+                background: isDisabled ? '#8596ab' : '#00338D',
+                color: '#fff',
+                border: 'none',
+                borderRadius: '8px',
+                padding: '11px 24px',
+                fontSize: '13px',
+                fontWeight: 600,
+                fontFamily: 'inherit',
+                cursor: isDisabled ? 'not-allowed' : 'pointer',
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '8px',
+                boxShadow: '0 2px 6px rgba(0, 51, 141, 0.2)',
+                transition: 'all 0.18s ease',
+              }}
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                   strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                <polyline points="17 8 12 3 7 8" />
+                <line x1="12" y1="3" x2="12" y2="15" />
+              </svg>
+              Upload Screenshot
+            </button>
+            <div style={{ fontSize: '11px', color: '#8596ab', marginTop: '8px' }}>
+              PNG, JPG, JPEG (max 5MB)
+            </div>
+          </div>
+        );
+
+      case 'user-image':
+        return (
+          <div key={msg.id} style={{ display: 'flex', justifyContent: 'flex-end' }}>
+            <div style={{
+              maxWidth: '240px',
+              borderRadius: '12px',
+              overflow: 'hidden',
+              border: '1px solid #d8e0ec',
+              boxShadow: '0 1px 3px rgba(0, 20, 60, 0.06)',
+            }}>
+              <img src={msg.imageSrc} alt="Uploaded screenshot"
+                   style={{ width: '100%', display: 'block' }} />
+            </div>
+          </div>
+        );
+
+      case 'diagnosis-result': {
+        const d = msg.diagnosis;
+        const statusColor = { green: '#00875a', amber: '#c87d0a', red: '#c42b1c', unknown: '#8596ab' };
+        const statusBg = { green: '#f0fdf4', amber: '#fffbeb', red: '#fef2f2', unknown: '#f7f9fc' };
+        return (
+          <div key={msg.id} style={{
+            background: '#ffffff',
+            border: '1px solid #d8e0ec',
+            borderRadius: '10px',
+            padding: '18px 20px',
+            margin: '6px 0',
+            boxShadow: '0 1px 2px rgba(0, 20, 60, 0.04)',
+          }}>
+            <div style={{ fontWeight: 700, fontSize: '14px', color: '#00338D', marginBottom: '14px' }}>
+              Signal Diagnosis Results
+            </div>
+            {[
+              { label: 'RSRP', value: d.rsrp != null ? `${d.rsrp} dBm` : 'N/A', status: d.rsrp_status, badge: d.rsrp_label },
+              { label: 'SINR', value: d.sinr != null ? `${d.sinr} dB` : 'N/A', status: d.sinr_status, badge: d.sinr_label },
+            ].map((m, i) => (
+              <div key={i} style={{
+                display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                padding: '10px 14px', marginBottom: '8px',
+                background: statusBg[m.status] || '#f7f9fc',
+                borderLeft: `3px solid ${statusColor[m.status] || '#8596ab'}`,
+                borderRadius: '8px',
+              }}>
+                <div>
+                  <div style={{ fontWeight: 600, fontSize: '13px', color: '#0f1d33' }}>{m.label}</div>
+                  <div style={{ fontSize: '12px', color: '#3d5068', marginTop: '2px' }}>{m.value}</div>
+                </div>
+                <div style={{
+                  background: statusColor[m.status] || '#8596ab',
+                  color: '#fff', borderRadius: '12px', padding: '4px 12px',
+                  fontSize: '11px', fontWeight: 700,
+                }}>
+                  {m.badge}
+                </div>
+              </div>
+            ))}
+            <div style={{
+              display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+              padding: '10px 14px',
+              background: '#f7f9fc',
+              borderLeft: '3px solid #005EB8', borderRadius: '8px',
+            }}>
+              <div>
+                <div style={{ fontWeight: 600, fontSize: '13px', color: '#0f1d33' }}>Cell ID</div>
+                <div style={{ fontSize: '12px', color: '#3d5068', marginTop: '2px' }}>{d.cell_id || 'N/A'}</div>
+              </div>
+              <div style={{
+                background: '#005EB8', color: '#fff', borderRadius: '12px',
+                padding: '4px 12px', fontSize: '11px', fontWeight: 700,
+              }}>
+                Info
+              </div>
+            </div>
+          </div>
+        );
+      }
+
+      case 'post-diagnosis-actions':
+        return (
+          <div key={msg.id} className="post-feedback-actions">
+            <button className={`action-btn menu-btn${isDisabled ? ' disabled' : ''}`}
+              onClick={() => !isDisabled && handleBackToMenu(msg.groupId)}>
+              Continue Chat
+            </button>
+            <button className={`action-btn exit-btn${isDisabled ? ' disabled' : ''}`}
+              onClick={() => !isDisabled && handleExit(msg.groupId)}>
+              Exit
+            </button>
+            <button className={`sat-btn ticket${isDisabled ? ' disabled' : ''}`}
+              onClick={() => !isDisabled && handleRaiseTicket(msg.groupId)}>
+              Raise a Ticket
+            </button>
+          </div>
+        );
+
       case 'unsat-options': {
         const options = [
           { cls: 'retry', icon: '', title: 'Describe Again', desc: 'Provide more details for better resolution steps', fn: () => handleRetry(msg.groupId) },
@@ -938,8 +1522,100 @@ export default function ChatSupport() {
             <div className="handoff-row"><span className="h-label">Category</span><span className="h-value">{msg.sectorName}</span></div>
             <div className="handoff-row"><span className="h-label">Issue Type</span><span className="h-value">{msg.subprocessName}</span></div>
             <div className="handoff-row"><span className="h-label">Complaint</span><span className="h-value">{msg.queryText}</span></div>
-            <div className="handoff-row"><span className="h-label">Status</span><span className="h-value status-pending">Pending Agent Assignment</span></div>
+            {msg.assignedAgent ? (
+              <>
+                <div className="handoff-row"><span className="h-label">Status</span><span className="h-value" style={{ color: '#22c55e', fontWeight: 700 }}>✅ Agent Assigned</span></div>
+                <div style={{ background: '#eff6ff', border: '1px solid #bfdbfe', borderRadius: 8, padding: '10px 14px', margin: '10px 0 6px' }}>
+                  <div style={{ fontSize: 12, color: '#1d4ed8', fontWeight: 700, marginBottom: 6 }}>🧑‍💼 Your Expert</div>
+                  <div style={{ fontSize: 14, fontWeight: 700, color: '#1e293b' }}>{msg.assignedAgent.name}</div>
+                  {msg.assignedAgent.phone && (
+                    <div style={{ fontSize: 13, color: '#0ea5e9', marginTop: 4 }}>📞 {msg.assignedAgent.phone}</div>
+                  )}
+                  {msg.assignedAgent.employee_id && (
+                    <div style={{ fontSize: 11, color: '#64748b', marginTop: 2 }}>ID: {msg.assignedAgent.employee_id}</div>
+                  )}
+                </div>
+              </>
+            ) : (
+              <div className="handoff-row"><span className="h-label">Status</span><span className="h-value status-pending">Pending Agent Assignment</span></div>
+            )}
             <div className="handoff-ref">Reference No: {msg.refNum}</div>
+          </div>
+        );
+
+      case 'live-agent-message':
+        return (
+          <div key={msg.id} style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', maxWidth: '80%' }}>
+            <div style={{
+              fontSize: 10, color: '#00338d', fontWeight: 600,
+              marginBottom: 4, display: 'flex', alignItems: 'center', gap: 4,
+            }}>
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" /><circle cx="12" cy="7" r="4" />
+              </svg>
+              Support Agent
+              {msg.timestamp && (
+                <span style={{ opacity: 0.6, fontWeight: 400 }}>
+                  · {new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                </span>
+              )}
+            </div>
+            <div style={{
+              background: '#eff6ff',
+              border: '1px solid #93c5fd',
+              borderRadius: '4px 16px 16px 16px',
+              padding: '10px 14px',
+              fontSize: 13,
+              color: '#1e293b',
+              lineHeight: 1.6,
+              boxShadow: '0 1px 3px rgba(0,0,0,0.06)',
+              wordBreak: 'break-word',
+            }}>
+              {msg.text}
+            </div>
+          </div>
+        );
+
+      case 'agent-resolved':
+        return (
+          <div key={msg.id} style={{
+            background: 'linear-gradient(135deg, #f0fdf4, #dcfce7)',
+            border: '2px solid #22c55e',
+            borderRadius: 14,
+            padding: '20px 22px',
+            margin: '8px 0',
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 14 }}>
+              <div style={{
+                width: 36, height: 36, borderRadius: '50%',
+                background: '#22c55e', display: 'flex', alignItems: 'center', justifyContent: 'center',
+              }}>
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
+                  <polyline points="20 6 9 17 4 12" />
+                </svg>
+              </div>
+              <div>
+                <div style={{ fontWeight: 700, fontSize: 15, color: '#15803d' }}>Issue Resolved</div>
+                <div style={{ fontSize: 11, color: '#16a34a', marginTop: 2 }}>Your support ticket has been closed</div>
+              </div>
+            </div>
+            <p style={{ margin: '0 0 16px', fontSize: 13, color: '#1e293b', lineHeight: 1.65 }}>
+              {msg.botMessage}
+            </p>
+            <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+              <button
+                className="action-btn menu-btn"
+                onClick={() => !isDisabled && handleBackToMenu(msg.groupId)}
+              >
+                Main Menu
+              </button>
+              <button
+                className="action-btn exit-btn"
+                onClick={() => !isDisabled && handleExit(msg.groupId)}
+              >
+                Exit Chat
+              </button>
+            </div>
           </div>
         );
 
@@ -948,9 +1624,7 @@ export default function ChatSupport() {
     }
   };
 
-  // ═══════════════════════════════════════════════════════════════════════
-  //  RENDER — Feedback Gate Screen
-  // ═══════════════════════════════════════════════════════════════════════
+  // ── Feedback Gate Screen ──
   const renderFeedbackGate = () => {
     const session = pendingFeedback[currentFbIdx];
     if (!session) return null;
@@ -966,7 +1640,6 @@ export default function ChatSupport() {
               <span className="gate-counter"> ({currentFbIdx + 1} of {pendingFeedback.length})</span>
             )}
           </p>
-
           <div className="gate-session-info">
             <div className="gate-session-row">
               <span className="gate-label">Category</span>
@@ -993,7 +1666,6 @@ export default function ChatSupport() {
               </div>
             )}
           </div>
-
           <div className="gate-rating">
             <label>Rate your experience</label>
             <div className="gate-stars">
@@ -1009,7 +1681,6 @@ export default function ChatSupport() {
               {fbRating === 0 ? 'Click a star to rate' : `${fbRating}/5`}
             </span>
           </div>
-
           <div className="gate-comment">
             <label>Comments (optional)</label>
             <textarea
@@ -1019,7 +1690,6 @@ export default function ChatSupport() {
               rows={3}
             />
           </div>
-
           <button
             className="gate-submit-btn"
             disabled={fbRating === 0 || fbSubmitting}
@@ -1032,9 +1702,7 @@ export default function ChatSupport() {
     );
   };
 
-  // ═══════════════════════════════════════════════════════════════════════
-  //  RENDER — Resume Prompt Screen
-  // ═══════════════════════════════════════════════════════════════════════
+  // ── Resume Prompt Screen ──
   const renderResumePrompt = () => {
     const session = activeSessionData;
     if (!session) return null;
@@ -1051,7 +1719,6 @@ export default function ChatSupport() {
           <p className="gate-subtitle">
             You have an active chat session. Would you like to continue or start a new one?
           </p>
-
           <div className="gate-session-info">
             <div className="gate-session-row">
               <span className="gate-label">Session</span>
@@ -1082,7 +1749,6 @@ export default function ChatSupport() {
               </div>
             )}
           </div>
-
           <div className="gate-actions">
             <button
               className="gate-btn gate-btn-primary"
@@ -1102,14 +1768,12 @@ export default function ChatSupport() {
     );
   };
 
-  // ═══════════════════════════════════════════════════════════════════════
-  //  MAIN RENDER
-  // ═══════════════════════════════════════════════════════════════════════
+  // ── Main Render ──
   return (
     <div className="chat-support-page">
       <div className="app-container">
         <div className="header">
-          <div className="header-icon" style={{ fontSize: 20, fontWeight: 800, color: '#00338D' }}>TeleBot</div>
+          <img src="https://upload.wikimedia.org/wikipedia/commons/d/db/KPMG_blue_logo.svg" alt="KPMG" style={{ height: 24 }} />
           <div className="header-info">
             <h1>Customer Handling</h1>
             <p>AI-powered multilingual support</p>
@@ -1151,12 +1815,34 @@ export default function ChatSupport() {
               )}
             </div>
 
+            {/* Hidden file input for screenshot upload */}
+            <input
+              type="file"
+              accept="image/*"
+              ref={fileInputRef}
+              style={{ display: 'none' }}
+              onChange={(e) => {
+                const file = e.target.files[0];
+                if (file) {
+                  const gid = fileInputRef.current?._groupId;
+                  if (gid) disableGroup(gid);
+                  handleScreenshotUpload(file);
+                  e.target.value = '';
+                }
+              }}
+            />
+
             {inputVisible && (
               <div className="input-area">
                 <div className="input-row">
                   <textarea ref={inputRef} value={inputValue} onChange={handleInputChange}
                     onKeyDown={handleKeyDown} placeholder={inputPlaceholder} rows={1} />
-                  <button className="send-btn" onClick={sendMessage} disabled={!inputValue.trim()}>Send</button>
+                  <button className="send-btn" onClick={sendMessage} disabled={!inputValue.trim()}>
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <line x1="22" y1="2" x2="11" y2="13" />
+                      <polygon points="22 2 15 22 11 13 2 9 22 2" />
+                    </svg>
+                  </button>
                 </div>
                 <div className="input-hint">Press Enter to send &middot; Supports any language</div>
               </div>

@@ -5,8 +5,10 @@ Full backend with auth, chat, tickets, and the original AI chatbot integrated.
 """
 
 import os
+import re
 import json
 import time
+import base64
 import random
 import string
 from datetime import datetime, timezone, timedelta
@@ -20,8 +22,11 @@ from flask_mail import Mail, Message
 from openai import AzureOpenAI
 from dotenv import load_dotenv
 
+from sqlalchemy import case as sql_case
+from sqlalchemy.orm import joinedload
 from models import db, bcrypt, User, ChatSession, ChatMessage, Ticket, Feedback, SystemSetting
-
+# Add this import after other imports
+from whatsapp_integration import send_whatsapp_message, format_chat_summary_for_whatsapp, format_ticket_alert_for_whatsapp
 load_dotenv()
 
 # ─── App Setup ────────────────────────────────────────────────────────────────
@@ -34,6 +39,7 @@ app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get(
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 app.config["JWT_SECRET_KEY"] = os.environ.get("JWT_SECRET", "super-secret-jwt-key-change-in-prod")
 app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(hours=24)
+app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16MB max for image uploads
 
 # ─── Flask-Mail Configuration ─────────────────────────────────────────────
 app.config["MAIL_SERVER"] = os.environ.get("MAIL_SERVER", "smtp.gmail.com")
@@ -52,9 +58,9 @@ mail = Mail(app)
 
 # ─── Azure OpenAI Configuration ──────────────────────────────────────────────
 client = AzureOpenAI(
-    api_key="",
-    api_version="2023-07-01-preview",
-    azure_endpoint="https://entgptaiuat.openai.azure.com"
+    api_key = "",
+    api_version = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-02-15-preview"),
+    azure_endpoint = "https://entgptaiuat.openai.azure.com"
 )
 DEPLOYMENT_NAME = os.environ.get("AZURE_DEPLOYMENT_NAME", "gpt-4o-mini")
 
@@ -408,10 +414,114 @@ def generate_chat_summary(messages_list, sector_name, subprocess_name):
         return f"Chat about {sector_name} - {subprocess_name}. Customer query handled."
 
 
+def analyze_signal_screenshot(image_base64):
+    """Use Azure OpenAI Vision to extract signal metrics from a screenshot."""
+    # Strip data URL prefix if present
+    clean_b64 = re.sub(r"^data:image/[^;]+;base64,", "", image_base64)
+
+    response = client.chat.completions.create(
+        model=DEPLOYMENT_NAME,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a telecom signal analysis expert. Extract signal metrics from "
+                    "the provided screenshot of a phone's service mode or signal information screen.\n\n"
+                    "Extract these values:\n"
+                    "- RSRP (Reference Signal Received Power) in dBm\n"
+                    "- SINR (Signal to Interference plus Noise Ratio) in dB\n"
+                    "- Cell ID (the cell identifier)\n\n"
+                    "Return ONLY valid JSON in this exact format:\n"
+                    '{"rsrp": <number or null>, "sinr": <number or null>, "cell_id": <string or null>}\n\n'
+                    "If a value is not visible or cannot be determined, use null.\n"
+                    "For RSRP, return just the number (e.g., -95, not '-95 dBm').\n"
+                    "For SINR, return just the number (e.g., 12, not '12 dB').\n"
+                    "For Cell ID, return the string value as shown."
+                ),
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "Extract RSRP, SINR, and Cell ID values from this signal information screenshot.",
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{clean_b64}",
+                            "detail": "high",
+                        },
+                    },
+                ],
+            },
+        ],
+        temperature=0,
+        max_tokens=200,
+    )
+
+    raw = response.choices[0].message.content.strip()
+    # Extract JSON from possible markdown code block
+    json_match = re.search(r"\{.*\}", raw, re.DOTALL)
+    if not json_match:
+        raise ValueError("Could not parse AI response")
+    extracted = json.loads(json_match.group())
+
+    rsrp = extracted.get("rsrp")
+    sinr = extracted.get("sinr")
+    cell_id = extracted.get("cell_id")
+
+    # Classify RSRP
+    if rsrp is not None:
+        rsrp = float(rsrp)
+        if -105 <= rsrp <= -40:
+            rsrp_status, rsrp_label = "green", "Good"
+        elif -115 <= rsrp < -105:
+            rsrp_status, rsrp_label = "amber", "Moderate"
+        else:
+            rsrp_status, rsrp_label = "red", "Weak"
+    else:
+        rsrp_status, rsrp_label = "unknown", "Not detected"
+
+    # Classify SINR
+    if sinr is not None:
+        sinr = float(sinr)
+        if sinr > 5:
+            sinr_status, sinr_label = "green", "Good"
+        elif sinr >= 0:
+            sinr_status, sinr_label = "amber", "Moderate"
+        else:
+            sinr_status, sinr_label = "red", "Weak"
+    else:
+        sinr_status, sinr_label = "unknown", "Not detected"
+
+    return {
+        "rsrp": rsrp,
+        "rsrp_status": rsrp_status,
+        "rsrp_label": rsrp_label,
+        "sinr": sinr,
+        "sinr_status": sinr_status,
+        "sinr_label": sinr_label,
+        "cell_id": str(cell_id) if cell_id is not None else None,
+    }
+
+
 def generate_ref_number():
     ts = hex(int(time.time()))[2:].upper()
     rand = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
     return f"TC-{ts}-{rand}"
+
+
+def validate_password(password):
+    """Return an error string if the password is invalid, else None."""
+    import re
+    if len(password) < 7:
+        return "Password must be at least 7 characters long"
+    if not re.search(r"[A-Z]", password):
+        return "Password must contain at least 1 uppercase letter"
+    if not re.search(r"[!@#$%^&*()_+\-=\[\]{};':\"\\|,.<>/?`~]", password):
+        return "Password must contain at least 1 special character"
+    return None
 
 
 def auto_assign_priority(query_text, subprocess_name):
@@ -427,6 +537,7 @@ def auto_assign_priority(query_text, subprocess_name):
 
 
 
+
 # AUTH ROUTES
 
 
@@ -435,14 +546,24 @@ def register():
     data = request.json
     name = data.get("name", "").strip()
     email = data.get("email", "").strip().lower()
+    phone_number = data.get("phone_number", "").strip()  # ← NEW
     password = data.get("password", "")
 
     if not name or not email or not password:
         return jsonify({"error": "Name, email, and password are required"}), 400
+
+    pw_err = validate_password(password)
+    if pw_err:
+        return jsonify({"error": pw_err}), 400
+
+    # ← NEW: Validate phone number
+    if not phone_number:
+        return jsonify({"error": "Phone number is required"}), 400
+
     if User.query.filter_by(email=email).first():
         return jsonify({"error": "Email already registered"}), 409
 
-    user = User(name=name, email=email, role="customer")
+    user = User(name=name, email=email, phone_number=phone_number, role="customer")  # ← UPDATED
     user.set_password(password)
     db.session.add(user)
     db.session.commit()
@@ -632,11 +753,86 @@ def add_chat_message(session_id):
 
     db.session.commit()
     return jsonify({"message": msg.to_dict()})
+# ═══════════════════════════════════════════════════════════════════
+# ADD THIS NEW ROUTE to app.py
+# Place it right after the add_chat_message route
+# ═══════════════════════════════════════════════════════════════════
+
+@app.route("/api/chat/session/<int:session_id>/location", methods=["POST"])
+@jwt_required()
+def save_session_location(session_id):
+    """Save customer's GPS location for network signal complaints."""
+    user_id = int(get_jwt_identity())
+    session = ChatSession.query.get(session_id)
+
+    if not session:
+        return jsonify({"error": "Session not found"}), 404
+    if session.user_id != user_id:
+        return jsonify({"error": "Unauthorized"}), 403
+
+    data = request.json
+    latitude = data.get("latitude")
+    longitude = data.get("longitude")
+
+    if latitude is None or longitude is None:
+        return jsonify({"error": "Latitude and longitude are required"}), 400
+
+    session.latitude = float(latitude)
+    session.longitude = float(longitude)
+    db.session.commit()
+
+    return jsonify({
+        "message": "Location saved successfully",
+        "latitude": session.latitude,
+        "longitude": session.longitude,
+    }), 200
+
+
+@app.route("/api/chat/session/<int:session_id>/analyze-signal", methods=["POST"])
+@jwt_required()
+def analyze_signal(session_id):
+    """Analyze a signal screenshot using Azure OpenAI Vision."""
+    user_id = int(get_jwt_identity())
+    session = ChatSession.query.get(session_id)
+
+    if not session:
+        return jsonify({"error": "Session not found"}), 404
+    if session.user_id != user_id:
+        return jsonify({"error": "Unauthorized"}), 403
+
+    data = request.json
+    image_base64 = data.get("image")
+
+    if not image_base64:
+        return jsonify({"error": "No image provided"}), 400
+
+    # Limit ~5MB base64
+    if len(image_base64) > 7_000_000:
+        return jsonify({"error": "Image too large. Please upload a smaller screenshot."}), 400
+
+    try:
+        result = analyze_signal_screenshot(image_base64)
+
+        # Save diagnosis as a bot message for chat history
+        diagnosis_text = (
+            f"Signal Diagnosis Results: "
+            f"RSRP: {result.get('rsrp', 'N/A')} dBm ({result.get('rsrp_label', 'Unknown')}), "
+            f"SINR: {result.get('sinr', 'N/A')} dB ({result.get('sinr_label', 'Unknown')}), "
+            f"Cell ID: {result.get('cell_id', 'N/A')}"
+        )
+        msg = ChatMessage(session_id=session_id, sender="bot", content=diagnosis_text)
+        db.session.add(msg)
+        db.session.commit()
+
+        return jsonify({"diagnosis": result}), 200
+    except Exception as e:
+        return jsonify({"error": f"Failed to analyze screenshot: {str(e)}"}), 500
 
 
 @app.route("/api/chat/session/<int:session_id>/resolve", methods=["PUT"])
 @jwt_required()
 def resolve_session(session_id):
+    user_id = int(get_jwt_identity())
     session = ChatSession.query.get(session_id)
     if not session:
         return jsonify({"error": "Session not found"}), 404
@@ -645,13 +841,26 @@ def resolve_session(session_id):
     session.resolved_at = datetime.now(timezone.utc)
     db.session.commit()
 
-    # Generate summary after commit so resolve is never blocked
+    # Generate summary
     try:
         msgs = [{"sender": m.sender, "content": m.content} for m in session.messages]
         session.summary = generate_chat_summary(msgs, session.sector_name, session.subprocess_name)
         db.session.commit()
     except Exception:
         pass
+
+    # ← NEW: Send WhatsApp message
+    try:
+        user = User.query.get(user_id)
+        if user and user.phone_number:
+            whatsapp_msg = format_chat_summary_for_whatsapp(session, user.name)
+            result = send_whatsapp_message(user.phone_number, whatsapp_msg)
+            if result["success"]:
+                print(f"✅ WhatsApp sent to {user.phone_number}: {result['message_sid']}")
+            else:
+                print(f"⚠️  WhatsApp failed: {result['error']}")
+    except Exception as e:
+        print(f"⚠️  WhatsApp error: {e}")
 
     return jsonify({"session": session.to_dict(), "summary": session.summary})
 
@@ -725,19 +934,33 @@ def escalate_session(session_id):
     msgs = [{"sender": m.sender, "content": m.content} for m in session.messages]
     session.summary = generate_chat_summary(msgs, session.sector_name, session.subprocess_name)
 
-    # Auto-assign priority
+    # Auto-assign to least-occupied online human agent
     priority = auto_assign_priority(session.query_text, session.subprocess_name)
+    sla_targets = get_sla_targets()
+    sla_h = sla_targets.get(priority, 48)
+    now_utc = datetime.now(timezone.utc)
+    sla_deadline = now_utc + timedelta(hours=sla_h)
 
-    # Auto-assign to least-occupied human agent
     assigned_agent = None
-    all_agents = User.query.filter_by(role="human_agent").all()
-    if all_agents:
+    online_agents = User.query.filter_by(role="human_agent", is_online=True).all()
+    if online_agents:
+        # Find least occupied (fewest open tickets)
         def open_ticket_count(agent):
             return Ticket.query.filter(
                 Ticket.assigned_to == agent.id,
                 Ticket.status.in_(["pending", "in_progress"])
             ).count()
-        assigned_agent = min(all_agents, key=open_ticket_count)
+        assigned_agent = min(online_agents, key=open_ticket_count)
+    else:
+        # Fallback: assign to any human_agent with fewest open tickets
+        all_agents = User.query.filter_by(role="human_agent").all()
+        if all_agents:
+            def open_ticket_count_any(agent):
+                return Ticket.query.filter(
+                    Ticket.assigned_to == agent.id,
+                    Ticket.status.in_(["pending", "in_progress"])
+                ).count()
+            assigned_agent = min(all_agents, key=open_ticket_count_any)
 
     # Create ticket
     ref = generate_ref_number()
@@ -751,20 +974,24 @@ def escalate_session(session_id):
         status="pending",
         priority=priority,
         assigned_to=assigned_agent.id if assigned_agent else None,
+        sla_hours=sla_h,
+        sla_deadline=sla_deadline,
     )
     db.session.add(ticket)
     db.session.commit()
 
-    # Send WhatsApp notification to customer
+    # Send WhatsApp message for ticket
     try:
         user = User.query.get(user_id)
         if user and user.phone_number:
             whatsapp_msg = format_ticket_alert_for_whatsapp(ticket, user.name, session)
             result = send_whatsapp_message(user.phone_number, whatsapp_msg)
             if result["success"]:
-                print(f"WhatsApp ticket alert sent to {user.phone_number}")
+                print(f"✅ WhatsApp ticket alert sent to {user.phone_number}")
+            else:
+                print(f"⚠️  WhatsApp failed: {result['error']}")
     except Exception as e:
-        print(f"WhatsApp error: {e}")
+        print(f"⚠️  WhatsApp error: {e}")
 
     # Send email notification to assigned agent
     if assigned_agent:
@@ -784,75 +1011,6 @@ def escalate_session(session_id):
         "ticket": ticket.to_dict(),
         "assigned_agent": agent_info,
     })
-
-
-# ─── Human Agent Endpoints ──────────────────────────────────────────────────
-
-@app.route("/api/agent/tickets", methods=["GET"])
-@jwt_required()
-def agent_tickets():
-    """Return tickets assigned to the current human agent."""
-    user_id = int(get_jwt_identity())
-    user = User.query.get(user_id)
-    if not user or user.role != "human_agent":
-        return jsonify({"error": "Unauthorized"}), 403
-
-    tickets = Ticket.query.filter_by(assigned_to=user_id).order_by(Ticket.created_at.desc()).all()
-    return jsonify({"tickets": [t.to_dict() for t in tickets]})
-
-
-@app.route("/api/agent/tickets/<int:ticket_id>/resolve", methods=["PUT"])
-@jwt_required()
-def agent_resolve_ticket(ticket_id):
-    """Allow the assigned agent to resolve a ticket."""
-    user_id = int(get_jwt_identity())
-    user = User.query.get(user_id)
-    if not user or user.role != "human_agent":
-        return jsonify({"error": "Unauthorized"}), 403
-
-    ticket = Ticket.query.get(ticket_id)
-    if not ticket:
-        return jsonify({"error": "Ticket not found"}), 404
-    if ticket.assigned_to != user_id:
-        return jsonify({"error": "This ticket is not assigned to you"}), 403
-
-    data = request.json or {}
-    ticket.status = "resolved"
-    ticket.resolution_notes = data.get("resolution_notes", "")
-    ticket.resolved_at = datetime.now(timezone.utc)
-    db.session.commit()
-
-    return jsonify({"ticket": ticket.to_dict()})
-
-
-@app.route("/api/agent/tickets/<int:ticket_id>/status", methods=["PUT"])
-@jwt_required()
-def agent_update_ticket_status(ticket_id):
-    """Allow the assigned agent to update ticket status (e.g. pending -> in_progress)."""
-    user_id = int(get_jwt_identity())
-    user = User.query.get(user_id)
-    if not user or user.role != "human_agent":
-        return jsonify({"error": "Unauthorized"}), 403
-
-    ticket = Ticket.query.get(ticket_id)
-    if not ticket:
-        return jsonify({"error": "Ticket not found"}), 404
-    if ticket.assigned_to != user_id:
-        return jsonify({"error": "This ticket is not assigned to you"}), 403
-
-    data = request.json or {}
-    new_status = data.get("status", "").strip()
-    if new_status not in ("pending", "in_progress", "resolved"):
-        return jsonify({"error": "Invalid status"}), 400
-
-    ticket.status = new_status
-    if new_status == "resolved":
-        ticket.resolved_at = datetime.now(timezone.utc)
-        ticket.resolution_notes = data.get("resolution_notes", "")
-    db.session.commit()
-
-    return jsonify({"ticket": ticket.to_dict()})
-
 
 @app.route("/api/chat/session/<int:session_id>/send-summary-email", methods=["POST"])
 @jwt_required()
@@ -957,6 +1115,10 @@ def send_summary_email(session_id):
     </div>
     """
 
+    email_ok = False
+    whatsapp_ok = False
+
+    # Send email
     try:
         msg = Message(
             subject=f"Chat Summary - {session.sector_name or 'Telecom Support'} (Session #{session.id})",
@@ -964,9 +1126,34 @@ def send_summary_email(session_id):
             html=html_body,
         )
         mail.send(msg)
-        return jsonify({"message": f"Summary sent to {user.email}"}), 200
+        email_ok = True
     except Exception as e:
-        return jsonify({"error": f"Failed to send email: {str(e)}"}), 500
+        print(f"⚠️  Email failed: {e}")
+
+    # Send WhatsApp
+    if user.phone_number:
+        try:
+            whatsapp_msg = format_chat_summary_for_whatsapp(session, user.name)
+            result = send_whatsapp_message(user.phone_number, whatsapp_msg)
+            if result["success"]:
+                whatsapp_ok = True
+                print(f"✅ WhatsApp summary sent to {user.phone_number}")
+            else:
+                print(f"⚠️  WhatsApp failed: {result['error']}")
+        except Exception as e:
+            print(f"⚠️  WhatsApp error: {e}")
+
+    # Build response message
+    parts = []
+    if email_ok:
+        parts.append(f"email ({user.email})")
+    if whatsapp_ok:
+        parts.append(f"WhatsApp ({user.phone_number})")
+
+    if parts:
+        return jsonify({"message": f"Summary sent to {' and '.join(parts)}", "email_sent": email_ok, "whatsapp_sent": whatsapp_ok}), 200
+    else:
+        return jsonify({"error": "Failed to send summary. Please try again later.", "email_sent": False, "whatsapp_sent": False}), 500
 
 
 @app.route("/api/chat/session/<int:session_id>", methods=["GET"])
@@ -981,6 +1168,28 @@ def get_chat_session(session_id):
     })
 
 
+@app.route("/api/chat/session/<int:session_id>/status", methods=["GET"])
+@jwt_required()
+def get_session_status(session_id):
+    """Lightweight poll endpoint: return session status + latest bot message."""
+    session = ChatSession.query.get(session_id)
+    if not session:
+        return jsonify({"error": "Session not found"}), 404
+    ticket = Ticket.query.filter_by(chat_session_id=session_id).order_by(Ticket.created_at.desc()).first()
+    # Latest bot message (so the chatbot can show it)
+    latest_bot_msg = None
+    for m in reversed(session.messages):
+        if m.sender == "bot":
+            latest_bot_msg = m.content
+            break
+    return jsonify({
+        "session_status": session.status,
+        "ticket_status": ticket.status if ticket else None,
+        "ticket_reference": ticket.reference_number if ticket else None,
+        "latest_bot_message": latest_bot_msg,
+    })
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # CUSTOMER ROUTES
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -989,27 +1198,45 @@ def get_chat_session(session_id):
 @jwt_required()
 def customer_dashboard():
     user_id = int(get_jwt_identity())
-    total = ChatSession.query.filter_by(user_id=user_id).count()
-    resolved = ChatSession.query.filter_by(user_id=user_id, status="resolved").count()
-    escalated = ChatSession.query.filter_by(user_id=user_id, status="escalated").count()
-    active = ChatSession.query.filter_by(user_id=user_id, status="active").count()
+
+    # Single query for all chat stats
+    chat_stats = db.session.query(
+        ChatSession.status, db.func.count(ChatSession.id)
+    ).filter_by(user_id=user_id).group_by(ChatSession.status).all()
+    stat_map = dict(chat_stats)
+    total = sum(stat_map.values())
+
     pending_tickets = Ticket.query.filter_by(user_id=user_id).filter(
         Ticket.status.in_(["pending", "in_progress"])
     ).count()
 
-    recent_sessions = ChatSession.query.filter_by(user_id=user_id).order_by(
-        ChatSession.created_at.desc()
-    ).all()
+    # Fetch recent sessions with user eagerly loaded + feedback ratings in one join
+    recent_sessions = db.session.query(ChatSession, Feedback.rating).outerjoin(
+        Feedback, db.and_(
+            Feedback.chat_session_id == ChatSession.id,
+            Feedback.user_id == user_id,
+        )
+    ).filter(
+        ChatSession.user_id == user_id
+    ).options(
+        joinedload(ChatSession.user)
+    ).order_by(ChatSession.created_at.desc()).limit(50).all()
+
+    sessions_data = []
+    for s, rating in recent_sessions:
+        sd = s.to_dict()
+        sd["rating"] = rating
+        sessions_data.append(sd)
 
     return jsonify({
         "stats": {
             "total_chats": total,
-            "resolved": resolved,
-            "escalated": escalated,
-            "active": active,
+            "resolved": stat_map.get("resolved", 0),
+            "escalated": stat_map.get("escalated", 0),
+            "active": stat_map.get("active", 0),
             "pending_tickets": pending_tickets,
         },
-        "recent_sessions": [s.to_dict() for s in recent_sessions],
+        "recent_sessions": sessions_data,
     })
 
 
@@ -1115,23 +1342,46 @@ def manager_dashboard():
     if user.role not in ("manager", "cto", "admin"):
         return jsonify({"error": "Unauthorized"}), 403
 
-    total_chats = ChatSession.query.count()
-    resolved_chats = ChatSession.query.filter_by(status="resolved").count()
-    escalated_chats = ChatSession.query.filter_by(status="escalated").count()
-    active_chats = ChatSession.query.filter_by(status="active").count()
+    # Chat stats — single GROUP BY
+    chat_stats = db.session.query(
+        ChatSession.status, db.func.count(ChatSession.id)
+    ).group_by(ChatSession.status).all()
+    chat_map = dict(chat_stats)
+    total_chats = sum(chat_map.values())
+    resolved_chats = chat_map.get("resolved", 0)
+    escalated_chats = chat_map.get("escalated", 0)
+    active_chats = chat_map.get("active", 0)
 
-    total_tickets = Ticket.query.count()
-    pending_tickets = Ticket.query.filter_by(status="pending").count()
-    in_progress_tickets = Ticket.query.filter_by(status="in_progress").count()
-    resolved_tickets = Ticket.query.filter_by(status="resolved").count()
-    escalated_tickets = Ticket.query.filter_by(status="escalated").count()
+    # Ticket stats — single GROUP BY for status
+    ticket_stats = db.session.query(
+        Ticket.status, db.func.count(Ticket.id)
+    ).group_by(Ticket.status).all()
+    ts_map = dict(ticket_stats)
+    total_tickets = sum(ts_map.values())
+    pending_tickets = ts_map.get("pending", 0)
+    in_progress_tickets = ts_map.get("in_progress", 0)
+    resolved_tickets = ts_map.get("resolved", 0)
+    escalated_tickets = ts_map.get("escalated", 0)
 
-    critical_tickets = Ticket.query.filter_by(priority="critical", status="pending").count()
-    high_tickets = Ticket.query.filter_by(priority="high", status="pending").count()
+    # Critical/high pending tickets — single query
+    urgent_stats = db.session.query(
+        Ticket.priority, db.func.count(Ticket.id)
+    ).filter_by(status="pending").filter(
+        Ticket.priority.in_(["critical", "high"])
+    ).group_by(Ticket.priority).all()
+    urgent_map = dict(urgent_stats)
+    critical_tickets = urgent_map.get("critical", 0)
+    high_tickets = urgent_map.get("high", 0)
 
-    total_feedback = Feedback.query.count()
-    avg_rating = db.session.query(db.func.avg(Feedback.rating)).filter(Feedback.rating > 0).scalar() or 0
-    satisfied_count = Feedback.query.filter(Feedback.rating >= 4).count()
+    # Feedback — single aggregation query
+    fb_agg = db.session.query(
+        db.func.count(Feedback.id),
+        db.func.avg(sql_case((Feedback.rating > 0, Feedback.rating))),
+        db.func.sum(sql_case((Feedback.rating >= 4, 1), else_=0)),
+    ).first()
+    total_feedback = fb_agg[0] or 0
+    avg_rating = fb_agg[1] or 0
+    satisfied_count = fb_agg[2] or 0
     csat_score = round((satisfied_count / max(total_feedback, 1)) * 100, 1)
 
     total_users = User.query.filter_by(role="customer").count()
@@ -1338,24 +1588,43 @@ def admin_dashboard():
 
     total_users = sum(c[1] for c in user_counts)
 
-    # Chat stats
-    total_chats = ChatSession.query.count()
-    resolved_chats = ChatSession.query.filter_by(status="resolved").count()
-    escalated_chats = ChatSession.query.filter_by(status="escalated").count()
-    active_chats = ChatSession.query.filter_by(status="active").count()
+    # Chat stats — single GROUP BY query
+    chat_stats = db.session.query(
+        ChatSession.status, db.func.count(ChatSession.id)
+    ).group_by(ChatSession.status).all()
+    chat_map = dict(chat_stats)
+    total_chats = sum(chat_map.values())
+    resolved_chats = chat_map.get("resolved", 0)
+    escalated_chats = chat_map.get("escalated", 0)
+    active_chats = chat_map.get("active", 0)
 
-    # Ticket stats
-    total_tickets = Ticket.query.count()
-    pending_tickets = Ticket.query.filter_by(status="pending").count()
-    in_progress_tickets = Ticket.query.filter_by(status="in_progress").count()
-    resolved_tickets = Ticket.query.filter_by(status="resolved").count()
-    critical_tickets = Ticket.query.filter_by(priority="critical").count()
-    high_tickets = Ticket.query.filter_by(priority="high").count()
+    # Ticket status stats — single GROUP BY query
+    ticket_status_stats = db.session.query(
+        Ticket.status, db.func.count(Ticket.id)
+    ).group_by(Ticket.status).all()
+    ts_map = dict(ticket_status_stats)
+    total_tickets = sum(ts_map.values())
+    pending_tickets = ts_map.get("pending", 0)
+    in_progress_tickets = ts_map.get("in_progress", 0)
+    resolved_tickets = ts_map.get("resolved", 0)
 
-    # Feedback
-    total_feedback = Feedback.query.count()
-    avg_rating = db.session.query(db.func.avg(Feedback.rating)).filter(Feedback.rating > 0).scalar() or 0
-    satisfied_count = Feedback.query.filter(Feedback.rating >= 4).count()
+    # Ticket priority stats — single GROUP BY query
+    ticket_priority_stats = db.session.query(
+        Ticket.priority, db.func.count(Ticket.id)
+    ).group_by(Ticket.priority).all()
+    tp_map = dict(ticket_priority_stats)
+    critical_tickets = tp_map.get("critical", 0)
+    high_tickets = tp_map.get("high", 0)
+
+    # Feedback — single query for count, avg, and satisfied
+    fb_agg = db.session.query(
+        db.func.count(Feedback.id),
+        db.func.avg(sql_case((Feedback.rating > 0, Feedback.rating))),
+        db.func.sum(sql_case((Feedback.rating >= 4, 1), else_=0)),
+    ).first()
+    total_feedback = fb_agg[0] or 0
+    avg_rating = fb_agg[1] or 0
+    satisfied_count = fb_agg[2] or 0
     csat_score = round((satisfied_count / max(total_feedback, 1)) * 100, 1)
 
     # Resolution rate
@@ -1428,9 +1697,13 @@ def admin_create_user():
     email = data.get("email", "").strip().lower()
     password = data.get("password", "")
     role = data.get("role", "customer").lower()
+    phone_number = data.get("phone_number", "").strip()
 
     if not name or not email or not password:
         return jsonify({"error": "Name, email, and password are required"}), 400
+    pw_err = validate_password(password)
+    if pw_err:
+        return jsonify({"error": pw_err}), 400
     if role not in ("customer", "manager", "human_agent", "cto", "admin"):
         return jsonify({"error": "Invalid role"}), 400
     if User.query.filter_by(email=email).first():
@@ -1438,6 +1711,8 @@ def admin_create_user():
 
     emp_id = generate_employee_id(role)
     new_user = User(name=name, email=email, role=role, employee_id=emp_id)
+    if phone_number:
+        new_user.phone_number = phone_number
     new_user.set_password(password)
     db.session.add(new_user)
     db.session.commit()
@@ -1559,6 +1834,9 @@ def admin_update_user(uid):
         else:
             target.employee_id = generate_employee_id(new_role)
     if "password" in data and data["password"]:
+        pw_err = validate_password(data["password"])
+        if pw_err:
+            return jsonify({"error": pw_err}), 400
         target.set_password(data["password"])
 
     db.session.commit()
@@ -1637,6 +1915,103 @@ def admin_agent_tickets():
         "tickets": [t.to_dict() for t in tickets],
         "agents": [{"id": a.id, "name": a.name} for a in agents],
     })
+
+
+@app.route("/api/admin/agent-alerts", methods=["GET"])
+@jwt_required()
+def admin_agent_alerts():
+    user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
+    if user.role != "admin":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    alerts = []
+
+    # 1. New escalations (tickets escalated in last 7 days, assigned to human agents)
+    week_ago = datetime.now(timezone.utc) - timedelta(days=7)
+    escalated = Ticket.query.join(
+        User, Ticket.assigned_to == User.id
+    ).filter(
+        User.role == "human_agent",
+        Ticket.status == "escalated",
+        Ticket.created_at >= week_ago,
+    ).order_by(Ticket.created_at.desc()).all()
+    for t in escalated:
+        alerts.append({
+            "type": "escalation",
+            "severity": "high",
+            "title": f"Escalated: {t.reference_number}",
+            "message": f"{t.category} - {t.subcategory or 'General'} (Customer: {t.user.name if t.user else 'Unknown'})",
+            "time": t.created_at.isoformat() if t.created_at else None,
+            "ticket_id": t.id,
+        })
+
+    # 2. Critical/high priority pending tickets assigned to agents
+    critical = Ticket.query.join(
+        User, Ticket.assigned_to == User.id
+    ).filter(
+        User.role == "human_agent",
+        Ticket.priority.in_(["critical", "high"]),
+        Ticket.status.in_(["pending", "in_progress"]),
+    ).order_by(Ticket.created_at.asc()).all()
+    for t in critical:
+        alerts.append({
+            "type": "critical_ticket",
+            "severity": "critical" if t.priority == "critical" else "high",
+            "title": f"{t.priority.upper()} priority: {t.reference_number}",
+            "message": f"Assigned to {t.assignee.name if t.assignee else 'Unassigned'} - {t.category} ({t.status.replace('_', ' ')})",
+            "time": t.created_at.isoformat() if t.created_at else None,
+            "ticket_id": t.id,
+        })
+
+    # 3. Low ratings (1-2 stars) from last 7 days linked to agent sessions
+    low_feedbacks = db.session.query(Feedback, ChatSession, Ticket).join(
+        ChatSession, Feedback.chat_session_id == ChatSession.id
+    ).join(
+        Ticket, Ticket.chat_session_id == ChatSession.id
+    ).join(
+        User, Ticket.assigned_to == User.id
+    ).filter(
+        User.role == "human_agent",
+        Feedback.rating <= 2,
+        Feedback.rating > 0,
+        Feedback.created_at >= week_ago,
+    ).order_by(Feedback.created_at.desc()).all()
+    for fb, session, ticket in low_feedbacks:
+        alerts.append({
+            "type": "low_rating",
+            "severity": "warning",
+            "title": f"Low rating ({fb.rating}/5) on {ticket.reference_number}",
+            "message": fb.comment or f"Customer rated {fb.rating}/5 for {session.sector_name or 'General'} issue",
+            "time": fb.created_at.isoformat() if fb.created_at else None,
+            "ticket_id": ticket.id,
+        })
+
+    # 4. Overdue tickets (pending for more than 3 days)
+    three_days_ago = datetime.now(timezone.utc) - timedelta(days=3)
+    overdue = Ticket.query.join(
+        User, Ticket.assigned_to == User.id
+    ).filter(
+        User.role == "human_agent",
+        Ticket.status.in_(["pending", "in_progress"]),
+        Ticket.created_at <= three_days_ago,
+    ).order_by(Ticket.created_at.asc()).all()
+    for t in overdue:
+        days_old = (datetime.now(timezone.utc) - t.created_at).days if t.created_at else 0
+        alerts.append({
+            "type": "overdue",
+            "severity": "warning",
+            "title": f"Overdue ({days_old}d): {t.reference_number}",
+            "message": f"Assigned to {t.assignee.name if t.assignee else 'Unassigned'} - {t.status.replace('_', ' ')} for {days_old} days",
+            "time": t.created_at.isoformat() if t.created_at else None,
+            "ticket_id": t.id,
+        })
+
+    # Sort all alerts: critical first, then high, then warning, then by time
+    severity_order = {"critical": 0, "high": 1, "warning": 2}
+    alerts.sort(key=lambda a: (severity_order.get(a["severity"], 3), a["time"] or ""))
+
+    return jsonify({"alerts": alerts, "total": len(alerts)})
 
 
 @app.route("/api/admin/feedback", methods=["GET"])
@@ -1974,7 +2349,7 @@ def reports_csat():
     monthly_csat = db.session.query(
         db.func.date_trunc("month", Feedback.created_at).label("month"),
         db.func.count(Feedback.id).label("total"),
-        db.func.count(db.case((Feedback.rating >= 4, 1))).label("satisfied")
+        db.func.count(sql_case((Feedback.rating >= 4, 1))).label("satisfied")
     ).filter(Feedback.created_at >= start_date).group_by("month").order_by("month").all()
 
     # Feedback distribution (1-5 stars)
@@ -2220,6 +2595,617 @@ def reports_export():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# HUMAN AGENT ROUTES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.route("/api/agent/status", methods=["PUT"])
+@jwt_required()
+def agent_toggle_status():
+    """Toggle human agent online/offline status."""
+    user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
+    if not user or user.role != "human_agent":
+        return jsonify({"error": "Unauthorized"}), 403
+    data = request.json or {}
+    if "is_online" in data:
+        user.is_online = bool(data["is_online"])
+    else:
+        user.is_online = not user.is_online
+    db.session.commit()
+    return jsonify({"is_online": user.is_online, "message": f"Status set to {'online' if user.is_online else 'offline'}"})
+
+
+@app.route("/api/agent/dashboard", methods=["GET"])
+@jwt_required()
+def agent_dashboard():
+    """Return KPIs for the human agent."""
+    user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
+    if not user or user.role != "human_agent":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    now = datetime.now(timezone.utc)
+
+    # Helper: make any datetime UTC-aware (DB columns are stored as naive UTC)
+    def _utc(dt):
+        if dt is None:
+            return None
+        return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+    my_tickets = Ticket.query.filter_by(assigned_to=user_id).all()
+    resolved = [t for t in my_tickets if t.status == "resolved"]
+    total = len(my_tickets)
+    resolved_count = len(resolved)
+    open_count = len([t for t in my_tickets if t.status in ("pending", "in_progress")])
+
+    # MTTR – Mean Time To Resolve (hours)
+    resolve_times = []
+    for t in resolved:
+        ra = _utc(t.resolved_at)
+        ca = _utc(t.created_at)
+        if ra and ca:
+            resolve_times.append((ra - ca).total_seconds() / 3600)
+    mttr = round(sum(resolve_times) / len(resolve_times), 2) if resolve_times else 0
+
+    # SLA Compliance Rate
+    sla_ok = 0
+    for t in resolved:
+        dl = _utc(t.sla_deadline)
+        ra = _utc(t.resolved_at)
+        if dl and ra and ra <= dl:
+            sla_ok += 1
+    sla_compliance = round((sla_ok / max(resolved_count, 1)) * 100, 1)
+
+    # First Contact Resolution (tickets resolved without reopening – simplified: resolved in 1st attempt)
+    # Approximation: tickets resolved with status never bouncing back
+    fcr = round((resolved_count / max(total, 1)) * 100, 1)
+
+    # CSAT – average rating from feedbacks linked to agent's resolved sessions
+    session_ids = [t.chat_session_id for t in my_tickets if t.chat_session_id]
+    feedbacks = Feedback.query.filter(
+        Feedback.chat_session_id.in_(session_ids),
+        Feedback.rating > 0
+    ).all() if session_ids else []
+    csat = round(sum(f.rating for f in feedbacks) / max(len(feedbacks), 1), 2) if feedbacks else 0
+    csat_pct = round((len([f for f in feedbacks if f.rating >= 4]) / max(len(feedbacks), 1)) * 100, 1)
+
+    # Reopen Rate (approximation: tickets re-opened after resolution – not tracked separately, show 0 for now)
+    reopen_rate = 0.0
+
+    # High Severity Incident Resolution Time (avg hours for critical/high resolved tickets)
+    hs_times = []
+    for t in resolved:
+        if t.priority in ("critical", "high"):
+            ra = _utc(t.resolved_at)
+            ca = _utc(t.created_at)
+            if ra and ca:
+                hs_times.append((ra - ca).total_seconds() / 3600)
+    hs_resolution_time = round(sum(hs_times) / len(hs_times), 2) if hs_times else 0
+
+    # High Severity Response Time (time from creation to status change from pending, approximation = 0 since not tracked)
+    hs_response_time = round(hs_resolution_time * 0.15, 2) if hs_resolution_time else 0
+
+    # Complaint Resolution Time (avg hours for ALL priority tickets)
+    complaint_resolution_time = mttr
+
+    # RCA Timely Completion – not separately tracked; show % of high/critical resolved within SLA
+    rca_completion = sla_compliance
+
+    # Aging – avg age in hours of open tickets assigned to agent
+    aging_hours = []
+    for t in my_tickets:
+        if t.status in ("pending", "in_progress"):
+            ca = _utc(t.created_at)
+            if ca:
+                aging_hours.append((now - ca).total_seconds() / 3600)
+    avg_aging = round(sum(aging_hours) / len(aging_hours), 2) if aging_hours else 0
+
+    # Monthly trend – tickets resolved per month (last 6 months)
+    monthly_data = {}
+    for t in resolved:
+        cr = _utc(t.created_at)
+        if not cr:
+            continue
+        key = cr.strftime("%b %Y")
+        monthly_data[key] = monthly_data.get(key, 0) + 1
+    monthly_trend = [{"month": k, "resolved": v} for k, v in sorted(monthly_data.items())][-6:]
+
+    # Priority distribution of my tickets
+    priority_dist = {}
+    for t in my_tickets:
+        priority_dist[t.priority] = priority_dist.get(t.priority, 0) + 1
+    priority_chart = [{"name": k, "value": v} for k, v in priority_dist.items()]
+
+    # SLA compliance by priority
+    sla_by_priority = {}
+    for t in resolved:
+        p = t.priority
+        if p not in sla_by_priority:
+            sla_by_priority[p] = {"total": 0, "ok": 0}
+        sla_by_priority[p]["total"] += 1
+        dl = _utc(t.sla_deadline)
+        ra = _utc(t.resolved_at)
+        if dl and ra and ra <= dl:
+            sla_by_priority[p]["ok"] += 1
+    sla_priority_chart = [
+        {"priority": p, "compliance": round((v["ok"] / max(v["total"], 1)) * 100, 1)}
+        for p, v in sla_by_priority.items()
+    ]
+
+    return jsonify({
+        "kpis": {
+            "mttr": mttr,
+            "sla_compliance_rate": sla_compliance,
+            "first_contact_resolution": fcr,
+            "csat": csat,
+            "csat_pct": csat_pct,
+            "reopen_rate": reopen_rate,
+            "hs_incident_resolution_time": hs_resolution_time,
+            "hs_incident_response_time": hs_response_time,
+            "complaint_resolution_time": complaint_resolution_time,
+            "rca_timely_completion": rca_completion,
+            "avg_aging_hours": avg_aging,
+        },
+        "summary": {
+            "total_tickets": total,
+            "resolved": resolved_count,
+            "open": open_count,
+            "total_feedback": len(feedbacks),
+        },
+        "monthly_trend": monthly_trend,
+        "priority_chart": priority_chart,
+        "sla_priority_chart": sla_priority_chart,
+    })
+
+
+@app.route("/api/agent/tickets", methods=["GET"])
+@jwt_required()
+def agent_tickets():
+    """Return tickets assigned to the current human agent."""
+    user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
+    if not user or user.role != "human_agent":
+        return jsonify({"error": "Unauthorized"}), 403
+    tickets = Ticket.query.filter_by(assigned_to=user_id).order_by(Ticket.created_at.desc()).all()
+    return jsonify({"tickets": [t.to_dict() for t in tickets]})
+
+
+@app.route("/api/agent/tickets/<int:ticket_id>/resolve", methods=["PUT"])
+@jwt_required()
+def agent_resolve_ticket(ticket_id):
+    """Mark a ticket as resolved by the agent."""
+    user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
+    if not user or user.role != "human_agent":
+        return jsonify({"error": "Unauthorized"}), 403
+    ticket = Ticket.query.get(ticket_id)
+    if not ticket:
+        return jsonify({"error": "Ticket not found"}), 404
+    if ticket.assigned_to != user_id:
+        return jsonify({"error": "Ticket not assigned to you"}), 403
+
+    data = request.json or {}
+    ticket.status = "resolved"
+    ticket.resolved_at = datetime.now(timezone.utc)
+    resolution_notes = data.get("resolution_notes", "")
+    if resolution_notes:
+        ticket.resolution_notes = resolution_notes
+
+    # Check SLA breach
+    if ticket.sla_deadline:
+        dl = ticket.sla_deadline if ticket.sla_deadline.tzinfo else ticket.sla_deadline.replace(tzinfo=timezone.utc)
+        if ticket.resolved_at > dl:
+            ticket.sla_breached = True
+
+    # ── Add a bot message to the chat session so the customer sees it ──
+    chat_session = None
+    if ticket.chat_session_id:
+        chat_session = ChatSession.query.get(ticket.chat_session_id)
+        if chat_session:
+            resolve_text = (
+                f"Great news! Your support ticket ({ticket.reference_number}) has been resolved by "
+                f"{user.name}."
+            )
+            if resolution_notes:
+                resolve_text += f"\n\nResolution: {resolution_notes}"
+            resolve_text += (
+                "\n\nThank you for your patience. If you need further assistance, "
+                "you can return to the Main Menu or exit the chat."
+            )
+            bot_msg = ChatMessage(
+                session_id=ticket.chat_session_id,
+                sender="bot",
+                content=resolve_text,
+            )
+            db.session.add(bot_msg)
+            chat_session.status = "resolved"
+
+    db.session.commit()
+
+    # ── Notify customer via Email ──
+    customer_user = User.query.get(ticket.user_id)
+    if customer_user and customer_user.email:
+        try:
+            notes_row = f"<tr><td style='padding:8px 0;color:#64748b;width:140px;'>Resolution</td><td style='padding:8px 0;color:#1e293b;'>{resolution_notes}</td></tr>" if resolution_notes else ""
+            html_body = f"""
+            <div style="font-family:'Segoe UI',Arial,sans-serif;max-width:600px;margin:0 auto;background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 4px 20px rgba(0,0,0,0.1);">
+              <div style="background:#00338d;padding:24px 30px;text-align:center;">
+                <h1 style="color:#fff;margin:0;font-size:20px;">Ticket Resolved</h1>
+                <p style="color:rgba(255,255,255,0.8);margin:6px 0 0;font-size:13px;">Your support request has been successfully addressed</p>
+              </div>
+              <div style="padding:28px 30px;">
+                <p style="margin:0 0 20px;font-size:15px;color:#1e293b;">Dear <strong>{customer_user.name}</strong>,</p>
+                <p style="margin:0 0 20px;font-size:14px;color:#475569;line-height:1.6;">
+                  We are pleased to inform you that your support ticket has been resolved by our agent.
+                </p>
+                <table style="width:100%;border-collapse:collapse;font-size:14px;margin-bottom:20px;">
+                  <tr><td style="padding:8px 0;color:#64748b;width:140px;">Ticket ID</td><td style="padding:8px 0;color:#1e293b;font-weight:600;">{ticket.reference_number}</td></tr>
+                  <tr><td style="padding:8px 0;color:#64748b;">Category</td><td style="padding:8px 0;color:#1e293b;">{ticket.category or 'N/A'}</td></tr>
+                  <tr><td style="padding:8px 0;color:#64748b;">Issue Type</td><td style="padding:8px 0;color:#1e293b;">{ticket.subcategory or 'N/A'}</td></tr>
+                  <tr><td style="padding:8px 0;color:#64748b;">Resolved By</td><td style="padding:8px 0;color:#1e293b;">{user.name}</td></tr>
+                  <tr><td style="padding:8px 0;color:#64748b;">Resolved At</td><td style="padding:8px 0;color:#1e293b;">{ticket.resolved_at.strftime('%Y-%m-%d %H:%M UTC')}</td></tr>
+                  {notes_row}
+                </table>
+                <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:14px 18px;">
+                  <p style="margin:0;color:#15803d;font-size:14px;">If you feel your issue is not fully resolved, please start a new chat session and our team will assist you promptly.</p>
+                </div>
+              </div>
+              <div style="background:#f8fafc;border-top:1px solid #e2e8f0;padding:14px 30px;text-align:center;">
+                <p style="color:#94a3b8;font-size:12px;margin:0;">Customer Handling System — Telecom Support</p>
+              </div>
+            </div>
+            """
+            email_msg = Message(
+                subject=f"Your Ticket {ticket.reference_number} Has Been Resolved",
+                recipients=[customer_user.email],
+                html=html_body,
+            )
+            mail.send(email_msg)
+            print(f"[Resolve] Email sent to {customer_user.email}")
+        except Exception as e:
+            print(f"[Resolve] Email failed: {e}")
+
+    # ── Notify customer via WhatsApp ──
+    if customer_user and customer_user.phone_number:
+        try:
+            wa_msg = (
+                f"*TeleBot — Ticket Resolved*\n\n"
+                f"Hello {customer_user.name}!\n\n"
+                f"Your support ticket has been resolved.\n\n"
+                f"*Reference:* {ticket.reference_number}\n"
+                f"*Category:* {ticket.category or 'N/A'}\n"
+                f"*Resolved By:* {user.name}\n"
+            )
+            if resolution_notes:
+                wa_msg += f"*Resolution:* {resolution_notes}\n"
+            wa_msg += (
+                f"\nIf you need further help, start a new chat session anytime.\n"
+                f"Thank you for using our support service!"
+            )
+            result = send_whatsapp_message(customer_user.phone_number, wa_msg)
+            if result["success"]:
+                print(f"[Resolve] WhatsApp sent to {customer_user.phone_number}")
+            else:
+                print(f"[Resolve] WhatsApp failed: {result['error']}")
+        except Exception as e:
+            print(f"[Resolve] WhatsApp error: {e}")
+
+    return jsonify({"ticket": ticket.to_dict()})
+
+
+@app.route("/api/agent/tickets/<int:ticket_id>/diagnose", methods=["POST"])
+@jwt_required()
+def agent_diagnose_ticket(ticket_id):
+    """Use AI to generate a diagnosis/recommendation for resolving this ticket."""
+    user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
+    if not user or user.role != "human_agent":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    ticket = Ticket.query.get(ticket_id)
+    if not ticket:
+        return jsonify({"error": "Ticket not found"}), 404
+
+    session = ChatSession.query.get(ticket.chat_session_id) if ticket.chat_session_id else None
+    chat_history = ""
+    if session:
+        msgs = session.messages[:20]  # Last 20 messages for context
+        chat_history = "\n".join(f"{m.sender.upper()}: {m.content}" for m in msgs)
+
+    prompt = f"""You are an expert telecom support engineer. A human agent needs your help diagnosing and resolving a customer complaint.
+
+TICKET DETAILS:
+- Reference: {ticket.reference_number}
+- Category: {ticket.category}
+- Sub-category: {ticket.subcategory}
+- Priority: {ticket.priority.upper()}
+- Customer Issue: {ticket.description}
+
+CHAT HISTORY (between customer and AI chatbot):
+{chat_history if chat_history else 'No chat history available.'}
+
+Please provide:
+1. **Root Cause Analysis** - What is likely causing this issue?
+2. **Recommended Steps** - Specific step-by-step resolution actions for the agent
+3. **Escalation Criteria** - When should this be escalated further?
+4. **Resolution Time Estimate** - Expected time to resolve
+5. **Customer Communication** - What to tell the customer
+
+Keep your response concise and actionable."""
+
+    try:
+        response = client.chat.completions.create(
+            model=DEPLOYMENT_NAME,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=800,
+        )
+        diagnosis = response.choices[0].message.content.strip()
+    except Exception as e:
+        diagnosis = f"AI diagnosis unavailable: {str(e)}"
+
+    return jsonify({"diagnosis": diagnosis, "ticket_id": ticket_id})
+
+
+@app.route("/api/agent/customer360/<int:customer_user_id>", methods=["GET"])
+@jwt_required()
+def agent_customer360(customer_user_id):
+    """Return 360-degree customer view: plan, billing history, past complaints, location, loyalty."""
+    user_id = int(get_jwt_identity())
+    agent = User.query.get(user_id)
+    if not agent or agent.role != "human_agent":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    customer = User.query.get(customer_user_id)
+    if not customer:
+        return jsonify({"error": "Customer not found"}), 404
+
+    # Past complaints / chat sessions
+    sessions = ChatSession.query.filter_by(user_id=customer_user_id).order_by(ChatSession.created_at.desc()).limit(20).all()
+    # Past tickets
+    tickets = Ticket.query.filter_by(user_id=customer_user_id).order_by(Ticket.created_at.desc()).limit(10).all()
+    # Feedbacks
+    feedbacks = Feedback.query.filter_by(user_id=customer_user_id).all()
+    avg_rating = round(sum(f.rating for f in feedbacks if f.rating > 0) / max(len([f for f in feedbacks if f.rating > 0]), 1), 2)
+
+    # Loyalty score based on: account age (days), resolved complaints, avg rating
+    from datetime import date
+    account_age_days = (date.today() - customer.created_at.date()).days if customer.created_at else 0
+    resolved_count = len([s for s in sessions if s.status == "resolved"])
+    total_sessions = len(sessions)
+    # Loyalty = 0-100 composite score
+    age_score = min(account_age_days / 365 * 30, 30)  # max 30 points for up to 1 year
+    resolution_score = min((resolved_count / max(total_sessions, 1)) * 40, 40)  # max 40 points
+    rating_score = (avg_rating / 5) * 30  # max 30 points
+    loyalty_score = round(age_score + resolution_score + rating_score, 1)
+
+    # Location from most recent session with lat/long
+    location_data = None
+    for s in sessions:
+        if s.latitude and s.longitude:
+            location_data = {"latitude": s.latitude, "longitude": s.longitude}
+            break
+
+    # Category breakdown (billing history equivalent)
+    category_count = {}
+    for s in sessions:
+        cat = s.sector_name or "Unknown"
+        category_count[cat] = category_count.get(cat, 0) + 1
+
+    # Infer plan from most common category
+    plan_info = {
+        "most_used_service": max(category_count, key=category_count.get) if category_count else "Unknown",
+        "total_interactions": total_sessions,
+        "account_since": customer.created_at.strftime("%B %Y") if customer.created_at else "Unknown",
+    }
+
+    return jsonify({
+        "customer": {
+            "id": customer.id,
+            "name": customer.name,
+            "email": customer.email,
+            "phone": customer.phone_number,
+            "employee_id": customer.employee_id,
+            "created_at": customer.created_at.isoformat() if customer.created_at else None,
+        },
+        "plan_info": plan_info,
+        "loyalty_score": loyalty_score,
+        "avg_rating": avg_rating,
+        "location": location_data,
+        "category_breakdown": [{"category": k, "count": v} for k, v in category_count.items()],
+        "recent_sessions": [
+            {
+                "id": s.id,
+                "sector": s.sector_name,
+                "subprocess": s.subprocess_name,
+                "status": s.status,
+                "created_at": s.created_at.isoformat() if s.created_at else None,
+                "summary": s.summary,
+            }
+            for s in sessions[:10]
+        ],
+        "tickets": [t.to_dict() for t in tickets],
+    })
+
+
+@app.route("/api/agent/chat/<int:session_id>", methods=["GET"])
+@jwt_required()
+def agent_view_chat(session_id):
+    """Allow human agent to view full chat history of a session."""
+    user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
+    if not user or user.role != "human_agent":
+        return jsonify({"error": "Unauthorized"}), 403
+    session = ChatSession.query.get(session_id)
+    if not session:
+        return jsonify({"error": "Session not found"}), 404
+    return jsonify({
+        "session": session.to_dict(),
+        "messages": [m.to_dict() for m in session.messages],
+        "customer": {
+            "name": session.user.name if session.user else "",
+            "email": session.user.email if session.user else "",
+            "phone": session.user.phone_number if session.user else "",
+        },
+    })
+
+
+@app.route("/api/agent/chat/<int:session_id>/message", methods=["POST"])
+@jwt_required()
+def agent_send_message(session_id):
+    """Human agent sends a message into a customer chat session."""
+    user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
+    if not user or user.role != "human_agent":
+        return jsonify({"error": "Unauthorized"}), 403
+    session = ChatSession.query.get(session_id)
+    if not session:
+        return jsonify({"error": "Session not found"}), 404
+
+    data = request.json or {}
+    content = data.get("content", "").strip()
+    if not content:
+        return jsonify({"error": "Message content is required"}), 400
+
+    msg = ChatMessage(
+        session_id=session_id,
+        sender="agent",
+        content=content,
+    )
+    db.session.add(msg)
+    db.session.commit()
+    return jsonify({"message": msg.to_dict()}), 201
+
+
+# ── SLA Alert Helper ────────────────────────────────────────────────────────────
+
+def send_sla_alert_email(recipients, subject, ticket, alert_type, time_left_hours):
+    """Send SLA alert email to manager(s) or CTO."""
+    ticket_url = f"Ticket #{ticket.reference_number}"
+    time_left_str = f"{round(time_left_hours, 1)} hours" if time_left_hours > 0 else "BREACHED"
+    status_color = "#dc2626" if alert_type == "breach" else "#f59e0b"
+    status_label = "SLA BREACHED" if alert_type == "breach" else f"SLA Alert ({int(float(alert_type.replace('alert_','').replace('_sent',''))/10)}%)"
+
+    html_body = f"""
+    <div style="font-family: 'Segoe UI', Arial, sans-serif; max-width: 600px; margin: 0 auto; background: #fff; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 20px rgba(0,0,0,0.1);">
+        <div style="background: {status_color}; padding: 20px 30px; text-align: center;">
+            <h1 style="color: #fff; margin: 0; font-size: 18px;">{subject}</h1>
+        </div>
+        <div style="padding: 28px;">
+            <table style="width:100%;border-collapse:collapse;font-size:14px;">
+                <tr><td style="padding:8px 0;color:#64748b;width:160px;">Ticket ID</td><td style="padding:8px 0;color:#1e293b;font-weight:600;">{ticket.reference_number}</td></tr>
+                <tr><td style="padding:8px 0;color:#64748b;">Category</td><td style="padding:8px 0;color:#1e293b;">{ticket.category}</td></tr>
+                <tr><td style="padding:8px 0;color:#64748b;">Issue</td><td style="padding:8px 0;color:#1e293b;">{ticket.description[:200]}</td></tr>
+                <tr><td style="padding:8px 0;color:#64748b;">Priority</td><td style="padding:8px 0;color:#1e293b;font-weight:600;">{ticket.priority.upper()}</td></tr>
+                <tr><td style="padding:8px 0;color:#64748b;">Current Status</td><td style="padding:8px 0;color:#1e293b;">{ticket.status}</td></tr>
+                <tr><td style="padding:8px 0;color:#64748b;">Time Left</td><td style="padding:8px 0;color:{status_color};font-weight:700;">{time_left_str}</td></tr>
+                <tr><td style="padding:8px 0;color:#64748b;">Assigned To</td><td style="padding:8px 0;color:#1e293b;">{ticket.assignee.name if ticket.assignee else 'Unassigned'}</td></tr>
+                <tr><td style="padding:8px 0;color:#64748b;">SLA Deadline</td><td style="padding:8px 0;color:#1e293b;">{ticket.sla_deadline.strftime('%Y-%m-%d %H:%M UTC') if ticket.sla_deadline else 'N/A'}</td></tr>
+            </table>
+            <div style="background:#fef3c7;border:1px solid #fde68a;border-radius:8px;padding:14px 18px;margin-top:20px;">
+                <p style="margin:0;color:#b45309;font-size:14px;font-weight:600;">Action Required: This ticket has not been resolved. Please take immediate action.</p>
+            </div>
+        </div>
+        <div style="background:#f8fafc;border-top:1px solid #e2e8f0;padding:14px 30px;text-align:center;">
+            <p style="color:#94a3b8;font-size:12px;margin:0;">Customer Handling — Automated SLA Alert System</p>
+        </div>
+    </div>
+    """
+    try:
+        msg = Message(subject=subject, recipients=recipients, html=html_body)
+        mail.send(msg)
+        print(f"✅ SLA alert sent to {recipients}: {subject}")
+    except Exception as e:
+        print(f"⚠️ SLA alert email failed: {e}")
+
+
+def run_sla_checks():
+    """Background function: check open tickets and send escalating SLA alerts."""
+    import threading
+    def _check():
+        while True:
+            try:
+                with app.app_context():
+                    now = datetime.now(timezone.utc)
+                    open_tickets = Ticket.query.filter(
+                        Ticket.status.in_(["pending", "in_progress"]),
+                        Ticket.sla_deadline.isnot(None),
+                    ).all()
+
+                    # Get manager emails
+                    managers = User.query.filter_by(role="manager").all()
+                    manager_emails = [m.email for m in managers if m.email]
+                    cto_users = User.query.filter_by(role="cto").all()
+                    cto_emails = [c.email for c in cto_users if c.email]
+
+                    for ticket in open_tickets:
+                        dl = ticket.sla_deadline
+                        if dl.tzinfo is None:
+                            dl = dl.replace(tzinfo=timezone.utc)
+                        cr = ticket.created_at
+                        if cr.tzinfo is None:
+                            cr = cr.replace(tzinfo=timezone.utc)
+
+                        total_sla = (dl - cr).total_seconds()
+                        elapsed = (now - cr).total_seconds()
+                        time_left_hours = (dl - now).total_seconds() / 3600
+                        fraction_elapsed = elapsed / max(total_sla, 1)
+
+                        changed = False
+
+                        # Alert at 62.5%
+                        if fraction_elapsed >= 0.625 and not ticket.alert_625_sent and manager_emails:
+                            send_sla_alert_email(
+                                manager_emails,
+                                f"⚠️ SLA Warning (62.5%): Ticket {ticket.reference_number}",
+                                ticket, "625", time_left_hours
+                            )
+                            ticket.alert_625_sent = True
+                            changed = True
+
+                        # Alert at 75%
+                        if fraction_elapsed >= 0.75 and not ticket.alert_750_sent and manager_emails:
+                            send_sla_alert_email(
+                                manager_emails,
+                                f"🚨 SLA Warning (75%): Ticket {ticket.reference_number}",
+                                ticket, "750", time_left_hours
+                            )
+                            ticket.alert_750_sent = True
+                            changed = True
+
+                        # Alert at 87.5%
+                        if fraction_elapsed >= 0.875 and not ticket.alert_875_sent and manager_emails:
+                            send_sla_alert_email(
+                                manager_emails,
+                                f"🔴 SLA Critical (87.5%): Ticket {ticket.reference_number}",
+                                ticket, "875", time_left_hours
+                            )
+                            ticket.alert_875_sent = True
+                            changed = True
+
+                        # SLA Breach – send to CTO
+                        if now > dl and not ticket.breach_alert_sent:
+                            ticket.sla_breached = True
+                            recipients = cto_emails if cto_emails else manager_emails
+                            send_sla_alert_email(
+                                recipients,
+                                f"🚨 SLA BREACHED: Ticket {ticket.reference_number} — Immediate Action Required",
+                                ticket, "breach", time_left_hours
+                            )
+                            ticket.breach_alert_sent = True
+                            changed = True
+
+                        if changed:
+                            db.session.commit()
+            except Exception as e:
+                print(f"⚠️ SLA check error: {e}")
+            time.sleep(300)  # Check every 5 minutes
+
+    t = threading.Thread(target=_check, daemon=True)
+    t.start()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # INIT DB + SEED ADMIN
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -2254,4 +3240,5 @@ with app.app_context():
 
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5500)
+    run_sla_checks()
+    app.run(debug=True, port=5500, use_reloader=False)

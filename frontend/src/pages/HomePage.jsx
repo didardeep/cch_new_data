@@ -6,21 +6,14 @@ export default function HomePage() {
   const { user } = useAuth();
 
   const handleGetStarted = () => {
-    if (user) {
-      if (user.role === 'customer') navigate('/customer/dashboard');
-      else if (user.role === 'manager') navigate('/manager/dashboard');
-      else if (user.role === 'admin') navigate('/admin/dashboard');
-      else navigate('/cto/dashboard');
-    } else {
-      navigate('/login');
-    }
+    navigate('/login');
   };
 
   return (
     <div className="home-page">
       <nav className="home-nav">
         <div className="home-logo">
-          <div className="home-logo-icon" style={{ fontSize: 28, fontWeight: 800, color: '#ffffff' }}>TeleBot</div>
+          <img src="https://upload.wikimedia.org/wikipedia/commons/d/db/KPMG_blue_logo.svg" alt="KPMG" style={{ height: 32, filter: 'brightness(0) invert(1)' }} />
           Customer Handling
         </div>
         <div className="home-nav-actions">
