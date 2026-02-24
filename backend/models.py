@@ -268,9 +268,13 @@ class KpiData(db.Model):
     site_id = db.Column(db.String(50), nullable=False, index=True)
     kpi_name = db.Column(db.String(100), nullable=False, index=True)
     date = db.Column(db.Date, nullable=False)
-    hour = db.Column(db.Integer, nullable=False)
+    hour = db.Column(db.Integer, nullable=False, default=0)
     value = db.Column(db.Float, nullable=True)
+    data_level = db.Column(db.String(10), nullable=False, default="site")  # 'site' or 'cell'
+    cell_id = db.Column(db.String(100), nullable=True)
+    cell_site_id = db.Column(db.String(100), nullable=True)
 
     __table_args__ = (
         db.Index("idx_kpi_site_name_date", "site_id", "kpi_name", "date"),
+        db.Index("idx_kpi_data_level", "data_level", "kpi_name"),
     )

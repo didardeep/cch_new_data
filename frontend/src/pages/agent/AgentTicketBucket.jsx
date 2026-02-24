@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { apiGet, apiPost, apiPut } from '../../api';
 
@@ -206,20 +206,28 @@ function DiagnoseModal({ ticket, onClose }) {
 }
 
 /* ── Network Diagnosis: 6-tab modal ──────────────────────────────────────────── */
+const PERIOD_LABELS = { month: 'Monthly', week: 'Weekly', day: 'Daily', hour: 'Hourly' };
+
 function NetworkDiagnosisModal({ ticket, onClose }) {
   const [tab, setTab] = useState('map');
   const [sites, setSites] = useState(null);
   const [customer, setCustomer] = useState(null);
   const [sitesLoading, setSitesLoading] = useState(true);
   const [sitesError, setSitesError] = useState('');
-  const [trends, setTrends] = useState(null);
+  // Trend state — separate for site and cell level
+  const [trendLevel, setTrendLevel] = useState('site'); // 'site' or 'cell'
   const [trendPeriod, setTrendPeriod] = useState('day');
+  const [trends, setTrends] = useState(null);
   const [trendsLoading, setTrendsLoading] = useState(false);
+  // Root cause & recommendation
   const [rootCause, setRootCause] = useState('');
   const [rcLoading, setRcLoading] = useState(false);
   const [recommendation, setRecommendation] = useState('');
   const [recLoading, setRecLoading] = useState(false);
   const [pdfLoading, setPdfLoading] = useState(false);
+  // Cache trend data for PDF
+  const [trendCache, setTrendCache] = useState({});
+  const trendCacheRef = useRef({});
 
   // Fetch nearest sites on mount
   useEffect(() => {
@@ -232,14 +240,25 @@ function NetworkDiagnosisModal({ ticket, onClose }) {
       .catch(() => { setSitesError('Failed to fetch site data.'); setSitesLoading(false); });
   }, [ticket.id]);
 
-  // Fetch trends when tab=trend or period changes
+  // Fetch trends when tab=trend or level/period changes
   useEffect(() => {
     if (tab !== 'trend' || !sites?.length) return;
+    const cacheKey = `${trendLevel}_${trendPeriod}`;
+    if (trendCacheRef.current[cacheKey]) {
+      setTrends(trendCacheRef.current[cacheKey]);
+      return;
+    }
     setTrendsLoading(true);
-    apiGet(`/api/agent/sites/${sites[0].site_id}/kpi-trends?period=${trendPeriod}`)
-      .then(d => { setTrends(d.trends || {}); setTrendsLoading(false); })
+    apiGet(`/api/agent/sites/${sites[0].site_id}/kpi-trends?period=${trendPeriod}&data_level=${trendLevel}`)
+      .then(d => {
+        const t = d.trends || {};
+        setTrends(t);
+        trendCacheRef.current[cacheKey] = t;
+        setTrendCache(prev => ({ ...prev, [cacheKey]: t }));
+        setTrendsLoading(false);
+      })
       .catch(() => { setTrends({}); setTrendsLoading(false); });
-  }, [tab, trendPeriod, sites]);
+  }, [tab, trendLevel, trendPeriod, sites]);
 
   const runRootCause = async () => {
     setRcLoading(true);
@@ -253,7 +272,23 @@ function NetworkDiagnosisModal({ ticket, onClose }) {
   const runRecommendation = async () => {
     setRecLoading(true);
     try {
-      const d = await apiPost(`/api/agent/tickets/${ticket.id}/recommendation`, { root_cause: rootCause });
+      // Build trend summary from cached data
+      let trendSummary = '';
+      for (const [key, data] of Object.entries(trendCache)) {
+        const [level, period] = key.split('_');
+        trendSummary += `\n${level.toUpperCase()} LEVEL (${PERIOD_LABELS[period] || period}):\n`;
+        for (const [kpiName, points] of Object.entries(data)) {
+          if (points.length > 0) {
+            const avgVals = points.map(p => p.avg);
+            const overall = (avgVals.reduce((a, b) => a + b, 0) / avgVals.length).toFixed(4);
+            trendSummary += `- ${kpiName}: overall avg=${overall}, points=${points.length}\n`;
+          }
+        }
+      }
+      const d = await apiPost(`/api/agent/tickets/${ticket.id}/recommendation`, {
+        root_cause: rootCause,
+        trend_summary: trendSummary,
+      });
       setRecommendation(d.recommendation || 'No recommendation available.');
     } catch { setRecommendation('Recommendation failed.'); }
     setRecLoading(false);
@@ -264,44 +299,119 @@ function NetworkDiagnosisModal({ ticket, onClose }) {
     try {
       const { default: jsPDF } = await import('jspdf');
       await import('jspdf-autotable');
+      const html2canvas = (await import('html2canvas')).default;
       const doc = new jsPDF('p', 'mm', 'a4');
       let y = 15;
       const pageW = doc.internal.pageSize.getWidth();
 
-      // Header
+      // ── Header ──
       doc.setFillColor(0, 51, 141);
-      doc.rect(0, 0, pageW, 30, 'F');
+      doc.rect(0, 0, pageW, 32, 'F');
       doc.setTextColor(255);
-      doc.setFontSize(16);
-      doc.text('AI Network Diagnosis Report', 14, 12);
+      doc.setFontSize(18);
+      doc.text('AI Network Diagnosis Report', 14, 14);
       doc.setFontSize(10);
-      doc.text(`Ticket: ${ticket.reference_number} | ${ticket.category} / ${ticket.subcategory} | Priority: ${ticket.priority?.toUpperCase()}`, 14, 22);
-      y = 38;
-
+      doc.text(`Ticket: ${ticket.reference_number} | ${ticket.category} / ${ticket.subcategory}`, 14, 22);
+      doc.text(`Priority: ${ticket.priority?.toUpperCase()} | Generated: ${new Date().toLocaleString()}`, 14, 28);
+      y = 40;
       doc.setTextColor(0);
 
-      // Site Information
+      // ── Map Screenshot ──
+      const mapEl = document.getElementById('diagnosis-map-container');
+      if (mapEl) {
+        try {
+          const canvas = await html2canvas(mapEl, { useCORS: true, allowTaint: true, scale: 2 });
+          const imgData = canvas.toDataURL('image/png');
+          doc.setFontSize(14);
+          doc.setFont(undefined, 'bold');
+          doc.text('1. Map Visualization', 14, y);
+          y += 6;
+          const imgW = pageW - 28;
+          const imgH = (canvas.height / canvas.width) * imgW;
+          doc.addImage(imgData, 'PNG', 14, y, imgW, Math.min(imgH, 100));
+          y += Math.min(imgH, 100) + 8;
+        } catch { /* map screenshot failed, skip */ }
+      }
+
+      // ── Site Information Table ──
       if (sites?.length) {
-        doc.setFontSize(13);
-        doc.text('Site Information', 14, y);
+        if (y > 230) { doc.addPage(); y = 15; }
+        doc.setFontSize(14);
+        doc.setFont(undefined, 'bold');
+        doc.text('2. Site Information', 14, y);
         y += 6;
+        doc.setFont(undefined, 'normal');
         doc.autoTable({
           startY: y,
           head: [['#', 'Site ID', 'Latitude', 'Longitude', 'Zone', 'Distance (km)']],
-          body: sites.map((s, i) => [i + 1, s.site_id, s.latitude?.toFixed(5), s.longitude?.toFixed(5), s.zone, s.distance_km]),
+          body: sites.map((s, i) => [i + 1, s.site_id, s.latitude?.toFixed(5), s.longitude?.toFixed(5), s.zone || '—', s.distance_km]),
           styles: { fontSize: 9 },
           headStyles: { fillColor: [0, 51, 141] },
           margin: { left: 14, right: 14 },
         });
         y = doc.lastAutoTable.finalY + 10;
+        if (customer) {
+          doc.setFontSize(9);
+          doc.text(`Customer Location: ${customer.latitude?.toFixed(5)}, ${customer.longitude?.toFixed(5)}`, 14, y);
+          y += 8;
+        }
       }
 
-      // Root Cause
-      if (rootCause) {
-        if (y > 240) { doc.addPage(); y = 15; }
-        doc.setFontSize(13);
-        doc.text('Root Cause Analysis', 14, y);
+      // ── Trend Analysis Crux ──
+      if (Object.keys(trendCache).length > 0) {
+        if (y > 220) { doc.addPage(); y = 15; }
+        doc.setFontSize(14);
+        doc.setFont(undefined, 'bold');
+        doc.text('3. Trend Analysis Summary', 14, y);
         y += 6;
+        doc.setFont(undefined, 'normal');
+
+        for (const [key, data] of Object.entries(trendCache)) {
+          const [level, period] = key.split('_');
+          if (y > 260) { doc.addPage(); y = 15; }
+          doc.setFontSize(11);
+          doc.setFont(undefined, 'bold');
+          doc.text(`${level.charAt(0).toUpperCase() + level.slice(1)} Level — ${PERIOD_LABELS[period] || period}`, 14, y);
+          y += 5;
+          doc.setFont(undefined, 'normal');
+
+          const tableBody = [];
+          for (const [kpiName, points] of Object.entries(data)) {
+            if (points.length > 0) {
+              const avgVals = points.map(p => p.avg);
+              const minVals = points.map(p => p.min);
+              const maxVals = points.map(p => p.max);
+              tableBody.push([
+                kpiName,
+                (avgVals.reduce((a, b) => a + b, 0) / avgVals.length).toFixed(2),
+                Math.min(...minVals).toFixed(2),
+                Math.max(...maxVals).toFixed(2),
+                points.length.toString(),
+              ]);
+            }
+          }
+          if (tableBody.length > 0) {
+            doc.autoTable({
+              startY: y,
+              head: [['KPI', 'Avg', 'Min', 'Max', 'Points']],
+              body: tableBody,
+              styles: { fontSize: 8 },
+              headStyles: { fillColor: [0, 51, 141] },
+              margin: { left: 14, right: 14 },
+            });
+            y = doc.lastAutoTable.finalY + 8;
+          }
+        }
+      }
+
+      // ── Root Cause Analysis ──
+      if (rootCause) {
+        if (y > 220) { doc.addPage(); y = 15; }
+        doc.setFontSize(14);
+        doc.setFont(undefined, 'bold');
+        doc.text('4. Root Cause Analysis', 14, y);
+        y += 7;
+        doc.setFont(undefined, 'normal');
         doc.setFontSize(9);
         const rcLines = doc.splitTextToSize(rootCause, pageW - 28);
         for (const line of rcLines) {
@@ -312,12 +422,14 @@ function NetworkDiagnosisModal({ ticket, onClose }) {
         y += 6;
       }
 
-      // Recommendations
+      // ── Final Recommendations ──
       if (recommendation) {
-        if (y > 240) { doc.addPage(); y = 15; }
-        doc.setFontSize(13);
-        doc.text('Final Recommendations', 14, y);
-        y += 6;
+        if (y > 220) { doc.addPage(); y = 15; }
+        doc.setFontSize(14);
+        doc.setFont(undefined, 'bold');
+        doc.text('5. Final Recommendations', 14, y);
+        y += 7;
+        doc.setFont(undefined, 'normal');
         doc.setFontSize(9);
         const recLines = doc.splitTextToSize(recommendation, pageW - 28);
         for (const line of recLines) {
@@ -404,35 +516,51 @@ function NetworkDiagnosisModal({ ticket, onClose }) {
             </div>
           )}
 
-          {/* ── Tab: Trend ────────────────────────────────────── */}
+          {/* ── Tab: Trend Analysis (Site Level / Cell Level) ── */}
           {tab === 'trend' && (
             <div>
+              {/* Data level toggle */}
+              <div style={{ display: 'flex', gap: 8, marginBottom: 14 }}>
+                {[{ key: 'site', label: 'Site Level Data Analysis' }, { key: 'cell', label: 'Cell Level Data Analysis' }].map(lv => (
+                  <button key={lv.key} onClick={() => { setTrendLevel(lv.key); setTrends(null); }} style={{
+                    padding: '8px 18px', borderRadius: 8, fontSize: 13, fontWeight: 700,
+                    border: '2px solid', cursor: 'pointer',
+                    background: trendLevel === lv.key ? '#00338D' : '#fff',
+                    color: trendLevel === lv.key ? '#fff' : '#00338D',
+                    borderColor: '#00338D',
+                  }}>
+                    {lv.label}
+                  </button>
+                ))}
+              </div>
+
+              {/* Period buttons */}
               <div style={{ display: 'flex', gap: 6, marginBottom: 16 }}>
                 {['month', 'week', 'day', 'hour'].map(p => (
                   <button key={p} onClick={() => setTrendPeriod(p)} style={{
                     padding: '5px 12px', borderRadius: 5, fontSize: 11, fontWeight: 600,
-                    border: '1px solid', cursor: 'pointer', textTransform: 'capitalize',
-                    background: trendPeriod === p ? '#00338D' : '#fff',
+                    border: '1px solid', cursor: 'pointer',
+                    background: trendPeriod === p ? '#0f172a' : '#fff',
                     color: trendPeriod === p ? '#fff' : '#475569',
-                    borderColor: trendPeriod === p ? '#00338D' : '#e2e8f0',
+                    borderColor: trendPeriod === p ? '#0f172a' : '#e2e8f0',
                   }}>
-                    {p}ly
+                    {PERIOD_LABELS[p]}
                   </button>
                 ))}
               </div>
               <div style={{ fontSize: 12, color: '#64748b', marginBottom: 12 }}>
-                Showing trends for nearest site: <strong style={{ color: '#00338D' }}>{sites[0]?.site_id}</strong>
+                Showing <strong style={{ color: trendLevel === 'site' ? '#00338D' : '#7c3aed' }}>{trendLevel}-level</strong> trends for nearest site: <strong style={{ color: '#00338D' }}>{sites[0]?.site_id}</strong>
               </div>
               {trendsLoading ? (
                 <div className="page-loader" style={{ height: 160 }}><div className="spinner" /></div>
               ) : !trends || Object.keys(trends).length === 0 ? (
                 <div style={{ textAlign: 'center', padding: 40, color: '#64748b' }}>
-                  No KPI data available for this site. Ask admin to upload KPI data.
+                  No {trendLevel}-level KPI data available for this site. Ask admin to upload {trendLevel}-level KPI data.
                 </div>
               ) : (
                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 12, maxHeight: 500, overflowY: 'auto' }}>
                   {Object.entries(trends).map(([kpiName, data]) => (
-                    <TrendMiniChart key={kpiName} kpiName={kpiName} data={data} />
+                    <TrendMiniChart key={kpiName} kpiName={kpiName} data={data} color={trendLevel === 'cell' ? '#7c3aed' : '#00338D'} />
                   ))}
                 </div>
               )}
@@ -445,7 +573,9 @@ function NetworkDiagnosisModal({ ticket, onClose }) {
               {!rootCause && !rcLoading && (
                 <div style={{ textAlign: 'center', padding: 30 }}>
                   <button className="btn btn-primary btn-sm" onClick={runRootCause}>Run Root Cause Analysis</button>
-                  <p style={{ fontSize: 12, color: '#64748b', marginTop: 10 }}>Uses AI to analyze KPI trends for nearest site: <strong>{sites[0]?.site_id}</strong></p>
+                  <p style={{ fontSize: 12, color: '#64748b', marginTop: 10 }}>
+                    Uses AI to analyze both site-level and cell-level KPI trends for nearest site: <strong>{sites[0]?.site_id}</strong>
+                  </p>
                 </div>
               )}
               {rcLoading && <div className="page-loader" style={{ height: 160 }}><div className="spinner" /></div>}
@@ -464,7 +594,7 @@ function NetworkDiagnosisModal({ ticket, onClose }) {
                 <div style={{ textAlign: 'center', padding: 30 }}>
                   <button className="btn btn-primary btn-sm" onClick={runRecommendation}>Get Recommendations</button>
                   <p style={{ fontSize: 12, color: '#64748b', marginTop: 10 }}>
-                    {rootCause ? 'Based on the root cause analysis' : 'Run root cause analysis first for better results'}
+                    {rootCause ? 'Based on the entire trend analysis and root cause analysis' : 'Run root cause analysis first for better results'}
                   </p>
                 </div>
               )}
@@ -484,12 +614,17 @@ function NetworkDiagnosisModal({ ticket, onClose }) {
                 <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><polyline points="9 15 12 18 15 15"/>
               </svg>
               <h3 style={{ margin: '0 0 8px', fontSize: 16, color: 'var(--text)' }}>Generate PDF Report</h3>
-              <p style={{ fontSize: 13, color: '#64748b', marginBottom: 20, lineHeight: 1.6 }}>
-                Includes: Site Information, Root Cause Analysis, and Final Recommendations.<br/>
-                {!rootCause && <span style={{ color: '#d97706' }}>Tip: Run Root Cause Analysis and Recommendations first for a complete report.</span>}
+              <p style={{ fontSize: 13, color: '#64748b', marginBottom: 10, lineHeight: 1.6 }}>
+                The PDF includes: Map Screenshot, Site Information Table, Trend Analysis Summary with Data,
+                Root Cause Analysis, and Final Recommendations.
               </p>
-              <button className="btn btn-primary" onClick={downloadPdf} disabled={pdfLoading}>
-                {pdfLoading ? 'Generating...' : 'Download PDF Report'}
+              <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 20 }}>
+                {!rootCause && <span style={{ color: '#d97706', display: 'block', marginBottom: 4 }}>Tip: Run Root Cause Analysis first.</span>}
+                {!recommendation && <span style={{ color: '#d97706', display: 'block', marginBottom: 4 }}>Tip: Get Recommendations first.</span>}
+                {Object.keys(trendCache).length === 0 && <span style={{ color: '#d97706', display: 'block' }}>Tip: View Trend Analysis tabs first to include trend data in the report.</span>}
+              </div>
+              <button className="btn btn-primary" onClick={downloadPdf} disabled={pdfLoading} style={{ fontSize: 14, padding: '10px 28px' }}>
+                {pdfLoading ? 'Generating PDF...' : 'Download PDF Report'}
               </button>
             </div>
           )}
@@ -532,7 +667,7 @@ function MapTab({ customer, sites }) {
   const bounds = allPoints.length > 1 ? allPoints : undefined;
 
   return (
-    <div style={{ height: 400, borderRadius: 8, overflow: 'hidden', border: '1px solid #e2e8f0' }}>
+    <div id="diagnosis-map-container" style={{ height: 400, borderRadius: 8, overflow: 'hidden', border: '1px solid #e2e8f0' }}>
       <MapContainer center={center} zoom={13} style={{ height: '100%', width: '100%' }} bounds={bounds} boundsOptions={{ padding: [40, 40] }}>
         <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" attribution='&copy; OSM' />
         {customer && (
@@ -559,7 +694,7 @@ function MapTab({ customer, sites }) {
 }
 
 /* ── Trend Mini Chart (using recharts) ────────────────────────────────────────── */
-function TrendMiniChart({ kpiName, data }) {
+function TrendMiniChart({ kpiName, data, color = '#00338D' }) {
   const [RC, setRC] = useState(null);
   useEffect(() => {
     import('recharts').then(m => setRC(m));
@@ -581,7 +716,7 @@ function TrendMiniChart({ kpiName, data }) {
           <XAxis dataKey="label" tick={{ fontSize: 8 }} interval="preserveStartEnd" />
           <YAxis tick={{ fontSize: 8 }} width={35} />
           <Tooltip contentStyle={{ fontSize: 11 }} />
-          <Line type="monotone" dataKey="avg" stroke="#00338D" strokeWidth={1.5} dot={false} />
+          <Line type="monotone" dataKey="avg" stroke={color} strokeWidth={1.5} dot={false} />
         </LineChart>
       </ResponsiveContainer>
     </div>

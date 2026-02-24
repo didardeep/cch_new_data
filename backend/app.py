@@ -2027,10 +2027,11 @@ def admin_upload_sites():
     return jsonify({"created": created, "updated": updated, "skipped": skipped, "total": created + updated})
 
 
-@app.route("/api/admin/upload-kpi", methods=["POST"])
+@app.route("/api/admin/upload-kpi-site-level", methods=["POST"])
 @jwt_required()
-def admin_upload_kpi():
-    """Upload KPI data Excel (Date, Hour, Site_ID, Value) with kpi_name."""
+def admin_upload_kpi_site_level():
+    """Upload site-level KPI workbook (27 sheets, sheet name = KPI name).
+    Each sheet: Site_ID column, then date columns with values."""
     user = User.query.get(int(get_jwt_identity()))
     if not user or user.role != "admin":
         return jsonify({"error": "Unauthorized"}), 403
@@ -2038,9 +2039,106 @@ def admin_upload_kpi():
     if "file" not in request.files:
         return jsonify({"error": "No file provided"}), 400
 
-    kpi_name = request.form.get("kpi_name", "").strip()
-    if not kpi_name:
-        return jsonify({"error": "kpi_name is required"}), 400
+    file = request.files["file"]
+    if not file.filename.endswith((".xlsx", ".xls")):
+        return jsonify({"error": "Only .xlsx or .xls files accepted"}), 400
+
+    import openpyxl
+    wb = openpyxl.load_workbook(file, data_only=True)
+
+    # Clear old site-level KPI data
+    KpiData.query.filter_by(data_level="site").delete()
+    db.session.flush()
+
+    total_inserted = 0
+    kpi_summary = []
+    errors = []
+
+    for ws in wb.worksheets:
+        kpi_name = ws.title.strip()
+        if not kpi_name:
+            continue
+
+        headers = [c.value for c in ws[1]]
+        if not headers or len(headers) < 2:
+            errors.append(f"Sheet '{kpi_name}': insufficient columns")
+            continue
+
+        # First column is Site_ID, remaining columns are dates
+        date_columns = []
+        for col_idx in range(1, len(headers)):
+            h = headers[col_idx]
+            if h is None:
+                continue
+            try:
+                if isinstance(h, datetime):
+                    date_columns.append((col_idx, h.date()))
+                elif isinstance(h, str):
+                    # Try multiple date formats
+                    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d"):
+                        try:
+                            date_columns.append((col_idx, datetime.strptime(h.strip(), fmt).date()))
+                            break
+                        except ValueError:
+                            continue
+                elif hasattr(h, 'date'):
+                    date_columns.append((col_idx, h.date()))
+            except Exception:
+                continue
+
+        if not date_columns:
+            errors.append(f"Sheet '{kpi_name}': no valid date columns found")
+            continue
+
+        sheet_inserted = 0
+        batch = []
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            site_id = str(row[0]).strip() if row[0] else None
+            if not site_id or site_id == "None":
+                continue
+
+            for col_idx, date_val in date_columns:
+                if col_idx < len(row) and row[col_idx] is not None:
+                    try:
+                        val = float(row[col_idx])
+                    except (ValueError, TypeError):
+                        continue
+                    batch.append(KpiData(
+                        site_id=site_id, kpi_name=kpi_name, date=date_val,
+                        hour=0, value=val, data_level="site"
+                    ))
+                    sheet_inserted += 1
+
+                    if len(batch) >= 2000:
+                        db.session.bulk_save_objects(batch)
+                        batch = []
+
+        if batch:
+            db.session.bulk_save_objects(batch)
+
+        total_inserted += sheet_inserted
+        kpi_summary.append({"name": kpi_name, "rows": sheet_inserted})
+
+    db.session.commit()
+    return jsonify({
+        "inserted": total_inserted,
+        "kpis_processed": len(kpi_summary),
+        "kpi_summary": kpi_summary,
+        "errors": errors,
+    })
+
+
+@app.route("/api/admin/upload-kpi-cell-level", methods=["POST"])
+@jwt_required()
+def admin_upload_kpi_cell_level():
+    """Upload cell-level KPI workbook (27 sheets, sheet name = KPI name).
+    Each sheet: Site_ID, Cell_ID, Cell_Site_ID columns, then date columns with values."""
+    user = User.query.get(int(get_jwt_identity()))
+    if not user or user.role != "admin":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    if "file" not in request.files:
+        return jsonify({"error": "No file provided"}), 400
 
     file = request.files["file"]
     if not file.filename.endswith((".xlsx", ".xls")):
@@ -2048,76 +2146,150 @@ def admin_upload_kpi():
 
     import openpyxl
     wb = openpyxl.load_workbook(file, data_only=True)
-    ws = wb.active
 
-    headers = [str(c.value).strip().lower() if c.value else "" for c in ws[1]]
-    col_map = {}
-    for i, h in enumerate(headers):
-        if "date" in h and "hour" not in h:
-            col_map["date"] = i
-        elif "hour" in h:
-            col_map["hour"] = i
-        elif "site" in h and "id" in h:
-            col_map["site_id"] = i
-        elif "value" in h or "val" in h:
-            col_map["value"] = i
-
-    required = ["date", "hour", "site_id", "value"]
-    missing = [k for k in required if k not in col_map]
-    if missing:
-        return jsonify({"error": f"Missing columns: {', '.join(missing)}. Found headers: {headers}"}), 400
-
-    # Clear old data for this KPI
-    KpiData.query.filter_by(kpi_name=kpi_name).delete()
+    # Clear old cell-level KPI data
+    KpiData.query.filter_by(data_level="cell").delete()
     db.session.flush()
 
-    inserted = 0
-    skipped = []
-    batch = []
-    for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
-        try:
-            date_val = row[col_map["date"]]
-            if isinstance(date_val, str):
-                date_val = datetime.strptime(date_val, "%Y-%m-%d").date()
-            elif isinstance(date_val, datetime):
-                date_val = date_val.date()
+    total_inserted = 0
+    kpi_summary = []
+    errors = []
 
-            hour_val = int(row[col_map["hour"]])
-            sid = str(row[col_map["site_id"]]).strip()
-            val = float(row[col_map["value"]]) if row[col_map["value"]] is not None else None
-        except Exception as e:
-            skipped.append(f"Row {row_idx}: {e}")
+    for ws in wb.worksheets:
+        kpi_name = ws.title.strip()
+        if not kpi_name:
             continue
 
-        batch.append(KpiData(site_id=sid, kpi_name=kpi_name, date=date_val, hour=hour_val, value=val))
-        inserted += 1
+        headers = [c.value for c in ws[1]]
+        if not headers or len(headers) < 4:
+            errors.append(f"Sheet '{kpi_name}': insufficient columns (need Site_ID, Cell_ID, Cell_Site_ID + dates)")
+            continue
 
-        if len(batch) >= 1000:
+        # First 3 columns: Site_ID, Cell_ID, Cell_Site_ID; remaining are dates
+        date_columns = []
+        for col_idx in range(3, len(headers)):
+            h = headers[col_idx]
+            if h is None:
+                continue
+            try:
+                if isinstance(h, datetime):
+                    date_columns.append((col_idx, h.date()))
+                elif isinstance(h, str):
+                    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d"):
+                        try:
+                            date_columns.append((col_idx, datetime.strptime(h.strip(), fmt).date()))
+                            break
+                        except ValueError:
+                            continue
+                elif hasattr(h, 'date'):
+                    date_columns.append((col_idx, h.date()))
+            except Exception:
+                continue
+
+        if not date_columns:
+            errors.append(f"Sheet '{kpi_name}': no valid date columns found")
+            continue
+
+        sheet_inserted = 0
+        batch = []
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            site_id = str(row[0]).strip() if row[0] else None
+            cell_id = str(row[1]).strip() if row[1] else None
+            cell_site_id = str(row[2]).strip() if row[2] else None
+            if not site_id or site_id == "None":
+                continue
+
+            for col_idx, date_val in date_columns:
+                if col_idx < len(row) and row[col_idx] is not None:
+                    try:
+                        val = float(row[col_idx])
+                    except (ValueError, TypeError):
+                        continue
+                    batch.append(KpiData(
+                        site_id=site_id, kpi_name=kpi_name, date=date_val,
+                        hour=0, value=val, data_level="cell",
+                        cell_id=cell_id, cell_site_id=cell_site_id
+                    ))
+                    sheet_inserted += 1
+
+                    if len(batch) >= 2000:
+                        db.session.bulk_save_objects(batch)
+                        batch = []
+
+        if batch:
             db.session.bulk_save_objects(batch)
-            batch = []
 
-    if batch:
-        db.session.bulk_save_objects(batch)
+        total_inserted += sheet_inserted
+        kpi_summary.append({"name": kpi_name, "rows": sheet_inserted})
+
     db.session.commit()
+    return jsonify({
+        "inserted": total_inserted,
+        "kpis_processed": len(kpi_summary),
+        "kpi_summary": kpi_summary,
+        "errors": errors,
+    })
 
-    return jsonify({"inserted": inserted, "kpi_name": kpi_name, "skipped": skipped})
+
+@app.route("/api/admin/delete-sites", methods=["DELETE"])
+@jwt_required()
+def admin_delete_sites():
+    """Delete all telecom site data."""
+    user = User.query.get(int(get_jwt_identity()))
+    if not user or user.role != "admin":
+        return jsonify({"error": "Unauthorized"}), 403
+    count = TelecomSite.query.count()
+    TelecomSite.query.delete()
+    db.session.commit()
+    return jsonify({"deleted": count})
+
+
+@app.route("/api/admin/delete-kpi-site-level", methods=["DELETE"])
+@jwt_required()
+def admin_delete_kpi_site_level():
+    """Delete all site-level KPI data."""
+    user = User.query.get(int(get_jwt_identity()))
+    if not user or user.role != "admin":
+        return jsonify({"error": "Unauthorized"}), 403
+    count = KpiData.query.filter_by(data_level="site").count()
+    KpiData.query.filter_by(data_level="site").delete()
+    db.session.commit()
+    return jsonify({"deleted": count})
+
+
+@app.route("/api/admin/delete-kpi-cell-level", methods=["DELETE"])
+@jwt_required()
+def admin_delete_kpi_cell_level():
+    """Delete all cell-level KPI data."""
+    user = User.query.get(int(get_jwt_identity()))
+    if not user or user.role != "admin":
+        return jsonify({"error": "Unauthorized"}), 403
+    count = KpiData.query.filter_by(data_level="cell").count()
+    KpiData.query.filter_by(data_level="cell").delete()
+    db.session.commit()
+    return jsonify({"deleted": count})
 
 
 @app.route("/api/admin/uploaded-kpis", methods=["GET"])
 @jwt_required()
 def admin_uploaded_kpis():
-    """Return list of uploaded KPI names with row counts."""
+    """Return list of uploaded KPI names with row counts, split by data level."""
     user = User.query.get(int(get_jwt_identity()))
     if not user or user.role != "admin":
         return jsonify({"error": "Unauthorized"}), 403
 
-    rows = db.session.query(
+    site_kpis = db.session.query(
         KpiData.kpi_name, db.func.count(KpiData.id)
-    ).group_by(KpiData.kpi_name).order_by(KpiData.kpi_name).all()
+    ).filter_by(data_level="site").group_by(KpiData.kpi_name).order_by(KpiData.kpi_name).all()
+
+    cell_kpis = db.session.query(
+        KpiData.kpi_name, db.func.count(KpiData.id)
+    ).filter_by(data_level="cell").group_by(KpiData.kpi_name).order_by(KpiData.kpi_name).all()
 
     site_count = TelecomSite.query.count()
     return jsonify({
-        "kpis": [{"name": r[0], "rows": r[1]} for r in rows],
+        "site_kpis": [{"name": r[0], "rows": r[1]} for r in site_kpis],
+        "cell_kpis": [{"name": r[0], "rows": r[1]} for r in cell_kpis],
         "site_count": site_count,
     })
 
@@ -3080,18 +3252,21 @@ def agent_nearest_sites(ticket_id):
 @app.route("/api/agent/sites/<site_id>/kpi-trends", methods=["GET"])
 @jwt_required()
 def agent_kpi_trends(site_id):
-    """Get KPI trend data for a site, aggregated by period (month/week/day/hour)."""
+    """Get KPI trend data for a site, aggregated by period (month/week/day/hour).
+    Supports data_level filter: 'site' or 'cell'."""
     user = User.query.get(int(get_jwt_identity()))
     if not user or user.role != "human_agent":
         return jsonify({"error": "Unauthorized"}), 403
 
     period = request.args.get("period", "day")
-    kpi_rows = KpiData.query.filter_by(site_id=site_id).all()
+    data_level = request.args.get("data_level", "site")
+
+    query = KpiData.query.filter_by(site_id=site_id, data_level=data_level)
+    kpi_rows = query.all()
 
     if not kpi_rows:
-        return jsonify({"error": f"No KPI data found for site {site_id}"}), 404
+        return jsonify({"error": f"No {data_level}-level KPI data found for site {site_id}"}), 404
 
-    # Group by kpi_name
     from collections import defaultdict
     kpi_groups = defaultdict(list)
     for r in kpi_rows:
@@ -3124,13 +3299,13 @@ def agent_kpi_trends(site_id):
             })
         result[kpi_name] = trend
 
-    return jsonify({"site_id": site_id, "period": period, "trends": result})
+    return jsonify({"site_id": site_id, "period": period, "data_level": data_level, "trends": result})
 
 
 @app.route("/api/agent/tickets/<int:ticket_id>/root-cause", methods=["POST"])
 @jwt_required()
 def agent_root_cause(ticket_id):
-    """AI root cause analysis using KPI trends of the nearest site."""
+    """AI root cause analysis using both site-level and cell-level KPI trends of the nearest site."""
     user = User.query.get(int(get_jwt_identity()))
     if not user or user.role != "human_agent":
         return jsonify({"error": "Unauthorized"}), 403
@@ -3151,20 +3326,38 @@ def agent_root_cause(ticket_id):
     nearest = min(sites, key=lambda s: haversine(session.latitude, session.longitude, s.latitude, s.longitude))
     dist_km = round(haversine(session.latitude, session.longitude, nearest.latitude, nearest.longitude), 2)
 
-    # Get KPI data for that site (daily averages, last 30 days)
     from collections import defaultdict
-    kpi_rows = KpiData.query.filter_by(site_id=nearest.site_id).all()
-    kpi_summary = defaultdict(list)
-    for r in kpi_rows:
-        if r.value is not None:
-            kpi_summary[r.kpi_name].append(r.value)
 
-    kpi_text = ""
-    for kpi_name, vals in kpi_summary.items():
+    # Get site-level KPI data
+    site_rows = KpiData.query.filter_by(site_id=nearest.site_id, data_level="site").all()
+    site_summary = defaultdict(list)
+    for r in site_rows:
+        if r.value is not None:
+            site_summary[r.kpi_name].append(r.value)
+
+    site_kpi_text = ""
+    for kpi_name, vals in site_summary.items():
         avg = round(sum(vals) / len(vals), 4)
         mn = round(min(vals), 4)
         mx = round(max(vals), 4)
-        kpi_text += f"- {kpi_name}: avg={avg}, min={mn}, max={mx} ({len(vals)} data points)\n"
+        site_kpi_text += f"- {kpi_name}: avg={avg}, min={mn}, max={mx} ({len(vals)} data points)\n"
+
+    # Get cell-level KPI data
+    cell_rows = KpiData.query.filter_by(site_id=nearest.site_id, data_level="cell").all()
+    cell_summary = defaultdict(lambda: defaultdict(list))
+    for r in cell_rows:
+        if r.value is not None:
+            cell_key = f"{r.cell_id}" if r.cell_id else "unknown"
+            cell_summary[r.kpi_name][cell_key].append(r.value)
+
+    cell_kpi_text = ""
+    for kpi_name, cells in cell_summary.items():
+        cell_kpi_text += f"- {kpi_name}:\n"
+        for cell_id, vals in cells.items():
+            avg = round(sum(vals) / len(vals), 4)
+            mn = round(min(vals), 4)
+            mx = round(max(vals), 4)
+            cell_kpi_text += f"    Cell {cell_id}: avg={avg}, min={mn}, max={mx} ({len(vals)} pts)\n"
 
     prompt = f"""You are an expert telecom network engineer performing root cause analysis.
 
@@ -3172,15 +3365,19 @@ TICKET: {ticket.reference_number} — {ticket.category} / {ticket.subcategory}
 CUSTOMER ISSUE: {ticket.description}
 NEAREST SITE: {nearest.site_id} (Zone: {nearest.zone}, Distance: {dist_km} km from customer)
 
-KPI SUMMARY FOR SITE {nearest.site_id}:
-{kpi_text if kpi_text else 'No KPI data available.'}
+SITE-LEVEL KPI SUMMARY FOR SITE {nearest.site_id}:
+{site_kpi_text if site_kpi_text else 'No site-level KPI data available.'}
 
-Analyze the KPI data above and provide:
-1. **KPI Assessment** — Which KPIs are performing well and which show degradation?
-2. **Anomaly Detection** — Any unusual patterns or outliers?
-3. **Root Cause Identification** — What is the most likely root cause of the network/signal issue?
-4. **Impact Assessment** — How severe is the issue and what is the scope of impact?
-5. **Correlation Analysis** — Are there related KPI degradations that point to a common cause?
+CELL-LEVEL KPI SUMMARY FOR SITE {nearest.site_id}:
+{cell_kpi_text if cell_kpi_text else 'No cell-level KPI data available.'}
+
+Analyze ALL the KPI data above (both site-level and cell-level) and provide:
+1. **Site-Level KPI Assessment** — Which site KPIs are performing well and which show degradation?
+2. **Cell-Level KPI Assessment** — Which cells show poor performance? Are specific cells causing issues?
+3. **Anomaly Detection** — Any unusual patterns or outliers at site or cell level?
+4. **Root Cause Identification** — What is the most likely root cause of the network/signal issue?
+5. **Impact Assessment** — How severe is the issue and what is the scope of impact?
+6. **Correlation Analysis** — Are there related KPI degradations across site and cell levels that point to a common cause?
 
 Be specific and reference actual KPI values in your analysis."""
 
@@ -3189,7 +3386,7 @@ Be specific and reference actual KPI values in your analysis."""
             model=DEPLOYMENT_NAME,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,
-            max_tokens=1200,
+            max_tokens=2000,
         )
         analysis = response.choices[0].message.content.strip()
     except Exception as e:
@@ -3206,7 +3403,7 @@ Be specific and reference actual KPI values in your analysis."""
 @app.route("/api/agent/tickets/<int:ticket_id>/recommendation", methods=["POST"])
 @jwt_required()
 def agent_recommendation(ticket_id):
-    """AI recommendation based on root cause analysis."""
+    """AI recommendation based on root cause analysis and full trend analysis."""
     user = User.query.get(int(get_jwt_identity()))
     if not user or user.role != "human_agent":
         return jsonify({"error": "Unauthorized"}), 403
@@ -3216,8 +3413,7 @@ def agent_recommendation(ticket_id):
         return jsonify({"error": "Ticket not found"}), 404
 
     root_cause = request.json.get("root_cause", "") if request.json else ""
-
-    session = ChatSession.query.get(ticket.chat_session_id) if ticket.chat_session_id else None
+    trend_summary = request.json.get("trend_summary", "") if request.json else ""
 
     prompt = f"""You are an expert telecom network engineer providing actionable recommendations.
 
@@ -3225,10 +3421,13 @@ TICKET: {ticket.reference_number} — {ticket.category} / {ticket.subcategory}
 CUSTOMER ISSUE: {ticket.description}
 PRIORITY: {ticket.priority.upper()}
 
+TREND ANALYSIS SUMMARY:
+{trend_summary if trend_summary else 'No trend analysis summary available.'}
+
 ROOT CAUSE ANALYSIS:
 {root_cause if root_cause else 'No root cause analysis available.'}
 
-Based on the above root cause analysis, provide:
+Based on the above trend analysis and root cause analysis, provide:
 1. **Immediate Actions** — Steps to take right now to restore service
 2. **Short-term Fixes** — Actions within 24-48 hours
 3. **Long-term Recommendations** — Permanent fixes to prevent recurrence
@@ -3242,7 +3441,7 @@ Be specific, actionable, and prioritize by impact."""
             model=DEPLOYMENT_NAME,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,
-            max_tokens=1000,
+            max_tokens=1500,
         )
         recommendation = response.choices[0].message.content.strip()
     except Exception as e:
@@ -3562,6 +3761,25 @@ def run_sla_checks():
 
 with app.app_context():
     db.create_all()
+
+    # Migrate: add new columns to kpi_data if they don't exist
+    from sqlalchemy import inspect as sa_inspect, text as sa_text
+    insp = sa_inspect(db.engine)
+    if insp.has_table("kpi_data"):
+        existing_cols = [c["name"] for c in insp.get_columns("kpi_data")]
+        with db.engine.connect() as conn:
+            if "data_level" not in existing_cols:
+                conn.execute(sa_text("ALTER TABLE kpi_data ADD COLUMN data_level VARCHAR(10) NOT NULL DEFAULT 'site'"))
+                conn.commit()
+                print(">>> Added data_level column to kpi_data")
+            if "cell_id" not in existing_cols:
+                conn.execute(sa_text("ALTER TABLE kpi_data ADD COLUMN cell_id VARCHAR(100)"))
+                conn.commit()
+                print(">>> Added cell_id column to kpi_data")
+            if "cell_site_id" not in existing_cols:
+                conn.execute(sa_text("ALTER TABLE kpi_data ADD COLUMN cell_site_id VARCHAR(100)"))
+                conn.commit()
+                print(">>> Added cell_site_id column to kpi_data")
 
     # Seed default admin if none exists
     if not User.query.filter_by(role="admin").first():
