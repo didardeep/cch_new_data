@@ -171,3 +171,5 @@ Manager → Dashboard / Chat Support / Active Tickets / Issue Tracking
 CTO → Executive Overview / All Tickets / Issue Tracking
   High-level KPIs, resolution rates, priority distribution
 ```
+# tele-cch-kp
+# tele-cch-kp

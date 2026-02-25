@@ -69,6 +69,10 @@ export default function ChatSupport() {
   const [locationStatus, setLocationStatus] = useState('idle'); // idle | requesting | granted | denied | blocked
   const locationRetryRef = useRef(null);
 
+  // ── Screenshot upload state ──
+  const [screenshotUploading, setScreenshotUploading] = useState(false);
+  const fileInputRef = useRef(null);
+
   const chatAreaRef = useRef(null);
   const inputRef = useRef(null);
   const sessionIdRef = useRef(null);
@@ -429,14 +433,23 @@ export default function ChatSupport() {
         onShare: () => {
           disableGroup(locGroupId);
           requestLocation(() => {
-            // After location is granted, continue to ask for issue description
+            // After location is granted, show signal codes + upload prompt
             setTimeout(() => {
               addMessage({
                 type: 'bot',
-                html: `Thank you! Your location has been recorded.<br><br>Now please <strong>describe your specific network issue</strong> so I can provide the best resolution.`,
+                html: `Thank you! Your location has been recorded.`,
               });
-              showInput('Describe your network issue in any language...');
-              stateRef.current.step = 'query';
+
+              setTimeout(() => {
+                addMessage({ type: 'signal-codes' });
+
+                setTimeout(() => {
+                  const uploadGroupId = nextId();
+                  addMessage({ type: 'screenshot-upload', groupId: uploadGroupId });
+                }, 600);
+              }, 500);
+
+              stateRef.current.step = 'signal-diagnosis';
             }, 500);
           });
         },
@@ -666,6 +679,76 @@ export default function ChatSupport() {
       navigate(`/customer/feedback${currentSessionId ? `?session=${currentSessionId}` : ''}`);
     }, 1500);
   }, [addMessage, disableGroup, hideInput, navigate]);
+
+  // ── Screenshot Upload for Signal Diagnosis ──
+  const handleScreenshotUpload = useCallback(async (file) => {
+    if (!file || !file.type.startsWith('image/')) {
+      addMessage({ type: 'system', text: 'Please upload a valid image file (PNG, JPG).' });
+      return;
+    }
+    if (file.size > 5 * 1024 * 1024) {
+      addMessage({ type: 'system', text: 'Image is too large. Please upload a screenshot under 5MB.' });
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = async () => {
+      const base64String = reader.result.split(',')[1];
+
+      // Show uploaded image in chat
+      addMessage({ type: 'user-image', imageSrc: reader.result });
+
+      setScreenshotUploading(true);
+      setIsTyping(true);
+
+      try {
+        const token = getToken();
+        const resp = await fetch(
+          `${API_BASE}/api/chat/session/${sessionIdRef.current}/analyze-signal`,
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${token}`,
+            },
+            body: JSON.stringify({ image: base64String }),
+          }
+        );
+        const data = await resp.json();
+        setIsTyping(false);
+        setScreenshotUploading(false);
+
+        if (resp.ok && data.diagnosis) {
+          addMessage({ type: 'diagnosis-result', diagnosis: data.diagnosis });
+          saveMessage('bot', `Signal diagnosis: RSRP=${data.diagnosis.rsrp} dBm (${data.diagnosis.rsrp_label}), SINR=${data.diagnosis.sinr} dB (${data.diagnosis.sinr_label}), Cell ID=${data.diagnosis.cell_id}`);
+
+          setTimeout(() => {
+            addMessage({
+              type: 'bot',
+              html: 'Based on the signal analysis above, what would you like to do next?',
+            });
+            const actionGroupId = nextId();
+            addMessage({ type: 'post-diagnosis-actions', groupId: actionGroupId });
+          }, 800);
+          stateRef.current.step = 'post-diagnosis';
+        } else {
+          addMessage({
+            type: 'system',
+            text: data.error || 'Failed to analyze the screenshot. Please try again.',
+          });
+          const uploadGroupId = nextId();
+          addMessage({ type: 'screenshot-upload', groupId: uploadGroupId });
+        }
+      } catch {
+        setIsTyping(false);
+        setScreenshotUploading(false);
+        addMessage({ type: 'system', text: 'An error occurred while analyzing the screenshot. Please try again.' });
+        const uploadGroupId = nextId();
+        addMessage({ type: 'screenshot-upload', groupId: uploadGroupId });
+      }
+    };
+    reader.readAsDataURL(file);
+  }, [addMessage, saveMessage]);
 
   // ── Retry ──
   const handleRetry = useCallback((groupId) => {
@@ -932,6 +1015,7 @@ export default function ChatSupport() {
       } catch {}
 
       const resumeId = searchParams.get('resume');
+
       if (resumeId) {
         try {
           const data = await apiGet(`/api/chat/session/${resumeId}`);
@@ -1184,6 +1268,203 @@ export default function ChatSupport() {
                 Stored securely for network diagnostics
               </div>
             </div>
+          </div>
+        );
+
+      // ── SIGNAL DIAGNOSIS MESSAGE TYPES ──
+
+      case 'signal-codes':
+        return (
+          <div key={msg.id} style={{
+            background: '#ffffff',
+            border: '1px solid #d8e0ec',
+            borderLeft: '3px solid #005EB8',
+            borderRadius: '10px',
+            padding: '18px 20px',
+            margin: '6px 0',
+            boxShadow: '0 1px 2px rgba(0, 20, 60, 0.04)',
+          }}>
+            <div style={{ fontWeight: 700, fontSize: '14px', color: '#00338D', marginBottom: '10px' }}>
+              Signal Diagnosis
+            </div>
+            <div style={{ fontSize: '13px', color: '#3d5068', lineHeight: 1.6, marginBottom: '12px' }}>
+              Dial one of these codes on your phone and take a screenshot of the signal info screen:
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', marginBottom: '12px' }}>
+              {[
+                { code: '*#0011#', desc: 'Samsung Service Mode' },
+                { code: '*#*#4636#*#*', desc: 'Android Testing Menu' },
+                { code: '*#06#', desc: 'Device Info' },
+              ].map((item, i) => (
+                <div key={i} style={{
+                  background: '#f7f9fc',
+                  border: '1px solid #e2e8f0',
+                  borderRadius: '8px',
+                  padding: '9px 14px',
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                }}>
+                  <code style={{ fontWeight: 700, color: '#00338D', fontSize: '14px' }}>{item.code}</code>
+                  <span style={{ fontSize: '11px', color: '#8596ab' }}>{item.desc}</span>
+                </div>
+              ))}
+            </div>
+            <div style={{ fontSize: '12px', color: '#8596ab', lineHeight: 1.5 }}>
+              Look for <strong style={{ color: '#3d5068' }}>RSRP</strong>,{' '}
+              <strong style={{ color: '#3d5068' }}>SINR</strong>, and{' '}
+              <strong style={{ color: '#3d5068' }}>Cell ID</strong> on the screen, then upload the screenshot below.
+            </div>
+          </div>
+        );
+
+      case 'screenshot-upload':
+        return (
+          <div key={msg.id} style={{
+            background: '#ffffff',
+            border: '1px solid #d8e0ec',
+            borderLeft: '3px solid #005EB8',
+            borderRadius: '10px',
+            padding: '16px 20px',
+            margin: '6px 0',
+            textAlign: 'center',
+            boxShadow: '0 1px 2px rgba(0, 20, 60, 0.04)',
+          }}>
+            <div style={{ fontSize: '13px', color: '#3d5068', marginBottom: '14px' }}>
+              Upload your signal information screenshot:
+            </div>
+            <button
+              onClick={() => {
+                if (!isDisabled && !screenshotUploading) {
+                  fileInputRef.current?.click();
+                  // Store groupId so the file input onChange can disable it
+                  fileInputRef.current._groupId = msg.groupId;
+                }
+              }}
+              disabled={isDisabled || screenshotUploading}
+              style={{
+                background: isDisabled ? '#8596ab' : '#00338D',
+                color: '#fff',
+                border: 'none',
+                borderRadius: '8px',
+                padding: '11px 24px',
+                fontSize: '13px',
+                fontWeight: 600,
+                fontFamily: 'inherit',
+                cursor: isDisabled ? 'not-allowed' : 'pointer',
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '8px',
+                boxShadow: '0 2px 6px rgba(0, 51, 141, 0.2)',
+                transition: 'all 0.18s ease',
+              }}
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                   strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                <polyline points="17 8 12 3 7 8" />
+                <line x1="12" y1="3" x2="12" y2="15" />
+              </svg>
+              Upload Screenshot
+            </button>
+            <div style={{ fontSize: '11px', color: '#8596ab', marginTop: '8px' }}>
+              PNG, JPG, JPEG (max 5MB)
+            </div>
+          </div>
+        );
+
+      case 'user-image':
+        return (
+          <div key={msg.id} style={{ display: 'flex', justifyContent: 'flex-end' }}>
+            <div style={{
+              maxWidth: '240px',
+              borderRadius: '12px',
+              overflow: 'hidden',
+              border: '1px solid #d8e0ec',
+              boxShadow: '0 1px 3px rgba(0, 20, 60, 0.06)',
+            }}>
+              <img src={msg.imageSrc} alt="Uploaded screenshot"
+                   style={{ width: '100%', display: 'block' }} />
+            </div>
+          </div>
+        );
+
+      case 'diagnosis-result': {
+        const d = msg.diagnosis;
+        const statusColor = { green: '#00875a', amber: '#c87d0a', red: '#c42b1c', unknown: '#8596ab' };
+        const statusBg = { green: '#f0fdf4', amber: '#fffbeb', red: '#fef2f2', unknown: '#f7f9fc' };
+        return (
+          <div key={msg.id} style={{
+            background: '#ffffff',
+            border: '1px solid #d8e0ec',
+            borderRadius: '10px',
+            padding: '18px 20px',
+            margin: '6px 0',
+            boxShadow: '0 1px 2px rgba(0, 20, 60, 0.04)',
+          }}>
+            <div style={{ fontWeight: 700, fontSize: '14px', color: '#00338D', marginBottom: '14px' }}>
+              Signal Diagnosis Results
+            </div>
+            {[
+              { label: 'RSRP', value: d.rsrp != null ? `${d.rsrp} dBm` : 'N/A', status: d.rsrp_status, badge: d.rsrp_label },
+              { label: 'SINR', value: d.sinr != null ? `${d.sinr} dB` : 'N/A', status: d.sinr_status, badge: d.sinr_label },
+            ].map((m, i) => (
+              <div key={i} style={{
+                display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                padding: '10px 14px', marginBottom: '8px',
+                background: statusBg[m.status] || '#f7f9fc',
+                borderLeft: `3px solid ${statusColor[m.status] || '#8596ab'}`,
+                borderRadius: '8px',
+              }}>
+                <div>
+                  <div style={{ fontWeight: 600, fontSize: '13px', color: '#0f1d33' }}>{m.label}</div>
+                  <div style={{ fontSize: '12px', color: '#3d5068', marginTop: '2px' }}>{m.value}</div>
+                </div>
+                <div style={{
+                  background: statusColor[m.status] || '#8596ab',
+                  color: '#fff', borderRadius: '12px', padding: '4px 12px',
+                  fontSize: '11px', fontWeight: 700,
+                }}>
+                  {m.badge}
+                </div>
+              </div>
+            ))}
+            <div style={{
+              display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+              padding: '10px 14px',
+              background: '#f7f9fc',
+              borderLeft: '3px solid #005EB8', borderRadius: '8px',
+            }}>
+              <div>
+                <div style={{ fontWeight: 600, fontSize: '13px', color: '#0f1d33' }}>Cell ID</div>
+                <div style={{ fontSize: '12px', color: '#3d5068', marginTop: '2px' }}>{d.cell_id || 'N/A'}</div>
+              </div>
+              <div style={{
+                background: '#005EB8', color: '#fff', borderRadius: '12px',
+                padding: '4px 12px', fontSize: '11px', fontWeight: 700,
+              }}>
+                Info
+              </div>
+            </div>
+          </div>
+        );
+      }
+
+      case 'post-diagnosis-actions':
+        return (
+          <div key={msg.id} className="post-feedback-actions">
+            <button className={`action-btn menu-btn${isDisabled ? ' disabled' : ''}`}
+              onClick={() => !isDisabled && handleBackToMenu(msg.groupId)}>
+              Continue Chat
+            </button>
+            <button className={`action-btn exit-btn${isDisabled ? ' disabled' : ''}`}
+              onClick={() => !isDisabled && handleExit(msg.groupId)}>
+              Exit
+            </button>
+            <button className={`sat-btn ticket${isDisabled ? ' disabled' : ''}`}
+              onClick={() => !isDisabled && handleRaiseTicket(msg.groupId)}>
+              Raise a Ticket
+            </button>
           </div>
         );
 
@@ -1531,6 +1812,23 @@ export default function ChatSupport() {
                 </div>
               )}
             </div>
+
+            {/* Hidden file input for screenshot upload */}
+            <input
+              type="file"
+              accept="image/*"
+              ref={fileInputRef}
+              style={{ display: 'none' }}
+              onChange={(e) => {
+                const file = e.target.files[0];
+                if (file) {
+                  const gid = fileInputRef.current?._groupId;
+                  if (gid) disableGroup(gid);
+                  handleScreenshotUpload(file);
+                  e.target.value = '';
+                }
+              }}
+            />
 
             {inputVisible && (
               <div className="input-area">

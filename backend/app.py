@@ -5,6 +5,7 @@ Full backend with auth, chat, tickets, and the original AI chatbot integrated.
 """
 
 import os
+import re
 import json
 import time
 import math
@@ -38,6 +39,7 @@ app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get(
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 app.config["JWT_SECRET_KEY"] = os.environ.get("JWT_SECRET", "super-secret-jwt-key-change-in-prod")
 app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(hours=24)
+app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16MB max for image uploads
 
 # ─── Flask-Mail Configuration ─────────────────────────────────────────────
 app.config["MAIL_SERVER"] = os.environ.get("MAIL_SERVER", "smtp.gmail.com")
@@ -53,18 +55,12 @@ bcrypt.init_app(app)
 jwt = JWTManager(app)
 mail = Mail(app)
 
-# ─── OTP Storage (in-memory) ────────────────────────────────────────────────
-otp_store = {}
-OTP_EXPIRY_MINUTES = 5
-OTP_MAX_ATTEMPTS = 5
-OTP_COOLDOWN_SECONDS = 60
-
 
 # ─── Azure OpenAI Configuration ──────────────────────────────────────────────
 client = AzureOpenAI(
-    api_key="",
-    api_version="2023-07-01-preview",
-    azure_endpoint="https://entgptaiuat.openai.azure.com"
+    api_key = "",
+    api_version = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-02-15-preview"),
+    azure_endpoint = "https://entgptaiuat.openai.azure.com"
 )
 DEPLOYMENT_NAME = os.environ.get("AZURE_DEPLOYMENT_NAME", "gpt-4o-mini")
 
@@ -418,6 +414,98 @@ def generate_chat_summary(messages_list, sector_name, subprocess_name):
         return f"Chat about {sector_name} - {subprocess_name}. Customer query handled."
 
 
+def analyze_signal_screenshot(image_base64):
+    """Use Azure OpenAI Vision to extract signal metrics from a screenshot."""
+    # Strip data URL prefix if present
+    clean_b64 = re.sub(r"^data:image/[^;]+;base64,", "", image_base64)
+
+    response = client.chat.completions.create(
+        model=DEPLOYMENT_NAME,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a telecom signal analysis expert. Extract signal metrics from "
+                    "the provided screenshot of a phone's service mode or signal information screen.\n\n"
+                    "Extract these values:\n"
+                    "- RSRP (Reference Signal Received Power) in dBm\n"
+                    "- SINR (Signal to Interference plus Noise Ratio) in dB\n"
+                    "- Cell ID (the cell identifier)\n\n"
+                    "Return ONLY valid JSON in this exact format:\n"
+                    '{"rsrp": <number or null>, "sinr": <number or null>, "cell_id": <string or null>}\n\n'
+                    "If a value is not visible or cannot be determined, use null.\n"
+                    "For RSRP, return just the number (e.g., -95, not '-95 dBm').\n"
+                    "For SINR, return just the number (e.g., 12, not '12 dB').\n"
+                    "For Cell ID, return the string value as shown."
+                ),
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "Extract RSRP, SINR, and Cell ID values from this signal information screenshot.",
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{clean_b64}",
+                            "detail": "high",
+                        },
+                    },
+                ],
+            },
+        ],
+        temperature=0,
+        max_tokens=200,
+    )
+
+    raw = response.choices[0].message.content.strip()
+    # Extract JSON from possible markdown code block
+    json_match = re.search(r"\{.*\}", raw, re.DOTALL)
+    if not json_match:
+        raise ValueError("Could not parse AI response")
+    extracted = json.loads(json_match.group())
+
+    rsrp = extracted.get("rsrp")
+    sinr = extracted.get("sinr")
+    cell_id = extracted.get("cell_id")
+
+    # Classify RSRP
+    if rsrp is not None:
+        rsrp = float(rsrp)
+        if -105 <= rsrp <= -40:
+            rsrp_status, rsrp_label = "green", "Good"
+        elif -115 <= rsrp < -105:
+            rsrp_status, rsrp_label = "amber", "Moderate"
+        else:
+            rsrp_status, rsrp_label = "red", "Weak"
+    else:
+        rsrp_status, rsrp_label = "unknown", "Not detected"
+
+    # Classify SINR
+    if sinr is not None:
+        sinr = float(sinr)
+        if sinr > 5:
+            sinr_status, sinr_label = "green", "Good"
+        elif sinr >= 0:
+            sinr_status, sinr_label = "amber", "Moderate"
+        else:
+            sinr_status, sinr_label = "red", "Weak"
+    else:
+        sinr_status, sinr_label = "unknown", "Not detected"
+
+    return {
+        "rsrp": rsrp,
+        "rsrp_status": rsrp_status,
+        "rsrp_label": rsrp_label,
+        "sinr": sinr,
+        "sinr_status": sinr_status,
+        "sinr_label": sinr_label,
+        "cell_id": str(cell_id) if cell_id is not None else None,
+    }
+
+
 def generate_ref_number():
     ts = hex(int(time.time()))[2:].upper()
     rand = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
@@ -447,54 +535,6 @@ def auto_assign_priority(query_text, subprocess_name):
         return "medium"
     return "low"
 
-
-def generate_otp():
-    """Generate a 6-digit numeric OTP."""
-    return ''.join(random.choices(string.digits, k=6))
-
-
-def cleanup_expired_otps():
-    """Remove expired OTPs from the store."""
-    now = datetime.now(timezone.utc)
-    expired = [e for e, d in otp_store.items() if d["expires_at"] < now]
-    for e in expired:
-        del otp_store[e]
-
-
-def send_otp_email(user_email, user_name, otp_code):
-    """Send OTP verification email."""
-    html_body = f"""
-    <div style="font-family: 'Segoe UI', Arial, sans-serif; max-width: 600px; margin: 0 auto; background: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 20px rgba(0,0,0,0.08);">
-        <div style="background: linear-gradient(135deg, #00338d 0%, #004fc4 100%); padding: 24px 30px; text-align: center;">
-            <h1 style="color: #ffffff; margin: 0; font-size: 20px; font-weight: 600;">Customer Handling</h1>
-            <p style="color: rgba(255,255,255,0.8); margin: 4px 0 0; font-size: 13px;">Login Verification Code</p>
-        </div>
-        <div style="padding: 30px;">
-            <p style="color: #1e293b; font-size: 15px; margin: 0 0 20px;">Hello <strong>{user_name}</strong>,</p>
-            <p style="color: #64748b; font-size: 14px; line-height: 1.6; margin: 0 0 24px;">
-                Your one-time verification code for logging in:
-            </p>
-            <div style="background: #f8fafc; border: 2px solid #00338d; border-radius: 10px; padding: 24px; margin-bottom: 24px; text-align: center;">
-                <span style="font-size: 36px; font-weight: 700; color: #00338d; letter-spacing: 8px;">{otp_code}</span>
-            </div>
-            <p style="color: #64748b; font-size: 14px; margin: 0 0 8px;">
-                This code is valid for <strong>{OTP_EXPIRY_MINUTES} minutes</strong>. Do not share it with anyone.
-            </p>
-            <p style="color: #94a3b8; font-size: 13px; margin: 0;">
-                If you did not request this code, please ignore this email.
-            </p>
-        </div>
-        <div style="background: #f8fafc; border-top: 1px solid #e2e8f0; padding: 16px 30px; text-align: center;">
-            <p style="color: #94a3b8; font-size: 12px; margin: 0;">Customer Handling &mdash; AI-Powered Support</p>
-        </div>
-    </div>
-    """
-    msg = Message(
-        subject="Your Login Verification Code - Customer Handling",
-        recipients=[user_email],
-        html=html_body,
-    )
-    mail.send(msg)
 
 
 
@@ -532,87 +572,15 @@ def register():
     return jsonify({"token": token, "user": user.to_dict()}), 201
 
 
-@app.route("/api/auth/send-otp", methods=["POST"])
-def send_otp():
-    """Step 1: check email and send OTP if employee."""
-    data = request.json
-    email = data.get("email", "").strip().lower()
-    if not email:
-        return jsonify({"error": "Email is required"}), 400
-
-    user = User.query.filter_by(email=email).first()
-    if not user:
-        return jsonify({"error": "Invalid email address"}), 404
-
-    # Customers skip OTP
-    if user.role == "customer":
-        return jsonify({"requires_otp": False}), 200
-
-    # Rate limit check
-    cleanup_expired_otps()
-    if email in otp_store:
-        created = otp_store[email].get("created_at", datetime.now(timezone.utc))
-        elapsed = (datetime.now(timezone.utc) - created).total_seconds()
-        if elapsed < OTP_COOLDOWN_SECONDS:
-            remaining = int(OTP_COOLDOWN_SECONDS - elapsed)
-            return jsonify({"error": f"Please wait {remaining} seconds before requesting a new code"}), 429
-
-    # Generate and store OTP
-    otp_code = generate_otp()
-    otp_store[email] = {
-        "code": otp_code,
-        "expires_at": datetime.now(timezone.utc) + timedelta(minutes=OTP_EXPIRY_MINUTES),
-        "attempts": 0,
-        "created_at": datetime.now(timezone.utc),
-    }
-
-    try:
-        send_otp_email(user.email, user.name, otp_code)
-    except Exception as e:
-        print(f"OTP email failed: {e}")
-        del otp_store[email]
-        return jsonify({"error": "Failed to send verification code. Please try again."}), 500
-
-    return jsonify({"requires_otp": True, "message": "Verification code sent to your email"}), 200
-
-
 @app.route("/api/auth/login", methods=["POST"])
 def login():
     data = request.json
     email = data.get("email", "").strip().lower()
     password = data.get("password", "")
-    otp = data.get("otp", "").strip()
 
     user = User.query.filter_by(email=email).first()
     if not user or not user.check_password(password):
         return jsonify({"error": "Invalid email or password"}), 401
-
-    # Employees must provide OTP
-    if user.role != "customer":
-        if not otp:
-            return jsonify({"error": "Verification code is required"}), 400
-
-        cleanup_expired_otps()
-        stored = otp_store.get(email)
-
-        if not stored:
-            return jsonify({"error": "No verification code found. Please request a new one."}), 400
-
-        if datetime.now(timezone.utc) > stored["expires_at"]:
-            del otp_store[email]
-            return jsonify({"error": "Verification code has expired. Please request a new one."}), 400
-
-        if stored["attempts"] >= OTP_MAX_ATTEMPTS:
-            del otp_store[email]
-            return jsonify({"error": "Too many failed attempts. Please request a new code."}), 429
-
-        if stored["code"] != otp:
-            stored["attempts"] += 1
-            remaining = OTP_MAX_ATTEMPTS - stored["attempts"]
-            return jsonify({"error": f"Invalid verification code. {remaining} attempts remaining."}), 401
-
-        # OTP verified — consume it
-        del otp_store[email]
 
     token = create_access_token(identity=str(user.id))
     return jsonify({"token": token, "user": user.to_dict()})
@@ -818,6 +786,47 @@ def save_session_location(session_id):
         "latitude": session.latitude,
         "longitude": session.longitude,
     }), 200
+
+
+@app.route("/api/chat/session/<int:session_id>/analyze-signal", methods=["POST"])
+@jwt_required()
+def analyze_signal(session_id):
+    """Analyze a signal screenshot using Azure OpenAI Vision."""
+    user_id = int(get_jwt_identity())
+    session = ChatSession.query.get(session_id)
+
+    if not session:
+        return jsonify({"error": "Session not found"}), 404
+    if session.user_id != user_id:
+        return jsonify({"error": "Unauthorized"}), 403
+
+    data = request.json
+    image_base64 = data.get("image")
+
+    if not image_base64:
+        return jsonify({"error": "No image provided"}), 400
+
+    # Limit ~5MB base64
+    if len(image_base64) > 7_000_000:
+        return jsonify({"error": "Image too large. Please upload a smaller screenshot."}), 400
+
+    try:
+        result = analyze_signal_screenshot(image_base64)
+
+        # Save diagnosis as a bot message for chat history
+        diagnosis_text = (
+            f"Signal Diagnosis Results: "
+            f"RSRP: {result.get('rsrp', 'N/A')} dBm ({result.get('rsrp_label', 'Unknown')}), "
+            f"SINR: {result.get('sinr', 'N/A')} dB ({result.get('sinr_label', 'Unknown')}), "
+            f"Cell ID: {result.get('cell_id', 'N/A')}"
+        )
+        msg = ChatMessage(session_id=session_id, sender="bot", content=diagnosis_text)
+        db.session.add(msg)
+        db.session.commit()
+
+        return jsonify({"diagnosis": result}), 200
+    except Exception as e:
+        return jsonify({"error": f"Failed to analyze screenshot: {str(e)}"}), 500
 
 
 @app.route("/api/chat/session/<int:session_id>/resolve", methods=["PUT"])
@@ -1928,6 +1937,103 @@ def admin_agent_tickets():
         "tickets": [t.to_dict() for t in tickets],
         "agents": [{"id": a.id, "name": a.name} for a in agents],
     })
+
+
+@app.route("/api/admin/agent-alerts", methods=["GET"])
+@jwt_required()
+def admin_agent_alerts():
+    user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
+    if user.role != "admin":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    alerts = []
+
+    # 1. New escalations (tickets escalated in last 7 days, assigned to human agents)
+    week_ago = datetime.now(timezone.utc) - timedelta(days=7)
+    escalated = Ticket.query.join(
+        User, Ticket.assigned_to == User.id
+    ).filter(
+        User.role == "human_agent",
+        Ticket.status == "escalated",
+        Ticket.created_at >= week_ago,
+    ).order_by(Ticket.created_at.desc()).all()
+    for t in escalated:
+        alerts.append({
+            "type": "escalation",
+            "severity": "high",
+            "title": f"Escalated: {t.reference_number}",
+            "message": f"{t.category} - {t.subcategory or 'General'} (Customer: {t.user.name if t.user else 'Unknown'})",
+            "time": t.created_at.isoformat() if t.created_at else None,
+            "ticket_id": t.id,
+        })
+
+    # 2. Critical/high priority pending tickets assigned to agents
+    critical = Ticket.query.join(
+        User, Ticket.assigned_to == User.id
+    ).filter(
+        User.role == "human_agent",
+        Ticket.priority.in_(["critical", "high"]),
+        Ticket.status.in_(["pending", "in_progress"]),
+    ).order_by(Ticket.created_at.asc()).all()
+    for t in critical:
+        alerts.append({
+            "type": "critical_ticket",
+            "severity": "critical" if t.priority == "critical" else "high",
+            "title": f"{t.priority.upper()} priority: {t.reference_number}",
+            "message": f"Assigned to {t.assignee.name if t.assignee else 'Unassigned'} - {t.category} ({t.status.replace('_', ' ')})",
+            "time": t.created_at.isoformat() if t.created_at else None,
+            "ticket_id": t.id,
+        })
+
+    # 3. Low ratings (1-2 stars) from last 7 days linked to agent sessions
+    low_feedbacks = db.session.query(Feedback, ChatSession, Ticket).join(
+        ChatSession, Feedback.chat_session_id == ChatSession.id
+    ).join(
+        Ticket, Ticket.chat_session_id == ChatSession.id
+    ).join(
+        User, Ticket.assigned_to == User.id
+    ).filter(
+        User.role == "human_agent",
+        Feedback.rating <= 2,
+        Feedback.rating > 0,
+        Feedback.created_at >= week_ago,
+    ).order_by(Feedback.created_at.desc()).all()
+    for fb, session, ticket in low_feedbacks:
+        alerts.append({
+            "type": "low_rating",
+            "severity": "warning",
+            "title": f"Low rating ({fb.rating}/5) on {ticket.reference_number}",
+            "message": fb.comment or f"Customer rated {fb.rating}/5 for {session.sector_name or 'General'} issue",
+            "time": fb.created_at.isoformat() if fb.created_at else None,
+            "ticket_id": ticket.id,
+        })
+
+    # 4. Overdue tickets (pending for more than 3 days)
+    three_days_ago = datetime.now(timezone.utc) - timedelta(days=3)
+    overdue = Ticket.query.join(
+        User, Ticket.assigned_to == User.id
+    ).filter(
+        User.role == "human_agent",
+        Ticket.status.in_(["pending", "in_progress"]),
+        Ticket.created_at <= three_days_ago,
+    ).order_by(Ticket.created_at.asc()).all()
+    for t in overdue:
+        days_old = (datetime.now(timezone.utc) - t.created_at).days if t.created_at else 0
+        alerts.append({
+            "type": "overdue",
+            "severity": "warning",
+            "title": f"Overdue ({days_old}d): {t.reference_number}",
+            "message": f"Assigned to {t.assignee.name if t.assignee else 'Unassigned'} - {t.status.replace('_', ' ')} for {days_old} days",
+            "time": t.created_at.isoformat() if t.created_at else None,
+            "ticket_id": t.id,
+        })
+
+    # Sort all alerts: critical first, then high, then warning, then by time
+    severity_order = {"critical": 0, "high": 1, "warning": 2}
+    alerts.sort(key=lambda a: (severity_order.get(a["severity"], 3), a["time"] or ""))
+
+    return jsonify({"alerts": alerts, "total": len(alerts)})
 
 
 @app.route("/api/admin/feedback", methods=["GET"])

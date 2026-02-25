@@ -8,11 +8,8 @@ export default function LoginPage() {
   const [step, setStep] = useState('choose'); // 'choose' | 'email' | 'credentials'
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
-  const [otp, setOtp] = useState('');
   const [error, setError] = useState('');
-  const [info, setInfo] = useState('');
   const [loading, setLoading] = useState(false);
-  const [resendCooldown, setResendCooldown] = useState(0);
   const navigate = useNavigate();
   const { login } = useAuth();
 
@@ -20,45 +17,21 @@ export default function LoginPage() {
     setLoginType(type);
     setStep('email');
     setError('');
-    setInfo('');
   };
 
   const handleEmailSubmit = async (e) => {
     e.preventDefault();
     setError('');
-    setInfo('');
-    setLoading(true);
-
-    if (loginType === 'employee') {
-      try {
-        const data = await apiPost('/api/auth/send-otp', { email });
-        if (data.error) {
-          setError(data.error);
-        } else {
-          setStep('credentials');
-          setInfo('A verification code has been sent to your email.');
-          startResendCooldown();
-        }
-      } catch {
-        setError('Something went wrong. Please try again.');
-      }
-    } else {
-      setStep('credentials');
-    }
-    setLoading(false);
+    setStep('credentials');
   };
 
   const handleLoginSubmit = async (e) => {
     e.preventDefault();
     setError('');
-    setInfo('');
     setLoading(true);
 
     try {
-      const body = { email, password };
-      if (loginType === 'employee') body.otp = otp;
-
-      const data = await apiPost('/api/auth/login', body);
+      const data = await apiPost('/api/auth/login', { email, password });
       if (data.error) {
         setError(data.error);
       } else {
@@ -76,55 +49,18 @@ export default function LoginPage() {
     setLoading(false);
   };
 
-  const startResendCooldown = () => {
-    setResendCooldown(60);
-    const interval = setInterval(() => {
-      setResendCooldown(prev => {
-        if (prev <= 1) { clearInterval(interval); return 0; }
-        return prev - 1;
-      });
-    }, 1000);
-  };
-
-  const handleResendOtp = async () => {
-    if (resendCooldown > 0) return;
-    setError('');
-    setInfo('');
-    setLoading(true);
-
-    try {
-      const data = await apiPost('/api/auth/send-otp', { email });
-      if (data.error) {
-        setError(data.error);
-      } else {
-        setInfo('A new verification code has been sent to your email.');
-        setOtp('');
-        startResendCooldown();
-      }
-    } catch {
-      setError('Failed to resend code. Please try again.');
-    }
-    setLoading(false);
-  };
-
   const handleBackToChoose = () => {
     setStep('choose');
     setLoginType(null);
     setEmail('');
     setPassword('');
-    setOtp('');
     setError('');
-    setInfo('');
-    setResendCooldown(0);
   };
 
   const handleBackToEmail = () => {
     setStep('email');
     setPassword('');
-    setOtp('');
     setError('');
-    setInfo('');
-    setResendCooldown(0);
   };
 
   const getSubtitle = () => {
@@ -143,15 +79,6 @@ export default function LoginPage() {
         </div>
 
         {error && <div className="form-error">{error}</div>}
-        {info && (
-          <div style={{
-            background: '#ecfdf5', border: '1px solid #a7f3d0',
-            borderRadius: 8, padding: '10px 14px', color: '#047857',
-            fontSize: 13, marginBottom: 16,
-          }}>
-            {info}
-          </div>
-        )}
 
         {step === 'choose' && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
@@ -208,7 +135,7 @@ export default function LoginPage() {
               style={{ width: '100%', marginTop: 8 }}
               disabled={loading}
             >
-              {loading ? (loginType === 'employee' ? 'Sending OTP...' : 'Checking...') : 'Continue'}
+              Continue
             </button>
             <button
               type="button"
@@ -256,43 +183,6 @@ export default function LoginPage() {
                 autoFocus
               />
             </div>
-
-            {loginType === 'employee' && (
-              <div className="form-group">
-                <label>Verification Code</label>
-                <input
-                  type="text"
-                  className="form-input"
-                  placeholder="Enter 6-digit code"
-                  value={otp}
-                  onChange={e => {
-                    const val = e.target.value.replace(/\D/g, '').slice(0, 6);
-                    setOtp(val);
-                  }}
-                  required
-                  maxLength={6}
-                  inputMode="numeric"
-                  autoComplete="one-time-code"
-                  style={{ letterSpacing: 4, fontSize: 18, textAlign: 'center' }}
-                />
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 6 }}>
-                  <small style={{ color: '#6b7280', fontSize: 12 }}>Check your email for the code</small>
-                  <button
-                    type="button"
-                    onClick={handleResendOtp}
-                    disabled={resendCooldown > 0 || loading}
-                    style={{
-                      background: 'none', border: 'none',
-                      cursor: resendCooldown > 0 ? 'default' : 'pointer',
-                      color: resendCooldown > 0 ? '#94a3b8' : '#00338D',
-                      fontSize: 12, fontWeight: 600, fontFamily: 'inherit',
-                    }}
-                  >
-                    {resendCooldown > 0 ? `Resend in ${resendCooldown}s` : 'Resend Code'}
-                  </button>
-                </div>
-              </div>
-            )}
 
             <button
               type="submit"
