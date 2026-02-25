@@ -88,6 +88,7 @@ export default function ChatSupport() {
     attempt: 0,
     previousSolutions: [],
     diagnosisSummary: '',
+    diagnosisRan: false,
   });
   const msgIdCounter = useRef(0);
 
@@ -644,8 +645,8 @@ export default function ChatSupport() {
         return;
       }
 
-      // If user mentions signal/network issues, offer diagnosis
-      if (classification.mentions_signal && isNetworkIssue(stateRef.current.subprocessName)) {
+      // If user mentions signal/network issues and diagnosis hasn't run yet, offer it once
+      if (classification.mentions_signal && isNetworkIssue(stateRef.current.subprocessName) && !stateRef.current.diagnosisRan) {
         addMessage({
           type: 'bot',
           html: `It sounds like you're experiencing signal issues. Would you like to run a signal diagnosis?`,
@@ -858,8 +859,9 @@ export default function ChatSupport() {
           addMessage({ type: 'diagnosis-result', diagnosis: data.diagnosis });
           saveMessage('bot', data.diagnosis.summary || `Signal: ${data.diagnosis.overall_label}`);
 
-          // Store diagnosis context for future solutions
+          // Store diagnosis context for future solutions (runs once per chat)
           stateRef.current.diagnosisSummary = data.diagnosis.summary || `Signal: ${data.diagnosis.overall_label}`;
+          stateRef.current.diagnosisRan = true;
 
           // Auto-trigger a solution based on diagnosis results
           setTimeout(() => {
@@ -1239,17 +1241,10 @@ export default function ChatSupport() {
       case 'solution-actions':
         return (
           <div key={msg.id} className="satisfaction-container">
-            <button className={`sat-btn ticket${isDisabled ? ' disabled' : ''}`}
-              onClick={() => !isDisabled && handleRaiseTicket(msg.groupId)}>Raise a Ticket</button>
             <button className={`sat-btn yes${isDisabled ? ' disabled' : ''}`}
               onClick={() => !isDisabled && handleBackToMenu(msg.groupId)}>Main Menu</button>
             <button className={`sat-btn no${isDisabled ? ' disabled' : ''}`}
               onClick={() => !isDisabled && handleExit(msg.groupId)}>Exit</button>
-            {isNetworkIssue(stateRef.current.subprocessName) && (
-              <button className={`sat-btn ticket${isDisabled ? ' disabled' : ''}`}
-                style={{ background: '#005EB8' }}
-                onClick={() => !isDisabled && handleSignalDiagnosis(msg.groupId)}>Run Signal Diagnosis</button>
-            )}
           </div>
         );
 
