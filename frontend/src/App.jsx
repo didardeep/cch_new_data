@@ -13,14 +13,17 @@ import ManagerChatSupport from './pages/manager/ManagerChatSupport';
 import ActiveTickets from './pages/manager/ActiveTickets';
 import IssueTracking from './pages/manager/IssueTracking';
 import ChatDetail from './pages/manager/ChatDetail';
+import ManagerAlertBox from './pages/manager/ManagerAlertBox';
 import CTOLayout from './pages/cto/CTOLayout';
 import CTODashboard from './pages/cto/CTODashboard';
+import CTOAlertBox from './pages/cto/CTOAlertBox';
 import AdminLayout from './pages/admin/AdminLayout';
 import AdminDashboard from './pages/admin/AdminDashboard';
 import UserManagement from './pages/admin/UserManagement';
 import AdminFeedback from './pages/admin/AdminFeedback';
 import ReportsPage from './pages/admin/ReportsPage';
 import AgentIssues from './pages/admin/AgentIssues';
+import DataUpload from './pages/admin/DataUpload';
 import AgentLayout from './pages/agent/AgentLayout';
 import AgentDashboard from './pages/agent/AgentDashboard';
 import AgentTicketBucket from './pages/agent/AgentTicketBucket';
@@ -68,6 +71,7 @@ export default function App() {
         <Route path="tracking" element={<IssueTracking />} />
         <Route path="chat-detail/:id" element={<ChatDetail />} />
         <Route path="reports" element={<ReportsPage />} />
+        <Route path="alerts" element={<ManagerAlertBox />} />
       </Route>
 
       {/* CTO Routes */}
@@ -76,6 +80,7 @@ export default function App() {
         <Route path="tickets" element={<ActiveTickets />} />
         <Route path="tracking" element={<IssueTracking />} />
         <Route path="chat-detail/:id" element={<ChatDetail />} />
+        <Route path="alerts" element={<CTOAlertBox />} />
       </Route>
 
       {/* Admin Routes */}
@@ -88,6 +93,7 @@ export default function App() {
         <Route path="agent-issues" element={<AgentIssues />} />
         <Route path="feedback" element={<AdminFeedback />} />
         <Route path="reports" element={<ReportsPage />} />
+        <Route path="data-upload" element={<DataUpload />} />
       </Route>
 
       {/* Human Agent Routes */}

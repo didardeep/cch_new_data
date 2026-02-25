@@ -11,6 +11,7 @@ const links = [
   { path: '/admin/agent-issues', label: 'Agent Issues', icon: ICON("M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M9 7a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM22 21v-2a4 4 0 0 0-3-3.87M19 7a4 4 0 0 1 0 7.75") },
   { path: '/admin/feedback', label: 'Feedback', icon: ICON("M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z") },
   { path: '/admin/reports', label: 'Reports & Analytics', icon: ICON("M3 3v18h18M9 17V9m4 8V5m4 12v-4") },
+  { path: '/admin/data-upload', label: 'Data Upload', icon: ICON("M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12") },
 ];
 
 export default function AdminLayout() {

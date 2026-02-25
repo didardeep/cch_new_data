@@ -1,25 +1,53 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { apiGet } from '../../api';
+import { apiGet, apiPut } from '../../api';
 import { useAuth } from '../../AuthContext';
 
 export default function CTODashboard() {
   const [data, setData] = useState(null);
   const [mgrData, setMgrData] = useState(null);
+  const [alerts, setAlerts] = useState([]); // New: SLA Alerts state
   const [loading, setLoading] = useState(true);
+  const [alertsExpanded, setAlertsExpanded] = useState(true); // New: Toggle for alerts
   const { user } = useAuth();
   const navigate = useNavigate();
+
+  // New: Function to fetch alerts separately for polling
+  const fetchAlerts = useCallback(async () => {
+    try {
+      const d = await apiGet('/api/cto/sla-alerts');
+      if (d?.alerts) setAlerts(d.alerts);
+    } catch { /* ignore */ }
+  }, []);
 
   useEffect(() => {
     Promise.all([
       apiGet('/api/cto/overview'),
       apiGet('/api/manager/dashboard'),
-    ]).then(([cto, mgr]) => {
+      apiGet('/api/cto/sla-alerts'), // New: Fetch alerts on load
+    ]).then(([cto, mgr, alertData]) => {
       setData(cto);
       setMgrData(mgr);
+      if (alertData?.alerts) setAlerts(alertData.alerts);
       setLoading(false);
     });
-  }, []);
+
+    // Poll for new breaches every 30 seconds
+    const iv = setInterval(fetchAlerts, 30000);
+    return () => clearInterval(iv);
+  }, [fetchAlerts]);
+
+  // New: Mark single alert as read
+  const markRead = async (id) => {
+    await apiPut(`/api/cto/sla-alerts/${id}/read`);
+    setAlerts(prev => prev.map(a => a.id === id ? { ...a, is_read: true } : a));
+  };
+
+  // New: Mark all as read
+  const markAllRead = async () => {
+    await apiPut('/api/cto/sla-alerts/read-all');
+    setAlerts(prev => prev.map(a => ({ ...a, is_read: true })));
+  };
 
   if (loading) return <div className="page-loader"><div className="spinner" /></div>;
 
@@ -27,6 +55,9 @@ export default function CTODashboard() {
   const priorities = data?.priority_breakdown || [];
   const resRate = data?.resolution_rate || 0;
   const avgRating = data?.avg_rating || 0;
+  
+  const unreadAlerts = alerts.filter(a => !a.is_read);
+  const unreadCount = unreadAlerts.length;
 
   return (
     <div>
@@ -34,6 +65,75 @@ export default function CTODashboard() {
         <h1>CTO Executive Overview</h1>
         <p>Welcome back, {user?.name}. High-level system health and KPIs.</p>
       </div>
+
+      {/* ── New: SLA Breaches Section ────────────────────────────────── */}
+      {alerts.length > 0 && (
+        <div style={{
+          background: '#fff', border: '1px solid #fca5a5', borderRadius: 12,
+          marginBottom: 24, overflow: 'hidden', boxShadow: '0 4px 12px rgba(220, 38, 38, 0.1)',
+        }}>
+          <div
+            onClick={() => setAlertsExpanded(!alertsExpanded)}
+            style={{
+              display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+              padding: '14px 20px', cursor: 'pointer',
+              background: unreadCount > 0 ? '#fef2f2' : '#f8fafc',
+              borderBottom: alertsExpanded ? '1px solid #fecaca' : 'none',
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#dc2626" strokeWidth="2.5">
+                <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
+              </svg>
+              <span style={{ fontSize: 15, fontWeight: 800, color: '#991b1b', letterSpacing: '-0.01em' }}>CRITICAL SLA BREACHES</span>
+              {unreadCount > 0 && (
+                <span style={{ background: '#dc2626', color: '#fff', fontSize: 11, fontWeight: 700, padding: '2px 8px', borderRadius: 10 }}>
+                  {unreadCount} New
+                </span>
+              )}
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+              {unreadCount > 0 && (
+                <button onClick={(e) => { e.stopPropagation(); markAllRead(); }} style={{ background: 'none', border: 'none', color: '#dc2626', fontSize: 12, fontWeight: 700, cursor: 'pointer' }}>
+                  Acknowledge All
+                </button>
+              )}
+              <span style={{ transform: alertsExpanded ? 'rotate(180deg)' : 'rotate(0)', transition: '0.2s', fontSize: 18, color: '#991b1b' }}>▾</span>
+            </div>
+          </div>
+
+          {alertsExpanded && (
+            <div style={{ maxHeight: 350, overflowY: 'auto' }}>
+              {alerts.map(a => (
+                <div key={a.id} style={{
+                  display: 'flex', alignItems: 'flex-start', gap: 14, padding: '16px 20px',
+                  borderBottom: '1px solid #fee2e2', background: a.is_read ? '#fff' : '#fff5f5',
+                  opacity: a.is_read ? 0.7 : 1
+                }}>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 4 }}>
+                      <span style={{ fontSize: 14, fontWeight: 800, color: '#7f1d1d' }}>{a.reference_number}</span>
+                      <span style={{ background: '#7f1d1d', color: '#fff', fontSize: 9, fontWeight: 900, padding: '2px 6px', borderRadius: 4 }}>BREACH</span>
+                      <span style={{ fontSize: 12, color: '#dc2626', fontWeight: 700 }}>{a.priority?.toUpperCase()} PRIORITY</span>
+                    </div>
+                    <p style={{ fontSize: 13, color: '#451a03', margin: '0 0 6px 0', lineHeight: 1.4 }}>{a.message}</p>
+                    <div style={{ display: 'flex', gap: 15, fontSize: 11, color: '#991b1b', fontWeight: 500 }}>
+                      <span>Agent: <strong>{a.assignee_name}</strong></span>
+                      <span>SLA: <strong>{a.sla_hours}h</strong></span>
+                      <span>Deadline: {new Date(a.sla_deadline).toLocaleString()}</span>
+                    </div>
+                  </div>
+                  {!a.is_read && (
+                    <button onClick={() => markRead(a.id)} style={{ background: '#dc2626', color: '#fff', border: 'none', borderRadius: 6, padding: '6px 12px', fontSize: 11, fontWeight: 700, cursor: 'pointer' }}>
+                      Acknowledge
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Top-level KPIs */}
       <div className="stats-grid" style={{ gridTemplateColumns: 'repeat(4, 1fr)' }}>
@@ -141,13 +241,12 @@ export default function CTODashboard() {
         <div className="section-card-body">
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 16 }}>
             {[
-              { label: 'Total Chats', val: s.total_chats || 0, icon: '' },
-              { label: 'Resolved Chats', val: s.resolved_chats || 0, icon: '' },
-              { label: 'Escalated Chats', val: s.escalated_chats || 0, icon: '' },
-              { label: 'Active Now', val: s.active_chats || 0, icon: '' },
+              { label: 'Total Chats', val: s.total_chats || 0 },
+              { label: 'Resolved Chats', val: s.resolved_chats || 0 },
+              { label: 'Escalated Chats', val: s.escalated_chats || 0 },
+              { label: 'Active Now', val: s.active_chats || 0 },
             ].map((item, i) => (
               <div key={i} style={{ textAlign: 'center', padding: 16, background: '#f8fafc', borderRadius: 10, border: '1px solid #e2e8f0' }}>
-                <div style={{ fontSize: 24, marginBottom: 6 }}>{item.icon}</div>
                 <div style={{ fontSize: 24, fontWeight: 700, color: '#1e293b' }}>{item.val}</div>
                 <div style={{ fontSize: 12, color: '#94a3b8', marginTop: 4 }}>{item.label}</div>
               </div>

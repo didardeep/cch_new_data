@@ -205,3 +205,76 @@ class Feedback(db.Model):
             "comment": self.comment,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
+
+
+class SlaAlert(db.Model):
+    __tablename__ = "sla_alerts"
+
+    id = db.Column(db.Integer, primary_key=True)
+    ticket_id = db.Column(db.Integer, db.ForeignKey("tickets.id"), nullable=False)
+    alert_level = db.Column(db.String(10), nullable=False)       # '625', '750', '875', 'breach'
+    recipient_role = db.Column(db.String(20), nullable=False)    # 'manager' or 'cto'
+    message = db.Column(db.String(300), nullable=False)
+    is_read = db.Column(db.Boolean, default=False)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+
+    ticket = db.relationship("Ticket", backref="sla_alerts")
+
+    def to_dict(self):
+        t = self.ticket
+        return {
+            "id": self.id,
+            "ticket_id": self.ticket_id,
+            "alert_level": self.alert_level,
+            "recipient_role": self.recipient_role,
+            "message": self.message,
+            "is_read": self.is_read,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "reference_number": t.reference_number if t else "",
+            "category": t.category if t else "",
+            "subcategory": t.subcategory if t else "",
+            "priority": t.priority if t else "",
+            "status": t.status if t else "",
+            "description": (t.description[:150] if t and t.description else ""),
+            "assignee_name": t.assignee.name if t and t.assignee else "Unassigned",
+            "sla_hours": t.sla_hours if t else None,
+            "sla_deadline": t.sla_deadline.isoformat() if t and t.sla_deadline else None,
+        }
+
+
+class TelecomSite(db.Model):
+    __tablename__ = "telecom_sites"
+
+    id = db.Column(db.Integer, primary_key=True)
+    site_id = db.Column(db.String(50), unique=True, nullable=False)
+    latitude = db.Column(db.Float, nullable=False)
+    longitude = db.Column(db.Float, nullable=False)
+    zone = db.Column(db.String(100), default="")
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "site_id": self.site_id,
+            "latitude": self.latitude,
+            "longitude": self.longitude,
+            "zone": self.zone,
+        }
+
+
+class KpiData(db.Model):
+    __tablename__ = "kpi_data"
+
+    id = db.Column(db.Integer, primary_key=True)
+    site_id = db.Column(db.String(50), nullable=False, index=True)
+    kpi_name = db.Column(db.String(100), nullable=False, index=True)
+    date = db.Column(db.Date, nullable=False)
+    hour = db.Column(db.Integer, nullable=False, default=0)
+    value = db.Column(db.Float, nullable=True)
+    data_level = db.Column(db.String(10), nullable=False, default="site")  # 'site' or 'cell'
+    cell_id = db.Column(db.String(100), nullable=True)
+    cell_site_id = db.Column(db.String(100), nullable=True)
+
+    __table_args__ = (
+        db.Index("idx_kpi_site_name_date", "site_id", "kpi_name", "date"),
+        db.Index("idx_kpi_data_level", "data_level", "kpi_name"),
+    )
