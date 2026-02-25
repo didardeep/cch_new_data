@@ -87,6 +87,7 @@ export default function ChatSupport() {
     resolution: '',
     attempt: 0,
     previousSolutions: [],
+    diagnosisSummary: '',
   });
   const msgIdCounter = useRef(0);
 
@@ -365,6 +366,7 @@ export default function ChatSupport() {
       previous_solutions: st.previousSolutions.slice(-10),
       attempt: st.attempt,
       original_query: st.attempt > 1 ? st.queryText : undefined,
+      diagnosis_summary: st.diagnosisSummary || undefined,
     });
     setIsTyping(false);
 
@@ -591,56 +593,6 @@ export default function ChatSupport() {
     }
   }, [addMessage, disableGroup]);
 
-  // ── Satisfied → Resolved ──
-  const handleSatisfied = useCallback(async (groupId) => {
-    disableGroup(groupId);
-    addMessage({ type: 'user', text: 'Yes, my issue is resolved' });
-    addMessage({ type: 'thankyou' });
-
-    if (sessionIdRef.current) {
-      try {
-        const token = getToken();
-        await fetch(`${API_BASE}/api/chat/session/${sessionIdRef.current}/resolve`, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-        });
-      } catch {}
-    }
-
-    setTimeout(() => {
-      addMessage({ type: 'bot', html: `What would you like to do next?` });
-      const actionGroupId = nextId();
-      addMessage({ type: 'post-feedback-actions', groupId: actionGroupId });
-    }, 1500);
-    stateRef.current.step = 'resolved';
-  }, [addMessage, disableGroup]);
-
-  // ── Unsatisfied → Ask for more details ──
-  const handleUnsatisfied = useCallback(async (groupId) => {
-    disableGroup(groupId);
-    addMessage({ type: 'user', text: 'No, my issue is not resolved' });
-
-    addMessage({
-      type: 'bot',
-      html: `I'm sorry that didn't help. Please <strong>describe your specific issue</strong> so I can provide a better solution.`,
-    });
-    showInput('Describe your issue in detail...');
-    stateRef.current.step = 'query';
-  }, [addMessage, disableGroup, showInput]);
-
-  // ── Continue Chat → User wants to keep chatting for more help ──
-  const handleContinueChat = useCallback((groupId) => {
-    disableGroup(groupId);
-    addMessage({ type: 'user', text: 'I want to continue chatting' });
-
-    addMessage({
-      type: 'bot',
-      html: `Sure! Please share more details about your issue, or describe what's still not working.`,
-    });
-    showInput('Tell me more about your issue...');
-    stateRef.current.step = 'query';
-  }, [addMessage, disableGroup, showInput]);
-
   // ── Signal Diagnosis — triggered from conversation when user has signal issues ──
   const handleSignalDiagnosis = useCallback((groupId) => {
     disableGroup(groupId);
@@ -798,18 +750,19 @@ export default function ChatSupport() {
 
         if (resp.ok && data.diagnosis) {
           addMessage({ type: 'diagnosis-result', diagnosis: data.diagnosis });
-          saveMessage('bot', `Signal diagnosis: RSRP=${data.diagnosis.rsrp} dBm (${data.diagnosis.rsrp_label}), SINR=${data.diagnosis.sinr} dB (${data.diagnosis.sinr_label}), Cell ID=${data.diagnosis.cell_id}`);
+          saveMessage('bot', data.diagnosis.summary || `Signal: ${data.diagnosis.overall_label}`);
 
+          // Store diagnosis context for future solutions
+          stateRef.current.diagnosisSummary = data.diagnosis.summary || `Signal: ${data.diagnosis.overall_label}`;
+
+          // Auto-trigger a solution based on diagnosis results
           setTimeout(() => {
             addMessage({
               type: 'bot',
-              html: 'Based on the signal analysis above, you can tell me more about your issue or choose an option below.',
+              html: 'Let me suggest a solution based on your signal diagnosis...',
             });
-            const actionGroupId = nextId();
-            addMessage({ type: 'solution-actions', groupId: actionGroupId });
-            showInput('Tell me more or ask a follow-up question...');
+            fetchSolution(`My signal diagnosis shows: ${stateRef.current.diagnosisSummary}`);
           }, 800);
-          stateRef.current.step = 'conversation';
         } else {
           addMessage({
             type: 'system',
@@ -1182,12 +1135,12 @@ export default function ChatSupport() {
       case 'solution-actions':
         return (
           <div key={msg.id} className="satisfaction-container">
-            <button className={`sat-btn yes${isDisabled ? ' disabled' : ''}`}
-              onClick={() => !isDisabled && handleContinueChat(msg.groupId)}>Continue Chat</button>
-            <button className={`sat-btn no${isDisabled ? ' disabled' : ''}`}
-              onClick={() => !isDisabled && handleExit(msg.groupId)}>Exit</button>
             <button className={`sat-btn ticket${isDisabled ? ' disabled' : ''}`}
               onClick={() => !isDisabled && handleRaiseTicket(msg.groupId)}>Raise a Ticket</button>
+            <button className={`sat-btn yes${isDisabled ? ' disabled' : ''}`}
+              onClick={() => !isDisabled && handleBackToMenu(msg.groupId)}>Main Menu</button>
+            <button className={`sat-btn no${isDisabled ? ' disabled' : ''}`}
+              onClick={() => !isDisabled && handleExit(msg.groupId)}>Exit</button>
             {isNetworkIssue(stateRef.current.subprocessName) && (
               <button className={`sat-btn ticket${isDisabled ? ' disabled' : ''}`}
                 style={{ background: '#005EB8' }}
@@ -1539,60 +1492,39 @@ export default function ChatSupport() {
 
       case 'diagnosis-result': {
         const d = msg.diagnosis;
-        const statusColor = { green: '#00875a', amber: '#c87d0a', red: '#c42b1c', unknown: '#8596ab' };
-        const statusBg = { green: '#f0fdf4', amber: '#fffbeb', red: '#fef2f2', unknown: '#f7f9fc' };
+        const overallColor = { green: '#00875a', amber: '#c87d0a', red: '#c42b1c', unknown: '#8596ab' };
+        const overallBg = { green: '#f0fdf4', amber: '#fffbeb', red: '#fef2f2', unknown: '#f7f9fc' };
+        const status = d.overall_status || 'unknown';
         return (
           <div key={msg.id} style={{
-            background: '#ffffff',
+            background: overallBg[status],
             border: '1px solid #d8e0ec',
+            borderLeft: `4px solid ${overallColor[status]}`,
             borderRadius: '10px',
             padding: '18px 20px',
             margin: '6px 0',
             boxShadow: '0 1px 2px rgba(0, 20, 60, 0.04)',
           }}>
-            <div style={{ fontWeight: 700, fontSize: '14px', color: '#00338D', marginBottom: '14px' }}>
-              Signal Diagnosis Results
-            </div>
-            {[
-              { label: 'RSRP', value: d.rsrp != null ? `${d.rsrp} dBm` : 'N/A', status: d.rsrp_status, badge: d.rsrp_label },
-              { label: 'SINR', value: d.sinr != null ? `${d.sinr} dB` : 'N/A', status: d.sinr_status, badge: d.sinr_label },
-            ].map((m, i) => (
-              <div key={i} style={{
-                display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-                padding: '10px 14px', marginBottom: '8px',
-                background: statusBg[m.status] || '#f7f9fc',
-                borderLeft: `3px solid ${statusColor[m.status] || '#8596ab'}`,
-                borderRadius: '8px',
-              }}>
-                <div>
-                  <div style={{ fontWeight: 600, fontSize: '13px', color: '#0f1d33' }}>{m.label}</div>
-                  <div style={{ fontSize: '12px', color: '#3d5068', marginTop: '2px' }}>{m.value}</div>
-                </div>
-                <div style={{
-                  background: statusColor[m.status] || '#8596ab',
-                  color: '#fff', borderRadius: '12px', padding: '4px 12px',
-                  fontSize: '11px', fontWeight: 700,
-                }}>
-                  {m.badge}
-                </div>
-              </div>
-            ))}
-            <div style={{
-              display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-              padding: '10px 14px',
-              background: '#f7f9fc',
-              borderLeft: '3px solid #005EB8', borderRadius: '8px',
-            }}>
-              <div>
-                <div style={{ fontWeight: 600, fontSize: '13px', color: '#0f1d33' }}>Cell ID</div>
-                <div style={{ fontSize: '12px', color: '#3d5068', marginTop: '2px' }}>{d.cell_id || 'N/A'}</div>
-              </div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '10px' }}>
               <div style={{
-                background: '#005EB8', color: '#fff', borderRadius: '12px',
-                padding: '4px 12px', fontSize: '11px', fontWeight: 700,
+                background: overallColor[status],
+                color: '#fff', borderRadius: '12px', padding: '4px 14px',
+                fontSize: '12px', fontWeight: 700,
               }}>
-                Info
+                Signal: {d.overall_label || 'Unknown'}
               </div>
+              {d.is_busy_hour && (
+                <div style={{
+                  background: '#c87d0a',
+                  color: '#fff', borderRadius: '12px', padding: '4px 14px',
+                  fontSize: '12px', fontWeight: 700,
+                }}>
+                  Peak Hours
+                </div>
+              )}
+            </div>
+            <div style={{ fontSize: '13px', color: '#1a2b42', lineHeight: '1.6' }}>
+              {d.summary}
             </div>
           </div>
         );

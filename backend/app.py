@@ -334,7 +334,7 @@ def generate_resolution(query, sector_name, subprocess_name, language):
         return f"I apologize, but I encountered an error. Please try again. Error: {str(e)}"
 
 
-def generate_single_solution(sector_name, subprocess_name, language, user_query="", previous_solutions=None, attempt=1, original_query=""):
+def generate_single_solution(sector_name, subprocess_name, language, user_query="", previous_solutions=None, attempt=1, original_query="", diagnosis_summary=""):
     """Generate a single focused solution. If user_query is provided, tailor to it. Avoids repeating previous solutions."""
     prev_block = ""
     if previous_solutions:
@@ -352,6 +352,15 @@ def generate_single_solution(sector_name, subprocess_name, language, user_query=
     if original_query and original_query != user_query:
         original_context = f"\n\nOriginal issue description: \"{original_query}\"\nThe user's follow-up message is: \"{user_query}\""
 
+    diagnosis_block = ""
+    if diagnosis_summary:
+        diagnosis_block = (
+            f"\n\nSIGNAL DIAGNOSIS RESULTS: {diagnosis_summary}\n"
+            "Use this diagnosis data to tailor your solution. If signal is poor/weak, suggest "
+            "signal-related fixes (relocate, check antenna, network mode). If signal is good, "
+            "focus on other causes (device settings, account issues, congestion)."
+        )
+
     try:
         response = client.chat.completions.create(
             model=DEPLOYMENT_NAME,
@@ -365,6 +374,7 @@ def generate_single_solution(sector_name, subprocess_name, language, user_query=
                     "Acknowledge the issue briefly and give the steps."
                     + query_block
                     + original_context
+                    + diagnosis_block
                     + prev_block +
                     f"\n\nIMPORTANT: Respond entirely in {language}. "
                     "Keep the tone professional, empathetic, and helpful."
@@ -500,6 +510,43 @@ def analyze_signal_screenshot(image_base64):
     else:
         sinr_status, sinr_label = "unknown", "Not detected"
 
+    # Determine busy hours (9-11 AM or 6-9 PM local time)
+    from datetime import datetime as dt
+    now = dt.now()
+    current_hour = now.hour
+    is_busy_hour = (9 <= current_hour < 11) or (18 <= current_hour < 21)
+
+    # Overall signal judgment
+    statuses = [s for s in [rsrp_status, sinr_status] if s != "unknown"]
+    if not statuses:
+        overall = "unknown"
+        overall_label = "Unable to determine signal quality"
+    elif any(s == "red" for s in statuses):
+        overall = "red"
+        overall_label = "Poor"
+    elif any(s == "amber" for s in statuses):
+        overall = "amber"
+        overall_label = "Moderate"
+    else:
+        overall = "green"
+        overall_label = "Good"
+
+    # Build summary message
+    if overall == "green":
+        summary = "Your signal strength is good. You should have stable connectivity in your area."
+    elif overall == "amber":
+        summary = "Your signal strength is moderate. You may experience occasional slowdowns or drops."
+    elif overall == "red":
+        summary = "Your signal strength is poor. This is likely causing the connectivity issues you're experiencing."
+    else:
+        summary = "We could not fully determine your signal quality from the screenshot."
+
+    if is_busy_hour:
+        summary += (
+            f" Note: You are currently in peak network hours ({now.strftime('%I:%M %p')}). "
+            "Network congestion during 9-11 AM and 6-9 PM can further degrade signal quality and speeds."
+        )
+
     return {
         "rsrp": rsrp,
         "rsrp_status": rsrp_status,
@@ -508,6 +555,10 @@ def analyze_signal_screenshot(image_base64):
         "sinr_status": sinr_status,
         "sinr_label": sinr_label,
         "cell_id": str(cell_id) if cell_id is not None else None,
+        "overall_status": overall,
+        "overall_label": overall_label,
+        "is_busy_hour": is_busy_hour,
+        "summary": summary,
     }
 
 
@@ -671,6 +722,7 @@ def resolve_step():
     previous_solutions = data.get("previous_solutions", [])
     attempt = data.get("attempt", 1)
     original_query = data.get("original_query", "")
+    diagnosis_summary = data.get("diagnosis_summary", "")
 
     sector = TELECOM_MENU.get(sector_key, {})
     sector_name = sector.get("name", "Telecom")
@@ -692,6 +744,7 @@ def resolve_step():
         previous_solutions=previous_solutions,
         attempt=attempt,
         original_query=original_query,
+        diagnosis_summary=diagnosis_summary,
     )
     return jsonify({
         "resolution": solution,
