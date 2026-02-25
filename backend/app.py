@@ -282,6 +282,38 @@ def detect_greeting(text: str) -> bool:
         return True   # fail-open: treat ambiguous input as a greeting
 
 
+def classify_user_response(text: str) -> dict:
+    """Classify user's response after a solution: is satisfied, mentions signal/network issues, or needs more help."""
+    try:
+        response = client.chat.completions.create(
+            model=DEPLOYMENT_NAME,
+            messages=[
+                {"role": "system", "content": (
+                    "You are classifying a customer's response in a telecom support chat. "
+                    "The customer was just given a solution and asked 'Did this help?'\n\n"
+                    "Determine:\n"
+                    "1. is_satisfied: Is the user saying the issue is resolved / they are happy / it worked / thank you / yes it helped? (true/false)\n"
+                    "2. mentions_signal: Does the user's message semantically relate to network signal, coverage, "
+                    "poor reception, no signal, weak signal, call drops, slow internet speed, network not available, "
+                    "data not working, or similar signal/network connectivity issues? (true/false)\n\n"
+                    'Respond with ONLY valid JSON: {"is_satisfied": true/false, "mentions_signal": true/false}'
+                )},
+                {"role": "user", "content": text},
+            ],
+            temperature=0,
+            max_tokens=30,
+        )
+        raw = response.choices[0].message.content.strip()
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+            raw = raw.strip()
+        return json.loads(raw)
+    except Exception:
+        return {"is_satisfied": False, "mentions_signal": False}
+
+
 def detect_language(text: str) -> str:
     try:
         response = client.chat.completions.create(
@@ -369,8 +401,9 @@ def generate_single_solution(sector_name, subprocess_name, language, user_query=
                     f"You are an expert telecom customer support agent. The user has an issue "
                     f"under the sector: '{sector_name}' and subprocess: '{subprocess_name}'.\n\n"
                     f"This is solution attempt #{attempt}.\n\n"
-                    "Provide ONE focused, actionable solution with 2-3 clear steps. "
+                    "Provide ONE focused, actionable solution with its step, how to take that action, keep in mind that steps would be how to perform that action. "
                     "Be concise and specific. Do not provide multiple alternative solutions — just one.\n"
+                    "Do NOT include any URLs, links, or website references in your response.\n"
                     "Acknowledge the issue briefly and give the steps."
                     + query_block
                     + original_context
@@ -767,6 +800,15 @@ def detect_greeting_route():
     text = data.get("text", "")
     is_greeting = detect_greeting(text)
     return jsonify({"is_greeting": is_greeting})
+
+
+@app.route("/api/classify-response", methods=["POST"])
+def classify_response_route():
+    """Classify user response: satisfied? mentions signal/network?"""
+    data = request.json
+    text = data.get("text", "")
+    result = classify_user_response(text)
+    return jsonify(result)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

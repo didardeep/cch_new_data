@@ -338,6 +338,59 @@ export default function ChatSupport() {
     stateRef.current.step = 'subprocess';
   }, [addMessage, disableGroup]);
 
+  // ── Auto-raise ticket (called when 6 attempts exhausted) ──
+  const autoRaiseTicket = useCallback(async () => {
+    addMessage({
+      type: 'bot',
+      html: `I'm sorry I wasn't able to resolve your issue. Let me raise a ticket for you so our support team can help.`,
+    });
+
+    let refNum = '';
+    let assignedAgent = null;
+    let slaHours = null;
+    if (sessionIdRef.current) {
+      try {
+        const token = getToken();
+        const resp = await fetch(`${API_BASE}/api/chat/session/${sessionIdRef.current}/escalate`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+        });
+        const data = await resp.json();
+        if (data.ticket) {
+          refNum = data.ticket.reference_number;
+          slaHours = data.ticket.sla_hours || null;
+        }
+        if (data.assigned_agent) {
+          assignedAgent = data.assigned_agent;
+        }
+      } catch {}
+    }
+
+    addMessage({
+      type: 'bot',
+      html: `Your ticket has been raised successfully!` +
+        (refNum ? `<br>Reference: <strong>${refNum}</strong>` : '') +
+        (assignedAgent
+          ? `<br><br>We are connecting you to our expert. Your dedicated support agent is:<br>
+             <div style="background:#eff6ff;border:1px solid #93c5fd;border-radius:8px;padding:10px 14px;margin:8px 0;display:inline-block;min-width:220px;">
+               <div style="font-size:13px;font-weight:700;color:#1e40af;">${assignedAgent.name}</div>
+               ${assignedAgent.phone ? `<div style="font-size:12px;color:#0ea5e9;margin-top:4px;">${assignedAgent.phone}</div>` : ''}
+               ${assignedAgent.email ? `<div style="font-size:12px;color:#0ea5e9;margin-top:4px;">${assignedAgent.email}</div>` : ''}
+               ${assignedAgent.employee_id ? `<div style="font-size:11px;color:#64748b;margin-top:2px;">ID: ${assignedAgent.employee_id}</div>` : ''}
+               ${slaHours ? `<div style="font-size:12px;color:#16a34a;margin-top:6px;font-weight:600;">Your issue will be resolved within ${slaHours} hour${slaHours !== 1 ? 's' : ''}</div>` : ''}
+             </div>`
+          : `<br><br>Our support team will reach out to you shortly.` +
+            (slaHours ? `<br><span style="color:#16a34a;font-weight:600;">Your issue will be resolved within ${slaHours} hour${slaHours !== 1 ? 's' : ''}</span>` : '')) +
+        `<br>You can track your ticket from the dashboard.`,
+    });
+
+    setTimeout(() => {
+      const actionGroupId = nextId();
+      addMessage({ type: 'post-feedback-actions', groupId: actionGroupId });
+    }, 1000);
+    stateRef.current.step = 'escalated';
+  }, [addMessage]);
+
   // ── Fetch a single solution step ──
   const fetchSolution = useCallback(async (userQuery) => {
     const st = stateRef.current;
@@ -391,18 +444,25 @@ export default function ChatSupport() {
       html: formatResolution(resolveData.resolution),
     });
 
+    // After 6 attempts, auto-raise a ticket
+    if (st.attempt >= 6) {
+      setTimeout(() => {
+        autoRaiseTicket();
+      }, 800);
+      return;
+    }
+
+    // Otherwise, ask "Did this help?" and show input for next query
     setTimeout(() => {
       addMessage({
         type: 'bot',
-        html: `Did this help? You can tell me more about your issue or try the options below.`,
+        html: `Did this help? If not, please describe what's still not working.`,
       });
-      const actionGroupId = nextId();
-      addMessage({ type: 'solution-actions', groupId: actionGroupId });
-      showInput('Tell me more or ask a follow-up question...');
+      showInput('Type your response...');
     }, 800);
 
     st.step = 'conversation';
-  }, [addMessage, saveMessage, showInput, createSession]);
+  }, [addMessage, saveMessage, showInput, createSession, autoRaiseTicket]);
 
   // ── Helper: After location is captured, always go to query input ──
   const afterLocationCaptured = useCallback(() => {
@@ -518,7 +578,7 @@ export default function ChatSupport() {
       setIsTyping(false);
       addMessage({
         type: 'bot',
-        html: `Hi ${userName}! I'm your AI-powered telecom support assistant. How can I help you today? Please choose one of the options below to get started:`,
+        html: `Hi dear ${userName}! Hope you're doing well. I'm your AI-powered telecom support assistant. How can I help you today? Please choose one of the options below to get started:`,
       });
       setTimeout(() => loadSectorMenu(), 600);
       stateRef.current.step = 'sector';
@@ -552,8 +612,54 @@ export default function ChatSupport() {
       return;
     }
 
-    // ── Conversation step: user typed directly instead of clicking a button ──
+    // ── Conversation step: classify user response ──
     if (stateRef.current.step === 'conversation') {
+      setIsTyping(true);
+      let classification = { is_satisfied: false, mentions_signal: false };
+      try {
+        classification = await chatApiCall('/api/classify-response', { text });
+      } catch {}
+      setIsTyping(false);
+
+      // If user is satisfied, show Exit / Main Menu
+      if (classification.is_satisfied) {
+        addMessage({ type: 'thankyou' });
+
+        if (sessionIdRef.current) {
+          try {
+            const token = getToken();
+            await fetch(`${API_BASE}/api/chat/session/${sessionIdRef.current}/resolve`, {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+            });
+          } catch {}
+        }
+
+        setTimeout(() => {
+          addMessage({ type: 'bot', html: `What would you like to do next?` });
+          const actionGroupId = nextId();
+          addMessage({ type: 'post-feedback-actions', groupId: actionGroupId });
+        }, 800);
+        stateRef.current.step = 'resolved';
+        return;
+      }
+
+      // If user mentions signal/network issues, offer diagnosis
+      if (classification.mentions_signal && isNetworkIssue(stateRef.current.subprocessName)) {
+        addMessage({
+          type: 'bot',
+          html: `It sounds like you're experiencing signal issues. Would you like to run a signal diagnosis?`,
+        });
+        const diagGroupId = nextId();
+        addMessage({
+          type: 'signal-offer',
+          groupId: diagGroupId,
+        });
+        stateRef.current.step = 'signal-offer';
+        return;
+      }
+
+      // Otherwise, treat as a follow-up query
       stateRef.current.step = 'query';
       // Fall through to fetchSolution below
     }
@@ -965,11 +1071,9 @@ export default function ChatSupport() {
       } else if (session.resolution) {
         addMessage({
           type: 'bot',
-          html: `Did this help? You can tell me more about your issue or try the options below.`,
+          html: `Did this help? If not, please describe what's still not working.`,
         });
-        const actionGroupId = nextId();
-        addMessage({ type: 'solution-actions', groupId: actionGroupId });
-        showInput('Tell me more or ask a follow-up question...');
+        showInput('Type your response...');
         stateRef.current.step = 'conversation';
       } else {
         addMessage({
@@ -1146,6 +1250,30 @@ export default function ChatSupport() {
                 style={{ background: '#005EB8' }}
                 onClick={() => !isDisabled && handleSignalDiagnosis(msg.groupId)}>Run Signal Diagnosis</button>
             )}
+          </div>
+        );
+
+      case 'signal-offer':
+        return (
+          <div key={msg.id} className="satisfaction-container">
+            <button className={`sat-btn yes${isDisabled ? ' disabled' : ''}`}
+              onClick={() => {
+                if (isDisabled) return;
+                disableGroup(msg.groupId);
+                handleSignalDiagnosis(msg.groupId);
+              }}>Yes, Run Diagnosis</button>
+            <button className={`sat-btn no${isDisabled ? ' disabled' : ''}`}
+              onClick={() => {
+                if (isDisabled) return;
+                disableGroup(msg.groupId);
+                addMessage({ type: 'user', text: 'No, continue chatting' });
+                addMessage({
+                  type: 'bot',
+                  html: `No problem! Please describe what's still not working.`,
+                });
+                showInput('Type your response...');
+                stateRef.current.step = 'conversation';
+              }}>No, Continue</button>
           </div>
         );
 
