@@ -192,7 +192,6 @@ export default function ChatSupport() {
           latitude,
           longitude,
         });
-        saveMessage('system', `Customer location shared: ${latitude.toFixed(6)}, ${longitude.toFixed(6)}`);
 
         // Continue the chat flow
         if (onSuccess) onSuccess();
@@ -218,7 +217,7 @@ export default function ChatSupport() {
         maximumAge: 0,
       }
     );
-  }, [addMessage, saveMessage, saveLocationToBackend, disableGroup]);
+  }, [addMessage, saveLocationToBackend, disableGroup]);
 
   // ── Poll for agent messages + resolution after handoff ──────────────────
   const lastSeenMsgIdRef = useRef(0);
@@ -321,7 +320,6 @@ export default function ChatSupport() {
 
     addMessage({ type: 'user', text: name });
     addMessage({ type: 'system', text: `Selected: ${name}` });
-    saveMessage('user', name, { sector_name: name });
 
     setIsTyping(true);
     const data = await chatApiCall('/api/subprocesses', {
@@ -337,7 +335,7 @@ export default function ChatSupport() {
     const spGroupId = nextId();
     addMessage({ type: 'subprocess-grid', subprocesses: limitSubprocesses(data.subprocesses), groupId: spGroupId });
     stateRef.current.step = 'subprocess';
-  }, [addMessage, disableGroup, saveMessage]);
+  }, [addMessage, disableGroup]);
 
   // ── Fetch a single solution step ──
   const fetchSolution = useCallback(async (userQuery) => {
@@ -348,7 +346,10 @@ export default function ChatSupport() {
       await createSession();
     }
 
-    st.queryText = userQuery;
+    // Only set queryText on the first attempt (preserve original query)
+    if (st.attempt === 1) {
+      st.queryText = userQuery;
+    }
     saveMessage('user', userQuery, {
       query_text: userQuery,
       sector_name: st.sectorName,
@@ -361,8 +362,9 @@ export default function ChatSupport() {
       subprocess_key: st.subprocessKey,
       query: userQuery,
       language: st.language,
-      previous_solutions: st.previousSolutions,
+      previous_solutions: st.previousSolutions.slice(-10),
       attempt: st.attempt,
+      original_query: st.attempt > 1 ? st.queryText : undefined,
     });
     setIsTyping(false);
 
@@ -390,14 +392,32 @@ export default function ChatSupport() {
     setTimeout(() => {
       addMessage({
         type: 'bot',
-        html: `Did this solution resolve your issue? <em>(Attempt ${st.attempt})</em>`,
+        html: `Did this help? You can tell me more about your issue or try the options below.`,
       });
-      const satGroupId = nextId();
-      addMessage({ type: 'satisfaction', groupId: satGroupId, attempt: st.attempt });
+      const actionGroupId = nextId();
+      addMessage({ type: 'solution-actions', groupId: actionGroupId });
+      showInput('Tell me more or ask a follow-up question...');
     }, 800);
 
-    st.step = 'feedback';
+    st.step = 'conversation';
   }, [addMessage, saveMessage, showInput, createSession]);
+
+  // ── Helper: After location is captured, always go to query input ──
+  const afterLocationCaptured = useCallback(() => {
+    setTimeout(() => {
+      addMessage({
+        type: 'bot',
+        html: `Thank you! Your location has been recorded.`,
+      });
+
+      addMessage({
+        type: 'bot',
+        html: `Please <strong>describe your specific issue</strong> so I can provide the best resolution.`,
+      });
+      showInput('Describe your issue in any language...');
+      stateRef.current.step = 'query';
+    }, 500);
+  }, [addMessage, showInput]);
 
   // ── Select Subprocess ──
   const selectSubprocess = useCallback(async (key, name, groupId) => {
@@ -408,66 +428,57 @@ export default function ChatSupport() {
     stateRef.current.previousSolutions = [];
 
     addMessage({ type: 'user', text: name });
-    saveMessage('user', name, { subprocess_name: name });
 
-    // ── LOCATION TRIGGER — If Network/Signal issue, request location FIRST ──
-    if (isNetworkIssue(name)) {
-      // Create session first so we have an ID to save location against
-      if (!sessionIdRef.current) {
-        await createSession();
-      }
-
-      addMessage({
-        type: 'bot',
-        html: `You selected <strong>${name}</strong>.<br><br>` +
-          `<strong>Location Required</strong><br>` +
-          `To help diagnose your network issue, we need your current location to check signal coverage in your area.<br><br>` +
-          `Please click <strong>"Share My Location"</strong> in the browser popup to continue.`,
-      });
-
-      // Show location prompt message
-      const locGroupId = nextId();
-      addMessage({
-        type: 'location-prompt',
-        groupId: locGroupId,
-        onShare: () => {
-          disableGroup(locGroupId);
-          requestLocation(() => {
-            // After location is granted, show signal codes + upload prompt
-            setTimeout(() => {
-              addMessage({
-                type: 'bot',
-                html: `Thank you! Your location has been recorded.`,
-              });
-
-              setTimeout(() => {
-                addMessage({ type: 'signal-codes' });
-
-                setTimeout(() => {
-                  const uploadGroupId = nextId();
-                  addMessage({ type: 'screenshot-upload', groupId: uploadGroupId });
-                }, 600);
-              }, 500);
-
-              stateRef.current.step = 'signal-diagnosis';
-            }, 500);
-          });
-        },
-      });
-
-      stateRef.current.step = 'location';
-      return;
+    // Create session first so we have an ID to save location against
+    if (!sessionIdRef.current) {
+      await createSession();
     }
 
-    // ── Normal flow for non-network issues ──
     addMessage({
       type: 'bot',
-      html: `You selected <strong>${name}</strong>. Please <strong>describe your specific issue</strong> so I can provide the best resolution.`,
+      html: `You selected <strong>${name}</strong>.<br><br>` +
+        `To help us assist you better, we need to know about your location.`,
     });
 
-    showInput('Describe your issue in any language...');
-    stateRef.current.step = 'query';
-  }, [addMessage, disableGroup, saveMessage, showInput, createSession, requestLocation]);
+    // Show location question for ALL subprocesses
+    const locQGroupId = nextId();
+    addMessage({
+      type: 'location-question',
+      groupId: locQGroupId,
+      onYes: () => {
+        disableGroup(locQGroupId);
+        addMessage({ type: 'user', text: "Yes, I'm at the issue location" });
+
+        // Show location prompt to request GPS
+        const locPromptGroupId = nextId();
+        addMessage({
+          type: 'location-prompt',
+          groupId: locPromptGroupId,
+          onShare: () => {
+            disableGroup(locPromptGroupId);
+            requestLocation(() => {
+              afterLocationCaptured(name);
+            });
+          },
+        });
+
+        stateRef.current.step = 'location';
+      },
+      onNo: () => {
+        disableGroup(locQGroupId);
+        addMessage({ type: 'user', text: "No, I'm at a different location" });
+
+        addMessage({
+          type: 'bot',
+          html: `Please describe the location where you're experiencing this issue (e.g., area, address, landmark):`,
+        });
+        showInput('Describe your issue location...');
+        stateRef.current.step = 'location-describe';
+      },
+    });
+
+    stateRef.current.step = 'location-question';
+  }, [addMessage, disableGroup, showInput, createSession, requestLocation, afterLocationCaptured]);
 
   // ── Send Message ──
   const sendMessage = useCallback(async () => {
@@ -512,6 +523,39 @@ export default function ChatSupport() {
       return;
     }
 
+    // ── Location description step: save text location and proceed ──
+    if (stateRef.current.step === 'location-describe') {
+      // Save location description to backend
+      if (sessionIdRef.current) {
+        try {
+          const token = getToken();
+          await fetch(`${API_BASE}/api/chat/session/${sessionIdRef.current}/location`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${token}`,
+            },
+            body: JSON.stringify({ location_description: text }),
+          });
+        } catch (e) {}
+      }
+
+      addMessage({
+        type: 'bot',
+        html: `Thank you! Location noted: <strong>${text}</strong>`,
+      });
+
+      // Proceed to appropriate next step based on issue type
+      afterLocationCaptured(stateRef.current.subprocessName);
+      return;
+    }
+
+    // ── Conversation step: user typed directly instead of clicking a button ──
+    if (stateRef.current.step === 'conversation') {
+      stateRef.current.step = 'query';
+      // Fall through to fetchSolution below
+    }
+
     if (stateRef.current.language === 'English') {
       try {
         const langData = await chatApiCall('/api/detect-language', { text });
@@ -523,7 +567,7 @@ export default function ChatSupport() {
     }
 
     await fetchSolution(text);
-  }, [inputValue, addMessage, hideInput, fetchSolution, loadSectorMenu, user]);
+  }, [inputValue, addMessage, hideInput, fetchSolution, loadSectorMenu, user, afterLocationCaptured]);
 
   // ── Send Summary Email ──
   const handleSendEmail = useCallback(async (groupId) => {
@@ -552,7 +596,6 @@ export default function ChatSupport() {
     disableGroup(groupId);
     addMessage({ type: 'user', text: 'Yes, my issue is resolved' });
     addMessage({ type: 'thankyou' });
-    saveMessage('user', 'Yes, my issue is resolved');
 
     if (sessionIdRef.current) {
       try {
@@ -570,13 +613,12 @@ export default function ChatSupport() {
       addMessage({ type: 'post-feedback-actions', groupId: actionGroupId });
     }, 1500);
     stateRef.current.step = 'resolved';
-  }, [addMessage, disableGroup, saveMessage]);
+  }, [addMessage, disableGroup]);
 
   // ── Unsatisfied → Ask for more details ──
   const handleUnsatisfied = useCallback(async (groupId) => {
     disableGroup(groupId);
     addMessage({ type: 'user', text: 'No, my issue is not resolved' });
-    saveMessage('user', 'No, my issue is not resolved');
 
     addMessage({
       type: 'bot',
@@ -584,9 +626,44 @@ export default function ChatSupport() {
     });
     showInput('Describe your issue in detail...');
     stateRef.current.step = 'query';
-  }, [addMessage, disableGroup, saveMessage, showInput]);
+  }, [addMessage, disableGroup, showInput]);
 
-  // ── Raise Ticket (user-initiated from attempt 2 onwards) ──
+  // ── Continue Chat → User wants to keep chatting for more help ──
+  const handleContinueChat = useCallback((groupId) => {
+    disableGroup(groupId);
+    addMessage({ type: 'user', text: 'I want to continue chatting' });
+
+    addMessage({
+      type: 'bot',
+      html: `Sure! Please share more details about your issue, or describe what's still not working.`,
+    });
+    showInput('Tell me more about your issue...');
+    stateRef.current.step = 'query';
+  }, [addMessage, disableGroup, showInput]);
+
+  // ── Signal Diagnosis — triggered from conversation when user has signal issues ──
+  const handleSignalDiagnosis = useCallback((groupId) => {
+    disableGroup(groupId);
+    addMessage({ type: 'user', text: 'Run signal diagnosis' });
+
+    addMessage({
+      type: 'bot',
+      html: `Let's diagnose your signal. Please follow the steps below to get your signal information.`,
+    });
+
+    setTimeout(() => {
+      addMessage({ type: 'signal-codes' });
+
+      setTimeout(() => {
+        const uploadGroupId = nextId();
+        addMessage({ type: 'screenshot-upload', groupId: uploadGroupId });
+      }, 600);
+    }, 500);
+
+    stateRef.current.step = 'signal-diagnosis';
+  }, [addMessage, disableGroup]);
+
+  // ── Raise Ticket (user-initiated) ──
   const handleRaiseTicket = useCallback(async (groupId) => {
     disableGroup(groupId);
     addMessage({ type: 'user', text: 'Raise a ticket' });
@@ -726,12 +803,13 @@ export default function ChatSupport() {
           setTimeout(() => {
             addMessage({
               type: 'bot',
-              html: 'Based on the signal analysis above, what would you like to do next?',
+              html: 'Based on the signal analysis above, you can tell me more about your issue or choose an option below.',
             });
             const actionGroupId = nextId();
-            addMessage({ type: 'post-diagnosis-actions', groupId: actionGroupId });
+            addMessage({ type: 'solution-actions', groupId: actionGroupId });
+            showInput('Tell me more or ask a follow-up question...');
           }, 800);
-          stateRef.current.step = 'post-diagnosis';
+          stateRef.current.step = 'conversation';
         } else {
           addMessage({
             type: 'system',
@@ -934,11 +1012,12 @@ export default function ChatSupport() {
       } else if (session.resolution) {
         addMessage({
           type: 'bot',
-          html: `Did this solution resolve your issue? <em>(Attempt ${stateRef.current.attempt} of 5)</em>`,
+          html: `Did this help? You can tell me more about your issue or try the options below.`,
         });
-        const satGroupId = nextId();
-        addMessage({ type: 'satisfaction', groupId: satGroupId });
-        stateRef.current.step = 'feedback';
+        const actionGroupId = nextId();
+        addMessage({ type: 'solution-actions', groupId: actionGroupId });
+        showInput('Tell me more or ask a follow-up question...');
+        stateRef.current.step = 'conversation';
       } else {
         addMessage({
           type: 'bot',
@@ -1100,15 +1179,19 @@ export default function ChatSupport() {
         return <div key={msg.id} className="non-telecom-warning" dangerouslySetInnerHTML={{ __html: msg.html }} />;
 
       case 'satisfaction':
+      case 'solution-actions':
         return (
           <div key={msg.id} className="satisfaction-container">
             <button className={`sat-btn yes${isDisabled ? ' disabled' : ''}`}
-              onClick={() => !isDisabled && handleSatisfied(msg.groupId)}>Yes, Resolved</button>
+              onClick={() => !isDisabled && handleContinueChat(msg.groupId)}>Continue Chat</button>
             <button className={`sat-btn no${isDisabled ? ' disabled' : ''}`}
-              onClick={() => !isDisabled && handleUnsatisfied(msg.groupId)}>No, Try Again</button>
-            {(msg.attempt || 0) >= 2 && (
+              onClick={() => !isDisabled && handleExit(msg.groupId)}>Exit</button>
+            <button className={`sat-btn ticket${isDisabled ? ' disabled' : ''}`}
+              onClick={() => !isDisabled && handleRaiseTicket(msg.groupId)}>Raise a Ticket</button>
+            {isNetworkIssue(stateRef.current.subprocessName) && (
               <button className={`sat-btn ticket${isDisabled ? ' disabled' : ''}`}
-                onClick={() => !isDisabled && handleRaiseTicket(msg.groupId)}>Raise a Ticket</button>
+                style={{ background: '#005EB8' }}
+                onClick={() => !isDisabled && handleSignalDiagnosis(msg.groupId)}>Run Signal Diagnosis</button>
             )}
           </div>
         );
@@ -1141,7 +1224,70 @@ export default function ChatSupport() {
           </div>
         );
 
-      // ── LOCATION PROMPT — shown when user selects Network/Signal issue ──
+      // ── LOCATION QUESTION — "Are you at the issue location?" ──
+      case 'location-question':
+        return (
+          <div key={msg.id} style={{
+            background: '#ffffff',
+            border: '1px solid #d8e0ec',
+            borderLeft: '3px solid #005EB8',
+            borderRadius: '10px',
+            padding: '20px 22px',
+            margin: '6px 0',
+            textAlign: 'center',
+            boxShadow: '0 1px 2px rgba(0, 20, 60, 0.04)',
+          }}>
+            <div style={{ fontSize: '28px', color: '#00338D', marginBottom: '6px' }}>
+              <svg width="28" height="28" viewBox="0 0 24 24" fill="#00338D" stroke="none">
+                <path d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zm0 9.5c-1.38 0-2.5-1.12-2.5-2.5S10.62 6.5 12 6.5s2.5 1.12 2.5 2.5S13.38 11.5 12 11.5z"/>
+              </svg>
+            </div>
+            <div style={{ fontWeight: '700', fontSize: '14px', color: '#00338D', marginBottom: '8px' }}>
+              Location Check
+            </div>
+            <div style={{ fontSize: '13px', color: '#3d5068', marginBottom: '16px', lineHeight: '1.6' }}>
+              Are you currently at the same location where you're experiencing this issue?
+            </div>
+            <div style={{ display: 'flex', gap: '10px', justifyContent: 'center' }}>
+              <button
+                onClick={() => !isDisabled && msg.onYes && msg.onYes()}
+                disabled={isDisabled}
+                style={{
+                  background: isDisabled ? '#8596ab' : '#00875A',
+                  color: '#fff',
+                  border: 'none',
+                  borderRadius: '8px',
+                  padding: '11px 26px',
+                  fontSize: '13px',
+                  fontWeight: '600',
+                  cursor: isDisabled ? 'not-allowed' : 'pointer',
+                  transition: 'all 0.2s',
+                }}
+              >
+                Yes, I'm here
+              </button>
+              <button
+                onClick={() => !isDisabled && msg.onNo && msg.onNo()}
+                disabled={isDisabled}
+                style={{
+                  background: isDisabled ? '#8596ab' : '#005EB8',
+                  color: '#fff',
+                  border: 'none',
+                  borderRadius: '8px',
+                  padding: '11px 26px',
+                  fontSize: '13px',
+                  fontWeight: '600',
+                  cursor: isDisabled ? 'not-allowed' : 'pointer',
+                  transition: 'all 0.2s',
+                }}
+              >
+                No, different location
+              </button>
+            </div>
+          </div>
+        );
+
+      // ── LOCATION PROMPT — shown to request GPS sharing ──
       case 'location-prompt':
         return (
           <div key={msg.id} style={{

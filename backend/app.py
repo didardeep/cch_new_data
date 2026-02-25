@@ -334,19 +334,23 @@ def generate_resolution(query, sector_name, subprocess_name, language):
         return f"I apologize, but I encountered an error. Please try again. Error: {str(e)}"
 
 
-def generate_single_solution(sector_name, subprocess_name, language, user_query="", previous_solutions=None, attempt=1):
+def generate_single_solution(sector_name, subprocess_name, language, user_query="", previous_solutions=None, attempt=1, original_query=""):
     """Generate a single focused solution. If user_query is provided, tailor to it. Avoids repeating previous solutions."""
     prev_block = ""
     if previous_solutions:
         prev_block = (
             "\n\nIMPORTANT: The following solutions have ALREADY been provided and did NOT work. "
             "Do NOT repeat them. Provide a DIFFERENT approach:\n"
-            + "\n---\n".join(previous_solutions)
+            + "\n---\n".join(previous_solutions[-10:])
         )
 
     query_block = ""
     if user_query:
         query_block = f"\n\nThe user described their specific issue as: \"{user_query}\""
+
+    original_context = ""
+    if original_query and original_query != user_query:
+        original_context = f"\n\nOriginal issue description: \"{original_query}\"\nThe user's follow-up message is: \"{user_query}\""
 
     try:
         response = client.chat.completions.create(
@@ -355,11 +359,12 @@ def generate_single_solution(sector_name, subprocess_name, language, user_query=
                 {"role": "system", "content": (
                     f"You are an expert telecom customer support agent. The user has an issue "
                     f"under the sector: '{sector_name}' and subprocess: '{subprocess_name}'.\n\n"
-                    f"This is solution attempt #{attempt} of 5.\n\n"
+                    f"This is solution attempt #{attempt}.\n\n"
                     "Provide ONE focused, actionable solution with 2-3 clear steps. "
                     "Be concise and specific. Do not provide multiple alternative solutions — just one.\n"
                     "Acknowledge the issue briefly and give the steps."
                     + query_block
+                    + original_context
                     + prev_block +
                     f"\n\nIMPORTANT: Respond entirely in {language}. "
                     "Keep the tone professional, empathetic, and helpful."
@@ -665,6 +670,7 @@ def resolve_step():
     language = data.get("language", "English")
     previous_solutions = data.get("previous_solutions", [])
     attempt = data.get("attempt", 1)
+    original_query = data.get("original_query", "")
 
     sector = TELECOM_MENU.get(sector_key, {})
     sector_name = sector.get("name", "Telecom")
@@ -685,6 +691,7 @@ def resolve_step():
         user_query=user_query,
         previous_solutions=previous_solutions,
         attempt=attempt,
+        original_query=original_query,
     )
     return jsonify({
         "resolution": solution,
@@ -773,18 +780,23 @@ def save_session_location(session_id):
     data = request.json
     latitude = data.get("latitude")
     longitude = data.get("longitude")
+    location_description = data.get("location_description")
 
-    if latitude is None or longitude is None:
-        return jsonify({"error": "Latitude and longitude are required"}), 400
+    if latitude is not None and longitude is not None:
+        session.latitude = float(latitude)
+        session.longitude = float(longitude)
+    elif location_description:
+        session.location_description = location_description
+    else:
+        return jsonify({"error": "Either coordinates or location description required"}), 400
 
-    session.latitude = float(latitude)
-    session.longitude = float(longitude)
     db.session.commit()
 
     return jsonify({
         "message": "Location saved successfully",
         "latitude": session.latitude,
         "longitude": session.longitude,
+        "location_description": session.location_description,
     }), 200
 
 
