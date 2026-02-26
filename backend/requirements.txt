@@ -7,3 +7,4 @@ flask-mail==0.10.0
 psycopg2-binary==2.9.10
 openai==1.82.0
 python-dotenv==1.1.0
+twilio==9.4.0
