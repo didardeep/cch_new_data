@@ -1304,17 +1304,15 @@ export default function ChatSupport() {
       case 'location-question':
         return (
           <div key={msg.id} style={{
-            background: '#ffffff',
-            border: '1px solid #d8e0ec',
-            borderLeft: '3px solid #005EB8',
+            background: 'rgba(0, 145, 218, 0.12)',
+            border: '1px solid rgba(0, 145, 218, 0.25)',
             borderRadius: '10px',
             padding: '20px 22px',
             margin: '6px 0',
             textAlign: 'center',
-            boxShadow: '0 1px 2px rgba(0, 20, 60, 0.04)',
           }}>
-            <div style={{ fontSize: '28px', color: '#00338D', marginBottom: '6px' }}>
-              <svg width="28" height="28" viewBox="0 0 24 24" fill="#00338D" stroke="none">
+            <div style={{ fontSize: '28px', color: '#0091DA', marginBottom: '6px' }}>
+              <svg width="28" height="28" viewBox="0 0 24 24" fill="#0091DA" stroke="none">
                 <path d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zm0 9.5c-1.38 0-2.5-1.12-2.5-2.5S10.62 6.5 12 6.5s2.5 1.12 2.5 2.5S13.38 11.5 12 11.5z"/>
               </svg>
             </div>
@@ -1329,7 +1327,7 @@ export default function ChatSupport() {
                 onClick={() => !isDisabled && msg.onYes && msg.onYes()}
                 disabled={isDisabled}
                 style={{
-                  background: isDisabled ? '#8596ab' : '#00875A',
+                  background: isDisabled ? '#8596ab' : '#0091DA',
                   color: '#fff',
                   border: 'none',
                   borderRadius: '8px',
@@ -1346,9 +1344,9 @@ export default function ChatSupport() {
                 onClick={() => !isDisabled && msg.onNo && msg.onNo()}
                 disabled={isDisabled}
                 style={{
-                  background: isDisabled ? '#8596ab' : '#005EB8',
-                  color: '#fff',
-                  border: 'none',
+                  background: isDisabled ? '#8596ab' : '#fff',
+                  color: isDisabled ? '#fff' : '#0091DA',
+                  border: '1px solid #0091DA',
                   borderRadius: '8px',
                   padding: '11px 26px',
                   fontSize: '13px',
@@ -1367,45 +1365,43 @@ export default function ChatSupport() {
       case 'location-prompt':
         return (
           <div key={msg.id} style={{
-            background: '#ffffff',
-            border: '1px solid #d8e0ec',
-            borderLeft: '3px solid #005EB8',
+            background: 'rgba(0, 145, 218, 0.12)',
+            border: 'none',
             borderRadius: '10px',
             padding: '20px 22px',
             margin: '6px 0',
             textAlign: 'center',
-            boxShadow: '0 1px 2px rgba(0, 20, 60, 0.04)',
+            boxShadow: '0 2px 8px rgba(0, 145, 218, 0.25)',
           }}>
-            <div style={{ fontSize: '28px', color: '#00338D', marginBottom: '6px' }}>
-              <svg width="28" height="28" viewBox="0 0 24 24" fill="#00338D" stroke="none">
+            <div style={{ fontSize: '28px', color: '#0091DA', marginBottom: '6px' }}>
+              <svg width="28" height="28" viewBox="0 0 24 24" fill="#0091DA" stroke="none">
                 <path d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zm0 9.5c-1.38 0-2.5-1.12-2.5-2.5S10.62 6.5 12 6.5s2.5 1.12 2.5 2.5S13.38 11.5 12 11.5z"/>
               </svg>
             </div>
-            <div style={{ fontWeight: '700', fontSize: '14px', color: '#00338D', marginBottom: '8px' }}>
+            <div style={{ fontWeight: '700', fontSize: '14px', color: '#0f1d33', marginBottom: '8px' }}>
               Location Access Required
             </div>
             <div style={{ fontSize: '13px', color: '#3d5068', marginBottom: '16px', lineHeight: '1.6' }}>
-              To diagnose your network issue and check signal coverage in your area,
-              we need your current location. This is <strong style={{ color: '#00338D' }}>required</strong> to continue.
+              To diagnose your issue and check coverage in your area,
+              we need your current location. This is <strong style={{ color: '#0f1d33' }}>required</strong> to continue.
             </div>
             <button
               onClick={() => !isDisabled && msg.onShare && msg.onShare()}
               disabled={isDisabled}
               style={{
-                background: isDisabled ? '#8596ab' : '#00338D',
+                background: isDisabled ? '#a0c4e8' : '#0091DA',
                 color: '#fff',
                 border: 'none',
                 borderRadius: '8px',
                 padding: '11px 26px',
                 fontSize: '13px',
-                fontWeight: '600',
+                fontWeight: '700',
                 fontFamily: 'inherit',
                 cursor: isDisabled ? 'not-allowed' : 'pointer',
                 display: 'flex',
                 alignItems: 'center',
                 gap: '8px',
                 margin: '0 auto',
-                boxShadow: '0 2px 6px rgba(0, 51, 141, 0.2)',
                 transition: 'all 0.18s ease',
               }}
             >
@@ -1500,15 +1496,14 @@ export default function ChatSupport() {
       case 'signal-codes':
         return (
           <div key={msg.id} style={{
-            background: '#ffffff',
-            border: '1px solid #d8e0ec',
-            borderLeft: '3px solid #005EB8',
+            background: 'rgba(0, 145, 218, 0.12)',
+            border: 'none',
             borderRadius: '10px',
             padding: '18px 20px',
             margin: '6px 0',
-            boxShadow: '0 1px 2px rgba(0, 20, 60, 0.04)',
+            boxShadow: '0 2px 8px rgba(0, 145, 218, 0.25)',
           }}>
-            <div style={{ fontWeight: 700, fontSize: '14px', color: '#00338D', marginBottom: '10px' }}>
+            <div style={{ fontWeight: 700, fontSize: '14px', color: '#0f1d33', marginBottom: '10px' }}>
               Signal Diagnosis
             </div>
             <div style={{ fontSize: '13px', color: '#3d5068', lineHeight: 1.6, marginBottom: '12px' }}>
@@ -1516,28 +1511,28 @@ export default function ChatSupport() {
             </div>
             <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', marginBottom: '12px' }}>
               {[
-                { code: '*#0011#', desc: 'Samsung Service Mode' },
-                { code: '*#*#4636#*#*', desc: 'Android Testing Menu' },
-                { code: '*#06#', desc: 'Device Info' },
+                { code: '*#0011#', desc: 'Samsung' },
+                { code: '*#*#4636#*#*', desc: 'Android' },
+                { code: '*#06#', desc: 'iPhone' },
               ].map((item, i) => (
                 <div key={i} style={{
-                  background: '#f7f9fc',
-                  border: '1px solid #e2e8f0',
+                  background: 'rgba(0, 145, 218, 0.1)',
+                  border: '1px solid rgba(0, 145, 218, 0.25)',
                   borderRadius: '8px',
                   padding: '9px 14px',
                   display: 'flex',
                   justifyContent: 'space-between',
                   alignItems: 'center',
                 }}>
-                  <code style={{ fontWeight: 700, color: '#00338D', fontSize: '14px' }}>{item.code}</code>
+                  <code style={{ fontWeight: 700, color: '#0f1d33', fontSize: '14px' }}>{item.code}</code>
                   <span style={{ fontSize: '11px', color: '#8596ab' }}>{item.desc}</span>
                 </div>
               ))}
             </div>
             <div style={{ fontSize: '12px', color: '#8596ab', lineHeight: 1.5 }}>
-              Look for <strong style={{ color: '#3d5068' }}>RSRP</strong>,{' '}
-              <strong style={{ color: '#3d5068' }}>SINR</strong>, and{' '}
-              <strong style={{ color: '#3d5068' }}>Cell ID</strong> on the screen, then upload the screenshot below.
+              Look for <strong style={{ color: '#0f1d33' }}>RSRP</strong>,{' '}
+              <strong style={{ color: '#0f1d33' }}>SINR</strong>, and{' '}
+              <strong style={{ color: '#0f1d33' }}>Cell ID</strong> on the screen, then upload the screenshot below.
             </div>
           </div>
         );
@@ -1545,14 +1540,13 @@ export default function ChatSupport() {
       case 'screenshot-upload':
         return (
           <div key={msg.id} style={{
-            background: '#ffffff',
-            border: '1px solid #d8e0ec',
-            borderLeft: '3px solid #005EB8',
+            background: 'rgba(0, 145, 218, 0.12)',
+            border: 'none',
             borderRadius: '10px',
             padding: '16px 20px',
             margin: '6px 0',
             textAlign: 'center',
-            boxShadow: '0 1px 2px rgba(0, 20, 60, 0.04)',
+            boxShadow: '0 2px 8px rgba(0, 145, 218, 0.25)',
           }}>
             <div style={{ fontSize: '13px', color: '#3d5068', marginBottom: '14px' }}>
               Upload your signal information screenshot:
@@ -1561,25 +1555,23 @@ export default function ChatSupport() {
               onClick={() => {
                 if (!isDisabled && !screenshotUploading) {
                   fileInputRef.current?.click();
-                  // Store groupId so the file input onChange can disable it
                   fileInputRef.current._groupId = msg.groupId;
                 }
               }}
               disabled={isDisabled || screenshotUploading}
               style={{
-                background: isDisabled ? '#8596ab' : '#00338D',
+                background: isDisabled ? '#a0c4e8' : '#0091DA',
                 color: '#fff',
                 border: 'none',
                 borderRadius: '8px',
                 padding: '11px 24px',
                 fontSize: '13px',
-                fontWeight: 600,
+                fontWeight: 700,
                 fontFamily: 'inherit',
                 cursor: isDisabled ? 'not-allowed' : 'pointer',
                 display: 'inline-flex',
                 alignItems: 'center',
                 gap: '8px',
-                boxShadow: '0 2px 6px rgba(0, 51, 141, 0.2)',
                 transition: 'all 0.18s ease',
               }}
             >
