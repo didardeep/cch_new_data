@@ -867,7 +867,7 @@ export default function ChatSupport() {
           setTimeout(() => {
             addMessage({
               type: 'bot',
-              html: 'Let me suggest a solution based on your signal diagnosis...',
+              html: 'Thank you for uploading your signal screenshot. I have analyzed your network parameters and identified the issue. Let me suggest a solution based on your signal diagnosis...',
             });
             fetchSolution(`My signal diagnosis shows: ${stateRef.current.diagnosisSummary}`);
           }, 800);
@@ -1513,7 +1513,7 @@ export default function ChatSupport() {
               {[
                 { code: '*#0011#', desc: 'Samsung' },
                 { code: '*#*#4636#*#*', desc: 'Android' },
-                { code: '*#06#', desc: 'iPhone' },
+                { code: '*3001#12345#*', desc: 'iPhone' },
               ].map((item, i) => (
                 <div key={i} style={{
                   background: 'rgba(0, 145, 218, 0.1)',
@@ -1641,6 +1641,45 @@ export default function ChatSupport() {
             <div style={{ fontSize: '13px', color: '#1a2b42', lineHeight: '1.6' }}>
               {d.summary}
             </div>
+            {d.nearest_sites && d.nearest_sites.length > 0 && (
+              <div style={{ marginTop: '14px', borderTop: '1px solid #d8e0ec', paddingTop: '14px' }}>
+                <div style={{ fontSize: '12px', fontWeight: 700, color: '#00338D', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: '10px' }}>
+                  Nearest Tower Sites
+                </div>
+                {d.nearest_sites.map((site, idx) => {
+                  const statusColor = site.status === 'ON AIR' ? '#00875a' : '#c42b1c';
+                  return (
+                    <div key={idx} style={{
+                      background: '#fff',
+                      border: '1px solid #d8e0ec',
+                      borderRadius: '8px',
+                      padding: '12px 14px',
+                      marginBottom: idx < d.nearest_sites.length - 1 ? '8px' : 0,
+                    }}>
+                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '6px' }}>
+                        <span style={{ fontWeight: 700, fontSize: '13px', color: '#0f1d33' }}>{site.site_id}</span>
+                        <span style={{
+                          fontSize: '11px', fontWeight: 700, color: statusColor,
+                          background: site.status === 'ON AIR' ? 'rgba(0,135,90,0.08)' : 'rgba(196,43,28,0.08)',
+                          padding: '2px 10px', borderRadius: '6px',
+                        }}>{site.status}</span>
+                      </div>
+                      <div style={{ fontSize: '12px', color: '#3d5068', lineHeight: '1.5' }}>
+                        <span style={{ color: '#8596ab' }}>Distance:</span> {site.distance_km} km
+                        {site.alarm && site.alarm !== 'None' && (
+                          <span style={{ marginLeft: '12px' }}><span style={{ color: '#8596ab' }}>Alarm:</span> {site.alarm}</span>
+                        )}
+                      </div>
+                      {site.solution && site.solution !== 'No action required' && (
+                        <div style={{ fontSize: '12px', color: '#00338D', marginTop: '4px', fontWeight: 600 }}>
+                          Action: {site.solution}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </div>
         );
       }

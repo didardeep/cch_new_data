@@ -58,11 +58,87 @@ mail = Mail(app)
 
 # ─── Azure OpenAI Configuration ──────────────────────────────────────────────
 client = AzureOpenAI(
-    api_key = "",
-    api_version = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-02-15-preview"),
-    azure_endpoint = "https://entgptaiuat.openai.azure.com"
+    api_key = os.environ.get("AZURE_OPENAI_API_KEY"),
+    api_version = os.environ.get("AZURE_OPENAI_API_VERSION"),
+    azure_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
 )
 DEPLOYMENT_NAME = os.environ.get("AZURE_DEPLOYMENT_NAME", "gpt-4o-mini")
+
+
+
+# ─── Nearest-Tower Lookup (loaded once at startup) ────────────────────────────
+_SITE_DATA = []
+
+def _load_site_data():
+    """Load telecom site data from Excel into memory once."""
+    global _SITE_DATA
+    excel_path = os.path.join(os.path.dirname(__file__), "Gurgaon_4G_1500_Sites.csv.xlsx")
+    if not os.path.exists(excel_path):
+        print(f"[WARN] Site Excel not found at {excel_path} - tower lookup disabled")
+        return
+    try:
+        import openpyxl
+        wb = openpyxl.load_workbook(excel_path, read_only=True)
+        ws = wb[wb.sheetnames[0]]
+        for i, row in enumerate(ws.iter_rows(values_only=True)):
+            if i == 0:
+                continue  # skip header
+            site_name = row[0] or ""
+            zone = row[1] or ""
+            lon = row[2]
+            lat = row[3]
+            status = row[4] or "Unknown"
+            alarm = row[5] or ""
+            solution = row[6] or ""
+            if lat is not None and lon is not None:
+                _SITE_DATA.append({
+                    "site_id": str(site_name),
+                    "zone": str(zone),
+                    "latitude": float(lat),
+                    "longitude": float(lon),
+                    "status": str(status),
+                    "alarm": str(alarm),
+                    "solution": str(solution),
+                })
+        wb.close()
+        print(f"[INFO] Loaded {len(_SITE_DATA)} telecom sites for tower lookup")
+    except Exception as e:
+        print(f"[WARN] Failed to load site data: {e}")
+
+_load_site_data()
+
+
+def _haversine(lat1, lon1, lat2, lon2):
+    """Calculate distance in km between two lat/lon points."""
+    R = 6371.0
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = (math.sin(dlat / 2) ** 2 +
+         math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) *
+         math.sin(dlon / 2) ** 2)
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def find_nearest_sites(lat, lon, n=3):
+    """Return the n nearest telecom sites to the given coordinates."""
+    if not _SITE_DATA or lat is None or lon is None:
+        return []
+    scored = []
+    for site in _SITE_DATA:
+        dist = _haversine(lat, lon, site["latitude"], site["longitude"])
+        scored.append((dist, site))
+    scored.sort(key=lambda x: x[0])
+    results = []
+    for dist, site in scored[:n]:
+        results.append({
+            "site_id": site["site_id"],
+            "zone": site["zone"],
+            "status": site["status"],
+            "alarm": site["alarm"] if site["alarm"] else "None",
+            "solution": site["solution"] if site["solution"] else "No action required",
+            "distance_km": round(dist, 2),
+        })
+    return results
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -350,9 +426,10 @@ def generate_resolution(query, sector_name, subprocess_name, language):
                     f"under the sector: '{sector_name}' and subprocess: '{subprocess_name}'.\n\n"
                     "Provide a helpful response in the following format:\n"
                     "1. Acknowledge the issue empathetically\n"
-                    "2. Provide 4-6 clear, actionable self-help troubleshooting steps\n"
-                    "3. If the steps don't resolve the issue, advise contacting customer care\n"
-                    "4. Provide a brief note about escalation options\n\n"
+                    "2. Provide 4-6 clear, actionable self-help troubleshooting steps\n\n"
+                    "STRICT RULE: Do NOT suggest the user to 'contact customer support', 'call customer care', "
+                    "'raise a ticket', 'reach out to support', or any form of escalation. "
+                    "Only provide self-help troubleshooting steps that the user can do on their own.\n\n"
                     f"IMPORTANT: Respond entirely in {language}. "
                     "Keep the tone professional, empathetic, and helpful."
                 )},
@@ -404,6 +481,9 @@ def generate_single_solution(sector_name, subprocess_name, language, user_query=
                     "Provide ONE focused, actionable solution with its step, how to take that action, keep in mind that steps would be how to perform that action. "
                     "Be concise and specific. Do not provide multiple alternative solutions — just one.\n"
                     "Do NOT include any URLs, links, or website references in your response.\n"
+                    "STRICT RULE: Do NOT suggest the user to 'contact customer support', 'call customer care', "
+                    "'raise a ticket', 'reach out to support', 'visit a service center', or any form of escalation. "
+                    "Only provide self-help troubleshooting steps that the user can do on their own.\n"
                     "Acknowledge the issue briefly and give the steps."
                     + query_block
                     + original_context
@@ -920,6 +1000,14 @@ def analyze_signal(session_id):
     try:
         result = analyze_signal_screenshot(image_base64)
 
+        # If signal is red (Poor), find the 3 nearest tower sites
+        if result.get("overall_status") == "red":
+            lat = session.latitude
+            lon = session.longitude
+            nearest = find_nearest_sites(lat, lon, n=3)
+            if nearest:
+                result["nearest_sites"] = nearest
+
         # Save diagnosis as a bot message for chat history
         diagnosis_text = (
             f"Signal Diagnosis Results: "
@@ -927,6 +1015,14 @@ def analyze_signal(session_id):
             f"SINR: {result.get('sinr', 'N/A')} dB ({result.get('sinr_label', 'Unknown')}), "
             f"Cell ID: {result.get('cell_id', 'N/A')}"
         )
+        if result.get("nearest_sites"):
+            diagnosis_text += "\n\nNearest Sites:\n"
+            for s in result["nearest_sites"]:
+                diagnosis_text += (
+                    f"- {s['site_id']} | Status: {s['status']} | "
+                    f"Alarm: {s['alarm']} | Distance: {s['distance_km']} km\n"
+                )
+
         msg = ChatMessage(session_id=session_id, sender="bot", content=diagnosis_text)
         db.session.add(msg)
         db.session.commit()
