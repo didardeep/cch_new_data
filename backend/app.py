@@ -952,24 +952,32 @@ def save_session_location(session_id):
     if session.user_id != user_id:
         return jsonify({"error": "Unauthorized"}), 403
 
-    data = request.json
-    latitude = data.get("latitude")
-    longitude = data.get("longitude")
-    location_description = data.get("location_description")
+    # ── Default coordinates (Gurgaon, Haryana) ────────────────────────────────
+    DEFAULT_LATITUDE  = 28.4595
+    DEFAULT_LONGITUDE = 77.0266
 
-    if latitude is not None and longitude is not None:
-        session.latitude = float(latitude)
-        session.longitude = float(longitude)
-    elif location_description:
-        session.location_description = location_description
-    else:
-        return jsonify({"error": "Either coordinates or location description required"}), 400
+    # data = request.json
+    # latitude = data.get("latitude")
+    # longitude = data.get("longitude")
+    # location_description = data.get("location_description")
+
+    # if latitude is not None and longitude is not None:
+    #     session.latitude = float(latitude)
+    #     session.longitude = float(longitude)
+    # elif location_description:
+    #     session.location_description = location_description
+    # else:
+    #     return jsonify({"error": "Either coordinates or location description required"}), 400
+
+    # Always use default lat/long regardless of what the client sends
+    session.latitude  = DEFAULT_LATITUDE
+    session.longitude = DEFAULT_LONGITUDE
 
     db.session.commit()
 
     return jsonify({
         "message": "Location saved successfully",
-        "latitude": session.latitude,
+        "latitude":  session.latitude,
         "longitude": session.longitude,
         "location_description": session.location_description,
     }), 200
