@@ -68,11 +68,87 @@ mail = Mail(app)
 
 # ─── Azure OpenAI Configuration ──────────────────────────────────────────────
 client = AzureOpenAI(
-    api_key = os.environ.get("AZURE_OPENAI_API_KEY", ""),
-    api_version = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-02-15-preview"),
-    azure_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT", "https://entgptaiuat.openai.azure.com")
+    api_key = os.environ.get("AZURE_OPENAI_API_KEY"),
+    api_version = os.environ.get("AZURE_OPENAI_API_VERSION"),
+    azure_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
 )
 DEPLOYMENT_NAME = os.environ.get("AZURE_DEPLOYMENT_NAME", "gpt-4o-mini")
+
+
+
+# ─── Nearest-Tower Lookup (loaded once at startup) ────────────────────────────
+_SITE_DATA = []
+
+def _load_site_data():
+    """Load telecom site data from Excel into memory once."""
+    global _SITE_DATA
+    excel_path = os.path.join(os.path.dirname(__file__), "Gurgaon_4G_1500_Sites.csv.xlsx")
+    if not os.path.exists(excel_path):
+        print(f"[WARN] Site Excel not found at {excel_path} - tower lookup disabled")
+        return
+    try:
+        import openpyxl
+        wb = openpyxl.load_workbook(excel_path, read_only=True)
+        ws = wb[wb.sheetnames[0]]
+        for i, row in enumerate(ws.iter_rows(values_only=True)):
+            if i == 0:
+                continue  # skip header
+            site_name = row[0] or ""
+            zone = row[1] or ""
+            lon = row[2]
+            lat = row[3]
+            status = row[4] or "Unknown"
+            alarm = row[5] or ""
+            solution = row[6] or ""
+            if lat is not None and lon is not None:
+                _SITE_DATA.append({
+                    "site_id": str(site_name),
+                    "zone": str(zone),
+                    "latitude": float(lat),
+                    "longitude": float(lon),
+                    "status": str(status),
+                    "alarm": str(alarm),
+                    "solution": str(solution),
+                })
+        wb.close()
+        print(f"[INFO] Loaded {len(_SITE_DATA)} telecom sites for tower lookup")
+    except Exception as e:
+        print(f"[WARN] Failed to load site data: {e}")
+
+_load_site_data()
+
+
+def _haversine(lat1, lon1, lat2, lon2):
+    """Calculate distance in km between two lat/lon points."""
+    R = 6371.0
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = (math.sin(dlat / 2) ** 2 +
+         math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) *
+         math.sin(dlon / 2) ** 2)
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def find_nearest_sites(lat, lon, n=3):
+    """Return the n nearest telecom sites to the given coordinates."""
+    if not _SITE_DATA or lat is None or lon is None:
+        return []
+    scored = []
+    for site in _SITE_DATA:
+        dist = _haversine(lat, lon, site["latitude"], site["longitude"])
+        scored.append((dist, site))
+    scored.sort(key=lambda x: x[0])
+    results = []
+    for dist, site in scored[:n]:
+        results.append({
+            "site_id": site["site_id"],
+            "zone": site["zone"],
+            "status": site["status"],
+            "alarm": site["alarm"] if site["alarm"] else "None",
+            "solution": site["solution"] if site["solution"] else "No action required",
+            "distance_km": round(dist, 2),
+        })
+    return results
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -292,6 +368,38 @@ def detect_greeting(text: str) -> bool:
         return True   # fail-open: treat ambiguous input as a greeting
 
 
+def classify_user_response(text: str) -> dict:
+    """Classify user's response after a solution: is satisfied, mentions signal/network issues, or needs more help."""
+    try:
+        response = client.chat.completions.create(
+            model=DEPLOYMENT_NAME,
+            messages=[
+                {"role": "system", "content": (
+                    "You are classifying a customer's response in a telecom support chat. "
+                    "The customer was just given a solution and asked 'Did this help?'\n\n"
+                    "Determine:\n"
+                    "1. is_satisfied: Is the user saying the issue is resolved / they are happy / it worked / thank you / yes it helped? (true/false)\n"
+                    "2. mentions_signal: Does the user's message semantically relate to network signal, coverage, "
+                    "poor reception, no signal, weak signal, call drops, slow internet speed, network not available, "
+                    "data not working, or similar signal/network connectivity issues? (true/false)\n\n"
+                    'Respond with ONLY valid JSON: {"is_satisfied": true/false, "mentions_signal": true/false}'
+                )},
+                {"role": "user", "content": text},
+            ],
+            temperature=0,
+            max_tokens=30,
+        )
+        raw = response.choices[0].message.content.strip()
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+            raw = raw.strip()
+        return json.loads(raw)
+    except Exception:
+        return {"is_satisfied": False, "mentions_signal": False}
+
+
 def detect_language(text: str) -> str:
     try:
         response = client.chat.completions.create(
@@ -326,11 +434,15 @@ def generate_resolution(query, sector_name, subprocess_name, language):
                 {"role": "system", "content": (
                     f"You are an expert telecom customer support agent. The user has a complaint "
                     f"under the sector: '{sector_name}' and subprocess: '{subprocess_name}'.\n\n"
+                    "IMPORTANT: Base your response on BOTH the selected dropdown context "
+                    "(sector/subprocess) and the user's query. "
+                    "If they conflict, prioritize the user's query while staying within telecom scope.\n\n"
                     "Provide a helpful response in the following format:\n"
                     "1. Acknowledge the issue empathetically\n"
-                    "2. Provide 4-6 clear, actionable self-help troubleshooting steps\n"
-                    "3. If the steps don't resolve the issue, advise contacting customer care\n"
-                    "4. Provide a brief note about escalation options\n\n"
+                    "2. Provide 4-6 clear, actionable self-help troubleshooting steps\n\n"
+                    "STRICT RULE: Do NOT suggest the user to 'contact customer support', 'call customer care', "
+                    "'raise a ticket', 'reach out to support', or any form of escalation. "
+                    "Only provide self-help troubleshooting steps that the user can do on their own.\n\n"
                     f"IMPORTANT: Respond entirely in {language}. "
                     "Keep the tone professional, empathetic, and helpful."
                 )},
@@ -344,19 +456,32 @@ def generate_resolution(query, sector_name, subprocess_name, language):
         return f"I apologize, but I encountered an error. Please try again. Error: {str(e)}"
 
 
-def generate_single_solution(sector_name, subprocess_name, language, user_query="", previous_solutions=None, attempt=1):
+def generate_single_solution(sector_name, subprocess_name, language, user_query="", previous_solutions=None, attempt=1, original_query="", diagnosis_summary=""):
     """Generate a single focused solution. If user_query is provided, tailor to it. Avoids repeating previous solutions."""
     prev_block = ""
     if previous_solutions:
         prev_block = (
             "\n\nIMPORTANT: The following solutions have ALREADY been provided and did NOT work. "
             "Do NOT repeat them. Provide a DIFFERENT approach:\n"
-            + "\n---\n".join(previous_solutions)
+            + "\n---\n".join(previous_solutions[-10:])
         )
 
     query_block = ""
     if user_query:
         query_block = f"\n\nThe user described their specific issue as: \"{user_query}\""
+
+    original_context = ""
+    if original_query and original_query != user_query:
+        original_context = f"\n\nOriginal issue description: \"{original_query}\"\nThe user's follow-up message is: \"{user_query}\""
+
+    diagnosis_block = ""
+    if diagnosis_summary:
+        diagnosis_block = (
+            f"\n\nSIGNAL DIAGNOSIS RESULTS: {diagnosis_summary}\n"
+            "Use this diagnosis data to tailor your solution. If signal is poor/weak, suggest "
+            "signal-related fixes (relocate, check antenna, network mode). If signal is good, "
+            "focus on other causes (device settings, account issues, congestion)."
+        )
 
     try:
         response = client.chat.completions.create(
@@ -365,11 +490,20 @@ def generate_single_solution(sector_name, subprocess_name, language, user_query=
                 {"role": "system", "content": (
                     f"You are an expert telecom customer support agent. The user has an issue "
                     f"under the sector: '{sector_name}' and subprocess: '{subprocess_name}'.\n\n"
-                    f"This is solution attempt #{attempt} of 5.\n\n"
-                    "Provide ONE focused, actionable solution with 2-3 clear steps. "
+                    f"This is solution attempt #{attempt}.\n\n"
+                    "IMPORTANT: Base this solution on BOTH the selected dropdown context "
+                    "(sector/subprocess) and the user's latest query. "
+                    "If they conflict, prioritize the latest query while staying within telecom scope.\n\n"
+                    "Provide ONE focused, actionable solution with its step, how to take that action, keep in mind that steps would be how to perform that action. "
                     "Be concise and specific. Do not provide multiple alternative solutions — just one.\n"
+                    "Do NOT include any URLs, links, or website references in your response.\n"
+                    "STRICT RULE: Do NOT suggest the user to 'contact customer support', 'call customer care', "
+                    "'raise a ticket', 'reach out to support', 'visit a service center', or any form of escalation. "
+                    "Only provide self-help troubleshooting steps that the user can do on their own.\n"
                     "Acknowledge the issue briefly and give the steps."
                     + query_block
+                    + original_context
+                    + diagnosis_block
                     + prev_block +
                     f"\n\nIMPORTANT: Respond entirely in {language}. "
                     "Keep the tone professional, empathetic, and helpful."
@@ -505,6 +639,43 @@ def analyze_signal_screenshot(image_base64):
     else:
         sinr_status, sinr_label = "unknown", "Not detected"
 
+    # Determine busy hours (9-11 AM or 6-9 PM local time)
+    from datetime import datetime as dt
+    now = dt.now()
+    current_hour = now.hour
+    is_busy_hour = (9 <= current_hour < 11) or (18 <= current_hour < 21)
+
+    # Overall signal judgment
+    statuses = [s for s in [rsrp_status, sinr_status] if s != "unknown"]
+    if not statuses:
+        overall = "unknown"
+        overall_label = "Unable to determine signal quality"
+    elif any(s == "red" for s in statuses):
+        overall = "red"
+        overall_label = "Poor"
+    elif any(s == "amber" for s in statuses):
+        overall = "amber"
+        overall_label = "Moderate"
+    else:
+        overall = "green"
+        overall_label = "Good"
+
+    # Build summary message
+    if overall == "green":
+        summary = "Your signal strength is good. You should have stable connectivity in your area."
+    elif overall == "amber":
+        summary = "Your signal strength is moderate. You may experience occasional slowdowns or drops."
+    elif overall == "red":
+        summary = "Your signal strength is poor. This is likely causing the connectivity issues you're experiencing."
+    else:
+        summary = "We could not fully determine your signal quality from the screenshot."
+
+    if is_busy_hour:
+        summary += (
+            f" Note: You are currently in peak network hours ({now.strftime('%I:%M %p')}). "
+            "Network congestion during 9-11 AM and 6-9 PM can further degrade signal quality and speeds."
+        )
+
     return {
         "rsrp": rsrp,
         "rsrp_status": rsrp_status,
@@ -513,6 +684,10 @@ def analyze_signal_screenshot(image_base64):
         "sinr_status": sinr_status,
         "sinr_label": sinr_label,
         "cell_id": str(cell_id) if cell_id is not None else None,
+        "overall_status": overall,
+        "overall_label": overall_label,
+        "is_busy_hour": is_busy_hour,
+        "summary": summary,
     }
 
 
@@ -643,12 +818,13 @@ def resolve_complaint():
     query = data.get("query", "").strip()
     sector_key = data.get("sector_key")
     subprocess_key = data.get("subprocess_key")
+    selected_subprocess = data.get("selected_subprocess", "").strip()
     language = data.get("language", "English")
     if not query:
         return jsonify({"error": "Please enter your complaint/query."}), 400
     sector = TELECOM_MENU.get(sector_key, {})
     sector_name = sector.get("name", "Telecom")
-    subprocess_name = get_subprocess_name(sector_key, subprocess_key)
+    subprocess_name = selected_subprocess or get_subprocess_name(sector_key, subprocess_key)
     if not is_telecom_related(query, sector_name=sector_name, subprocess_name=subprocess_name):
         msg = (
             "I'm sorry, but I can only assist with **telecom-related** complaints. "
@@ -672,14 +848,17 @@ def resolve_step():
     data = request.json
     sector_key = data.get("sector_key")
     subprocess_key = data.get("subprocess_key")
+    selected_subprocess = data.get("selected_subprocess", "").strip()
     user_query = data.get("query", "").strip()
     language = data.get("language", "English")
     previous_solutions = data.get("previous_solutions", [])
     attempt = data.get("attempt", 1)
+    original_query = data.get("original_query", "")
+    diagnosis_summary = data.get("diagnosis_summary", "")
 
     sector = TELECOM_MENU.get(sector_key, {})
     sector_name = sector.get("name", "Telecom")
-    subprocess_name = get_subprocess_name(sector_key, subprocess_key)
+    subprocess_name = selected_subprocess or get_subprocess_name(sector_key, subprocess_key)
 
     # If user provided a query, check if it's telecom-related
     if user_query:
@@ -696,6 +875,8 @@ def resolve_step():
         user_query=user_query,
         previous_solutions=previous_solutions,
         attempt=attempt,
+        original_query=original_query,
+        diagnosis_summary=diagnosis_summary,
     )
     return jsonify({
         "resolution": solution,
@@ -718,6 +899,15 @@ def detect_greeting_route():
     text = data.get("text", "")
     is_greeting = detect_greeting(text)
     return jsonify({"is_greeting": is_greeting})
+
+
+@app.route("/api/classify-response", methods=["POST"])
+def classify_response_route():
+    """Classify user response: satisfied? mentions signal/network?"""
+    data = request.json
+    text = data.get("text", "")
+    result = classify_user_response(text)
+    return jsonify(result)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -783,21 +973,34 @@ def save_session_location(session_id):
     if session.user_id != user_id:
         return jsonify({"error": "Unauthorized"}), 403
 
-    data = request.json
-    latitude = data.get("latitude")
-    longitude = data.get("longitude")
+    # ── Default coordinates (Gurgaon, Haryana) ────────────────────────────────
+    DEFAULT_LATITUDE  = 28.4595
+    DEFAULT_LONGITUDE = 77.0266
 
-    if latitude is None or longitude is None:
-        return jsonify({"error": "Latitude and longitude are required"}), 400
+    # data = request.json
+    # latitude = data.get("latitude")
+    # longitude = data.get("longitude")
+    # location_description = data.get("location_description")
 
-    session.latitude = float(latitude)
-    session.longitude = float(longitude)
+    # if latitude is not None and longitude is not None:
+    #     session.latitude = float(latitude)
+    #     session.longitude = float(longitude)
+    # elif location_description:
+    #     session.location_description = location_description
+    # else:
+    #     return jsonify({"error": "Either coordinates or location description required"}), 400
+
+    # Always use default lat/long regardless of what the client sends
+    session.latitude  = DEFAULT_LATITUDE
+    session.longitude = DEFAULT_LONGITUDE
+
     db.session.commit()
 
     return jsonify({
         "message": "Location saved successfully",
-        "latitude": session.latitude,
+        "latitude":  session.latitude,
         "longitude": session.longitude,
+        "location_description": session.location_description,
     }), 200
 
 
@@ -827,6 +1030,14 @@ def analyze_signal(session_id):
     try:
         result = analyze_signal_screenshot(image_base64)
 
+        # If signal is red (Poor), find the 3 nearest tower sites
+        if result.get("overall_status") == "red":
+            lat = session.latitude
+            lon = session.longitude
+            nearest = find_nearest_sites(lat, lon, n=3)
+            if nearest:
+                result["nearest_sites"] = nearest
+
         # Save diagnosis as a bot message for chat history
         diagnosis_text = (
             f"Signal Diagnosis Results: "
@@ -834,6 +1045,14 @@ def analyze_signal(session_id):
             f"SINR: {result.get('sinr', 'N/A')} dB ({result.get('sinr_label', 'Unknown')}), "
             f"Cell ID: {result.get('cell_id', 'N/A')}"
         )
+        if result.get("nearest_sites"):
+            diagnosis_text += "\n\nNearest Sites:\n"
+            for s in result["nearest_sites"]:
+                diagnosis_text += (
+                    f"- {s['site_id']} | Status: {s['status']} | "
+                    f"Alarm: {s['alarm']} | Distance: {s['distance_km']} km\n"
+                )
+
         msg = ChatMessage(session_id=session_id, sender="bot", content=diagnosis_text)
         db.session.add(msg)
         db.session.commit()
@@ -878,6 +1097,61 @@ def resolve_session(session_id):
         print(f"⚠️  WhatsApp error: {e}")
 
     return jsonify({"session": session.to_dict(), "summary": session.summary})
+
+
+def send_ticket_assignment_email(agent, ticket, session):
+    """Send a styled HTML email to the assigned agent with ticket details."""
+    if not agent or not agent.email:
+        return
+
+    sla_deadline_str = ticket.sla_deadline.strftime('%B %d, %Y at %I:%M %p UTC') if ticket.sla_deadline else 'N/A'
+    description_preview = (ticket.description[:300] + '...') if ticket.description and len(ticket.description) > 300 else (ticket.description or 'N/A')
+
+    html_body = f"""
+    <div style="font-family:'Segoe UI',Arial,sans-serif;max-width:600px;margin:0 auto;background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 4px 20px rgba(0,0,0,0.08);">
+        <div style="background:linear-gradient(135deg,#00338d 0%,#004fc4 100%);padding:24px 30px;text-align:center;">
+            <h1 style="color:#fff;margin:0;font-size:20px;font-weight:600;">New Ticket Assigned</h1>
+            <p style="color:rgba(255,255,255,0.8);margin:4px 0 0;font-size:13px;">A support ticket has been assigned to you</p>
+        </div>
+        <div style="padding:28px 30px;">
+            <p style="margin:0 0 20px;font-size:15px;color:#1e293b;">Hello <strong>{agent.name}</strong>,</p>
+            <p style="margin:0 0 20px;font-size:14px;color:#475569;line-height:1.6;">
+                A new customer support ticket has been assigned to you. Please review the details below:
+            </p>
+            <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:20px;margin-bottom:20px;">
+                <table style="width:100%;border-collapse:collapse;font-size:14px;">
+                    <tr><td style="padding:8px 0;color:#94a3b8;width:140px;">Reference</td><td style="padding:8px 0;color:#1e293b;font-weight:600;">{ticket.reference_number}</td></tr>
+                    <tr><td style="padding:8px 0;color:#94a3b8;">Category</td><td style="padding:8px 0;color:#1e293b;">{ticket.category or 'N/A'}</td></tr>
+                    <tr><td style="padding:8px 0;color:#94a3b8;">Issue Type</td><td style="padding:8px 0;color:#1e293b;">{ticket.subcategory or 'N/A'}</td></tr>
+                    <tr><td style="padding:8px 0;color:#94a3b8;">Priority</td><td style="padding:8px 0;color:#1e293b;font-weight:700;">{ticket.priority.upper() if ticket.priority else 'N/A'}</td></tr>
+                    <tr><td style="padding:8px 0;color:#94a3b8;">SLA Hours</td><td style="padding:8px 0;color:#1e293b;">{ticket.sla_hours or 'N/A'} hours</td></tr>
+                    <tr><td style="padding:8px 0;color:#94a3b8;">SLA Deadline</td><td style="padding:8px 0;color:#dc2626;font-weight:600;">{sla_deadline_str}</td></tr>
+                </table>
+            </div>
+            <div style="border-left:3px solid #2563eb;background:#eff6ff;border-radius:0 10px 10px 0;padding:16px 20px;margin-bottom:20px;">
+                <h3 style="color:#1e40af;font-size:13px;text-transform:uppercase;letter-spacing:0.08em;margin:0 0 10px;">Customer Description</h3>
+                <p style="color:#1e293b;font-size:14px;line-height:1.7;margin:0;">{description_preview}</p>
+            </div>
+            <div style="background:#eff6ff;border:1px solid #93c5fd;border-radius:8px;padding:14px 18px;">
+                <p style="margin:0;color:#1e40af;font-size:14px;font-weight:600;">Please review this ticket and begin working on it at your earliest convenience.</p>
+            </div>
+        </div>
+        <div style="background:#f8fafc;border-top:1px solid #e2e8f0;padding:14px 30px;text-align:center;">
+            <p style="color:#94a3b8;font-size:12px;margin:0;">Customer Handling &mdash; Automated Ticket Assignment</p>
+        </div>
+    </div>
+    """
+
+    try:
+        msg = Message(
+            subject=f"New Ticket Assigned - {ticket.reference_number}",
+            recipients=[agent.email],
+            html=html_body,
+        )
+        mail.send(msg)
+        print(f"Assignment email sent to agent {agent.name} at {agent.email}")
+    except Exception as e:
+        print(f"Agent assignment email failed: {e}")
 
 
 @app.route("/api/chat/session/<int:session_id>/escalate", methods=["PUT"])
@@ -954,10 +1228,15 @@ def escalate_session(session_id):
     except Exception as e:
         print(f"⚠️  WhatsApp error: {e}")
 
+    # Send email notification to assigned agent
+    if assigned_agent:
+        send_ticket_assignment_email(assigned_agent, ticket, session)
+
     agent_info = None
     if assigned_agent:
         agent_info = {
             "name": assigned_agent.name,
+            "email": assigned_agent.email,
             "phone": assigned_agent.phone_number,
             "employee_id": assigned_agent.employee_id,
         }
@@ -1110,10 +1389,12 @@ def send_summary_email(session_id):
 @app.route("/api/chat/session/<int:session_id>", methods=["GET"])
 @jwt_required()
 def get_chat_session(session_id):
-    # FIX: Legacy query.get replaced
-    session = db.session.get(ChatSession, session_id)
+    user_id = int(get_jwt_identity())
+    session = ChatSession.query.get(session_id)
     if not session:
         return jsonify({"error": "Session not found"}), 404
+    if session.user_id != user_id:
+        return jsonify({"error": "Unauthorized"}), 403
     return jsonify({
         "session": session.to_dict(),
         "messages": [m.to_dict() for m in session.messages],
