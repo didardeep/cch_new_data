@@ -105,9 +105,9 @@ export default function CustomerDashboard() {
               <tbody>
                 {sessions.map(s => (
                   <tr key={s.id}
-                    style={s.status === 'active' ? { cursor: 'pointer', background: '#eff6ff' } : {}}
-                    onClick={() => s.status === 'active' && navigate(`/customer/chat?resume=${s.id}`)}
-                    title={s.status === 'active' ? 'Click to resume this chat' : ''}
+                    style={{ cursor: 'pointer' }}
+                    onClick={() => navigate(`/customer/chat?resume=${s.id}`)}
+                    title="Click to open this chat"
                   >
                     <td>#{s.id}</td>
                     <td>{s.sector_name || '—'}</td>
@@ -116,7 +116,9 @@ export default function CustomerDashboard() {
                     </td>
                     <td>
                       <span className={`badge badge-${s.status}`}>{s.status}</span>
-                      {s.status === 'active' && <span style={{ fontSize: 11, color: '#3b82f6', marginLeft: 6 }}>Resume</span>}
+                      <span style={{ fontSize: 11, color: '#3b82f6', marginLeft: 6 }}>
+                        {s.status === 'active' ? 'Resume' : 'Open'}
+                      </span>
                     </td>
                     <td style={{ fontSize: 12, color: '#94a3b8' }}>
                       {s.created_at ? new Date(s.created_at).toLocaleDateString() : '—'}
