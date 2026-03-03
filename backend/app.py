@@ -424,6 +424,9 @@ def generate_resolution(query, sector_name, subprocess_name, language):
                 {"role": "system", "content": (
                     f"You are an expert telecom customer support agent. The user has a complaint "
                     f"under the sector: '{sector_name}' and subprocess: '{subprocess_name}'.\n\n"
+                    "IMPORTANT: Base your response on BOTH the selected dropdown context "
+                    "(sector/subprocess) and the user's query. "
+                    "If they conflict, prioritize the user's query while staying within telecom scope.\n\n"
                     "Provide a helpful response in the following format:\n"
                     "1. Acknowledge the issue empathetically\n"
                     "2. Provide 4-6 clear, actionable self-help troubleshooting steps\n\n"
@@ -478,6 +481,9 @@ def generate_single_solution(sector_name, subprocess_name, language, user_query=
                     f"You are an expert telecom customer support agent. The user has an issue "
                     f"under the sector: '{sector_name}' and subprocess: '{subprocess_name}'.\n\n"
                     f"This is solution attempt #{attempt}.\n\n"
+                    "IMPORTANT: Base this solution on BOTH the selected dropdown context "
+                    "(sector/subprocess) and the user's latest query. "
+                    "If they conflict, prioritize the latest query while staying within telecom scope.\n\n"
                     "Provide ONE focused, actionable solution with its step, how to take that action, keep in mind that steps would be how to perform that action. "
                     "Be concise and specific. Do not provide multiple alternative solutions — just one.\n"
                     "Do NOT include any URLs, links, or website references in your response.\n"
@@ -801,12 +807,13 @@ def resolve_complaint():
     query = data.get("query", "").strip()
     sector_key = data.get("sector_key")
     subprocess_key = data.get("subprocess_key")
+    selected_subprocess = data.get("selected_subprocess", "").strip()
     language = data.get("language", "English")
     if not query:
         return jsonify({"error": "Please enter your complaint/query."}), 400
     sector = TELECOM_MENU.get(sector_key, {})
     sector_name = sector.get("name", "Telecom")
-    subprocess_name = get_subprocess_name(sector_key, subprocess_key)
+    subprocess_name = selected_subprocess or get_subprocess_name(sector_key, subprocess_key)
     if not is_telecom_related(query, sector_name=sector_name, subprocess_name=subprocess_name):
         msg = (
             "I'm sorry, but I can only assist with **telecom-related** complaints. "
@@ -830,6 +837,7 @@ def resolve_step():
     data = request.json
     sector_key = data.get("sector_key")
     subprocess_key = data.get("subprocess_key")
+    selected_subprocess = data.get("selected_subprocess", "").strip()
     user_query = data.get("query", "").strip()
     language = data.get("language", "English")
     previous_solutions = data.get("previous_solutions", [])
@@ -839,7 +847,7 @@ def resolve_step():
 
     sector = TELECOM_MENU.get(sector_key, {})
     sector_name = sector.get("name", "Telecom")
-    subprocess_name = get_subprocess_name(sector_key, subprocess_key)
+    subprocess_name = selected_subprocess or get_subprocess_name(sector_key, subprocess_key)
 
     # If user provided a query, check if it's telecom-related
     if user_query:
@@ -1370,9 +1378,12 @@ def send_summary_email(session_id):
 @app.route("/api/chat/session/<int:session_id>", methods=["GET"])
 @jwt_required()
 def get_chat_session(session_id):
+    user_id = int(get_jwt_identity())
     session = ChatSession.query.get(session_id)
     if not session:
         return jsonify({"error": "Session not found"}), 404
+    if session.user_id != user_id:
+        return jsonify({"error": "Unauthorized"}), 403
     return jsonify({
         "session": session.to_dict(),
         "messages": [m.to_dict() for m in session.messages],

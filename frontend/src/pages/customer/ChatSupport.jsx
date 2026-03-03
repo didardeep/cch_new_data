@@ -43,6 +43,21 @@ function limitSubprocesses(subprocesses) {
   return Object.fromEntries([...major.slice(0, 5), ...others]);
 }
 
+const SUBPROCESS_FOLLOWUP_OPTIONS = {
+  'network / signal problems': [
+    'Internet / Mobile Data',
+    'Calls',
+    'SMS / OTP',
+    'Others',
+  ],
+};
+
+function getFollowupOptions(subprocessName) {
+  if (!subprocessName) return [];
+  const key = subprocessName.trim().toLowerCase();
+  return SUBPROCESS_FOLLOWUP_OPTIONS[key] || [];
+}
+
 export default function ChatSupport() {
   const { user } = useAuth();
   const navigate = useNavigate();
@@ -61,6 +76,7 @@ export default function ChatSupport() {
   const [fbSubmitting, setFbSubmitting] = useState(false);
 
   const [messages, setMessages] = useState([]);
+  const [inlineSubprocessPicker, setInlineSubprocessPicker] = useState(null);
   const [inputVisible, setInputVisible] = useState(false);
   const [inputPlaceholder, setInputPlaceholder] = useState('Describe your issue...');
   const [inputValue, setInputValue] = useState('');
@@ -82,6 +98,7 @@ export default function ChatSupport() {
     sectorName: null,
     subprocessKey: null,
     subprocessName: null,
+    subprocessSubType: null,
     language: 'English',
     queryText: '',
     resolution: '',
@@ -267,6 +284,7 @@ export default function ChatSupport() {
 
   const startChat = useCallback(async () => {
     setMessages([]);
+    setInlineSubprocessPicker(null);
     setDisabledGroups(new Set());
     setLocationStatus('idle');
     stateRef.current = {
@@ -298,6 +316,7 @@ export default function ChatSupport() {
 
   const selectSector = useCallback(async (key, name, groupId) => {
     disableGroup(groupId);
+    setInlineSubprocessPicker(null);
     stateRef.current.sectorKey = key;
     stateRef.current.sectorName = name;
     addMessage({ type: 'user', text: name });
@@ -310,6 +329,51 @@ export default function ChatSupport() {
     addMessage({ type: 'subprocess-grid', subprocesses: limitSubprocesses(data.subprocesses), groupId: spGroupId });
     stateRef.current.step = 'subprocess';
   }, [addMessage, disableGroup]);
+
+  const afterLocationCaptured = useCallback(() => {
+    setTimeout(() => {
+      addMessage({ type: 'bot', html: `Thank you! Your location has been recorded.` });
+      addMessage({ type: 'bot', html: `Please <strong>describe your specific issue</strong> so I can provide the best resolution.` });
+      showInput('Describe your issue in any language...');
+      stateRef.current.step = 'query';
+    }, 500);
+  }, [addMessage, showInput]);
+
+  const beginLocationFlow = useCallback(async (selectedIssueLabel) => {
+    if (!sessionIdRef.current) { await createSession(); }
+    addMessage({
+      type: 'bot',
+      html: `You selected <strong>${selectedIssueLabel}</strong>.<br><br>To help us assist you better, we need to know about your location.`,
+    });
+    const locQGroupId = nextId();
+    addMessage({
+      type: 'location-question',
+      groupId: locQGroupId,
+      onYes: () => {
+        disableGroup(locQGroupId);
+        addMessage({ type: 'user', text: "Yes, I'm at the issue location" });
+        const locPromptGroupId = nextId();
+        addMessage({
+          type: 'location-prompt',
+          groupId: locPromptGroupId,
+          onShare: () => {
+            disableGroup(locPromptGroupId);
+            // requestLocation will use DEFAULT_LATITUDE/DEFAULT_LONGITUDE (see above)
+            requestLocation(() => { afterLocationCaptured(selectedIssueLabel); });
+          },
+        });
+        stateRef.current.step = 'location';
+      },
+      onNo: () => {
+        disableGroup(locQGroupId);
+        addMessage({ type: 'user', text: "No, I'm at a different location" });
+        addMessage({ type: 'bot', html: `Please describe the location where you're experiencing this issue (e.g., area, address, landmark):` });
+        showInput('Describe your issue location...');
+        stateRef.current.step = 'location-describe';
+      },
+    });
+    stateRef.current.step = 'location-question';
+  }, [addMessage, disableGroup, showInput, createSession, requestLocation, afterLocationCaptured]);
 
   const autoRaiseTicket = useCallback(async () => {
     addMessage({ type: 'bot', html: `I'm sorry I wasn't able to resolve your issue. Let me raise a ticket for you so our support team can help.` });
@@ -362,6 +426,7 @@ export default function ChatSupport() {
     const resolveData = await chatApiCall('/api/resolve-step', {
       sector_key: st.sectorKey,
       subprocess_key: st.subprocessKey,
+      selected_subprocess: st.subprocessName || undefined,
       query: userQuery,
       language: st.language,
       previous_solutions: st.previousSolutions.slice(-10),
@@ -393,56 +458,29 @@ export default function ChatSupport() {
     st.step = 'conversation';
   }, [addMessage, saveMessage, showInput, createSession, autoRaiseTicket]);
 
-  const afterLocationCaptured = useCallback(() => {
-    setTimeout(() => {
-      addMessage({ type: 'bot', html: `Thank you! Your location has been recorded.` });
-      addMessage({ type: 'bot', html: `Please <strong>describe your specific issue</strong> so I can provide the best resolution.` });
-      showInput('Describe your issue in any language...');
-      stateRef.current.step = 'query';
-    }, 500);
-  }, [addMessage, showInput]);
+  const selectSubprocess = useCallback(async (key, name, groupId, selectedOption = null) => {
+    const followupOptions = getFollowupOptions(name);
+    if (followupOptions.length > 0 && !selectedOption) {
+      setInlineSubprocessPicker({
+        groupId,
+        subprocessKey: key,
+        subprocessName: name,
+        options: followupOptions,
+      });
+      return;
+    }
 
-  const selectSubprocess = useCallback(async (key, name, groupId) => {
     disableGroup(groupId);
+    setInlineSubprocessPicker(null);
     stateRef.current.subprocessKey = key;
-    stateRef.current.subprocessName = name;
+    stateRef.current.subprocessSubType = selectedOption || null;
+    const finalSubprocessName = selectedOption ? `${name} - ${selectedOption}` : name;
+    stateRef.current.subprocessName = finalSubprocessName;
     stateRef.current.attempt = 0;
     stateRef.current.previousSolutions = [];
-    addMessage({ type: 'user', text: name });
-    if (!sessionIdRef.current) { await createSession(); }
-    addMessage({
-      type: 'bot',
-      html: `You selected <strong>${name}</strong>.<br><br>To help us assist you better, we need to know about your location.`,
-    });
-    const locQGroupId = nextId();
-    addMessage({
-      type: 'location-question',
-      groupId: locQGroupId,
-      onYes: () => {
-        disableGroup(locQGroupId);
-        addMessage({ type: 'user', text: "Yes, I'm at the issue location" });
-        const locPromptGroupId = nextId();
-        addMessage({
-          type: 'location-prompt',
-          groupId: locPromptGroupId,
-          onShare: () => {
-            disableGroup(locPromptGroupId);
-            // requestLocation will use DEFAULT_LATITUDE/DEFAULT_LONGITUDE (see above)
-            requestLocation(() => { afterLocationCaptured(name); });
-          },
-        });
-        stateRef.current.step = 'location';
-      },
-      onNo: () => {
-        disableGroup(locQGroupId);
-        addMessage({ type: 'user', text: "No, I'm at a different location" });
-        addMessage({ type: 'bot', html: `Please describe the location where you're experiencing this issue (e.g., area, address, landmark):` });
-        showInput('Describe your issue location...');
-        stateRef.current.step = 'location-describe';
-      },
-    });
-    stateRef.current.step = 'location-question';
-  }, [addMessage, disableGroup, showInput, createSession, requestLocation, afterLocationCaptured]);
+    addMessage({ type: 'user', text: finalSubprocessName });
+    await beginLocationFlow(finalSubprocessName);
+  }, [addMessage, disableGroup, beginLocationFlow]);
 
   const sendMessage = useCallback(async () => {
     const text = inputValue.trim();
@@ -671,6 +709,11 @@ export default function ChatSupport() {
           stateRef.current.diagnosisSummary = data.diagnosis.summary || `Signal: ${data.diagnosis.overall_label}`;
           stateRef.current.diagnosisRan = true;
           setTimeout(() => {
+            if (data.diagnosis.overall_status === 'red') {
+              addMessage({ type: 'bot', html: 'Your signal is poor. Please try using your phone in an open area or near a window to improve reception. I am now raising a ticket so our support team can assist you directly.' });
+              autoRaiseTicket();
+              return;
+            }
             addMessage({ type: 'bot', html: 'Thank you for uploading your signal screenshot. I have analyzed your network parameters and identified the issue. Let me suggest a solution based on your signal diagnosis...' });
             fetchSolution(`My signal diagnosis shows: ${stateRef.current.diagnosisSummary}`);
           }, 800);
@@ -688,7 +731,7 @@ export default function ChatSupport() {
       }
     };
     reader.readAsDataURL(file);
-  }, [addMessage, saveMessage]);
+  }, [addMessage, saveMessage, fetchSolution, autoRaiseTicket]);
 
   const handleRetry = useCallback((groupId) => {
     disableGroup(groupId);
@@ -762,6 +805,7 @@ export default function ChatSupport() {
   const resumeChat = useCallback(async (session, msgs) => {
     setInitPhase('chat');
     setMessages([]);
+    setInlineSubprocessPicker(null);
     setDisabledGroups(new Set());
     hideInput();
     sessionIdRef.current = session.id;
@@ -782,7 +826,10 @@ export default function ChatSupport() {
       if (stateRef.current.sectorKey && session.subprocess_name) {
         const spData = await chatApiCall('/api/subprocesses', { sector_key: stateRef.current.sectorKey, language: 'English' });
         for (const [key, name] of Object.entries(spData.subprocesses)) {
-          if (name === session.subprocess_name) { stateRef.current.subprocessKey = key; break; }
+          if (name === session.subprocess_name || session.subprocess_name.startsWith(`${name} - `)) {
+            stateRef.current.subprocessKey = key;
+            break;
+          }
         }
       }
     } catch {}
@@ -810,6 +857,16 @@ export default function ChatSupport() {
     setMessages(prev => [...prev, ...newMsgs]);
     scrollToBottom();
     setTimeout(async () => {
+      if (session.status && session.status !== 'active') {
+        addMessage({
+          type: 'bot',
+          html: `This chat session is <strong>${session.status}</strong>. You are viewing the complete chat history.`,
+        });
+        addMessage({ type: 'bot', html: `Start a new chat if you need more help.` });
+        hideInput();
+        stateRef.current.step = 'view-only';
+        return;
+      }
       if (!session.sector_name) {
         addMessage({ type: 'bot', html: 'Please select your <strong>telecom service category</strong>:' });
         loadSectorMenu();
@@ -849,7 +906,7 @@ export default function ChatSupport() {
     if (resumeId) {
       try {
         const data = await apiGet(`/api/chat/session/${resumeId}`);
-        if (data?.session?.status === 'active') { setActiveSessionData(data.session); setActiveSessionMsgs(data.messages || []); setInitPhase('resume-prompt'); return; }
+        if (data?.session) { setActiveSessionData(data.session); setActiveSessionMsgs(data.messages || []); setInitPhase('resume-prompt'); return; }
       } catch {}
     }
     const activeData = await apiGet('/api/customer/active-session');
@@ -870,7 +927,7 @@ export default function ChatSupport() {
       if (resumeId) {
         try {
           const data = await apiGet(`/api/chat/session/${resumeId}`);
-          if (data?.session?.status === 'active') { setActiveSessionData(data.session); setActiveSessionMsgs(data.messages || []); setInitPhase('resume-prompt'); return; }
+          if (data?.session) { setActiveSessionData(data.session); setActiveSessionMsgs(data.messages || []); setInitPhase('resume-prompt'); return; }
         } catch {}
       }
       const activeData = await apiGet('/api/customer/active-session');
@@ -909,13 +966,37 @@ export default function ChatSupport() {
           <div key={msg.id} className="subprocess-grid">
             {Object.entries(msg.subprocesses).map(([sk, sname], idx) => {
               const isOthers = sname === 'Others' || sname.toLowerCase().includes('other');
+              const hasFollowup = getFollowupOptions(sname).length > 0;
+              const isExpanded = inlineSubprocessPicker &&
+                inlineSubprocessPicker.groupId === msg.groupId &&
+                inlineSubprocessPicker.subprocessKey === sk;
               return (
-                <button key={sk} className={`subprocess-chip${isOthers ? ' others' : ''}${isDisabled ? ' disabled' : ''}`}
-                  onClick={() => !isDisabled && selectSubprocess(sk, sname, msg.groupId)}>
-                  <div className="chip-num">{isOthers ? '···' : idx + 1}</div>
-                  <div className="chip-label">{sname}</div>
-                  <div className="chip-arrow">›</div>
-                </button>
+                <div key={sk} style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                  <button className={`subprocess-chip${isOthers ? ' others' : ''}${isDisabled ? ' disabled' : ''}`}
+                    onClick={() => !isDisabled && selectSubprocess(sk, sname, msg.groupId)}>
+                    <div className="chip-num">{isOthers ? '···' : idx + 1}</div>
+                    <div className="chip-label">{sname}</div>
+                    <div className="chip-arrow">›</div>
+                  </button>
+                  {hasFollowup && isExpanded && !isDisabled && (
+                    <div style={{ marginTop: '-4px' }}>
+                      <select
+                        defaultValue=""
+                        onChange={(e) => {
+                          const selected = e.target.value;
+                          if (!selected) return;
+                          selectSubprocess(sk, sname, msg.groupId, selected);
+                        }}
+                        style={{ width: '100%', padding: '10px 12px', borderRadius: 8, border: '1px solid #cbd5e1', fontSize: 14 }}
+                      >
+                        <option value="" disabled>Select one option</option>
+                        {(inlineSubprocessPicker.options || []).map((opt, optIdx) => (
+                          <option key={`${opt}-${optIdx}`} value={opt}>{opt}</option>
+                        ))}
+                      </select>
+                    </div>
+                  )}
+                </div>
               );
             })}
           </div>
@@ -1313,12 +1394,17 @@ export default function ChatSupport() {
     const session = activeSessionData;
     if (!session) return null;
     const lastMsg = activeSessionMsgs.length > 0 ? activeSessionMsgs[activeSessionMsgs.length - 1] : null;
+    const isActiveSession = session.status === 'active';
     return (
       <div className="gate-overlay">
         <div className="gate-card resume-gate">
           <div className="gate-icon">&#128172;</div>
-          <h2 className="gate-title">Active Chat Found</h2>
-          <p className="gate-subtitle">You have an active chat session. Would you like to continue or start a new one?</p>
+          <h2 className="gate-title">{isActiveSession ? 'Active Chat Found' : 'Previous Chat Found'}</h2>
+          <p className="gate-subtitle">
+            {isActiveSession
+              ? 'You have an active chat session. Would you like to continue or start a new one?'
+              : 'Would you like to open this chat history or start a new chat?'}
+          </p>
           <div className="gate-session-info">
             <div className="gate-session-row"><span className="gate-label">Session</span><span className="gate-value">#{session.id}</span></div>
             {session.sector_name && <div className="gate-session-row"><span className="gate-label">Category</span><span className="gate-value">{session.sector_name}</span></div>}
@@ -1327,7 +1413,9 @@ export default function ChatSupport() {
             {lastMsg && <div className="gate-summary"><span className="gate-label">Last message</span><p>{lastMsg.content.length > 120 ? lastMsg.content.slice(0, 120) + '...' : lastMsg.content}</p></div>}
           </div>
           <div className="gate-actions">
-            <button className="gate-btn gate-btn-primary" onClick={() => resumeChat(activeSessionData, activeSessionMsgs)}>Continue Chat</button>
+            <button className="gate-btn gate-btn-primary" onClick={() => resumeChat(activeSessionData, activeSessionMsgs)}>
+              {isActiveSession ? 'Continue Chat' : 'Open Chat'}
+            </button>
             <button className="gate-btn gate-btn-secondary" onClick={() => startChat()}>Start New Chat</button>
           </div>
         </div>
@@ -1400,3 +1488,5 @@ export default function ChatSupport() {
     </div>
   );
 }
+
+
