@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { useSearchParams, useNavigate } from 'react-router-dom';
-import { getToken, apiGet, apiPost } from '../../api';
+import { API_BASE, getToken, apiGet, apiPost } from '../../api';
 import { useAuth } from '../../AuthContext';
 import '../../styles/chatbot.css';
 

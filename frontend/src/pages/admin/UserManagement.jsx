@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import { apiGet, apiPost, apiPut, apiDelete, getToken } from '../../api';
+import { API_BASE, apiGet, apiPost, apiPut, apiDelete, getToken } from '../../api';
 
 export default function UserManagement() {
   const [users, setUsers] = useState([]);
@@ -100,7 +100,7 @@ export default function UserManagement() {
     formData.append('file', file);
     try {
       const token = getToken();
-      const resp = await fetch('/api/admin/users/upload', {
+      const resp = await fetch(`${API_BASE}/api/admin/users/upload`, {
         method: 'POST',
         headers: { Authorization: `Bearer ${token}` },
         body: formData,
