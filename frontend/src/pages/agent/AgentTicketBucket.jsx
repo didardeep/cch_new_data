@@ -1,8 +1,8 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+﻿import { useState, useEffect, useCallback, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { apiGet, apiPost, apiPut } from '../../api';
 
-/* ── SVG Icons ───────────────────────────────────────────────────────────────── */
+/* â”€â”€ SVG Icons â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 const IC = {
   chat:    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>,
   cpu:     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></svg>,
@@ -13,9 +13,10 @@ const IC = {
   refresh: <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>,
   x:       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>,
   chart:   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>,
+  tune:    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>,
 };
 
-/* ── Priority config ─────────────────────────────────────────────────────────── */
+/* â”€â”€ Priority config â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 const P_CFG = {
   critical: { bar: '#dc2626', badgeClass: 'badge-critical', label: 'Critical' },
   high:     { bar: '#f97316', badgeClass: 'badge-high',     label: 'High'     },
@@ -23,7 +24,7 @@ const P_CFG = {
   low:      { bar: '#10b981', badgeClass: 'badge-low',      label: 'Low'      },
 };
 
-/* ── Live SLA Timer ──────────────────────────────────────────────────────────── */
+/* â”€â”€ Live SLA Timer â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 function SlaTimer({ deadline, slaHours, status }) {
   const [remaining, setRemaining] = useState(null);
   const [pct, setPct] = useState(0);
@@ -72,7 +73,7 @@ function SlaTimer({ deadline, slaHours, status }) {
   );
 }
 
-/* ── Modal wrapper ───────────────────────────────────────────────────────────── */
+/* â”€â”€ Modal wrapper â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 function Modal({ title, onClose, width = 560, children }) {
   return (
     <div style={{ position: 'fixed', inset: 0, background: 'rgba(15,23,42,0.45)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 }}>
@@ -87,7 +88,7 @@ function Modal({ title, onClose, width = 560, children }) {
   );
 }
 
-/* ── Customer 360 Modal ──────────────────────────────────────────────────────── */
+/* â”€â”€ Customer 360 Modal â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 function Customer360Modal({ customerId, onClose }) {
   const [data, setData]   = useState(null);
   const [loading, setLoading] = useState(true);
@@ -96,7 +97,7 @@ function Customer360Modal({ customerId, onClose }) {
   }, [customerId]);
 
   return (
-    <Modal title="Customer 360°" onClose={onClose} width={620}>
+    <Modal title="Customer 360Â°" onClose={onClose} width={620}>
       {loading ? (
         <div className="page-loader" style={{ height: 180 }}><div className="spinner" /></div>
       ) : !data ? (
@@ -105,10 +106,10 @@ function Customer360Modal({ customerId, onClose }) {
         <>
           {/* Customer info */}
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px 20px', padding: '14px 16px', background: 'var(--bg)', borderRadius: 'var(--radius-sm)', marginBottom: 16 }}>
-            {[['Name', data.customer?.name], ['Email', data.customer?.email], ['Phone', data.customer?.phone || '—'], ['Member Since', data.plan_info?.account_since]].map(([k, v]) => (
+            {[['Name', data.customer?.name], ['Email', data.customer?.email], ['Phone', data.customer?.phone || ' - '], ['Member Since', data.plan_info?.account_since]].map(([k, v]) => (
               <div key={k}>
                 <div style={{ fontSize: 10, fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 2 }}>{k}</div>
-                <div style={{ fontSize: 13, color: 'var(--text)', fontWeight: 500 }}>{v || '—'}</div>
+                <div style={{ fontSize: 13, color: 'var(--text)', fontWeight: 500 }}>{v || ' - '}</div>
               </div>
             ))}
           </div>
@@ -167,10 +168,10 @@ function Customer360Modal({ customerId, onClose }) {
               {data.recent_sessions.slice(0, 5).map(s => (
                 <div key={s.id} style={{ padding: '10px 14px', background: 'var(--bg)', borderRadius: 'var(--radius-sm)', marginBottom: 8 }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
-                    <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--text)' }}>{s.sector} — {s.subprocess}</span>
+                    <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--text)' }}>{s.sector}  -  {s.subprocess}</span>
                     <span className={`badge badge-${s.status}`}>{s.status}</span>
                   </div>
-                  {s.summary && <div style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.5 }}>{s.summary.slice(0, 120)}…</div>}
+                  {s.summary && <div style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.5 }}>{s.summary.slice(0, 120)}...</div>}
                 </div>
               ))}
             </div>
@@ -181,7 +182,7 @@ function Customer360Modal({ customerId, onClose }) {
   );
 }
 
-/* ── AI Diagnosis Modal (6-tab for network/signal, placeholder for others) ──── */
+/* â”€â”€ AI Diagnosis Modal (6-tab for network/signal, placeholder for others) â”€â”€â”€â”€ */
 function DiagnoseModal({ ticket, onClose }) {
   const isNetwork = ticket.category?.toLowerCase().includes('mobile services') &&
     ticket.subcategory?.toLowerCase().includes('network');
@@ -205,16 +206,17 @@ function DiagnoseModal({ ticket, onClose }) {
   return <NetworkDiagnosisModal ticket={ticket} onClose={onClose} />;
 }
 
-/* ── Network Diagnosis: 6-tab modal ──────────────────────────────────────────── */
+/* â”€â”€ Network Diagnosis: 6-tab modal â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 const PERIOD_LABELS = { month: 'Monthly', week: 'Weekly', day: 'Daily', hour: 'Hourly' };
 
 function NetworkDiagnosisModal({ ticket, onClose }) {
   const [tab, setTab] = useState('map');
   const [sites, setSites] = useState(null);
+  const [solutionSite, setSolutionSite] = useState(null);
   const [customer, setCustomer] = useState(null);
   const [sitesLoading, setSitesLoading] = useState(true);
   const [sitesError, setSitesError] = useState('');
-  // Trend state — separate for site and cell level
+  // Trend state  -  separate for site and cell level
   const [trendLevel, setTrendLevel] = useState('site'); // 'site' or 'cell'
   const [trendPeriod, setTrendPeriod] = useState('day');
   const [trends, setTrends] = useState(null);
@@ -294,17 +296,144 @@ function NetworkDiagnosisModal({ ticket, onClose }) {
     setRecLoading(false);
   };
 
+  const formatAlarms = (alarmText) => {
+    if (!alarmText || !alarmText.trim()) return 'No active alarms';
+    return alarmText.length > 90 ? `${alarmText.slice(0, 90)}...` : alarmText;
+  };
+
+  const cleanAiText = (raw = '') => (
+    String(raw)
+      .replace(/\r/g, '')
+      .replace(/^#{1,6}\s*/gm, '')
+      .replace(/\*\*(.*?)\*\*/g, '$1')
+      .replace(/\*(.*?)\*/g, '$1')
+      .replace(/`/g, '')
+      .replace(/^\s*[-•]\s+/gm, '')
+      .replace(/^\s*\*+\s*/gm, '')
+      .replace(/\\rightarrow/g, '->')
+      .replace(/\$/g, '')
+      .replace(/[ \t]+/g, ' ')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim()
+  );
+
+  const isSectionHeading = (line = '') =>
+    /^(\d+\.\s+.+|Recommendations?:?|Final Recommendations?:?|Root Cause Analysis:?|Capacity Expansion:?|Immediate Actions:?|Short-term Fixes:?|Long-term Recommendations:?|Escalation Path:?|Customer Communication:?|Impact Assessment:?|Correlation Analysis:?)/i.test(line.trim());
+
+  const isImportantLine = (line = '') =>
+    /(critical|root cause|congestion|throughput|latency|handover|prb|on air|off air|severity|impact|scope|site-wide|bottleneck|\b\d+(?:\.\d+)?\s?(?:%|mbps|ms|km)\b)/i.test(line);
+
+  const highlightInline = (line) => {
+    const tokenRe = /(\b\d+(?:\.\d+)?\s?(?:%|Mbps|ms|km)\b|\b(?:Critical|Root Cause|Primary Cause|Secondary Cause|Congestion|Throughput|Latency|Handover|PRB Utilization|ON AIR|OFF AIR|Severity|Impact|Scope|Site-wide)\b)/gi;
+    return line.split(tokenRe).map((part, i) => (
+      /^(?:\d+(?:\.\d+)?\s?(?:%|Mbps|ms|km)|Critical|Root Cause|Primary Cause|Secondary Cause|Congestion|Throughput|Latency|Handover|PRB Utilization|ON AIR|OFF AIR|Severity|Impact|Scope|Site-wide)$/i.test(part)
+        ? <strong key={`${part}-${i}`}>{part}</strong>
+        : <span key={`${part}-${i}`}>{part}</span>
+    ));
+  };
+
+  const renderProfessionalText = (raw) => {
+    const linesText = cleanAiText(raw).split('\n').map(l => l.trim()).filter(Boolean);
+    return linesText.map((line, idx) => {
+      const heading = isSectionHeading(line);
+      const important = isImportantLine(line);
+      return (
+        <p
+          key={`${idx}-${line.slice(0, 20)}`}
+          style={{
+            margin: heading ? '14px 0 8px' : '0 0 10px',
+            fontSize: heading ? 15 : 14,
+            lineHeight: heading ? 1.5 : 1.72,
+            color: '#1e293b',
+            fontFamily: "'Segoe UI', Arial, sans-serif",
+            fontWeight: heading || important ? 600 : 400,
+          }}
+        >
+          {highlightInline(line)}
+        </p>
+      );
+    });
+  };
+
+  const summarizeForPdf = (raw, { min = 4, max = 5 } = {}) => {
+    const lines = cleanAiText(raw)
+      .split('\n')
+      .map(l => l.trim().replace(/^\d+\.\s*/, ''))
+      .filter(Boolean)
+      .filter(l => !isSectionHeading(l));
+
+    const ranked = lines
+      .map(line => ({ line, score: (isImportantLine(line) ? 2 : 0) + Math.min(line.length / 90, 1) }))
+      .sort((a, b) => b.score - a.score)
+      .map(x => x.line);
+
+    const unique = [];
+    for (const line of ranked) {
+      if (!unique.some(u => u.toLowerCase() === line.toLowerCase())) unique.push(line);
+      if (unique.length >= max) break;
+    }
+
+    if (unique.length < min) {
+      for (const line of lines) {
+        if (!unique.some(u => u.toLowerCase() === line.toLowerCase())) unique.push(line);
+        if (unique.length >= min) break;
+      }
+    }
+
+    return unique.slice(0, max).map(l => l.length > 180 ? `${l.slice(0, 177)}...` : l);
+  };
+
+  const drawTrendChart = (doc, { x, y, w, h, title, points, color = [0, 51, 141] }) => {
+    const vals = points.map(p => Number(p?.avg)).filter(v => Number.isFinite(v));
+    if (vals.length < 2) return;
+
+    const min = Math.min(...vals);
+    const max = Math.max(...vals);
+    const span = Math.max(max - min, 1e-6);
+    const px = 8;
+    const py = 8;
+    const plotX = x + px;
+    const plotY = y + py;
+    const plotW = w - px * 2;
+    const plotH = h - py * 2;
+
+    doc.setDrawColor(226, 232, 240);
+    doc.roundedRect(x, y, w, h, 1.5, 1.5, 'S');
+    doc.setFontSize(8.5);
+    doc.setTextColor(30, 41, 59);
+    doc.text(title.length > 28 ? `${title.slice(0, 28)}...` : title, x + 2, y + 5);
+
+    doc.setDrawColor(203, 213, 225);
+    doc.line(plotX, plotY + plotH, plotX + plotW, plotY + plotH);
+    doc.line(plotX, plotY, plotX, plotY + plotH);
+
+    doc.setDrawColor(...color);
+    for (let i = 1; i < vals.length; i++) {
+      const x1 = plotX + ((i - 1) / (vals.length - 1)) * plotW;
+      const x2 = plotX + (i / (vals.length - 1)) * plotW;
+      const y1 = plotY + (1 - (vals[i - 1] - min) / span) * plotH;
+      const y2 = plotY + (1 - (vals[i] - min) / span) * plotH;
+      doc.line(x1, y1, x2, y2);
+    }
+
+    doc.setFontSize(7.5);
+    doc.setTextColor(71, 85, 105);
+    doc.text(`min ${min.toFixed(2)}`, x + 2, y + h - 2);
+    doc.text(`max ${max.toFixed(2)}`, x + w - 18, y + h - 2);
+  };
+
   const downloadPdf = async () => {
     setPdfLoading(true);
     try {
       const { default: jsPDF } = await import('jspdf');
-      await import('jspdf-autotable');
+      const { default: autoTable } = await import('jspdf-autotable');
       const html2canvas = (await import('html2canvas')).default;
       const doc = new jsPDF('p', 'mm', 'a4');
       let y = 15;
       const pageW = doc.internal.pageSize.getWidth();
+      const previousTab = tab;
 
-      // ── Header ──
+      // â”€â”€ Header â”€â”€
       doc.setFillColor(0, 51, 141);
       doc.rect(0, 0, pageW, 32, 'F');
       doc.setTextColor(255);
@@ -316,7 +445,11 @@ function NetworkDiagnosisModal({ ticket, onClose }) {
       y = 40;
       doc.setTextColor(0);
 
-      // ── Map Screenshot ──
+      // â”€â”€ Map Screenshot â”€â”€
+      if (previousTab !== 'map') {
+        setTab('map');
+        await new Promise(resolve => setTimeout(resolve, 900));
+      }
       const mapEl = document.getElementById('diagnosis-map-container');
       if (mapEl) {
         try {
@@ -332,8 +465,11 @@ function NetworkDiagnosisModal({ ticket, onClose }) {
           y += Math.min(imgH, 100) + 8;
         } catch { /* map screenshot failed, skip */ }
       }
+      if (previousTab !== 'map') {
+        setTab(previousTab);
+      }
 
-      // ── Site Information Table ──
+      // â”€â”€ Site Information Table â”€â”€
       if (sites?.length) {
         if (y > 230) { doc.addPage(); y = 15; }
         doc.setFontSize(14);
@@ -341,15 +477,24 @@ function NetworkDiagnosisModal({ ticket, onClose }) {
         doc.text('2. Site Information', 14, y);
         y += 6;
         doc.setFont(undefined, 'normal');
-        doc.autoTable({
+        autoTable(doc, {
           startY: y,
-          head: [['#', 'Site ID', 'Latitude', 'Longitude', 'Zone', 'Distance (km)']],
-          body: sites.map((s, i) => [i + 1, s.site_id, s.latitude?.toFixed(5), s.longitude?.toFixed(5), s.zone || '—', s.distance_km]),
+          head: [['#', 'Site ID', 'Latitude', 'Longitude', 'Zone', 'Distance (km)', 'Status', 'Alarms']],
+          body: sites.map((s, i) => [
+            i + 1,
+            s.site_id,
+            s.latitude?.toFixed(5),
+            s.longitude?.toFixed(5),
+            s.zone || 'N/A',
+            s.distance_km,
+            s.site_status || 'on_air',
+            s.alarms || 'No active alarms',
+          ]),
           styles: { fontSize: 9 },
           headStyles: { fillColor: [0, 51, 141] },
           margin: { left: 14, right: 14 },
         });
-        y = doc.lastAutoTable.finalY + 10;
+        y = (doc.lastAutoTable?.finalY || y) + 10;
         if (customer) {
           doc.setFontSize(9);
           doc.text(`Customer Location: ${customer.latitude?.toFixed(5)}, ${customer.longitude?.toFixed(5)}`, 14, y);
@@ -357,7 +502,7 @@ function NetworkDiagnosisModal({ ticket, onClose }) {
         }
       }
 
-      // ── Trend Analysis Crux ──
+      // â”€â”€ Trend Analysis Crux â”€â”€
       if (Object.keys(trendCache).length > 0) {
         if (y > 220) { doc.addPage(); y = 15; }
         doc.setFontSize(14);
@@ -368,75 +513,102 @@ function NetworkDiagnosisModal({ ticket, onClose }) {
 
         for (const [key, data] of Object.entries(trendCache)) {
           const [level, period] = key.split('_');
-          if (y > 260) { doc.addPage(); y = 15; }
+          if (y > 245) { doc.addPage(); y = 15; }
           doc.setFontSize(11);
           doc.setFont(undefined, 'bold');
-          doc.text(`${level.charAt(0).toUpperCase() + level.slice(1)} Level — ${PERIOD_LABELS[period] || period}`, 14, y);
-          y += 5;
+          doc.text(`${level.charAt(0).toUpperCase() + level.slice(1)} Level - ${PERIOD_LABELS[period] || period}`, 14, y);
+          y += 4;
           doc.setFont(undefined, 'normal');
 
-          const tableBody = [];
-          for (const [kpiName, points] of Object.entries(data)) {
-            if (points.length > 0) {
-              const avgVals = points.map(p => p.avg);
-              const minVals = points.map(p => p.min);
-              const maxVals = points.map(p => p.max);
-              tableBody.push([
-                kpiName,
-                (avgVals.reduce((a, b) => a + b, 0) / avgVals.length).toFixed(2),
-                Math.min(...minVals).toFixed(2),
-                Math.max(...maxVals).toFixed(2),
-                points.length.toString(),
-              ]);
-            }
+          const chartEntries = Object.entries(data)
+            .filter(([, points]) => Array.isArray(points) && points.length > 1)
+            .slice(0, 4);
+
+          if (chartEntries.length === 0) {
+            doc.setFontSize(9);
+            doc.setTextColor(100, 116, 139);
+            doc.text('No trend chart data available.', 14, y + 5);
+            doc.setTextColor(0);
+            y += 12;
+            continue;
           }
-          if (tableBody.length > 0) {
-            doc.autoTable({
-              startY: y,
-              head: [['KPI', 'Avg', 'Min', 'Max', 'Points']],
-              body: tableBody,
-              styles: { fontSize: 8 },
-              headStyles: { fillColor: [0, 51, 141] },
-              margin: { left: 14, right: 14 },
+
+          const chartW = (pageW - 14 * 2 - 6) / 2;
+          const chartH = 34;
+          const rowCount = Math.ceil(chartEntries.length / 2);
+          const blockHeight = rowCount * (chartH + 5) + 2;
+          if (y + blockHeight > 285) {
+            doc.addPage();
+            y = 15;
+          }
+
+          chartEntries.forEach(([kpiName, points], idx) => {
+            const col = idx % 2;
+            const row = Math.floor(idx / 2);
+            const cx = 14 + col * (chartW + 6);
+            const cy = y + row * (chartH + 5);
+            drawTrendChart(doc, {
+              x: cx,
+              y: cy,
+              w: chartW,
+              h: chartH,
+              title: kpiName,
+              points,
+              color: level === 'cell' ? [124, 58, 237] : [0, 51, 141],
             });
-            y = doc.lastAutoTable.finalY + 8;
-          }
+          });
+
+          y += blockHeight + 4;
         }
       }
 
-      // ── Root Cause Analysis ──
+      // â”€â”€ Root Cause Analysis â”€â”€
       if (rootCause) {
         if (y > 220) { doc.addPage(); y = 15; }
         doc.setFontSize(14);
         doc.setFont(undefined, 'bold');
         doc.text('4. Root Cause Analysis', 14, y);
         y += 7;
-        doc.setFont(undefined, 'normal');
-        doc.setFontSize(9);
-        const rcLines = doc.splitTextToSize(rootCause, pageW - 28);
-        for (const line of rcLines) {
-          if (y > 280) { doc.addPage(); y = 15; }
-          doc.text(line, 14, y);
-          y += 4.5;
-        }
+        const rcLines = summarizeForPdf(rootCause, { min: 4, max: 5 });
+        rcLines.forEach((rawLine, idx) => {
+          const wrapped = doc.splitTextToSize(rawLine, pageW - 28);
+          const prefix = `${idx + 1}. `;
+          let first = true;
+          for (const line of wrapped) {
+            if (y > 280) { doc.addPage(); y = 15; }
+            doc.setFont(undefined, isSectionHeading(rawLine) || isImportantLine(rawLine) ? 'bold' : 'normal');
+            doc.setFontSize(isSectionHeading(rawLine) ? 11 : (isImportantLine(rawLine) ? 10 : 9));
+            doc.text(first ? `${prefix}${line}` : `   ${line}`, 14, y);
+            first = false;
+            y += 4.8;
+          }
+          y += 0.6;
+        });
         y += 6;
       }
 
-      // ── Final Recommendations ──
+      // â”€â”€ Final Recommendations â”€â”€
       if (recommendation) {
         if (y > 220) { doc.addPage(); y = 15; }
         doc.setFontSize(14);
         doc.setFont(undefined, 'bold');
         doc.text('5. Final Recommendations', 14, y);
         y += 7;
-        doc.setFont(undefined, 'normal');
-        doc.setFontSize(9);
-        const recLines = doc.splitTextToSize(recommendation, pageW - 28);
-        for (const line of recLines) {
-          if (y > 280) { doc.addPage(); y = 15; }
-          doc.text(line, 14, y);
-          y += 4.5;
-        }
+        const recLines = summarizeForPdf(recommendation, { min: 3, max: 5 });
+        recLines.forEach((rawLine, idx) => {
+          const wrapped = doc.splitTextToSize(rawLine, pageW - 28);
+          const prefix = `${idx + 1}. `;
+          let first = true;
+          for (const line of wrapped) {
+            if (y > 280) { doc.addPage(); y = 15; }
+            doc.setFont(undefined, isSectionHeading(rawLine) || isImportantLine(rawLine) ? 'bold' : 'normal');
+            doc.setFontSize(isSectionHeading(rawLine) ? 11 : (isImportantLine(rawLine) ? 10 : 9));
+            doc.text(first ? `${prefix}${line}` : `   ${line}`, 14, y);
+            first = false;
+            y += 4.8;
+          }
+          y += 0.6;
+        });
       }
 
       doc.save(`Diagnosis_${ticket.reference_number}.pdf`);
@@ -481,31 +653,51 @@ function NetworkDiagnosisModal({ ticket, onClose }) {
         </div>
       ) : (
         <>
-          {/* ── Tab: Map ─────────────────────────────────────── */}
+          {/* â”€â”€ Tab: Map â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
           {tab === 'map' && <MapTab customer={customer} sites={sites} />}
 
-          {/* ── Tab: Site Info ────────────────────────────────── */}
+          {/* â”€â”€ Tab: Site Info â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
           {tab === 'sites' && (
             <div>
               <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
                 <thead>
                   <tr style={{ background: '#f8fafc', borderBottom: '2px solid #e2e8f0' }}>
-                    {['#', 'Site ID', 'Latitude', 'Longitude', 'Zone', 'Distance (km)'].map(h => (
+                    {['#', 'Site ID', 'Latitude', 'Longitude', 'Zone', 'Status', 'Alarms', 'Solution'].map(h => (
                       <th key={h} style={{ padding: '10px 12px', textAlign: 'left', fontSize: 11, fontWeight: 700, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.05em' }}>{h}</th>
                     ))}
                   </tr>
                 </thead>
                 <tbody>
-                  {sites.map((s, i) => (
-                    <tr key={s.site_id} style={{ borderBottom: '1px solid #f1f5f9', background: i === 0 ? '#eff6ff' : '#fff' }}>
-                      <td style={{ padding: '10px 12px', fontWeight: 700 }}>{i + 1}</td>
-                      <td style={{ padding: '10px 12px', fontWeight: 600, color: '#00338D' }}>{s.site_id}</td>
-                      <td style={{ padding: '10px 12px' }}>{s.latitude?.toFixed(5)}</td>
-                      <td style={{ padding: '10px 12px' }}>{s.longitude?.toFixed(5)}</td>
-                      <td style={{ padding: '10px 12px' }}>{s.zone || '—'}</td>
-                      <td style={{ padding: '10px 12px', fontWeight: 700, color: i === 0 ? '#16a34a' : '#475569' }}>{s.distance_km} km</td>
-                    </tr>
-                  ))}
+                  {sites.map((s, i) => {
+                    const isOffAir = (s.site_status || '').toLowerCase() === 'off_air';
+                    return (
+                      <tr key={s.site_id} style={{ borderBottom: '1px solid #f1f5f9', background: i === 0 ? '#eff6ff' : '#fff' }}>
+                        <td style={{ padding: '10px 12px', fontWeight: 700 }}>{i + 1}</td>
+                        <td style={{ padding: '10px 12px', fontWeight: 600, color: '#00338D' }}>{s.site_id}</td>
+                        <td style={{ padding: '10px 12px' }}>{s.latitude?.toFixed(5)}</td>
+                        <td style={{ padding: '10px 12px' }}>{s.longitude?.toFixed(5)}</td>
+                        <td style={{ padding: '10px 12px' }}>{s.zone || 'N/A'}</td>
+                        <td style={{ padding: '10px 12px' }}>
+                          <span className={`badge badge-${isOffAir ? 'critical' : 'resolved'}`}>
+                            {(s.site_status || 'on_air').replace('_', ' ')}
+                          </span>
+                        </td>
+                        <td style={{ padding: '10px 12px', maxWidth: 300, whiteSpace: 'normal', lineHeight: 1.45 }}>
+                          {formatAlarms(s.alarms)}
+                        </td>
+                        <td style={{ padding: '10px 12px' }}>
+                          <button
+                            className="btn btn-outline btn-sm"
+                            onClick={() => setSolutionSite(s)}
+                            disabled={!s.solution}
+                            title={s.solution ? 'View solution details' : 'No solution available'}
+                          >
+                            {s.solution ? 'View Solution' : 'No Solution'}
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
               {customer && (
@@ -516,7 +708,7 @@ function NetworkDiagnosisModal({ ticket, onClose }) {
             </div>
           )}
 
-          {/* ── Tab: Trend Analysis (Site Level / Cell Level) ── */}
+          {/* â”€â”€ Tab: Trend Analysis (Site Level / Cell Level) â”€â”€ */}
           {tab === 'trend' && (
             <div>
               {/* Data level toggle */}
@@ -567,7 +759,7 @@ function NetworkDiagnosisModal({ ticket, onClose }) {
             </div>
           )}
 
-          {/* ── Tab: Root Cause ───────────────────────────────── */}
+          {/* â”€â”€ Tab: Root Cause â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
           {tab === 'rca' && (
             <div>
               {!rootCause && !rcLoading && (
@@ -580,14 +772,14 @@ function NetworkDiagnosisModal({ ticket, onClose }) {
               )}
               {rcLoading && <div className="page-loader" style={{ height: 160 }}><div className="spinner" /></div>}
               {rootCause && (
-                <div style={{ fontSize: 13, lineHeight: 1.8, color: 'var(--text)', whiteSpace: 'pre-wrap', background: 'var(--bg)', padding: 16, borderRadius: 8, maxHeight: 450, overflowY: 'auto' }}>
-                  {rootCause}
+                <div style={{ background: 'var(--bg)', padding: 16, borderRadius: 8, maxHeight: 450, overflowY: 'auto', border: '1px solid #e2e8f0' }}>
+                  {renderProfessionalText(rootCause)}
                 </div>
               )}
             </div>
           )}
 
-          {/* ── Tab: Recommendation ──────────────────────────── */}
+          {/* â”€â”€ Tab: Recommendation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
           {tab === 'rec' && (
             <div>
               {!recommendation && !recLoading && (
@@ -600,14 +792,14 @@ function NetworkDiagnosisModal({ ticket, onClose }) {
               )}
               {recLoading && <div className="page-loader" style={{ height: 160 }}><div className="spinner" /></div>}
               {recommendation && (
-                <div style={{ fontSize: 13, lineHeight: 1.8, color: 'var(--text)', whiteSpace: 'pre-wrap', background: 'var(--bg)', padding: 16, borderRadius: 8, maxHeight: 450, overflowY: 'auto' }}>
-                  {recommendation}
+                <div style={{ background: 'var(--bg)', padding: 16, borderRadius: 8, maxHeight: 450, overflowY: 'auto', border: '1px solid #e2e8f0' }}>
+                  {renderProfessionalText(recommendation)}
                 </div>
               )}
             </div>
           )}
 
-          {/* ── Tab: Download PDF ─────────────────────────────── */}
+          {/* â”€â”€ Tab: Download PDF â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
           {tab === 'pdf' && (
             <div style={{ textAlign: 'center', padding: 40 }}>
               <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#00338D" strokeWidth="1.5" style={{ marginBottom: 16 }}>
@@ -630,11 +822,44 @@ function NetworkDiagnosisModal({ ticket, onClose }) {
           )}
         </>
       )}
+
+      {solutionSite && (
+        <Modal
+          title={`Site Solution - ${solutionSite.site_id}`}
+          onClose={() => setSolutionSite(null)}
+          width={620}
+        >
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px 14px', marginBottom: 14 }}>
+            <div>
+              <div style={{ fontSize: 11, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>Site Status</div>
+              <div style={{ marginTop: 4, fontSize: 13, fontWeight: 600 }}>
+                {(solutionSite.site_status || 'on_air').replace('_', ' ')}
+              </div>
+            </div>
+            <div>
+              <div style={{ fontSize: 11, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>Zone</div>
+              <div style={{ marginTop: 4, fontSize: 13, fontWeight: 600 }}>{solutionSite.zone || 'N/A'}</div>
+            </div>
+          </div>
+          <div style={{ marginBottom: 12 }}>
+            <div style={{ fontSize: 11, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 6 }}>Active Alarms</div>
+            <div style={{ background: '#fff7ed', border: '1px solid #fed7aa', borderRadius: 8, padding: 12, fontSize: 13, lineHeight: 1.6 }}>
+              {solutionSite.alarms || 'No active alarms'}
+            </div>
+          </div>
+          <div>
+            <div style={{ fontSize: 11, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 6 }}>Recommended Solution</div>
+            <div style={{ background: '#eff6ff', border: '1px solid #bfdbfe', borderRadius: 8, padding: 12, fontSize: 13, lineHeight: 1.7, whiteSpace: 'pre-wrap' }}>
+              {solutionSite.solution || 'No solution available for this site.'}
+            </div>
+          </div>
+        </Modal>
+      )}
     </Modal>
   );
 }
 
-/* ── Map Tab (Leaflet) ───────────────────────────────────────────────────────── */
+/* â”€â”€ Map Tab (Leaflet) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 function MapTab({ customer, sites }) {
   const [mapReady, setMapReady] = useState(false);
   const [Leaflet, setLeaflet] = useState(null);
@@ -684,7 +909,7 @@ function MapTab({ customer, sites }) {
               Distance: {s.distance_km} km
             </Popup>
             <Tooltip direction="top" offset={[0, -30]}>
-              {s.site_id} — {s.distance_km} km
+              {s.site_id}  -  {s.distance_km} km
             </Tooltip>
           </Marker>
         ))}
@@ -693,7 +918,7 @@ function MapTab({ customer, sites }) {
   );
 }
 
-/* ── Trend Mini Chart (using recharts) ────────────────────────────────────────── */
+/* â”€â”€ Trend Mini Chart (using recharts) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 function TrendMiniChart({ kpiName, data, color = '#00338D' }) {
   const [RC, setRC] = useState(null);
   useEffect(() => {
@@ -723,7 +948,99 @@ function TrendMiniChart({ kpiName, data, color = '#00338D' }) {
   );
 }
 
-/* ── Resolve Modal ───────────────────────────────────────────────────────────── */
+/* â”€â”€ Resolve Modal â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+function ParameterChangeModal({ ticket, onClose }) {
+  const [proposed, setProposed] = useState('');
+  const [change, setChange] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [submitting, setSubmitting] = useState(false);
+  const [msg, setMsg] = useState('');
+
+  const loadStatus = useCallback(async () => {
+    setLoading(true);
+    try {
+      const d = await apiGet(`/api/agent/tickets/${ticket.id}/parameter-change`);
+      setChange(d?.change || null);
+    } catch (_) {
+      setChange(null);
+    }
+    setLoading(false);
+  }, [ticket.id]);
+
+  useEffect(() => {
+    loadStatus();
+  }, [loadStatus]);
+
+  const submit = async () => {
+    if (!proposed.trim()) return;
+    setSubmitting(true);
+    setMsg('');
+    try {
+      const d = await apiPost(`/api/agent/tickets/${ticket.id}/parameter-change`, {
+        proposed_change: proposed.trim(),
+      });
+      setMsg(d?.message || 'Request submitted.');
+      setProposed('');
+      await loadStatus();
+    } catch (_) {
+      setMsg('Failed to submit request.');
+    }
+    setSubmitting(false);
+  };
+
+  return (
+    <Modal title="Parameter Change Request" onClose={onClose} width={560}>
+      <div style={{ marginBottom: 12, fontSize: 13, color: 'var(--text-secondary)', lineHeight: 1.55 }}>
+        Submit a technical parameter change for manager approval for ticket <strong>{ticket.reference_number}</strong>.
+      </div>
+
+      {loading ? (
+        <div className="page-loader" style={{ height: 100 }}><div className="spinner" /></div>
+      ) : change ? (
+        <div style={{ background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', padding: 12, marginBottom: 14 }}>
+          <div style={{ fontSize: 11, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 6 }}>Latest Request Status</div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+            <span className={`badge badge-${change.status === 'approved' ? 'resolved' : change.status === 'disapproved' ? 'critical' : 'pending'}`}>
+              {change.status}
+            </span>
+            {change.reviewed_at && (
+              <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                Reviewed {new Date(change.reviewed_at).toLocaleString()}
+              </span>
+            )}
+          </div>
+          <div style={{ fontSize: 12, color: 'var(--text)' }}><strong>Proposed:</strong> {change.proposed_change}</div>
+          {change.manager_note && (
+            <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 6 }}>
+              <strong>Manager Note:</strong> {change.manager_note}
+            </div>
+          )}
+        </div>
+      ) : null}
+
+      <div className="form-group">
+        <label>Proposed Change</label>
+        <textarea
+          className="feedback-textarea"
+          rows={4}
+          value={proposed}
+          onChange={e => setProposed(e.target.value)}
+          placeholder="Describe the parameter/configuration change and expected impact..."
+        />
+      </div>
+
+      {msg && <div style={{ marginTop: 8, fontSize: 12, color: '#475569' }}>{msg}</div>}
+
+      <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end', marginTop: 16 }}>
+        <button className="btn btn-ghost btn-sm" onClick={onClose}>Close</button>
+        <button className="btn btn-primary btn-sm" onClick={submit} disabled={submitting || !proposed.trim()}>
+          {submitting ? 'Submitting...' : 'Submit for Approval'}
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
 function ResolveModal({ ticket, onClose, onResolved }) {
   const [notes, setNotes]       = useState('');
   const [submitting, setSubmitting] = useState(false);
@@ -761,14 +1078,14 @@ function ResolveModal({ ticket, onClose, onResolved }) {
       <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end' }}>
         <button className="btn btn-ghost btn-sm" onClick={onClose}>Cancel</button>
         <button className="btn btn-success btn-sm" onClick={handle} disabled={submitting}>
-          {submitting ? 'Resolving…' : 'Mark as Resolved'}
+          {submitting ? 'Resolving...' : 'Mark as Resolved'}
         </button>
       </div>
     </Modal>
   );
 }
 
-/* ── Action button ───────────────────────────────────────────────────────────── */
+/* â”€â”€ Action button â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 function ActionBtn({ onClick, icon, label, variant = 'ghost' }) {
   return (
     <button className={`btn btn-${variant} btn-sm`} onClick={onClick} style={{ display: 'inline-flex', alignItems: 'center', gap: 5, fontSize: 12 }}>
@@ -777,7 +1094,7 @@ function ActionBtn({ onClick, icon, label, variant = 'ghost' }) {
   );
 }
 
-/* ── Main Component ──────────────────────────────────────────────────────────── */
+/* â”€â”€ Main Component â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 export default function AgentTicketBucket() {
   const [tickets, setTickets]   = useState([]);
   const [loading, setLoading]   = useState(true);
@@ -898,7 +1215,7 @@ export default function AgentTicketBucket() {
                     <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text)' }}>{ticket.user_name}</div>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 12, color: 'var(--text-secondary)', marginTop: 2 }}>
                       <span style={{ color: 'var(--primary)' }}>{IC.phone}</span>
-                      {ticket.user_phone || '—'}
+                      {ticket.user_phone || ' - '}
                     </div>
                   </div>
                 </div>
@@ -907,7 +1224,7 @@ export default function AgentTicketBucket() {
                 <div style={{ padding: '10px 20px', borderBottom: '1px solid var(--border-light)' }}>
                   <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 4 }}>Issue Description</div>
                   <div style={{ fontSize: 13, color: 'var(--text-secondary)', lineHeight: 1.6 }}>
-                    {(ticket.description || '').slice(0, 220)}{(ticket.description || '').length > 220 ? '…' : ''}
+                    {(ticket.description || '').slice(0, 220)}{(ticket.description || '').length > 220 ? '...' : ''}
                   </div>
                 </div>
 
@@ -919,10 +1236,13 @@ export default function AgentTicketBucket() {
                   <ActionBtn onClick={() => setModal({ type: 'diagnose', ticket })} icon={IC.cpu} label="AI Diagnosis" />
                   <ActionBtn onClick={() => setModal({ type: 'c360', customerId: ticket.user_id })} icon={IC.user360} label="Customer 360" />
                   {!isResolved && (
+                    <ActionBtn onClick={() => setModal({ type: 'param', ticket })} icon={IC.tune} label="Parameter Change" />
+                  )}
+                  {!isResolved && (
                     <ActionBtn onClick={() => setModal({ type: 'resolve', ticket })} icon={IC.check} label="Mark Resolved" variant="success" />
                   )}
                   <div style={{ marginLeft: 'auto', fontSize: 11, color: 'var(--text-muted)' }}>
-                    Created {ticket.created_at ? new Date(ticket.created_at).toLocaleString() : '—'}
+                    Created {ticket.created_at ? new Date(ticket.created_at).toLocaleString() : ' - '}
                     {ticket.resolved_at && <>&nbsp;&middot;&nbsp;Resolved {new Date(ticket.resolved_at).toLocaleString()}</>}
                   </div>
                 </div>
@@ -935,7 +1255,16 @@ export default function AgentTicketBucket() {
       {/* Modals */}
       {modal?.type === 'c360'     && <Customer360Modal customerId={modal.customerId} onClose={() => setModal(null)} />}
       {modal?.type === 'diagnose' && <DiagnoseModal    ticket={modal.ticket}         onClose={() => setModal(null)} />}
+      {modal?.type === 'param'    && <ParameterChangeModal ticket={modal.ticket}      onClose={() => setModal(null)} />}
       {modal?.type === 'resolve'  && <ResolveModal     ticket={modal.ticket}         onClose={() => setModal(null)} onResolved={handleResolved} />}
     </div>
   );
 }
+
+
+
+
+
+
+
+

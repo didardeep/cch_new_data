@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { apiGet } from '../../api';
+import { API_BASE, apiGet } from '../../api';
 import {
   AreaChart, Area, BarChart, Bar, PieChart, Pie, Cell, LineChart, Line,
   ComposedChart, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer
@@ -378,7 +378,7 @@ export default function ReportsPage() {
 
   const handleExportCSV = async () => {
     const token = localStorage.getItem('token');
-    const resp = await fetch(`/api/reports/export?format=csv&section=${tab}&range=${range}`, {
+    const resp = await fetch(`${API_BASE}/api/reports/export?format=csv&section=${tab}&range=${range}`, {
       headers: { Authorization: `Bearer ${token}` }
     });
     if (resp.ok) {
