@@ -31,6 +31,12 @@ function isNetworkIssue(subprocessName) {
   return name.includes('network') || name.includes('signal');
 }
 
+const NETWORK_SIGNAL_SUBOPTIONS = {
+  internet_signal: 'Internet/Signal Problems',
+  call_failure: 'Call Failure',
+  call_drop: 'Call Drop',
+};
+
 function limitSubprocesses(subprocesses) {
   const entries = Object.entries(subprocesses);
   const others = entries.filter(([, v]) => v === 'Others' || v.toLowerCase().includes('other'));
@@ -410,8 +416,39 @@ export default function ChatSupport() {
     addMessage({ type: 'user', text: name });
     saveMessage('user', name, { subprocess_name: name });
 
-    // ── LOCATION TRIGGER — If Network/Signal issue, request location FIRST ──
+    // ── NETWORK SUB-OPTIONS ──
     if (isNetworkIssue(name)) {
+      addMessage({
+        type: 'bot',
+        html: `You selected <strong>${name}</strong>. Please choose the <strong>specific issue type</strong>:`,
+      });
+
+      const subIssueGroupId = nextId();
+      addMessage({
+        type: 'network-subissue-grid',
+        options: NETWORK_SIGNAL_SUBOPTIONS,
+        groupId: subIssueGroupId,
+      });
+      stateRef.current.step = 'network-subissue';
+      return;
+    }
+
+    // ── Normal flow for non-network issues ──
+    addMessage({
+      type: 'bot',
+      html: `You selected <strong>${name}</strong>. Please <strong>describe your specific issue</strong> so I can provide the best resolution.`,
+    });
+
+    showInput('Describe your issue in any language...');
+    stateRef.current.step = 'query';
+  }, [addMessage, disableGroup, saveMessage, showInput]);
+
+  const selectNetworkSubissue = useCallback(async (key, name, groupId) => {
+    disableGroup(groupId);
+    addMessage({ type: 'user', text: name });
+    saveMessage('user', name);
+
+    if (key === 'internet_signal') {
       // Create session first so we have an ID to save location against
       if (!sessionIdRef.current) {
         await createSession();
@@ -419,13 +456,11 @@ export default function ChatSupport() {
 
       addMessage({
         type: 'bot',
-        html: `You selected <strong>${name}</strong>.<br><br>` +
-          `<strong>Location Required</strong><br>` +
+        html: `<strong>Location Required</strong><br>` +
           `To help diagnose your network issue, we need your current location to check signal coverage in your area.<br><br>` +
           `Please click <strong>"Share My Location"</strong> in the browser popup to continue.`,
       });
 
-      // Show location prompt message
       const locGroupId = nextId();
       addMessage({
         type: 'location-prompt',
@@ -433,7 +468,6 @@ export default function ChatSupport() {
         onShare: () => {
           disableGroup(locGroupId);
           requestLocation(() => {
-            // After location is granted, show signal codes + upload prompt
             setTimeout(() => {
               addMessage({
                 type: 'bot',
@@ -459,15 +493,13 @@ export default function ChatSupport() {
       return;
     }
 
-    // ── Normal flow for non-network issues ──
     addMessage({
       type: 'bot',
-      html: `You selected <strong>${name}</strong>. Please <strong>describe your specific issue</strong> so I can provide the best resolution.`,
+      html: `Please <strong>describe your specific issue</strong> so I can provide the best resolution.`,
     });
-
     showInput('Describe your issue in any language...');
     stateRef.current.step = 'query';
-  }, [addMessage, disableGroup, saveMessage, showInput, createSession, requestLocation]);
+  }, [addMessage, disableGroup, saveMessage, createSession, requestLocation, showInput]);
 
   // ── Send Message ──
   const sendMessage = useCallback(async () => {
@@ -1083,6 +1115,21 @@ export default function ChatSupport() {
                 </button>
               );
             })}
+          </div>
+        );
+
+      case 'network-subissue-grid':
+        return (
+          <div key={msg.id} className="subprocess-grid">
+            {Object.entries(msg.options).map(([sk, sname], idx) => (
+              <button key={sk}
+                className={`subprocess-chip${isDisabled ? ' disabled' : ''}`}
+                onClick={() => !isDisabled && selectNetworkSubissue(sk, sname, msg.groupId)}>
+                <div className="chip-num">{idx + 1}</div>
+                <div className="chip-label">{sname}</div>
+                <div className="chip-arrow">â€º</div>
+              </button>
+            ))}
           </div>
         );
 
