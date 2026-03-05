@@ -1,9 +1,10 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { useSearchParams, useNavigate } from 'react-router-dom';
-import { getToken, apiGet, apiPost } from '../../api';
+import { API_BASE, getToken, apiGet, apiPost } from '../../api';
 import { useAuth } from '../../AuthContext';
 import '../../styles/chatbot.css';
 
+<<<<<<< HEAD
 const API_BASE = '';
 
 // ── DEFAULT LOCATION (used instead of real GPS) ──────────────────────────────
@@ -12,6 +13,8 @@ const DEFAULT_LATITUDE = 28.4595;   // Gurgaon, Haryana, India
 const DEFAULT_LONGITUDE = 77.0266;
 // ─────────────────────────────────────────────────────────────────────────────
 
+=======
+>>>>>>> madhav
 async function chatApiCall(endpoint, body) {
   const token = getToken();
   const headers = { 'Content-Type': 'application/json' };
