@@ -4,11 +4,24 @@ import { apiGet, apiPut } from '../../api';
 export default function ActiveTickets() {
   const [tickets, setTickets] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [changesLoading, setChangesLoading] = useState(true);
+  const [changeRequests, setChangeRequests] = useState([]);
   const [statusFilter, setStatusFilter] = useState('');
   const [priorityFilter, setPriorityFilter] = useState('');
   const [search, setSearch] = useState('');
   const [editingId, setEditingId] = useState(null);
   const [editData, setEditData] = useState({});
+
+  const loadChangeRequests = async () => {
+    setChangesLoading(true);
+    try {
+      const d = await apiGet('/api/manager/parameter-changes?status=pending');
+      setChangeRequests(d?.changes || []);
+    } catch (_) {
+      setChangeRequests([]);
+    }
+    setChangesLoading(false);
+  };
 
   const loadTickets = () => {
     const params = new URLSearchParams();
@@ -21,7 +34,10 @@ export default function ActiveTickets() {
     });
   };
 
-  useEffect(() => { loadTickets(); }, [statusFilter, priorityFilter]);
+  useEffect(() => {
+    loadTickets();
+    loadChangeRequests();
+  }, [statusFilter, priorityFilter]);
 
   const handleSearch = (e) => {
     e.preventDefault();
@@ -35,6 +51,17 @@ export default function ActiveTickets() {
     loadTickets();
   };
 
+  const handleReviewChange = async (changeId, decision) => {
+    const note = window.prompt(
+      decision === 'approved'
+        ? 'Optional note for agent (approval):'
+        : 'Reason for disapproval (recommended):',
+      ''
+    );
+    await apiPut(`/api/manager/parameter-changes/${changeId}/review`, { decision, note: note || '' });
+    loadChangeRequests();
+  };
+
   if (loading) return <div className="page-loader"><div className="spinner" /></div>;
 
   return (
@@ -42,6 +69,53 @@ export default function ActiveTickets() {
       <div className="page-header">
         <h1>Active Tickets</h1>
         <p>Manage and resolve customer support tickets</p>
+      </div>
+
+      <div className="table-card" style={{ marginBottom: 16 }}>
+        <div className="table-header">
+          <h3>Pending Parameter Change Requests ({changeRequests.length})</h3>
+        </div>
+        {changesLoading ? (
+          <div className="page-loader" style={{ minHeight: 80 }}><div className="spinner" /></div>
+        ) : changeRequests.length === 0 ? (
+          <div className="empty-state" style={{ padding: 16 }}>
+            <p>No pending requests.</p>
+          </div>
+        ) : (
+          <div className="table-scroll">
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>Ticket</th>
+                  <th>Agent</th>
+                  <th>Proposed Change</th>
+                  <th>Requested At</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {changeRequests.map(c => (
+                  <tr key={c.id}>
+                    <td style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12 }}>
+                      {c.ticket?.reference_number || `#${c.ticket_id}`}
+                    </td>
+                    <td>{c.agent_name || `Agent #${c.agent_id}`}</td>
+                    <td style={{ maxWidth: 360, whiteSpace: 'normal', lineHeight: 1.5 }}>{c.proposed_change}</td>
+                    <td style={{ fontSize: 12, color: '#94a3b8', whiteSpace: 'nowrap' }}>
+                      {c.created_at ? new Date(c.created_at).toLocaleString() : '-'}
+                    </td>
+                    <td>
+                      <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                        <button className="btn btn-success btn-sm" onClick={() => handleReviewChange(c.id, 'approved')}>Approve</button>
+                        <button className="btn btn-outline btn-sm" onClick={() => handleReviewChange(c.id, 'disapproved')}>Disapprove</button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
       </div>
 
       <div className="table-card">
