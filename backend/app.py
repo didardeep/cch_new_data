@@ -66,11 +66,15 @@ mail = Mail(app)
 
 
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> 86dc249d97ad07ce1db7fdaa4005c1f640eb6299
 # ─── Azure OpenAI Configuration ──────────────────────────────────────────────
 client = AzureOpenAI(
     api_key = os.environ.get("AZURE_OPENAI_API_KEY"),
     api_version = os.environ.get("AZURE_OPENAI_API_VERSION"),
     azure_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
+<<<<<<< HEAD
 =======
 # ─── Google Gemini Configuration (OpenAI-compatible endpoint) ────────────────
 # Using Gemini 1.5 Flash via Google's OpenAI-compatible API
@@ -87,6 +91,8 @@ client = OpenAI(
     api_key=os.environ.get("GEMINI_API_KEY"),
     base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
 >>>>>>> madhav
+=======
+>>>>>>> 86dc249d97ad07ce1db7fdaa4005c1f640eb6299
 )
 
 DEPLOYMENT_NAME = "gemini-3-flash-preview"
@@ -474,12 +480,17 @@ def generate_resolution(query, sector_name, subprocess_name, language):
 
 
 <<<<<<< HEAD
+<<<<<<< HEAD
 def generate_single_solution(sector_name, subprocess_name, language, user_query="", previous_solutions=None, attempt=1, original_query="", diagnosis_summary=""):
     """Generate a single focused solution. If user_query is provided, tailor to it. Avoids repeating previous solutions."""
 =======
 def generate_single_solution(sector_name, subprocess_name, language, user_query="", previous_solutions=None, attempt=1):
     """Generate a single focused solution."""
 >>>>>>> madhav
+=======
+def generate_single_solution(sector_name, subprocess_name, language, user_query="", previous_solutions=None, attempt=1, original_query="", diagnosis_summary=""):
+    """Generate a single focused solution. If user_query is provided, tailor to it. Avoids repeating previous solutions."""
+>>>>>>> 86dc249d97ad07ce1db7fdaa4005c1f640eb6299
     prev_block = ""
     if previous_solutions:
         prev_block = (
@@ -1040,6 +1051,9 @@ def analyze_signal(session_id):
         result = analyze_signal_screenshot(image_base64)
 
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> 86dc249d97ad07ce1db7fdaa4005c1f640eb6299
         # If signal is red (Poor), find the 3 nearest tower sites
         if result.get("overall_status") == "red":
             lat = session.latitude
@@ -1049,8 +1063,11 @@ def analyze_signal(session_id):
                 result["nearest_sites"] = nearest
 
         # Save diagnosis as a bot message for chat history
+<<<<<<< HEAD
 =======
 >>>>>>> madhav
+=======
+>>>>>>> 86dc249d97ad07ce1db7fdaa4005c1f640eb6299
         diagnosis_text = (
             f"Signal Diagnosis Results: "
             f"RSRP: {result.get('rsrp', 'N/A')} dBm ({result.get('rsrp_label', 'Unknown')}), "
@@ -1380,11 +1397,16 @@ def send_summary_email(session_id):
 @jwt_required()
 def get_chat_session(session_id):
 <<<<<<< HEAD
+<<<<<<< HEAD
     user_id = int(get_jwt_identity())
     session = ChatSession.query.get(session_id)
 =======
     session = db.session.get(ChatSession, session_id)
 >>>>>>> madhav
+=======
+    user_id = int(get_jwt_identity())
+    session = ChatSession.query.get(session_id)
+>>>>>>> 86dc249d97ad07ce1db7fdaa4005c1f640eb6299
     if not session:
         return jsonify({"error": "Session not found"}), 404
     if session.user_id != user_id:

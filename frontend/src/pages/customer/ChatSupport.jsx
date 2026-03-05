@@ -1,10 +1,9 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { useSearchParams, useNavigate } from 'react-router-dom';
-import { API_BASE, getToken, apiGet, apiPost } from '../../api';
+import { getToken, apiGet, apiPost } from '../../api';
 import { useAuth } from '../../AuthContext';
 import '../../styles/chatbot.css';
 
-<<<<<<< HEAD
 const API_BASE = '';
 
 // ── DEFAULT LOCATION (used instead of real GPS) ──────────────────────────────
@@ -13,8 +12,6 @@ const DEFAULT_LATITUDE = 28.4595;   // Gurgaon, Haryana, India
 const DEFAULT_LONGITUDE = 77.0266;
 // ─────────────────────────────────────────────────────────────────────────────
 
-=======
->>>>>>> madhav
 async function chatApiCall(endpoint, body) {
   const token = getToken();
   const headers = { 'Content-Type': 'application/json' };
@@ -48,10 +45,9 @@ function limitSubprocesses(subprocesses) {
 
 const SUBPROCESS_FOLLOWUP_OPTIONS = {
   'network / signal problems': [
-    'Internet / Mobile Data',
-    'Calls',
-    'SMS / OTP',
-    'Others',
+    'Internet/Signal Problems',
+    'Call Failure',
+    'Call Drop',
   ],
 };
 
@@ -79,7 +75,6 @@ export default function ChatSupport() {
   const [fbSubmitting, setFbSubmitting] = useState(false);
 
   const [messages, setMessages] = useState([]);
-  const [inlineSubprocessPicker, setInlineSubprocessPicker] = useState(null);
   const [inputVisible, setInputVisible] = useState(false);
   const [inputPlaceholder, setInputPlaceholder] = useState('Describe your issue...');
   const [inputValue, setInputValue] = useState('');
@@ -287,7 +282,6 @@ export default function ChatSupport() {
 
   const startChat = useCallback(async () => {
     setMessages([]);
-    setInlineSubprocessPicker(null);
     setDisabledGroups(new Set());
     setLocationStatus('idle');
     stateRef.current = {
@@ -319,7 +313,6 @@ export default function ChatSupport() {
 
   const selectSector = useCallback(async (key, name, groupId) => {
     disableGroup(groupId);
-    setInlineSubprocessPicker(null);
     stateRef.current.sectorKey = key;
     stateRef.current.sectorName = name;
     addMessage({ type: 'user', text: name });
@@ -461,27 +454,45 @@ export default function ChatSupport() {
     st.step = 'conversation';
   }, [addMessage, saveMessage, showInput, createSession, autoRaiseTicket]);
 
-  const selectSubprocess = useCallback(async (key, name, groupId, selectedOption = null) => {
+  const selectSubprocess = useCallback(async (key, name, groupId) => {
     const followupOptions = getFollowupOptions(name);
-    if (followupOptions.length > 0 && !selectedOption) {
-      setInlineSubprocessPicker({
-        groupId,
-        subprocessKey: key,
-        subprocessName: name,
-        options: followupOptions,
+    if (followupOptions.length > 0) {
+      disableGroup(groupId);
+      stateRef.current.subprocessKey = key;
+      stateRef.current.subprocessName = name;
+      stateRef.current.subprocessSubType = null;
+      stateRef.current.attempt = 0;
+      stateRef.current.previousSolutions = [];
+      addMessage({ type: 'user', text: name });
+      addMessage({
+        type: 'bot',
+        html: `You selected <strong>${name}</strong>. Please choose the <strong>specific issue type</strong>:`,
       });
+      const subIssueGroupId = nextId();
+      addMessage({ type: 'network-subissue-grid', options: followupOptions, groupId: subIssueGroupId });
+      stateRef.current.step = 'network-subissue';
       return;
     }
 
     disableGroup(groupId);
-    setInlineSubprocessPicker(null);
     stateRef.current.subprocessKey = key;
-    stateRef.current.subprocessSubType = selectedOption || null;
-    const finalSubprocessName = selectedOption ? `${name} - ${selectedOption}` : name;
+    stateRef.current.subprocessSubType = null;
+    stateRef.current.subprocessName = name;
+    stateRef.current.attempt = 0;
+    stateRef.current.previousSolutions = [];
+    addMessage({ type: 'user', text: name });
+    await beginLocationFlow(name);
+  }, [addMessage, disableGroup, beginLocationFlow]);
+
+  const selectNetworkSubissue = useCallback(async (name, groupId) => {
+    disableGroup(groupId);
+    stateRef.current.subprocessSubType = name;
+    const baseName = stateRef.current.subprocessName || 'Network / Signal Problems';
+    const finalSubprocessName = `${baseName} - ${name}`;
     stateRef.current.subprocessName = finalSubprocessName;
     stateRef.current.attempt = 0;
     stateRef.current.previousSolutions = [];
-    addMessage({ type: 'user', text: finalSubprocessName });
+    addMessage({ type: 'user', text: name });
     await beginLocationFlow(finalSubprocessName);
   }, [addMessage, disableGroup, beginLocationFlow]);
 
@@ -808,7 +819,6 @@ export default function ChatSupport() {
   const resumeChat = useCallback(async (session, msgs) => {
     setInitPhase('chat');
     setMessages([]);
-    setInlineSubprocessPicker(null);
     setDisabledGroups(new Set());
     hideInput();
     sessionIdRef.current = session.id;
@@ -969,39 +979,28 @@ export default function ChatSupport() {
           <div key={msg.id} className="subprocess-grid">
             {Object.entries(msg.subprocesses).map(([sk, sname], idx) => {
               const isOthers = sname === 'Others' || sname.toLowerCase().includes('other');
-              const hasFollowup = getFollowupOptions(sname).length > 0;
-              const isExpanded = inlineSubprocessPicker &&
-                inlineSubprocessPicker.groupId === msg.groupId &&
-                inlineSubprocessPicker.subprocessKey === sk;
               return (
-                <div key={sk} style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                  <button className={`subprocess-chip${isOthers ? ' others' : ''}${isDisabled ? ' disabled' : ''}`}
-                    onClick={() => !isDisabled && selectSubprocess(sk, sname, msg.groupId)}>
-                    <div className="chip-num">{isOthers ? '···' : idx + 1}</div>
-                    <div className="chip-label">{sname}</div>
-                    <div className="chip-arrow">›</div>
-                  </button>
-                  {hasFollowup && isExpanded && !isDisabled && (
-                    <div style={{ marginTop: '-4px' }}>
-                      <select
-                        defaultValue=""
-                        onChange={(e) => {
-                          const selected = e.target.value;
-                          if (!selected) return;
-                          selectSubprocess(sk, sname, msg.groupId, selected);
-                        }}
-                        style={{ width: '100%', padding: '10px 12px', borderRadius: 8, border: '1px solid #cbd5e1', fontSize: 14 }}
-                      >
-                        <option value="" disabled>Select one option</option>
-                        {(inlineSubprocessPicker.options || []).map((opt, optIdx) => (
-                          <option key={`${opt}-${optIdx}`} value={opt}>{opt}</option>
-                        ))}
-                      </select>
-                    </div>
-                  )}
-                </div>
+                <button key={sk} className={`subprocess-chip${isOthers ? ' others' : ''}${isDisabled ? ' disabled' : ''}`}
+                  onClick={() => !isDisabled && selectSubprocess(sk, sname, msg.groupId)}>
+                  <div className="chip-num">{isOthers ? '···' : idx + 1}</div>
+                  <div className="chip-label">{sname}</div>
+                  <div className="chip-arrow">›</div>
+                </button>
               );
             })}
+          </div>
+        );
+      case 'network-subissue-grid':
+        return (
+          <div key={msg.id} className="subprocess-grid">
+            {(msg.options || []).map((name, idx) => (
+              <button key={`${name}-${idx}`} className={`subprocess-chip${isDisabled ? ' disabled' : ''}`}
+                onClick={() => !isDisabled && selectNetworkSubissue(name, msg.groupId)}>
+                <div className="chip-num">{idx + 1}</div>
+                <div className="chip-label">{name}</div>
+                <div className="chip-arrow">›</div>
+              </button>
+            ))}
           </div>
         );
       case 'resolution':
@@ -1491,5 +1490,7 @@ export default function ChatSupport() {
     </div>
   );
 }
+
+
 
 
