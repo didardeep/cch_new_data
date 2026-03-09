@@ -2,7 +2,7 @@
 Telecom Customer Complaint Handling System - Backend
 =====================================================
 Full backend with auth, chat, tickets, and the original AI chatbot integrated.
-Updated to use Google Gemini 1.5 Flash via OpenAI-compatible endpoint.
+Updated to use Azure OpenAI API directly.
 """
 
 import os
@@ -20,10 +20,11 @@ from flask_jwt_extended import (
     JWTManager, create_access_token, jwt_required, get_jwt_identity
 )
 from flask_mail import Mail, Message
-
-# ── Google Gemini via OpenAI-compatible SDK ──────────────────────────────────
-from openai import OpenAI
 from dotenv import load_dotenv
+from types import SimpleNamespace
+import urllib.request
+import urllib.parse
+import urllib.error
 
 from sqlalchemy import case as sql_case
 from sqlalchemy.orm import joinedload
@@ -50,7 +51,7 @@ app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get(
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(hours=24)
 
-# ─── Flask-Mail Configuration ─────────────────────────────────────────────
+# Flask-Mail Configuration
 app.config["MAIL_SERVER"] = os.environ.get("MAIL_SERVER", "smtp.gmail.com")
 app.config["MAIL_PORT"] = int(os.environ.get("MAIL_PORT", 587))
 app.config["MAIL_USE_TLS"] = os.environ.get("MAIL_USE_TLS", "True").lower() in ("true", "1", "yes")
@@ -64,15 +65,101 @@ bcrypt.init_app(app)
 jwt = JWTManager(app)
 mail = Mail(app)
 
+# -- Azure OpenAI Configuration ----------------------------------------------
+AZURE_OPENAI_API_KEY = os.environ.get("AZURE_OPENAI_API_KEY")
+AZURE_OPENAI_ENDPOINT = os.environ.get("AZURE_OPENAI_ENDPOINT")
+AZURE_OPENAI_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
+DEPLOYMENT_NAME = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini")
 
-# ─── Azure OpenAI Configuration ──────────────────────────────────────────────
-client = AzureOpenAI(
-    api_key = os.environ.get("AZURE_OPENAI_API_KEY"),
-    api_version = os.environ.get("AZURE_OPENAI_API_VERSION"),
-    azure_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
+if not AZURE_OPENAI_API_KEY:
+    raise RuntimeError("Missing AZURE_OPENAI_API_KEY in environment.")
+if not AZURE_OPENAI_ENDPOINT:
+    raise RuntimeError("Missing AZURE_OPENAI_ENDPOINT in environment.")
+
+
+class _AzureCompletions:
+    def __init__(self, api_key: str, api_base: str, api_version: str):
+        self.api_key = api_key
+        self.api_base = api_base.rstrip("/")
+        self.api_version = api_version
+
+    def create(self, model, messages, temperature=0.2, max_tokens=512, **kwargs):
+        deployment = urllib.parse.quote(model or "", safe="")
+        query = urllib.parse.urlencode({"api-version": self.api_version})
+        url = f"{self.api_base}/openai/deployments/{deployment}/chat/completions?{query}"
+
+        payload = {
+            "messages": messages or [{"role": "user", "content": ""}],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        for key in ("top_p", "presence_penalty", "frequency_penalty", "response_format"):
+            if key in kwargs and kwargs[key] is not None:
+                payload[key] = kwargs[key]
+
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "api-key": self.api_key,
+            },
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                data = json.loads(resp.read().decode("utf-8") or "{}")
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", errors="ignore")
+            raise RuntimeError(f"Azure OpenAI HTTP {e.code}: {detail}")
+        except Exception as e:
+            raise RuntimeError(f"Azure OpenAI request failed: {e}")
+
+        choices = data.get("choices") or []
+        content = ""
+        if choices and isinstance(choices[0], dict):
+            content_obj = (choices[0].get("message") or {}).get("content")
+            if isinstance(content_obj, str):
+                content = content_obj.strip()
+            elif isinstance(content_obj, list):
+                # Handle multimodal content blocks by concatenating text parts.
+                text_parts = []
+                for item in content_obj:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        text_parts.append(item.get("text", ""))
+                content = "".join(text_parts).strip()
+
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
+        )
+
+
+class _AzureChat:
+    def __init__(self, api_key: str, api_base: str, api_version: str):
+        self.completions = _AzureCompletions(api_key, api_base, api_version)
+
+
+class _AzureClient:
+    def __init__(self, api_key: str, api_base: str, api_version: str):
+        self.chat = _AzureChat(api_key, api_base, api_version)
+
+
+client = _AzureClient(
+    api_key=AZURE_OPENAI_API_KEY,
+    api_base=AZURE_OPENAI_ENDPOINT,
+    api_version=AZURE_OPENAI_API_VERSION,
 )
 
-DEPLOYMENT_NAME = "gemini-3-flash-preview"
+
+def _friendly_ai_error(err: Exception) -> str:
+    msg = str(err)
+    low = msg.lower()
+    if ("429" in msg) or ("resource_exhausted" in low) or ("quota" in low):
+        return "Our AI service is temporarily unavailable due to usage limits. Please try again in about 1 minute."
+    if ("401" in msg) or ("403" in msg):
+        return "Our AI service is currently unavailable due to configuration/access restrictions. Please try again later."
+    return "I apologize, but I encountered a temporary AI service issue. Please try again."
 
 
 
@@ -453,7 +540,7 @@ def generate_resolution(query, sector_name, subprocess_name, language):
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
-        return f"I apologize, but I encountered an error. Please try again. Error: {str(e)}"
+        return _friendly_ai_error(e)
 
 
 def generate_single_solution(sector_name, subprocess_name, language, user_query="", previous_solutions=None, attempt=1, original_query="", diagnosis_summary=""):
@@ -515,7 +602,7 @@ def generate_single_solution(sector_name, subprocess_name, language, user_query=
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
-        return f"I apologize, but I encountered an error. Please try again. Error: {str(e)}"
+        return _friendly_ai_error(e)
 
 
 def translate_text(text: str, target_language: str) -> str:
@@ -559,7 +646,7 @@ def generate_chat_summary(messages_list, sector_name, subprocess_name):
 
 
 def analyze_signal_screenshot(image_base64):
-    """Use Gemini Vision to extract signal metrics from a screenshot."""
+    """Use Azure OpenAI Vision to extract signal metrics from a screenshot."""
     # Strip data URL prefix if present
     clean_b64 = re.sub(r"^data:image/[^;]+;base64,", "", image_base64)
 
@@ -996,7 +1083,7 @@ def save_session_location(session_id):
 @app.route("/api/chat/session/<int:session_id>/analyze-signal", methods=["POST"])
 @jwt_required()
 def analyze_signal(session_id):
-    """Analyze a signal screenshot using Gemini Vision."""
+    """Analyze a signal screenshot using Azure OpenAI Vision."""
     user_id = int(get_jwt_identity())
     session = db.session.get(ChatSession, session_id)
 
@@ -1986,8 +2073,11 @@ def admin_upload_users():
         return jsonify({"error": "No file uploaded"}), 400
 
     file = request.files["file"]
-    if not file.filename.endswith((".xlsx", ".xls")):
-        return jsonify({"error": "Only Excel files (.xlsx, .xls) are allowed"}), 400
+    if not file.filename.lower().endswith((".xlsx", ".xlsm")):
+        return jsonify({"error": "Only .xlsx or .xlsm files are supported (.xls is not supported)."}), 400
+    ok, err = _validate_ooxml_excel_upload(file)
+    if not ok:
+        return jsonify({"error": err}), 400
 
     from openpyxl import load_workbook
     import io
@@ -1995,8 +2085,8 @@ def admin_upload_users():
     try:
         wb = load_workbook(io.BytesIO(file.read()))
         ws = wb.active
-    except Exception:
-        return jsonify({"error": "Could not read Excel file"}), 400
+    except Exception as e:
+        return jsonify({"error": f"Could not read Excel workbook. Please upload a valid .xlsx/.xlsm file. Details: {str(e)}"}), 400
 
     headers = [str(cell.value or "").strip().lower() for cell in ws[1]]
     required = {"name", "email", "role"}
@@ -2294,6 +2384,30 @@ def haversine(lat1, lon1, lat2, lon2):
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
+def _validate_ooxml_excel_upload(file_storage):
+    """Validate that uploaded file is a real OOXML workbook (.xlsx/.xlsm), not renamed/corrupt/temp file."""
+    name = (file_storage.filename or "").strip()
+    if name.startswith("~$"):
+        return False, "You selected an Excel temporary lock file (~$...). Please upload the actual workbook."
+
+    # OOXML files are ZIP containers and start with 'PK'
+    try:
+        stream = file_storage.stream
+        pos = stream.tell()
+        magic = stream.read(4)
+        stream.seek(pos)
+    except Exception:
+        magic = b""
+
+    if not magic.startswith(b"PK"):
+        return False, (
+            "Invalid Excel workbook format. Please upload a real .xlsx/.xlsm file "
+            "(not .xls, not CSV renamed to .xlsx, and not a temporary file)."
+        )
+
+    return True, None
+
+
 @app.route("/api/admin/upload-sites", methods=["POST"])
 @jwt_required()
 def admin_upload_sites():
@@ -2305,8 +2419,11 @@ def admin_upload_sites():
         return jsonify({"error": "No file provided"}), 400
 
     file = request.files["file"]
-    if not file.filename.endswith((".xlsx", ".xls")):
-        return jsonify({"error": "Only .xlsx or .xls files accepted"}), 400
+    if not file.filename.lower().endswith((".xlsx", ".xlsm")):
+        return jsonify({"error": "Only .xlsx or .xlsm files are supported (.xls is not supported)."}), 400
+    ok, err = _validate_ooxml_excel_upload(file)
+    if not ok:
+        return jsonify({"error": err}), 400
 
     import openpyxl, tempfile
     from psycopg2.extras import execute_values
@@ -2319,7 +2436,7 @@ def admin_upload_sites():
         try:
             wb = openpyxl.load_workbook(path, data_only=True)
         except Exception as e:
-            return jsonify({"error": f"Invalid Excel file: {str(e)}"}), 400
+            return jsonify({"error": f"Invalid Excel workbook. Please upload a valid .xlsx/.xlsm file. Details: {str(e)}"}), 400
 
         ws = wb.active
         headers = [str(c.value).strip().lower() if c.value else "" for c in ws[1]]
@@ -2429,6 +2546,9 @@ def admin_upload_kpi_site_level():
 
     if not file.filename.lower().endswith(('.xlsx', '.xlsm')):
         return jsonify({"error": "Please upload a .xlsx or .xlsm file."}), 400
+    ok, err = _validate_ooxml_excel_upload(file)
+    if not ok:
+        return jsonify({"error": err}), 400
 
     import openpyxl, tempfile, io, csv
     from sqlalchemy import text as sa_text
@@ -2456,6 +2576,16 @@ def admin_upload_kpi_site_level():
         ]
         COPY_SQL = "COPY kpi_data (site_id, kpi_name, date, hour, value, data_level) FROM STDIN WITH (FORMAT CSV, NULL '')"
         FLUSH_AT = 200_000
+
+        def _to_float(val):
+            if val is None:
+                raise ValueError("empty")
+            if isinstance(val, (int, float)):
+                return float(val)
+            s = str(val).strip().replace(",", "")
+            if s.endswith("%"):
+                s = s[:-1]
+            return float(s)
 
         raw_conn = db.engine.raw_connection()
         cur = raw_conn.cursor()
@@ -2510,7 +2640,7 @@ def admin_upload_kpi_site_level():
                     for col_idx, col_date in date_map:
                         if col_idx < row_len and row[col_idx] is not None:
                             try:
-                                writer.writerow((site_id, kpi_name, col_date, 0, float(row[col_idx]), "site"))
+                                writer.writerow((site_id, kpi_name, col_date, 0, _to_float(row[col_idx]), "site"))
                                 row_count += 1
                             except (ValueError, TypeError):
                                 continue
@@ -2571,6 +2701,9 @@ def admin_upload_kpi_cell_level():
 
     if not file.filename.lower().endswith(('.xlsx', '.xlsm')):
         return jsonify({"error": "Invalid file format. Please upload a .xlsx or .xlsm file."}), 400
+    ok, err = _validate_ooxml_excel_upload(file)
+    if not ok:
+        return jsonify({"error": err}), 400
 
     import openpyxl, tempfile, io, csv
     from sqlalchemy import text as sa_text
@@ -2599,6 +2732,16 @@ def admin_upload_kpi_cell_level():
         ]
         COPY_SQL = "COPY kpi_data (site_id, cell_id, cell_site_id, kpi_name, date, hour, value, data_level) FROM STDIN WITH (FORMAT CSV, NULL '')"
         FLUSH_AT = 200_000
+
+        def _to_float(val):
+            if val is None:
+                raise ValueError("empty")
+            if isinstance(val, (int, float)):
+                return float(val)
+            s = str(val).strip().replace(",", "")
+            if s.endswith("%"):
+                s = s[:-1]
+            return float(s)
 
         raw_conn = db.engine.raw_connection()
         cur = raw_conn.cursor()
@@ -2655,7 +2798,7 @@ def admin_upload_kpi_cell_level():
                     for col_idx, col_date in date_col_map:
                         if col_idx < row_len and row[col_idx] is not None:
                             try:
-                                writer.writerow((site_id, cell_id, cell_site_id, kpi_name, col_date, 0, float(row[col_idx]), "cell"))
+                                writer.writerow((site_id, cell_id, cell_site_id, kpi_name, col_date, 0, _to_float(row[col_idx]), "cell"))
                                 row_count += 1
                             except (ValueError, TypeError):
                                 continue
@@ -3572,7 +3715,7 @@ def agent_resolve_ticket(ticket_id):
 @app.route("/api/agent/tickets/<int:ticket_id>/diagnose", methods=["POST"])
 @jwt_required()
 def agent_diagnose_ticket(ticket_id):
-    """Use Gemini AI to generate a diagnosis/recommendation for resolving this ticket."""
+    """Use Azure OpenAI to generate a diagnosis/recommendation for resolving this ticket."""
     user_id = int(get_jwt_identity())
     user = db.session.get(User, user_id)
     if not user or user.role != "human_agent":
@@ -3618,7 +3761,7 @@ Keep your response concise and actionable."""
         )
         diagnosis = response.choices[0].message.content.strip()
     except Exception as e:
-        diagnosis = f"AI diagnosis unavailable: {str(e)}"
+        diagnosis = _friendly_ai_error(e)
 
     return jsonify({"diagnosis": diagnosis, "ticket_id": ticket_id})
 
@@ -3720,7 +3863,7 @@ def agent_kpi_trends(site_id):
 @app.route("/api/agent/tickets/<int:ticket_id>/root-cause", methods=["POST"])
 @jwt_required()
 def agent_root_cause(ticket_id):
-    """Gemini AI root cause analysis using site-level and cell-level KPI trends."""
+    """Azure OpenAI root cause analysis using site-level and cell-level KPI trends."""
     user = db.session.get(User, int(get_jwt_identity()))
     if not user or user.role != "human_agent":
         return jsonify({"error": "Unauthorized"}), 403
@@ -3839,7 +3982,7 @@ Be specific and reference actual KPI values in your analysis."""
         )
         analysis = response.choices[0].message.content.strip()
     except Exception as e:
-        analysis = f"Root cause analysis unavailable: {str(e)}"
+        analysis = _friendly_ai_error(e)
 
     return jsonify({
         "analysis": analysis,
@@ -3853,7 +3996,7 @@ Be specific and reference actual KPI values in your analysis."""
 @app.route("/api/agent/tickets/<int:ticket_id>/recommendation", methods=["POST"])
 @jwt_required()
 def agent_recommendation(ticket_id):
-    """Gemini AI recommendation based on root cause analysis and full trend analysis."""
+    """Azure OpenAI recommendation based on root cause analysis and full trend analysis."""
     user = db.session.get(User, int(get_jwt_identity()))
     if not user or user.role != "human_agent":
         return jsonify({"error": "Unauthorized"}), 403
@@ -3895,7 +4038,7 @@ Be specific, actionable, and prioritize by impact."""
         )
         recommendation = response.choices[0].message.content.strip()
     except Exception as e:
-        recommendation = f"Recommendation unavailable: {str(e)}"
+        recommendation = _friendly_ai_error(e)
 
     return jsonify({"recommendation": recommendation})
 
@@ -4346,3 +4489,6 @@ with app.app_context():
 if __name__ == "__main__":
     run_sla_checks()
     app.run(debug=True, port=5500, use_reloader=False)
+
+
+
