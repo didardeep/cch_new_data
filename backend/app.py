@@ -4014,12 +4014,12 @@ def agent_root_cause(ticket_id):
     site_kpi_text = _build_kpi_summary_text(site_rows, selected_kpis, "site-level")
     cell_kpi_text = _build_kpi_summary_text(cell_rows, selected_kpis, "cell-level")
 
-    prompt = f"""You are an expert telecom network engineer performing root cause analysis.
+    if site_status == "off_air":
+        prompt = f"""You are an expert telecom network engineer performing root cause analysis.
 
 TICKET: {ticket.reference_number} - {ticket.category} / {ticket.subcategory}
 CUSTOMER ISSUE: {ticket.description}
 PROBLEM TYPE: {problem_type_label}
-NEAREST SITE: {nearest.site_id} (Zone: {nearest.zone}, Distance: {dist_km} km from customer)
 NEAREST SITE: {nearest_site_id} (Zone: {nearest_zone}, Distance: {dist_km} km from customer)
 
 SITE STATUS: OFF AIR. This site is currently down.
@@ -4048,7 +4048,7 @@ Do not add headings, summaries, or extra sections."""
 TICKET: {ticket.reference_number} - {ticket.category} / {ticket.subcategory}
 CUSTOMER ISSUE: {ticket.description}
 PROBLEM TYPE: {problem_type_label}
-NEAREST SITE: {nearest.site_id} (Zone: {nearest.zone}, Distance: {dist_km} km from customer)
+NEAREST SITE: {nearest_site_id} (Zone: {nearest_zone}, Distance: {dist_km} km from customer)
 
 SITE STATUS: ON AIR. Analysis must be based on KPI trends only.
 Use only these KPI families relevant to {problem_type_label}: {", ".join(selected_kpis) if selected_kpis else "No matched KPI names"}.
