@@ -1,4 +1,4 @@
-"""
+﻿"""
 Telecom Customer Complaint Handling System - Backend
 =====================================================
 Full backend with auth, chat, tickets, and the original AI chatbot integrated.
@@ -440,7 +440,7 @@ def generate_resolution(query, sector_name, subprocess_name, language):
                     "If they conflict, prioritize the user's query while staying within telecom scope.\n\n"
                     "Provide a helpful response in the following format:\n"
                     "1. Acknowledge the issue empathetically\n"
-                    "2. Provide 4-6 clear, actionable self-help troubleshooting steps\n\n"
+                    "2. Provide ONE focused solution at a time with 3-6 clear, step-by-step actions that explain exactly how to carry out that solution\n\n"
                     "STRICT RULE: Do NOT suggest the user to 'contact customer support', 'call customer care', "
                     "'raise a ticket', 'reach out to support', or any form of escalation. "
                     "Only provide self-help troubleshooting steps that the user can do on their own.\n\n"
@@ -495,8 +495,8 @@ def generate_single_solution(sector_name, subprocess_name, language, user_query=
                     "IMPORTANT: Base this solution on BOTH the selected dropdown context "
                     "(sector/subprocess) and the user's latest query. "
                     "If they conflict, prioritize the latest query while staying within telecom scope.\n\n"
-                    "Provide ONE focused, actionable solution with its step, how to take that action, keep in mind that steps would be how to perform that action. "
-                    "Be concise and specific. Do not provide multiple alternative solutions — just one.\n"
+                    "Provide ONE focused, actionable solution at a time with steps that explain how to perform that action. "
+                    "Be concise and specific. Do not provide multiple alternative solutions -- just one.\n"
                     "Do NOT include any URLs, links, or website references in your response.\n"
                     "STRICT RULE: Do NOT suggest the user to 'contact customer support', 'call customer care', "
                     "'raise a ticket', 'reach out to support', 'visit a service center', or any form of escalation. "
@@ -4196,4 +4196,5 @@ with app.app_context():
 if __name__ == "__main__":
     run_sla_checks()
     app.run(debug=True, port=5500, use_reloader=False)
+
 

@@ -46,9 +46,8 @@ function limitSubprocesses(subprocesses) {
 const SUBPROCESS_FOLLOWUP_OPTIONS = {
   'network / signal problems': [
     'Internet / Mobile Data',
-    'Calls',
-    'SMS / OTP',
-    'Others',
+    'Call Failure',
+    'Call Drop',
   ],
 };
 
@@ -392,7 +391,7 @@ export default function ChatSupport() {
         if (data.assigned_agent) { assignedAgent = data.assigned_agent; }
       } catch {}
     }
-    const header = prefaceHtml || `I'm sorry I wasn't able to resolve your issue. I'm raising a ticket so our support team can help.`;
+    const header = prefaceHtml || `Sorry, I will raise a ticket for you.`;
     addMessage({
       type: 'bot',
       html: `${header}<br><br>Your ticket has been raised successfully!` +
@@ -625,7 +624,8 @@ export default function ChatSupport() {
     }
     addMessage({
       type: 'bot',
-      html: `Your ticket has been raised successfully!` +
+      html: `Sorry, I will raise a ticket for you.` +
+        `<br><br>Your ticket has been raised successfully!` +
         (refNum ? `<br>Reference: <strong>${refNum}</strong>` : '') +
         (assignedAgent
           ? `<br><br>We are connecting you to our expert. Your dedicated support agent is:<br>
@@ -788,7 +788,8 @@ export default function ChatSupport() {
         : `<br><br>Our support team will contact you shortly.` + (slaHours ? `<br><span style="color:#16a34a;font-weight:600;">⏱ Your issue will be resolved within ${slaHours} hour${slaHours !== 1 ? 's' : ''}</span>` : '');
       addMessage({
         type: 'bot',
-        html: `Your request has been submitted and a support ticket has been raised.` + agentCard +
+        html: `Sorry, I will raise a ticket for you.` +
+          `<br><br>Your request has been submitted and a support ticket has been raised.` + agentCard +
           `<br>Reference: <strong>${refNum}</strong><br><br>The agent may send you messages below — please stay in this chat.<br><br>What would you like to do next?`,
       });
       setTimeout(() => { const ag = nextId(); addMessage({ type: 'post-feedback-actions', groupId: ag }); }, 400);
