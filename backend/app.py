@@ -59,11 +59,10 @@ jwt = JWTManager(app)
 mail = Mail(app)
 
 
-# ─── Azure OpenAI Configuration ──────────────────────────────────────────────
-client = AzureOpenAI(
-    api_key = os.environ.get("AZURE_OPENAI_API_KEY"),
-    api_version = os.environ.get("AZURE_OPENAI_API_VERSION"),
-    azure_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
+# ─── Google Gemini Configuration (OpenAI-compatible endpoint) ────────────────
+client = OpenAI(
+    api_key=os.environ.get("GEMINI_API_KEY"),
+    base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
 )
 DEPLOYMENT_NAME = os.environ.get("AZURE_DEPLOYMENT_NAME", "gpt-4o-mini")
 
@@ -4012,14 +4011,8 @@ def agent_root_cause(ticket_id):
             cell_key = f"{r.cell_id}" if r.cell_id else "unknown"
             cell_summary[r.kpi_name][cell_key].append(r.value)
 
-    cell_kpi_text = ""
-    for kpi_name, cells in cell_summary.items():
-        cell_kpi_text += f"- {kpi_name}:\n"
-        for cell_id, vals in cells.items():
-            avg = round(sum(vals) / len(vals), 4)
-            mn = round(min(vals), 4)
-            mx = round(max(vals), 4)
-            cell_kpi_text += f"    Cell {cell_id}: avg={avg}, min={mn}, max={mx} ({len(vals)} pts)\n"
+    site_kpi_text = _build_kpi_summary_text(site_rows, selected_kpis, "site-level")
+    cell_kpi_text = _build_kpi_summary_text(cell_rows, selected_kpis, "cell-level")
 
     prompt = f"""You are an expert telecom network engineer performing root cause analysis.
 
@@ -4105,7 +4098,20 @@ Be specific and reference actual KPI values in your analysis."""
             fallback_points=fallback_rca,
         )
     except Exception as e:
-        analysis = f"Root cause analysis unavailable: {str(e)}"
+        analysis = _force_numbered_points(
+            "",
+            min_points=4,
+            max_points=5,
+            fallback_points=[
+                f"**Model Error**: Root cause analysis could not be generated automatically: {str(e)}.",
+                f"**Focus Area**: Nearest site {nearest.site_id} and problem type {problem_type_label} remain the active technical focus.",
+                "**Trend Review**: Review daily/hourly KPI movement against weekly/monthly baseline to isolate degradation start time.",
+                "**Fault Domain**: Correlate degraded cell-level indicators with site-level KPI shifts to validate fault domain.",
+            ],
+        )
+
+    # Generate PDF-friendly version (plain text, no markdown)
+    analysis_pdf = _format_points_for_pdf(analysis)
 
     return jsonify({
         "analysis": analysis,
@@ -4175,10 +4181,24 @@ Do not add headings, summaries, or extra sections."""
             ],
         )
     except Exception as e:
-        recommendation = f"Recommendation unavailable: {str(e)}"
+        recommendation = _force_numbered_points(
+            "",
+            min_points=3,
+            max_points=4,
+            fallback_points=[
+                f"**Model Error**: Recommendation generation failed: {str(e)}; proceed with technical triage on related KPI path.",
+                "**KPI Recovery**: Validate daily/hourly KPI recovery after corrective action before closure.",
+                "**Escalation**: Escalate with KPI and alarm evidence if stability is not achieved within the defined SLA window.",
+            ],
+        )
 
-    return jsonify({"recommendation": recommendation})
+    # Generate PDF-friendly version (plain text, no markdown)
+    recommendation_pdf = _format_points_for_pdf(recommendation)
 
+    return jsonify({
+        "recommendation": recommendation,
+        "recommendation_pdf": recommendation_pdf,
+    })
 
 @app.route("/api/agent/customer360/<int:customer_user_id>", methods=["GET"])
 @jwt_required()
@@ -4544,5 +4564,4 @@ with app.app_context():
 if __name__ == "__main__":
     run_sla_checks()
     app.run(debug=True, port=5500, use_reloader=False)
-
 
