@@ -70,6 +70,49 @@ DEPLOYMENT_NAME = os.environ.get("AZURE_DEPLOYMENT_NAME", "gpt-4o-mini")
 
 
 
+_SITE_DATA = []
+
+
+def _load_site_data():
+    """Load telecom site data from local Excel into memory once."""
+    global _SITE_DATA
+    excel_path = os.environ.get(
+        "SITE_EXCEL_PATH",
+        os.path.join(os.path.dirname(__file__), "Gurgaon_4G_1500_Sites.csv.xlsx"),
+    )
+    if not os.path.exists(excel_path):
+        print(f"[WARN] Site Excel not found at {excel_path} - nearest-site lookup disabled")
+        return
+    try:
+        import openpyxl
+        wb = openpyxl.load_workbook(excel_path, read_only=True)
+        ws = wb[wb.sheetnames[0]]
+        for i, row in enumerate(ws.iter_rows(values_only=True)):
+            if i == 0:
+                continue
+            site_name = row[0] or ""
+            zone = row[1] or ""
+            lon = row[2]
+            lat = row[3]
+            status = row[4] or "Unknown"
+            alarm = row[5] or ""
+            solution = row[6] or ""
+            if lat is not None and lon is not None:
+                _SITE_DATA.append({
+                    "site_id": str(site_name),
+                    "zone": str(zone),
+                    "latitude": float(lat),
+                    "longitude": float(lon),
+                    "status": str(status),
+                    "alarm": str(alarm),
+                    "solution": str(solution),
+                })
+        wb.close()
+        print(f"[INFO] Loaded {len(_SITE_DATA)} telecom sites from Excel for nearest lookup")
+    except Exception as e:
+        print(f"[WARN] Failed to load site Excel: {e}")
+
+
 def _haversine(lat1, lon1, lat2, lon2):
     """Calculate distance in km between two lat/lon points."""
     R = 6371.0
@@ -82,33 +125,32 @@ def _haversine(lat1, lon1, lat2, lon2):
 
 
 def find_nearest_sites(lat, lon, n=3):
-    """Return the n nearest telecom sites to the given coordinates from DB."""
-    if lat is None or lon is None:
-        return []
-
-    sites = TelecomSite.query.all()
-    if not sites:
+    """Return the n nearest telecom sites to the given coordinates from Excel data."""
+    if not _SITE_DATA or lat is None or lon is None:
         return []
 
     scored = []
-    for site in sites:
-        if site.latitude is None or site.longitude is None:
-            continue
-        dist = _haversine(lat, lon, site.latitude, site.longitude)
+    for site in _SITE_DATA:
+        dist = _haversine(lat, lon, site["latitude"], site["longitude"])
         scored.append((dist, site))
 
     scored.sort(key=lambda x: x[0])
     results = []
     for dist, site in scored[:n]:
         results.append({
-            "site_id": site.site_id,
-            "zone": site.zone,
-            "status": site.site_status or "on_air",
-            "alarm": site.alarms if site.alarms else "None",
-            "solution": site.solution if site.solution else "No action required",
+            "site_id": site["site_id"],
+            "zone": site["zone"],
+            "latitude": site["latitude"],
+            "longitude": site["longitude"],
+            "status": site["status"] if site["status"] else "Unknown",
+            "alarm": site["alarm"] if site["alarm"] else "None",
+            "solution": site["solution"] if site["solution"] else "No action required",
             "distance_km": round(dist, 2),
         })
     return results
+
+
+_load_site_data()
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  CHATBOT CODE 
@@ -985,13 +1027,7 @@ def analyze_signal(session_id):
     try:
         result = analyze_signal_screenshot(image_base64)
 
-        # If signal is red (Poor), find the 3 nearest tower sites
-        if result.get("overall_status") == "red":
-            lat = session.latitude
-            lon = session.longitude
-            nearest = find_nearest_sites(lat, lon, n=3)
-            if nearest:
-                result["nearest_sites"] = nearest
+        # If signal is red (Poor), do not include nearest tower sites in user-facing diagnosis
 
         # Save diagnosis as a bot message for chat history
         diagnosis_text = (
@@ -3584,25 +3620,13 @@ def agent_nearest_sites(ticket_id):
         return jsonify({"error": "Customer location not available"}), 400
 
     cust_lat, cust_lng = session.latitude, session.longitude
-    sites = TelecomSite.query.all()
-    if not sites:
-        return jsonify({"error": "No site data uploaded. Ask admin to upload site data."}), 400
-
-    ranked = []
-    for s in sites:
-        dist = haversine(cust_lat, cust_lng, s.latitude, s.longitude)
-        ranked.append({
-            "site_id": s.site_id,
-            "latitude": s.latitude,
-            "longitude": s.longitude,
-            "zone": s.zone,
-            "distance_km": round(dist, 2),
-        })
-    ranked.sort(key=lambda x: x["distance_km"])
+    ranked = find_nearest_sites(cust_lat, cust_lng, n=3)
+    if not ranked:
+        return jsonify({"error": "No Excel site data available for nearest-site lookup."}), 400
 
     return jsonify({
         "customer": {"latitude": cust_lat, "longitude": cust_lng},
-        "nearest_sites": ranked[:3],
+        "nearest_sites": ranked,
     })
 
 
@@ -3675,18 +3699,19 @@ def agent_root_cause(ticket_id):
     if not session or not session.latitude or not session.longitude:
         return jsonify({"error": "Customer location not available"}), 400
 
-    # Find nearest site
-    sites = TelecomSite.query.all()
-    if not sites:
-        return jsonify({"error": "No site data"}), 400
-
-    nearest = min(sites, key=lambda s: haversine(session.latitude, session.longitude, s.latitude, s.longitude))
-    dist_km = round(haversine(session.latitude, session.longitude, nearest.latitude, nearest.longitude), 2)
+    # Find nearest site from Excel-backed site data
+    nearest_list = find_nearest_sites(session.latitude, session.longitude, n=1)
+    if not nearest_list:
+        return jsonify({"error": "No Excel site data available for nearest-site lookup."}), 400
+    nearest = nearest_list[0]
+    nearest_site_id = nearest["site_id"]
+    nearest_zone = nearest.get("zone")
+    dist_km = nearest["distance_km"]
 
     from collections import defaultdict
 
     # Get site-level KPI data
-    site_rows = KpiData.query.filter_by(site_id=nearest.site_id, data_level="site").all()
+    site_rows = KpiData.query.filter_by(site_id=nearest_site_id, data_level="site").all()
     site_summary = defaultdict(list)
     for r in site_rows:
         if r.value is not None:
@@ -3700,7 +3725,7 @@ def agent_root_cause(ticket_id):
         site_kpi_text += f"- {kpi_name}: avg={avg}, min={mn}, max={mx} ({len(vals)} data points)\n"
 
     # Get cell-level KPI data
-    cell_rows = KpiData.query.filter_by(site_id=nearest.site_id, data_level="cell").all()
+    cell_rows = KpiData.query.filter_by(site_id=nearest_site_id, data_level="cell").all()
     cell_summary = defaultdict(lambda: defaultdict(list))
     for r in cell_rows:
         if r.value is not None:
@@ -3720,12 +3745,12 @@ def agent_root_cause(ticket_id):
 
 TICKET: {ticket.reference_number} — {ticket.category} / {ticket.subcategory}
 CUSTOMER ISSUE: {ticket.description}
-NEAREST SITE: {nearest.site_id} (Zone: {nearest.zone}, Distance: {dist_km} km from customer)
+NEAREST SITE: {nearest_site_id} (Zone: {nearest_zone}, Distance: {dist_km} km from customer)
 
-SITE-LEVEL KPI SUMMARY FOR SITE {nearest.site_id}:
+SITE-LEVEL KPI SUMMARY FOR SITE {nearest_site_id}:
 {site_kpi_text if site_kpi_text else 'No site-level KPI data available.'}
 
-CELL-LEVEL KPI SUMMARY FOR SITE {nearest.site_id}:
+CELL-LEVEL KPI SUMMARY FOR SITE {nearest_site_id}:
 {cell_kpi_text if cell_kpi_text else 'No cell-level KPI data available.'}
 
 Analyze ALL the KPI data above (both site-level and cell-level) and provide:
@@ -3751,8 +3776,8 @@ Be specific and reference actual KPI values in your analysis."""
 
     return jsonify({
         "analysis": analysis,
-        "site_id": nearest.site_id,
-        "site_zone": nearest.zone,
+        "site_id": nearest_site_id,
+        "site_zone": nearest_zone,
         "distance_km": dist_km,
     })
 

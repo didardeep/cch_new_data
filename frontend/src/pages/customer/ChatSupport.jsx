@@ -375,8 +375,8 @@ export default function ChatSupport() {
     stateRef.current.step = 'location-question';
   }, [addMessage, disableGroup, showInput, createSession, requestLocation, afterLocationCaptured]);
 
-  const autoRaiseTicket = useCallback(async () => {
-    addMessage({ type: 'bot', html: `I'm sorry I wasn't able to resolve your issue. Let me raise a ticket for you so our support team can help.` });
+  const autoRaiseTicket = useCallback(async (opts = {}) => {
+    const { prefaceHtml } = opts;
     let refNum = '';
     let assignedAgent = null;
     let slaHours = null;
@@ -392,9 +392,10 @@ export default function ChatSupport() {
         if (data.assigned_agent) { assignedAgent = data.assigned_agent; }
       } catch {}
     }
+    const header = prefaceHtml || `I'm sorry I wasn't able to resolve your issue. I'm raising a ticket so our support team can help.`;
     addMessage({
       type: 'bot',
-      html: `Your ticket has been raised successfully!` +
+      html: `${header}<br><br>Your ticket has been raised successfully!` +
         (refNum ? `<br>Reference: <strong>${refNum}</strong>` : '') +
         (assignedAgent
           ? `<br><br>We are connecting you to our expert. Your dedicated support agent is:<br>
@@ -680,11 +681,15 @@ export default function ChatSupport() {
 
   const handleScreenshotUpload = useCallback(async (file) => {
     if (!file || !file.type.startsWith('image/')) {
-      addMessage({ type: 'system', text: 'Please upload a valid image file (PNG, JPG).' });
+      addMessage({ type: 'system', text: 'Please upload a valid image file (PNG or JPG).' });
+      const uploadGroupId = nextId();
+      addMessage({ type: 'screenshot-upload', groupId: uploadGroupId });
       return;
     }
     if (file.size > 5 * 1024 * 1024) {
       addMessage({ type: 'system', text: 'Image is too large. Please upload a screenshot under 5MB.' });
+      const uploadGroupId = nextId();
+      addMessage({ type: 'screenshot-upload', groupId: uploadGroupId });
       return;
     }
     const reader = new FileReader();
@@ -710,8 +715,9 @@ export default function ChatSupport() {
           stateRef.current.diagnosisRan = true;
           setTimeout(() => {
             if (data.diagnosis.overall_status === 'red') {
-              addMessage({ type: 'bot', html: 'Your signal is poor. Please try using your phone in an open area or near a window to improve reception. I am now raising a ticket so our support team can assist you directly.' });
-              autoRaiseTicket();
+              autoRaiseTicket({
+                prefaceHtml: 'Your signal is really poor. I am raising a ticket now so our support team can assist you directly.'
+              });
               return;
             }
             addMessage({ type: 'bot', html: 'Thank you for uploading your signal screenshot. I have analyzed your network parameters and identified the issue. Let me suggest a solution based on your signal diagnosis...' });
