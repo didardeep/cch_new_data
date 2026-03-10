@@ -59,12 +59,13 @@ jwt = JWTManager(app)
 mail = Mail(app)
 
 
-# ─── Google Gemini Configuration (OpenAI-compatible endpoint) ────────────────
-client = OpenAI(
-    api_key=os.environ.get("GEMINI_API_KEY"),
-    base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
+# ─── Azure OpenAI Configuration ──────────────────────────────────────────────
+client = AzureOpenAI(
+    api_key=os.environ.get("AZURE_OPENAI_API_KEY"),
+    api_version=os.environ.get("AZURE_OPENAI_API_VERSION"),
+    azure_endpoint=os.environ.get("AZURE_OPENAI_ENDPOINT"),
 )
-DEPLOYMENT_NAME = os.environ.get("AZURE_DEPLOYMENT_NAME", "gpt-4o-mini")
+DEPLOYMENT_NAME = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini")
 
 
 
@@ -86,18 +87,10 @@ def _load_site_data():
         print(f"[WARN] Site Excel not found at {excel_path} - nearest-site lookup disabled")
         return
 
-    # Use the first match found
-    target_file = potential_files[0]
-    excel_path = os.path.join(backend_dir, target_file)
-    
-    print(f"[INFO] Attempting to load site data from: {target_file}")
-
     try:
         import openpyxl
-        wb = openpyxl.load_workbook(excel_path, read_only=True, data_only=True)
+        wb = openpyxl.load_workbook(excel_path, read_only=True)
         ws = wb[wb.sheetnames[0]]
-        
-        temp_data = []
         for i, row in enumerate(ws.iter_rows(values_only=True)):
             if i == 0:
                 continue
@@ -109,20 +102,15 @@ def _load_site_data():
             alarm = row[5] or ""
             solution = row[6] or ""
             if lat is not None and lon is not None:
-                try:
-                    temp_data.append({
-                        "site_id": str(site_name),
-                        "zone": str(zone),
-                        "latitude": float(lat),
-                        "longitude": float(lon),
-                        "status": str(status),
-                        "alarm": str(alarm),
-                        "solution": str(solution),
-                    })
-                except (ValueError, TypeError):
-                    continue
-        
-        _SITE_DATA = temp_data
+                _SITE_DATA.append({
+                    "site_id": str(site_name),
+                    "zone": str(zone),
+                    "latitude": float(lat),
+                    "longitude": float(lon),
+                    "status": str(status),
+                    "alarm": str(alarm),
+                    "solution": str(solution),
+                })
         wb.close()
         print(f"[INFO] Loaded {len(_SITE_DATA)} telecom sites from Excel for nearest lookup")
     except Exception as e:
