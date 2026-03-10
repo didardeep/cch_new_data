@@ -570,6 +570,18 @@ export default function ChatSupport() {
       addMessage({ type: 'system', text: `Language detected: ${stateRef.current.language}` });
     }
 
+    if (stateRef.current.attempt > 0 && !stateRef.current.diagnosisRan && isNetworkIssue(stateRef.current.subprocessName)) {
+      let classification = { mentions_signal: false };
+      try { classification = await chatApiCall('/api/classify-response', { text }); } catch {}
+      if (classification.mentions_signal) {
+        addMessage({ type: 'bot', html: `It sounds like you're experiencing signal issues. Would you like to run a signal diagnosis?` });
+        const diagGroupId = nextId();
+        addMessage({ type: 'signal-offer', groupId: diagGroupId });
+        stateRef.current.step = 'signal-offer';
+        return;
+      }
+    }
+
     await fetchSolution(text);
   }, [inputValue, addMessage, hideInput, fetchSolution, loadSectorMenu, user, afterLocationCaptured]);
 
