@@ -67,7 +67,7 @@ export default function CTODashboard() {
       </div>
 
       {/* ── New: SLA Breaches Section ────────────────────────────────── */}
-      {alerts.length > 0 && (
+      {unreadAlerts.length > 0 && (
         <div style={{
           background: '#fff', border: '1px solid #fca5a5', borderRadius: 12,
           marginBottom: 24, overflow: 'hidden', boxShadow: '0 4px 12px rgba(220, 38, 38, 0.1)',
@@ -104,11 +104,11 @@ export default function CTODashboard() {
 
           {alertsExpanded && (
             <div style={{ maxHeight: 350, overflowY: 'auto' }}>
-              {alerts.map(a => (
+              {unreadAlerts.map(a => (
                 <div key={a.id} style={{
                   display: 'flex', alignItems: 'flex-start', gap: 14, padding: '16px 20px',
-                  borderBottom: '1px solid #fee2e2', background: a.is_read ? '#fff' : '#fff5f5',
-                  opacity: a.is_read ? 0.7 : 1
+                  borderBottom: '1px solid #fee2e2', background: '#fff5f5',
+                  opacity: 1
                 }}>
                   <div style={{ flex: 1 }}>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 4 }}>
@@ -123,11 +123,9 @@ export default function CTODashboard() {
                       <span>Deadline: {new Date(a.sla_deadline).toLocaleString()}</span>
                     </div>
                   </div>
-                  {!a.is_read && (
-                    <button onClick={() => markRead(a.id)} style={{ background: '#dc2626', color: '#fff', border: 'none', borderRadius: 6, padding: '6px 12px', fontSize: 11, fontWeight: 700, cursor: 'pointer' }}>
-                      Acknowledge
-                    </button>
-                  )}
+                  <button onClick={() => markRead(a.id)} style={{ background: '#dc2626', color: '#fff', border: 'none', borderRadius: 6, padding: '6px 12px', fontSize: 11, fontWeight: 700, cursor: 'pointer' }}>
+                    Acknowledge
+                  </button>
                 </div>
               ))}
             </div>

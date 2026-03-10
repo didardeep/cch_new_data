@@ -252,6 +252,9 @@ class TelecomSite(db.Model):
     latitude = db.Column(db.Float, nullable=False)
     longitude = db.Column(db.Float, nullable=False)
     zone = db.Column(db.String(100), default="")
+    site_status = db.Column(db.String(20), default="on_air")   # 'on_air' or 'off_air'
+    alarms = db.Column(db.Text, default="")
+    solution = db.Column(db.Text, default="")
 
     def to_dict(self):
         return {
@@ -260,6 +263,43 @@ class TelecomSite(db.Model):
             "latitude": self.latitude,
             "longitude": self.longitude,
             "zone": self.zone,
+            "site_status": self.site_status or "on_air",
+            "alarms": self.alarms or "",
+            "solution": self.solution or "",
+        }
+
+
+class ParameterChange(db.Model):
+    __tablename__ = "parameter_changes"
+
+    id = db.Column(db.Integer, primary_key=True)
+    ticket_id = db.Column(db.Integer, db.ForeignKey("tickets.id"), nullable=False)
+    agent_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
+    proposed_change = db.Column(db.Text, nullable=False)
+    status = db.Column(db.String(20), default="pending")   # 'pending', 'approved', 'disapproved'
+    manager_note = db.Column(db.Text, default="")
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+    reviewed_at = db.Column(db.DateTime, nullable=True)
+    reviewed_by = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=True)
+
+    ticket = db.relationship("Ticket", backref="parameter_changes", foreign_keys=[ticket_id])
+    agent = db.relationship("User", foreign_keys=[agent_id], backref="submitted_changes")
+    reviewer = db.relationship("User", foreign_keys=[reviewed_by], backref="reviewed_changes")
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "ticket_id": self.ticket_id,
+            "agent_id": self.agent_id,
+            "agent_name": self.agent.name if self.agent else "",
+            "proposed_change": self.proposed_change,
+            "status": self.status,
+            "manager_note": self.manager_note,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "reviewed_at": self.reviewed_at.isoformat() if self.reviewed_at else None,
+            "reviewed_by": self.reviewed_by,
+            "reviewer_name": self.reviewer.name if self.reviewer else None,
+            "ticket": self.ticket.to_dict() if self.ticket else None,
         }
 
 

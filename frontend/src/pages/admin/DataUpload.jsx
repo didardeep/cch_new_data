@@ -185,7 +185,7 @@ export default function DataUpload() {
         </div>
         <div className="section-card-body">
           <p style={{ fontSize: 13, color: '#64748b', marginBottom: 16 }}>
-            Upload an Excel file (.xlsx) with columns: <strong>Site_ID, Latitude, Longitude, Zone</strong>
+            Upload an Excel file (.xlsx) with columns: <strong>Site_ID, Latitude, Longitude, Zone, Status, Alarm, Solution</strong>
           </p>
           <div style={{ display: 'flex', gap: 16, alignItems: 'center', marginBottom: 16 }}>
             <div style={{ background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 8, padding: '10px 16px' }}>
@@ -211,11 +211,11 @@ export default function DataUpload() {
             <div style={{ marginTop: 14, background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: 8, padding: 12, fontSize: 13 }}>
               <strong style={{ color: '#16a34a' }}>Upload Successful</strong>
               <div style={{ marginTop: 6, color: '#475569' }}>
-                Created: {siteResult.created} &middot; Updated: {siteResult.updated} &middot; Total: {siteResult.total}
+                Total rows processed: {siteResult.total ?? 0}
               </div>
               {siteResult.skipped?.length > 0 && (
                 <div style={{ marginTop: 6, color: '#d97706', fontSize: 12 }}>
-                  Skipped: {siteResult.skipped.slice(0, 5).join('; ')}
+                  Skipped ({siteResult.skipped.length}): {siteResult.skipped.slice(0, 5).join('; ')}
                   {siteResult.skipped.length > 5 && ` ... and ${siteResult.skipped.length - 5} more`}
                 </div>
               )}
@@ -259,7 +259,7 @@ export default function DataUpload() {
               <div style={{ marginTop: 14, background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: 8, padding: 12, fontSize: 13 }}>
                 <strong style={{ color: '#16a34a' }}>Upload Successful</strong>
                 <div style={{ marginTop: 6, color: '#475569' }}>
-                  KPIs processed: {siteLevelResult.kpis_processed} &middot; Total rows: {siteLevelResult.inserted?.toLocaleString()}
+                  {siteLevelResult.message || 'Site-level KPI upload completed.'}
                 </div>
                 {siteLevelResult.errors?.length > 0 && (
                   <div style={{ marginTop: 6, color: '#d97706', fontSize: 12 }}>
@@ -303,7 +303,7 @@ export default function DataUpload() {
               <div style={{ marginTop: 14, background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: 8, padding: 12, fontSize: 13 }}>
                 <strong style={{ color: '#16a34a' }}>Upload Successful</strong>
                 <div style={{ marginTop: 6, color: '#475569' }}>
-                  KPIs processed: {cellLevelResult.kpis_processed} &middot; Total rows: {cellLevelResult.inserted?.toLocaleString()}
+                  {cellLevelResult.message || 'Cell-level KPI upload completed.'}
                 </div>
                 {cellLevelResult.errors?.length > 0 && (
                   <div style={{ marginTop: 6, color: '#d97706', fontSize: 12 }}>
