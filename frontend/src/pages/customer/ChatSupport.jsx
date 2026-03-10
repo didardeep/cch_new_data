@@ -422,12 +422,15 @@ export default function ChatSupport() {
     if (!sessionIdRef.current) { await createSession(); }
     if (st.attempt === 1) { st.queryText = userQuery; }
     saveMessage('user', userQuery, { query_text: userQuery, sector_name: st.sectorName, subprocess_name: st.subprocessName });
+    const effectiveQuery = st.subprocessSubType
+      ? `${userQuery}\n\nIssue type: ${st.subprocessSubType}`
+      : userQuery;
     setIsTyping(true);
     const resolveData = await chatApiCall('/api/resolve-step', {
       sector_key: st.sectorKey,
       subprocess_key: st.subprocessKey,
       selected_subprocess: st.subprocessName || undefined,
-      query: userQuery,
+      query: effectiveQuery,
       language: st.language,
       previous_solutions: st.previousSolutions.slice(-10),
       attempt: st.attempt,
