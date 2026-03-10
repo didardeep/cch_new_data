@@ -4059,17 +4059,13 @@ SITE-LEVEL KPI SUMMARY:
 CELL-LEVEL KPI SUMMARY:
 {cell_kpi_text if cell_kpi_text else 'No cell-level KPI data available.'}
 
-Respond with exactly 4 to 5 numbered points.
-Format each point as: **Brief Title**: One or two sentences of precise explanation with KPI evidence.
-Each point must be self-contained, technically accurate, and directly relevant.
-Do not add headings, summaries, or extra sections."""
 Analyze ALL the KPI data above (both site-level and cell-level) and provide:
-1. **Site-Level KPI Assessment** — Which site KPIs are performing well and which show degradation?
-2. **Cell-Level KPI Assessment** — Which cells show poor performance? Are specific cells causing issues?
-3. **Anomaly Detection** — Any unusual patterns or outliers at site or cell level?
-4. **Root Cause Identification** — What is the most likely root cause of the network/signal issue?
-5. **Impact Assessment** — How severe is the issue and what is the scope of impact?
-6. **Correlation Analysis** — Are there related KPI degradations across site and cell levels that point to a common cause?
+1. **Site-Level KPI Assessment** - Which site KPIs are performing well and which show degradation?
+2. **Cell-Level KPI Assessment** - Which cells show poor performance? Are specific cells causing issues?
+3. **Anomaly Detection** - Any unusual patterns or outliers at site or cell level?
+4. **Root Cause Identification** - What is the most likely root cause of the network/signal issue?
+5. **Impact Assessment** - How severe is the issue and what is the scope of impact?
+6. **Correlation Analysis** - Are there related KPI degradations across site and cell levels that point to a common cause?
 
 Be specific and reference actual KPI values in your analysis."""
 
