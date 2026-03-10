@@ -71,7 +71,7 @@ export default function ManagerDashboard() {
       </div>
 
       {/* ── SLA Alerts Section ──────────────────────────────────────── */}
-      {alerts.length > 0 && (
+      {unreadAlerts.length > 0 && (
         <div style={{
           background: '#fff', border: '1px solid #e2e8f0', borderRadius: 12,
           marginBottom: 24, overflow: 'hidden', boxShadow: '0 1px 4px rgba(0,0,0,0.05)',
@@ -122,7 +122,7 @@ export default function ManagerDashboard() {
           {/* Alert list */}
           {alertsExpanded && (
             <div style={{ maxHeight: 400, overflowY: 'auto' }}>
-              {alerts.map(a => {
+              {unreadAlerts.map(a => {
                 const ls = LEVEL_STYLE[a.alert_level] || LEVEL_STYLE['625'];
                 const pb = PRIORITY_BADGE[a.priority] || PRIORITY_BADGE.medium;
                 const deadline = a.sla_deadline ? new Date(a.sla_deadline) : null;
@@ -137,8 +137,8 @@ export default function ManagerDashboard() {
                     display: 'flex', alignItems: 'flex-start', gap: 14,
                     padding: '14px 20px',
                     borderBottom: '1px solid #f1f5f9',
-                    background: a.is_read ? '#fff' : '#fffbeb',
-                    opacity: a.is_read ? 0.7 : 1,
+                    background: '#fffbeb',
+                    opacity: 1,
                   }}>
                     {/* Severity badge */}
                     <span style={{
@@ -177,8 +177,7 @@ export default function ManagerDashboard() {
                     </div>
 
                     {/* Mark read */}
-                    {!a.is_read && (
-                      <button
+                    <button
                         onClick={() => markRead(a.id)}
                         title="Mark as read"
                         style={{
@@ -189,7 +188,6 @@ export default function ManagerDashboard() {
                       >
                         ✓
                       </button>
-                    )}
                   </div>
                 );
               })}
@@ -268,3 +266,4 @@ export default function ManagerDashboard() {
     </div>
   );
 }
+

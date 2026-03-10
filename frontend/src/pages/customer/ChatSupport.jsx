@@ -45,7 +45,7 @@ function limitSubprocesses(subprocesses) {
 
 const SUBPROCESS_FOLLOWUP_OPTIONS = {
   'network / signal problems': [
-    'Internet/Signal Problems',
+    'Internet Speed',
     'Call Failure',
     'Call Drop',
   ],

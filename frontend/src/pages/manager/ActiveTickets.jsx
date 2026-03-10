@@ -11,6 +11,8 @@ export default function ActiveTickets() {
   const [search, setSearch] = useState('');
   const [editingId, setEditingId] = useState(null);
   const [editData, setEditData] = useState({});
+  const [reviewDialog, setReviewDialog] = useState({ open: false, changeId: null, decision: null });
+  const [reviewNote, setReviewNote] = useState('');
 
   const loadChangeRequests = async () => {
     setChangesLoading(true);
@@ -51,14 +53,23 @@ export default function ActiveTickets() {
     loadTickets();
   };
 
-  const handleReviewChange = async (changeId, decision) => {
-    const note = window.prompt(
-      decision === 'approved'
-        ? 'Optional note for agent (approval):'
-        : 'Reason for disapproval (recommended):',
-      ''
-    );
-    await apiPut(`/api/manager/parameter-changes/${changeId}/review`, { decision, note: note || '' });
+  const openReviewDialog = (changeId, decision) => {
+    setReviewDialog({ open: true, changeId, decision });
+    setReviewNote('');
+  };
+
+  const closeReviewDialog = () => {
+    setReviewDialog({ open: false, changeId: null, decision: null });
+    setReviewNote('');
+  };
+
+  const submitReview = async () => {
+    if (!reviewDialog.changeId || !reviewDialog.decision) return;
+    await apiPut(`/api/manager/parameter-changes/${reviewDialog.changeId}/review`, {
+      decision: reviewDialog.decision,
+      note: reviewNote.trim(),
+    });
+    closeReviewDialog();
     loadChangeRequests();
   };
 
@@ -70,6 +81,67 @@ export default function ActiveTickets() {
         <h1>Active Tickets</h1>
         <p>Manage and resolve customer support tickets</p>
       </div>
+
+      {reviewDialog.open && (
+        <div
+          style={{
+            position: 'fixed',
+            inset: 0,
+            background: 'rgba(15, 23, 42, 0.45)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            zIndex: 50,
+            padding: 16,
+          }}
+          onClick={closeReviewDialog}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              width: '100%',
+              maxWidth: 520,
+              background: '#fff',
+              borderRadius: 12,
+              boxShadow: '0 20px 40px rgba(15, 23, 42, 0.2)',
+              border: '1px solid #e2e8f0',
+              padding: 20,
+            }}
+          >
+            <div style={{ fontSize: 14, fontWeight: 700, color: '#0f172a', marginBottom: 6 }}>
+              {reviewDialog.decision === 'approved' ? 'Approve Change' : 'Disapprove Change'}
+            </div>
+            <div style={{ fontSize: 12, color: '#64748b', marginBottom: 12 }}>
+              {reviewDialog.decision === 'approved'
+                ? 'Optional note for the agent.'
+                : 'Reason for disapproval (recommended).'}
+            </div>
+            <textarea
+              value={reviewNote}
+              onChange={(e) => setReviewNote(e.target.value)}
+              placeholder={reviewDialog.decision === 'approved' ? 'Add an optional note...' : 'Add a short reason...'}
+              rows={4}
+              style={{
+                width: '100%',
+                borderRadius: 10,
+                border: '1px solid #e2e8f0',
+                padding: '10px 12px',
+                fontSize: 13,
+                color: '#0f172a',
+                outline: 'none',
+                resize: 'vertical',
+                boxShadow: 'inset 0 1px 2px rgba(15, 23, 42, 0.05)',
+              }}
+            />
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 16 }}>
+              <button className="btn btn-ghost btn-sm" onClick={closeReviewDialog}>Cancel</button>
+              <button className="btn btn-success btn-sm" onClick={submitReview}>
+                {reviewDialog.decision === 'approved' ? 'Approve' : 'Disapprove'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       <div className="table-card" style={{ marginBottom: 16 }}>
         <div className="table-header">
@@ -106,8 +178,8 @@ export default function ActiveTickets() {
                     </td>
                     <td>
                       <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
-                        <button className="btn btn-success btn-sm" onClick={() => handleReviewChange(c.id, 'approved')}>Approve</button>
-                        <button className="btn btn-outline btn-sm" onClick={() => handleReviewChange(c.id, 'disapproved')}>Disapprove</button>
+                        <button className="btn btn-success btn-sm" onClick={() => openReviewDialog(c.id, 'approved')}>Approve</button>
+                        <button className="btn btn-outline btn-sm" onClick={() => openReviewDialog(c.id, 'disapproved')}>Disapprove</button>
                       </div>
                     </td>
                   </tr>

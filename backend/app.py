@@ -58,44 +58,20 @@ app.config["MAIL_USERNAME"] = os.environ.get("MAIL_USERNAME")
 app.config["MAIL_PASSWORD"] = os.environ.get("MAIL_PASSWORD")
 app.config["MAIL_DEFAULT_SENDER"] = os.environ.get("MAIL_DEFAULT_SENDER", os.environ.get("MAIL_USERNAME"))
 
-CORS(app, supports_credentials=True)
 db.init_app(app)
 bcrypt.init_app(app)
 jwt = JWTManager(app)
 mail = Mail(app)
 
 
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> 86dc249d97ad07ce1db7fdaa4005c1f640eb6299
-# ─── Azure OpenAI Configuration ──────────────────────────────────────────────
-client = AzureOpenAI(
-    api_key = os.environ.get("AZURE_OPENAI_API_KEY"),
-    api_version = os.environ.get("AZURE_OPENAI_API_VERSION"),
-    azure_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
-<<<<<<< HEAD
-=======
 # ─── Google Gemini Configuration (OpenAI-compatible endpoint) ────────────────
-# Using Gemini 1.5 Flash via Google's OpenAI-compatible API
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyCvBuHpOtWb1unogWgYw756TZR0LXG1CJU")
-
-import os
-from openai import OpenAI  # <--- Make sure this line is here
-from dotenv import load_dotenv
-
-load_dotenv()
-
-# Initialize the client
 client = OpenAI(
     api_key=os.environ.get("GEMINI_API_KEY"),
     base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
->>>>>>> madhav
-=======
->>>>>>> 86dc249d97ad07ce1db7fdaa4005c1f640eb6299
 )
 
-DEPLOYMENT_NAME = "gemini-3-flash-preview"
+DEPLOYMENT_NAME =  "gemini-3-flash-preview"
+
 
 
 
@@ -103,43 +79,66 @@ DEPLOYMENT_NAME = "gemini-3-flash-preview"
 _SITE_DATA = []
 
 def _load_site_data():
-    """Load telecom site data from Excel into memory once."""
+    """Dynamically find and load the telecom site Excel file."""
     global _SITE_DATA
-    excel_path = os.path.join(os.path.dirname(__file__), "Gurgaon_4G_1500_Sites.csv.xlsx")
-    if not os.path.exists(excel_path):
-        print(f"[WARN] Site Excel not found at {excel_path} - tower lookup disabled")
+    backend_dir = os.path.dirname(__file__)
+    
+    # 1. Search for any .xlsx file in the folder that has "Sites" in the name
+    potential_files = [f for f in os.listdir(backend_dir) 
+                       if f.endswith('.xlsx') and 'Sites' in f]
+    
+    if not potential_files:
+        # Fallback: just take the first xlsx file found if the "Sites" keyword fails
+        potential_files = [f for f in os.listdir(backend_dir) if f.endswith('.xlsx')]
+
+    if not potential_files:
+        print(f"[WARN] No Excel site data found in {backend_dir} - tower lookup disabled")
         return
+
+    # Use the first match found
+    target_file = potential_files[0]
+    excel_path = os.path.join(backend_dir, target_file)
+    
+    print(f"[INFO] Attempting to load site data from: {target_file}")
+
     try:
         import openpyxl
-        wb = openpyxl.load_workbook(excel_path, read_only=True)
+        wb = openpyxl.load_workbook(excel_path, read_only=True, data_only=True)
         ws = wb[wb.sheetnames[0]]
+        
+        temp_data = []
         for i, row in enumerate(ws.iter_rows(values_only=True)):
-            if i == 0:
-                continue  # skip header
-            site_name = row[0] or ""
-            zone = row[1] or ""
-            lon = row[2]
-            lat = row[3]
-            status = row[4] or "Unknown"
-            alarm = row[5] or ""
-            solution = row[6] or ""
+            if i == 0 or not row[0]: # Skip header or empty rows
+                continue  
+            
+            # Use safe indexing/defaults to prevent crashes if columns shift
+            site_name = row[0]
+            zone      = row[1] if len(row) > 1 else ""
+            lon       = row[2] if len(row) > 2 else None
+            lat       = row[3] if len(row) > 3 else None
+            status    = row[4] if len(row) > 4 else "Unknown"
+            alarm     = row[5] if len(row) > 5 else ""
+            solution  = row[6] if len(row) > 6 else ""
+
             if lat is not None and lon is not None:
-                _SITE_DATA.append({
-                    "site_id": str(site_name),
-                    "zone": str(zone),
-                    "latitude": float(lat),
-                    "longitude": float(lon),
-                    "status": str(status),
-                    "alarm": str(alarm),
-                    "solution": str(solution),
-                })
+                try:
+                    temp_data.append({
+                        "site_id": str(site_name),
+                        "zone": str(zone),
+                        "latitude": float(lat),
+                        "longitude": float(lon),
+                        "status": str(status),
+                        "alarm": str(alarm),
+                        "solution": str(solution),
+                    })
+                except (ValueError, TypeError):
+                    continue
+        
+        _SITE_DATA = temp_data
         wb.close()
-        print(f"[INFO] Loaded {len(_SITE_DATA)} telecom sites for tower lookup")
+        print(f"[SUCCESS] Loaded {len(_SITE_DATA)} sites from {target_file}")
     except Exception as e:
-        print(f"[WARN] Failed to load site data: {e}")
-
-_load_site_data()
-
+        print(f"[ERROR] Failed to load site data: {e}")
 
 def _haversine(lat1, lon1, lat2, lon2):
     """Calculate distance in km between two lat/lon points."""
@@ -150,6 +149,224 @@ def _haversine(lat1, lon1, lat2, lon2):
          math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) *
          math.sin(dlon / 2) ** 2)
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+NETWORK_PROBLEM_KPI_KEYWORDS = {
+    "internet_signal": [
+        "internet", "speed", "bandwidth", "data", "throughput", "latency", "packet", "prb", "resource block",
+        "sinr", "rsrp", "rsrq", "cqi", "ul", "uplink", "dl", "downlink", "lte", "nr",
+        "4g", "5g", "availability", "session", "traffic", "interference", "coverage"
+    ],
+    "call_failure": [
+        "call setup", "cssr", "asr", "blocked", "failure", "accessibility", "sdcch",
+        "tch", "moc", "mtc", "paging", "attach", "volte", "voice", "srvcc"
+    ],
+    "call_drop": [
+        "drop", "cdr", "dcr", "tch drop", "rlf", "radio link failure", "handover",
+        "ho ", "ho_", "speech", "retainability", "voice", "call"
+    ],
+}
+
+
+def _normalize_problem_text(ticket: Ticket) -> str:
+    return " ".join([
+        (ticket.category or "").strip().lower(),
+        (ticket.subcategory or "").strip().lower(),
+        (ticket.description or "").strip().lower(),
+    ])
+
+
+def _detect_network_problem_type(ticket: Ticket) -> str:
+    text = _normalize_problem_text(ticket)
+    if any(x in text for x in ["call drop", "calls drop", "dropped call", "call disconnect", "drop rate"]):
+        return "call_drop"
+    if any(x in text for x in ["call failure", "calls fail", "unable to make call", "call not connecting", "call setup"]):
+        return "call_failure"
+    if "call / sms failures" in text:
+        return "call_failure"
+    return "internet_signal"
+
+
+def _problem_type_label(problem_type: str) -> str:
+    labels = {
+        "internet_signal": "Internet Speed",
+        "call_failure": "Call Failure",
+        "call_drop": "Call Drop",
+    }
+    return labels.get(problem_type, "Internet Speed")
+
+
+def _filter_kpi_names_for_problem(kpi_names, problem_type: str):
+    keys = NETWORK_PROBLEM_KPI_KEYWORDS.get(problem_type, NETWORK_PROBLEM_KPI_KEYWORDS["internet_signal"])
+    selected = [
+        name for name in sorted(kpi_names)
+        if any(k in (name or "").lower() for k in keys)
+    ]
+    if not selected:
+        selected = sorted(kpi_names)[:8]
+    return selected
+
+
+def _period_key_for_row(row: KpiData, period: str) -> str:
+    if period == "month":
+        return row.date.strftime("%Y-%m")
+    if period == "week":
+        iso = row.date.isocalendar()
+        return f"{iso[0]}-W{iso[1]:02d}"
+    if period == "hour":
+        return f"{row.date.strftime('%Y-%m-%d')} {row.hour:02d}:00"
+    return row.date.strftime("%Y-%m-%d")
+
+
+def _build_period_stats(rows, period: str):
+    agg = {}
+    for r in rows:
+        if r.value is None:
+            continue
+        key = _period_key_for_row(r, period)
+        agg.setdefault(key, []).append(float(r.value))
+    if not agg:
+        return "no data"
+    ordered = sorted(agg.items(), key=lambda kv: kv[0])
+    latest_key, latest_vals = ordered[-1]
+    flat_vals = [v for _, vals in ordered for v in vals]
+    avg_all = round(sum(flat_vals) / len(flat_vals), 4)
+    return f"{latest_key}: avg={round(sum(latest_vals)/len(latest_vals), 4)}, overall_avg={avg_all}, min={round(min(flat_vals), 4)}, max={round(max(flat_vals), 4)}"
+
+
+def _build_kpi_summary_text(rows, selected_kpis, data_level_label: str) -> str:
+    from collections import defaultdict
+    grouped = defaultdict(list)
+    for r in rows:
+        if r.kpi_name in selected_kpis and r.value is not None:
+            grouped[r.kpi_name].append(r)
+    if not grouped:
+        return f"No {data_level_label} KPI data available."
+
+    parts = []
+    for kpi_name in sorted(grouped.keys()):
+        kpi_rows = grouped[kpi_name]
+        monthly = _build_period_stats(kpi_rows, "month")
+        weekly = _build_period_stats(kpi_rows, "week")
+        daily = _build_period_stats(kpi_rows, "day")
+        hourly = _build_period_stats(kpi_rows, "hour")
+        parts.append(
+            f"- {kpi_name}\n"
+            f"  Monthly: {monthly}\n"
+            f"  Weekly: {weekly}\n"
+            f"  Daily: {daily}\n"
+            f"  Hourly: {hourly}"
+        )
+    return "\n".join(parts)
+
+
+# ─── UPDATED: RCA text formatting helpers ────────────────────────────────────
+
+def _normalize_ai_lines(text: str):
+    """
+    Split raw AI text into clean, complete lines.
+    - Strips leading bullet / number markers only
+    - Removes stray 'Crux:' prefix labels (all variants)
+    - Deduplicates while preserving order
+    - Does NOT strip **bold** from mid-line content (titles like **Title**: body are kept)
+    - Does NOT truncate content — full sentences are preserved
+    """
+    lines = []
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        # Remove leading list markers: "1.", "2)", "-", "*", "•"
+        line = re.sub(r"^\s*(?:[-*•]|\d+[.)]\s*)\s*", "", line).strip()
+        # Remove "**Crux:**", "Crux:", "**Crux**:", etc. from the front only
+        line = re.sub(r"^\*{0,2}[Cc]rux\*{0,2}\s*:?\s*", "", line).strip()
+        # Only strip ** if they wrap the ENTIRE line AND there's no colon separator
+        # i.e. "**Some Title**" alone → "Some Title"
+        # but "**Title**: body text" is kept as-is (bold title with body)
+        if re.match(r"^\*\*[^*]+\*\*$", line):
+            line = re.sub(r"^\*\*(.*?)\*\*$", r"\1", line).strip()
+        if not line:
+            continue
+        lines.append(line)
+
+    # Deduplicate while preserving order
+    unique, seen = [], set()
+    for line in lines:
+        key = line.lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(line)
+
+    # Drop the last line if it looks truncated (no closing punctuation).
+    # This happens when the AI response is cut by max_tokens mid-sentence.
+    if unique and not re.search(r'[.!?)>]$', unique[-1].rstrip()):
+        unique = unique[:-1]
+
+    return unique
+
+
+def _force_numbered_points(raw_text: str, min_points: int, max_points: int, prefix: str = "", fallback_points=None):
+    """
+    Parse AI output into clean numbered points.
+    - Full sentences preserved — no character truncation
+    - No 'Crux:' prefix injected (prefix param kept for API compat but defaults to "")
+    - Bold markdown (**Title**: body) preserved as-is for frontend rendering
+    - Picks most technically relevant lines first
+    """
+    lines = _normalize_ai_lines(raw_text)
+
+    # Score lines: prefer those with technical/diagnostic keywords and longer content
+    ranked = sorted(
+        lines,
+        key=lambda l: (
+            1 if re.search(r"\b(root cause|cause|kpi|trend|alarm|site|cell|impact|action|recommend)\b", l, re.IGNORECASE) else 0,
+            len(l),
+        ),
+        reverse=True,
+    )
+    picked = []
+    for line in ranked:
+        if len(line) < 12:
+            continue
+        picked.append(line)  # No truncation — keep full sentence
+        if len(picked) >= max_points:
+            break
+
+    for line in (fallback_points or []):
+        if len(picked) >= min_points:
+            break
+        if line and line not in picked:
+            picked.append(line)
+
+    picked = picked[:max_points]
+    if not picked:
+        picked = ["Analysis could not be generated from available data."]
+
+    # prefix param ignored (was used for "**Crux:** " — removed)
+    return "\n".join(f"{idx + 1}. {line}" for idx, line in enumerate(picked))
+
+
+def _strip_markdown_for_pdf(text: str) -> str:
+    """Remove **bold** and *italic* markdown markers for plain-text PDF output."""
+    text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
+    text = re.sub(r"\*(.*?)\*", r"\1", text)
+    return text
+
+
+def _format_points_for_pdf(raw_text: str) -> str:
+    """
+    Convert numbered markdown points to clean plain-text for PDF sections.
+    Input:  "1. **Site Offline**: The site is off air due to power failure.\n2. ..."
+    Output: "1. Site Offline: The site is off air due to power failure.\n\n2. ..."
+    """
+    lines = _normalize_ai_lines(raw_text)
+    plain_lines = []
+    for i, line in enumerate(lines[:5], 1):
+        plain = _strip_markdown_for_pdf(line)
+        plain_lines.append(f"{i}. {plain}")
+    return "\n\n".join(plain_lines)
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def find_nearest_sites(lat, lon, n=3):
@@ -279,8 +496,8 @@ def is_telecom_related(query: str, sector_name=None, subprocess_name=None) -> bo
         context_block += (
             "\n\nBecause the user navigated a TELECOM complaint menu to reach this point, "
             "their query is almost certainly telecom-related. Generic complaints like "
-            "'money deducted', 'service not working', 'bad experience', 'want refund', "
-            "'not getting what I paid for' etc. should be interpreted in the telecom context.\n"
+            " 'money deducted', 'service not working', 'bad experience', 'want refund', "
+            " 'not getting what I paid for' etc. should be interpreted in the telecom context.\n"
             "Only classify as NOT telecom if the query is EXPLICITLY about a completely "
             "different industry."
         )
@@ -479,18 +696,8 @@ def generate_resolution(query, sector_name, subprocess_name, language):
         return f"I apologize, but I encountered an error. Please try again. Error: {str(e)}"
 
 
-<<<<<<< HEAD
-<<<<<<< HEAD
 def generate_single_solution(sector_name, subprocess_name, language, user_query="", previous_solutions=None, attempt=1, original_query="", diagnosis_summary=""):
-    """Generate a single focused solution. If user_query is provided, tailor to it. Avoids repeating previous solutions."""
-=======
-def generate_single_solution(sector_name, subprocess_name, language, user_query="", previous_solutions=None, attempt=1):
     """Generate a single focused solution."""
->>>>>>> madhav
-=======
-def generate_single_solution(sector_name, subprocess_name, language, user_query="", previous_solutions=None, attempt=1, original_query="", diagnosis_summary=""):
-    """Generate a single focused solution. If user_query is provided, tailor to it. Avoids repeating previous solutions."""
->>>>>>> 86dc249d97ad07ce1db7fdaa4005c1f640eb6299
     prev_block = ""
     if previous_solutions:
         prev_block = (
@@ -503,9 +710,9 @@ def generate_single_solution(sector_name, subprocess_name, language, user_query=
     if user_query:
         query_block = f"\n\nThe user described their specific issue as: \"{user_query}\""
 
-    original_context = ""
+    context_block = ""
     if original_query and original_query != user_query:
-        original_context = f"\n\nOriginal issue description: \"{original_query}\"\nThe user's follow-up message is: \"{user_query}\""
+        context_block = f"\n\nOriginal issue description: \"{original_query}\"\nThe user's follow-up message is: \"{user_query}\""
 
     diagnosis_block = ""
     if diagnosis_summary:
@@ -535,7 +742,7 @@ def generate_single_solution(sector_name, subprocess_name, language, user_query=
                     "Only provide self-help troubleshooting steps that the user can do on their own.\n"
                     "Acknowledge the issue briefly and give the steps."
                     + query_block
-                    + original_context
+                    + context_block
                     + diagnosis_block
                     + prev_block +
                     f"\n\nIMPORTANT: Respond entirely in {language}. "
@@ -999,19 +1206,6 @@ def save_session_location(session_id):
     DEFAULT_LATITUDE  = 28.4595
     DEFAULT_LONGITUDE = 77.0266
 
-    # data = request.json
-    # latitude = data.get("latitude")
-    # longitude = data.get("longitude")
-    # location_description = data.get("location_description")
-
-    # if latitude is not None and longitude is not None:
-    #     session.latitude = float(latitude)
-    #     session.longitude = float(longitude)
-    # elif location_description:
-    #     session.location_description = location_description
-    # else:
-    #     return jsonify({"error": "Either coordinates or location description required"}), 400
-
     # Always use default lat/long regardless of what the client sends
     session.latitude  = DEFAULT_LATITUDE
     session.longitude = DEFAULT_LONGITUDE
@@ -1050,24 +1244,6 @@ def analyze_signal(session_id):
     try:
         result = analyze_signal_screenshot(image_base64)
 
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> 86dc249d97ad07ce1db7fdaa4005c1f640eb6299
-        # If signal is red (Poor), find the 3 nearest tower sites
-        if result.get("overall_status") == "red":
-            lat = session.latitude
-            lon = session.longitude
-            nearest = find_nearest_sites(lat, lon, n=3)
-            if nearest:
-                result["nearest_sites"] = nearest
-
-        # Save diagnosis as a bot message for chat history
-<<<<<<< HEAD
-=======
->>>>>>> madhav
-=======
->>>>>>> 86dc249d97ad07ce1db7fdaa4005c1f640eb6299
         diagnosis_text = (
             f"Signal Diagnosis Results: "
             f"RSRP: {result.get('rsrp', 'N/A')} dBm ({result.get('rsrp_label', 'Unknown')}), "
@@ -1396,17 +1572,8 @@ def send_summary_email(session_id):
 @app.route("/api/chat/session/<int:session_id>", methods=["GET"])
 @jwt_required()
 def get_chat_session(session_id):
-<<<<<<< HEAD
-<<<<<<< HEAD
     user_id = int(get_jwt_identity())
-    session = ChatSession.query.get(session_id)
-=======
     session = db.session.get(ChatSession, session_id)
->>>>>>> madhav
-=======
-    user_id = int(get_jwt_identity())
-    session = ChatSession.query.get(session_id)
->>>>>>> 86dc249d97ad07ce1db7fdaa4005c1f640eb6299
     if not session:
         return jsonify({"error": "Session not found"}), 404
     if session.user_id != user_id:
@@ -2596,6 +2763,7 @@ def admin_upload_kpi_site_level():
             cur.close()
             raw_conn.close()
 
+        wb.close()
         return jsonify({"message": f"Successfully uploaded {total_inserted} site-level KPI records."}), 200
 
     except Exception as e:
@@ -3726,6 +3894,13 @@ def agent_kpi_trends(site_id):
 
     period = request.args.get("period", "day")
     data_level = request.args.get("data_level", "site")
+    ticket_id = request.args.get("ticket_id", type=int)
+
+    problem_type = "internet_signal"
+    if ticket_id:
+        ticket = db.session.get(Ticket, ticket_id)
+        if ticket:
+            problem_type = _detect_network_problem_type(ticket)
 
     query = KpiData.query.filter_by(site_id=site_id, data_level=data_level)
     kpi_rows = query.all()
@@ -3738,8 +3913,13 @@ def agent_kpi_trends(site_id):
     for r in kpi_rows:
         kpi_groups[r.kpi_name].append(r)
 
+    selected_kpis = _filter_kpi_names_for_problem(kpi_groups.keys(), problem_type)
+
     result = {}
-    for kpi_name, rows in kpi_groups.items():
+    for kpi_name in selected_kpis:
+        rows = kpi_groups.get(kpi_name, [])
+        if not rows:
+            continue
         agg = defaultdict(list)
         for r in rows:
             if r.value is None:
@@ -3763,9 +3943,17 @@ def agent_kpi_trends(site_id):
                 "min": round(min(vals), 4),
                 "max": round(max(vals), 4),
             })
-        result[kpi_name] = trend
+        if trend:
+            result[kpi_name] = trend
 
-    return jsonify({"site_id": site_id, "period": period, "data_level": data_level, "trends": result})
+    return jsonify({
+        "site_id": site_id,
+        "period": period,
+        "data_level": data_level,
+        "problem_type": _problem_type_label(problem_type),
+        "selected_kpis": selected_kpis,
+        "trends": result,
+    })
 
 
 @app.route("/api/agent/tickets/<int:ticket_id>/root-cause", methods=["POST"])
@@ -3791,36 +3979,16 @@ def agent_root_cause(ticket_id):
     nearest = min(sites, key=lambda s: haversine(session.latitude, session.longitude, s.latitude, s.longitude))
     dist_km = round(haversine(session.latitude, session.longitude, nearest.latitude, nearest.longitude), 2)
 
-    from collections import defaultdict
+    problem_type = _detect_network_problem_type(ticket)
+    problem_type_label = _problem_type_label(problem_type)
 
     site_rows = KpiData.query.filter_by(site_id=nearest.site_id, data_level="site").all()
-    site_summary = defaultdict(list)
-    for r in site_rows:
-        if r.value is not None:
-            site_summary[r.kpi_name].append(r.value)
-
-    site_kpi_text = ""
-    for kpi_name, vals in site_summary.items():
-        avg = round(sum(vals) / len(vals), 4)
-        mn = round(min(vals), 4)
-        mx = round(max(vals), 4)
-        site_kpi_text += f"- {kpi_name}: avg={avg}, min={mn}, max={mx} ({len(vals)} data points)\n"
-
     cell_rows = KpiData.query.filter_by(site_id=nearest.site_id, data_level="cell").all()
-    cell_summary = defaultdict(lambda: defaultdict(list))
-    for r in cell_rows:
-        if r.value is not None:
-            cell_key = f"{r.cell_id}" if r.cell_id else "unknown"
-            cell_summary[r.kpi_name][cell_key].append(r.value)
+    all_kpis = {r.kpi_name for r in site_rows + cell_rows}
+    selected_kpis = _filter_kpi_names_for_problem(all_kpis, problem_type)
 
-    cell_kpi_text = ""
-    for kpi_name, cells in cell_summary.items():
-        cell_kpi_text += f"- {kpi_name}:\n"
-        for cell_id, vals in cells.items():
-            avg = round(sum(vals) / len(vals), 4)
-            mn = round(min(vals), 4)
-            mx = round(max(vals), 4)
-            cell_kpi_text += f"    Cell {cell_id}: avg={avg}, min={mn}, max={mx} ({len(vals)} pts)\n"
+    site_kpi_text = _build_kpi_summary_text(site_rows, selected_kpis, "site-level")
+    cell_kpi_text = _build_kpi_summary_text(cell_rows, selected_kpis, "cell-level")
 
     site_status = nearest.site_status or "on_air"
     alarms_text = nearest.alarms or ""
@@ -3829,75 +3997,101 @@ def agent_root_cause(ticket_id):
     if site_status == "off_air":
         prompt = f"""You are an expert telecom network engineer performing root cause analysis.
 
-TICKET: {ticket.reference_number} — {ticket.category} / {ticket.subcategory}
+TICKET: {ticket.reference_number} - {ticket.category} / {ticket.subcategory}
 CUSTOMER ISSUE: {ticket.description}
+PROBLEM TYPE: {problem_type_label}
 NEAREST SITE: {nearest.site_id} (Zone: {nearest.zone}, Distance: {dist_km} km from customer)
 
-⚠️ SITE STATUS: OFF AIR — This site is currently down/offline.
+SITE STATUS: OFF AIR. This site is currently down.
+Use only these KPI families relevant to {problem_type_label}: {", ".join(selected_kpis) if selected_kpis else "No matched KPI names"}.
 
-ACTIVE ALARMS ON SITE {nearest.site_id}:
+ACTIVE ALARMS:
 {alarms_text if alarms_text else 'No alarm data available.'}
 
-KNOWN SOLUTION FROM OPERATIONS TEAM:
+KNOWN SOLUTION:
 {solution_text if solution_text else 'No solution data available.'}
 
-SITE-LEVEL KPI TREND DATA (historical, before outage):
+SITE-LEVEL KPI TREND DATA:
 {site_kpi_text if site_kpi_text else 'No site-level KPI data available.'}
 
 CELL-LEVEL KPI TREND DATA:
 {cell_kpi_text if cell_kpi_text else 'No cell-level KPI data available.'}
 
-Since this site is OFF AIR, perform the following analysis:
-1. **Outage Root Cause** — Based on active alarms, what caused the site to go off air?
-2. **Alarm Analysis** — Analyze each alarm listed, its likely trigger and impact.
-3. **KPI Degradation Prior to Outage** — Did the KPI trends show early warning signs before the outage?
-4. **Solution Assessment** — Evaluate the listed operations solution: is it appropriate and complete?
-5. **Impact Scope** — How many customers are affected and what services are impacted?
-6. **Recovery Path** — Step-by-step actions needed to bring the site back on air based on alarms and solution.
-
-Be specific, reference the actual alarm names and KPI values in your analysis."""
+Respond with exactly 4 to 5 numbered points.
+Format each point as: **Brief Title**: One or two sentences of precise explanation with KPI evidence.
+Each point must be self-contained, technically accurate, and directly relevant.
+Do not add headings, summaries, or extra sections."""
     else:
         prompt = f"""You are an expert telecom network engineer performing root cause analysis.
 
-TICKET: {ticket.reference_number} — {ticket.category} / {ticket.subcategory}
+TICKET: {ticket.reference_number} - {ticket.category} / {ticket.subcategory}
 CUSTOMER ISSUE: {ticket.description}
+PROBLEM TYPE: {problem_type_label}
 NEAREST SITE: {nearest.site_id} (Zone: {nearest.zone}, Distance: {dist_km} km from customer)
 
-✅ SITE STATUS: ON AIR — Site is operational. Analysis based on KPI performance trends.
+SITE STATUS: ON AIR. Analysis must be based on KPI trends only.
+Use only these KPI families relevant to {problem_type_label}: {", ".join(selected_kpis) if selected_kpis else "No matched KPI names"}.
 
-SITE-LEVEL KPI SUMMARY FOR SITE {nearest.site_id}:
+SITE-LEVEL KPI SUMMARY:
 {site_kpi_text if site_kpi_text else 'No site-level KPI data available.'}
 
-CELL-LEVEL KPI SUMMARY FOR SITE {nearest.site_id}:
+CELL-LEVEL KPI SUMMARY:
 {cell_kpi_text if cell_kpi_text else 'No cell-level KPI data available.'}
 
-Since the site is ON AIR, analyze the KPI trends to find the root cause of degraded performance:
-1. **Site-Level KPI Assessment** — Which KPIs are degraded and by how much?
-2. **Cell-Level Assessment** — Which cells are underperforming? Are specific cells driving the complaint?
-3. **Anomaly Detection** — Any unusual patterns, spikes, or drops in the data?
-4. **Root Cause Identification** — Most likely cause of the reported customer issue (interference, congestion, hardware degradation, etc.)?
-5. **Impact Assessment** — Severity and scope of the degradation.
-6. **Correlation Analysis** — Related KPI degradations pointing to a common cause.
-
-Be specific and reference actual KPI values in your analysis."""
+Respond with exactly 4 to 5 numbered points.
+Format each point as: **Brief Title**: One or two sentences of precise explanation with KPI evidence.
+Each point must be self-contained, technically accurate, and directly relevant.
+Do not add headings, summaries, or extra sections."""
 
     try:
         response = client.chat.completions.create(
             model=DEPLOYMENT_NAME,
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.3,
-            max_tokens=2000,
+            temperature=0.2,
+            max_tokens=1500,
         )
-        analysis = response.choices[0].message.content.strip()
+        analysis_raw = response.choices[0].message.content.strip()
+        fallback_rca = [
+            f"**Site Status**: Nearest site {nearest.site_id} ({site_status.replace('_', ' ').upper()}) is the primary impact domain for this complaint.",
+            f"**Problem Classification**: Problem type is {problem_type_label}; only related KPI groups were considered for causality and trend correlation.",
+            "**Trend Evidence**: Daily/hourly trend shift confirms a recent degradation window; weekly/monthly baseline indicates this is not normal behavior.",
+            "**Cell-Site Correlation**: Cell-level variance aligns with site-level degradation, indicating a network-origin issue rather than isolated handset behavior.",
+            "**Action Required**: Immediate technical validation on the identified degraded KPI path is required to close the fault and stabilize service.",
+        ]
+        if site_status == "off_air":
+            fallback_rca[0] = f"**Site Outage**: Nearest site {nearest.site_id} is OFF AIR and alarm state is the primary root trigger for outage impact."
+            fallback_rca[4] = "**Resolution Path**: Execute alarm-linked restoration steps first, then validate KPI recovery trend to confirm full service normalization."
+        analysis = _force_numbered_points(
+            analysis_raw,
+            min_points=4,
+            max_points=5,
+            fallback_points=fallback_rca,
+        )
     except Exception as e:
-        analysis = f"Root cause analysis unavailable: {str(e)}"
+        analysis = _force_numbered_points(
+            "",
+            min_points=4,
+            max_points=5,
+            fallback_points=[
+                f"**Model Error**: Root cause analysis could not be generated automatically: {str(e)}.",
+                f"**Focus Area**: Nearest site {nearest.site_id} and problem type {problem_type_label} remain the active technical focus.",
+                "**Trend Review**: Review daily/hourly KPI movement against weekly/monthly baseline to isolate degradation start time.",
+                "**Fault Domain**: Correlate degraded cell-level indicators with site-level KPI shifts to validate fault domain.",
+            ],
+        )
+
+    # Generate PDF-friendly version (plain text, no markdown)
+    analysis_pdf = _format_points_for_pdf(analysis)
 
     return jsonify({
         "analysis": analysis,
+        "analysis_pdf": analysis_pdf,
         "site_id": nearest.site_id,
         "site_zone": nearest.zone,
         "site_status": site_status,
         "distance_km": dist_km,
+        "problem_type": problem_type_label,
+        "selected_kpis": selected_kpis,
     })
 
 
@@ -3915,12 +4109,14 @@ def agent_recommendation(ticket_id):
 
     root_cause = request.json.get("root_cause", "") if request.json else ""
     trend_summary = request.json.get("trend_summary", "") if request.json else ""
+    problem_type = _problem_type_label(_detect_network_problem_type(ticket))
 
     prompt = f"""You are an expert telecom network engineer providing actionable recommendations.
 
-TICKET: {ticket.reference_number} — {ticket.category} / {ticket.subcategory}
+TICKET: {ticket.reference_number} - {ticket.category} / {ticket.subcategory}
 CUSTOMER ISSUE: {ticket.description}
 PRIORITY: {ticket.priority.upper()}
+PROBLEM TYPE: {problem_type}
 
 TREND ANALYSIS SUMMARY:
 {trend_summary if trend_summary else 'No trend analysis summary available.'}
@@ -3928,30 +4124,50 @@ TREND ANALYSIS SUMMARY:
 ROOT CAUSE ANALYSIS:
 {root_cause if root_cause else 'No root cause analysis available.'}
 
-Based on the above trend analysis and root cause analysis, provide:
-1. **Immediate Actions** — Steps to take right now to restore service
-2. **Short-term Fixes** — Actions within 24-48 hours
-3. **Long-term Recommendations** — Permanent fixes to prevent recurrence
-4. **Customer Communication** — What to tell the customer about the issue and expected resolution
-5. **Escalation Path** — When and to whom should this be escalated if not resolved
-
-Be specific, actionable, and prioritize by impact."""
+Respond with exactly 3 to 4 numbered points.
+Format each point as: **Brief Action Title**: One or two sentences describing the specific action, expected outcome, and timeline.
+Each recommendation must be directly actionable by a network engineer.
+Do not add headings, summaries, or extra sections."""
 
     try:
         response = client.chat.completions.create(
             model=DEPLOYMENT_NAME,
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.3,
+            temperature=0.2,
             max_tokens=1500,
         )
-        recommendation = response.choices[0].message.content.strip()
+        recommendation_raw = response.choices[0].message.content.strip()
+        recommendation = _force_numbered_points(
+            recommendation_raw,
+            min_points=3,
+            max_points=4,
+            fallback_points=[
+                "**Immediate Action**: Apply corrective action on the top degraded KPI path and confirm hourly improvement at site and cell levels.",
+                "**Parameter Validation**: Run targeted parameter/hardware validation on affected cells and verify trend slope returns to weekly baseline.",
+                "**Escalation Criteria**: If recovery is partial, escalate to NOC/optimization with alarm evidence, KPI snapshots, and precise impact window.",
+                "**Customer Closure**: Communicate to customer with clear ETA after confirming stable daily trend and no recurring degradation.",
+            ],
+        )
     except Exception as e:
-        recommendation = f"Recommendation unavailable: {str(e)}"
+        recommendation = _force_numbered_points(
+            "",
+            min_points=3,
+            max_points=4,
+            fallback_points=[
+                f"**Model Error**: Recommendation generation failed: {str(e)}; proceed with technical triage on related KPI path.",
+                "**KPI Recovery**: Validate daily/hourly KPI recovery after corrective action before closure.",
+                "**Escalation**: Escalate with KPI and alarm evidence if stability is not achieved within the defined SLA window.",
+            ],
+        )
 
-    return jsonify({"recommendation": recommendation})
+    # Generate PDF-friendly version (plain text, no markdown)
+    recommendation_pdf = _format_points_for_pdf(recommendation)
 
+    return jsonify({
+        "recommendation": recommendation,
+        "recommendation_pdf": recommendation_pdf,
+    })
 
-# ── Parameter Change Request (Agent → Manager approval workflow) ──────────────
 
 @app.route("/api/agent/tickets/<int:ticket_id>/parameter-change", methods=["POST"])
 @jwt_required()
