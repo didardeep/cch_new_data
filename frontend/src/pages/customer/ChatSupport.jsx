@@ -413,6 +413,10 @@ export default function ChatSupport() {
             (slaHours ? `<br><span style="color:#16a34a;font-weight:600;">Your issue will be resolved within ${slaHours} hour${slaHours !== 1 ? 's' : ''}</span>` : '')) +
         `<br>You can track your ticket from the dashboard.`,
     });
+    setTimeout(() => {
+      const actionGroupId = nextId();
+      addMessage({ type: 'post-actions', groupId: actionGroupId });
+    }, 600);
     stateRef.current.step = 'escalated';
   }, [addMessage]);
 
@@ -506,6 +510,10 @@ export default function ChatSupport() {
     stateRef.current.attempt = 0;
     stateRef.current.previousSolutions = [];
     addMessage({ type: 'user', text: name });
+    if (isMobileNetworkIssue(stateRef.current.sectorName, finalSubprocessName)) {
+      await beginLocationFlow(finalSubprocessName);
+      return;
+    }
     addMessage({ type: 'bot', html: `Please <strong>describe your specific issue</strong> so I can provide the best resolution.` });
     showInput('Describe your issue in any language...');
     stateRef.current.step = 'query';
@@ -575,6 +583,8 @@ export default function ChatSupport() {
         }
         setTimeout(() => {
           addMessage({ type: 'bot', html: `What would you like to do next?` });
+          const actionGroupId = nextId();
+          addMessage({ type: 'post-actions', groupId: actionGroupId });
         }, 800);
         stateRef.current.step = 'resolved';
         return;
@@ -679,7 +689,7 @@ export default function ChatSupport() {
             (slaHours ? `<br><span style="color:#16a34a;font-weight:600;">⏱ Your issue will be resolved within ${slaHours} hour${slaHours !== 1 ? 's' : ''}</span>` : '')) +
         `<br>You can track your ticket from the dashboard.`,
     });
-    setTimeout(() => { const ag = nextId(); addMessage({ type: 'post-feedback-actions', groupId: ag }); }, 1000);
+    setTimeout(() => { const ag = nextId(); addMessage({ type: 'post-actions', groupId: ag }); }, 1000);
     stateRef.current.step = 'escalated';
     agentResolvedShownRef.current = false;
     setHandoffActive(true);
@@ -829,6 +839,8 @@ export default function ChatSupport() {
           `<br><br>Your request has been submitted and a support ticket has been raised.` + agentCard +
           `<br>Reference: <strong>${refNum}</strong><br><br>The agent may send you messages below — please stay in this chat.<br><br>What would you like to do next?`,
       });
+      const actionGroupId = nextId();
+      addMessage({ type: 'post-actions', groupId: actionGroupId });
     }, 1500);
     stateRef.current.step = 'human_handoff';
     agentResolvedShownRef.current = false;
@@ -1073,7 +1085,7 @@ export default function ChatSupport() {
             <div className="ty-msg">We're glad we could help resolve your issue.<br />If you face any other telecom issues, feel free to come back anytime!</div>
           </div>
         );
-      case 'post-feedback-actions':
+      case 'post-actions':
         return (
           <div key={msg.id} className="post-feedback-actions">
             <button className={`action-btn menu-btn${isDisabled ? ' disabled' : ''}`} onClick={() => !isDisabled && handleBackToMenu(msg.groupId)}>Main Menu</button>

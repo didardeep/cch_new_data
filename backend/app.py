@@ -77,44 +77,8 @@ _SITE_DATA = []
 
 
 def _load_site_data():
-    """Load telecom site data from local Excel into memory once."""
-    global _SITE_DATA
-    excel_path = os.environ.get(
-        "SITE_EXCEL_PATH",
-        os.path.join(os.path.dirname(__file__), "Gurgaon_4G_1500_Sites.csv.xlsx"),
-    )
-    if not os.path.exists(excel_path):
-        print(f"[WARN] Site Excel not found at {excel_path} - nearest-site lookup disabled")
-        return
-
-    try:
-        import openpyxl
-        wb = openpyxl.load_workbook(excel_path, read_only=True)
-        ws = wb[wb.sheetnames[0]]
-        for i, row in enumerate(ws.iter_rows(values_only=True)):
-            if i == 0:
-                continue
-            site_name = row[0] or ""
-            zone = row[1] or ""
-            lon = row[2]
-            lat = row[3]
-            status = row[4] or "Unknown"
-            alarm = row[5] or ""
-            solution = row[6] or ""
-            if lat is not None and lon is not None:
-                _SITE_DATA.append({
-                    "site_id": str(site_name),
-                    "zone": str(zone),
-                    "latitude": float(lat),
-                    "longitude": float(lon),
-                    "status": str(status),
-                    "alarm": str(alarm),
-                    "solution": str(solution),
-                })
-        wb.close()
-        print(f"[INFO] Loaded {len(_SITE_DATA)} telecom sites from Excel for nearest lookup")
-    except Exception as e:
-        print(f"[WARN] Failed to load site Excel: {e}")
+    """Legacy Excel loader (disabled). Site data is now loaded via admin upload into DB."""
+    return
 
 
 def _haversine(lat1, lon1, lat2, lon2):
@@ -347,32 +311,37 @@ def _format_points_for_pdf(raw_text: str) -> str:
 
 
 def find_nearest_sites(lat, lon, n=3):
-    """Return the n nearest telecom sites to the given coordinates from Excel data."""
-    if not _SITE_DATA or lat is None or lon is None:
+    """Return the n nearest telecom sites to the given coordinates from DB uploads."""
+    if lat is None or lon is None:
+        return []
+
+    sites = TelecomSite.query.all()
+    if not sites:
         return []
 
     scored = []
-    for site in _SITE_DATA:
-        dist = _haversine(lat, lon, site["latitude"], site["longitude"])
+    for site in sites:
+        dist = _haversine(lat, lon, site.latitude, site.longitude)
         scored.append((dist, site))
 
     scored.sort(key=lambda x: x[0])
     results = []
     for dist, site in scored[:n]:
+        status = (site.site_status or "on_air").upper()
         results.append({
-            "site_id": site["site_id"],
-            "zone": site["zone"],
-            "latitude": site["latitude"],
-            "longitude": site["longitude"],
-            "status": site["status"] if site["status"] else "Unknown",
-            "alarm": site["alarm"] if site["alarm"] else "None",
-            "solution": site["solution"] if site["solution"] else "No action required",
+            "site_id": site.site_id,
+            "zone": site.zone or "",
+            "latitude": site.latitude,
+            "longitude": site.longitude,
+            "status": status,
+            "alarm": site.alarms or "None",
+            "solution": site.solution or "No action required",
             "distance_km": round(dist, 2),
         })
     return results
 
 
-_load_site_data()
+# Excel loading disabled; site data comes from admin upload into DB.
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  CHATBOT CODE 
@@ -647,6 +616,13 @@ def detect_language(text: str) -> str:
         return result.get("language", "English")
     except Exception:
         return "English"
+
+def _friendly_ai_error(err: Exception) -> str:
+    """Return a user-friendly message when the AI provider is unavailable."""
+    return (
+        "I'm having trouble reaching the AI service right now. "
+        "Please try again in a few moments."
+    )
 
 
 def generate_resolution(query, sector_name, subprocess_name, language):
