@@ -36,6 +36,13 @@ function isNetworkIssue(subprocessName) {
   return name.includes('network') || name.includes('signal');
 }
 
+function isMobileNetworkIssue(sectorName, subprocessName) {
+  if (!sectorName || !subprocessName) return false;
+  const sector = sectorName.toLowerCase();
+  const sub = subprocessName.toLowerCase();
+  return sector.includes('mobile services') && sub.includes('network / signal problems');
+}
+
 function limitSubprocesses(subprocesses) {
   const entries = Object.entries(subprocesses);
   const others = entries.filter(([, v]) => v === 'Others' || v.toLowerCase().includes('other'));
@@ -45,7 +52,7 @@ function limitSubprocesses(subprocesses) {
 
 const SUBPROCESS_FOLLOWUP_OPTIONS = {
   'network / signal problems': [
-    'Internet Speed',
+    'Internet / Mobile Data',
     'Call Failure',
     'Call Drop',
   ],
@@ -371,8 +378,8 @@ export default function ChatSupport() {
     stateRef.current.step = 'location-question';
   }, [addMessage, disableGroup, showInput, createSession, requestLocation, afterLocationCaptured]);
 
-  const autoRaiseTicket = useCallback(async () => {
-    addMessage({ type: 'bot', html: `I'm sorry I wasn't able to resolve your issue. Let me raise a ticket for you so our support team can help.` });
+  const autoRaiseTicket = useCallback(async (opts = {}) => {
+    const { prefaceHtml } = opts;
     let refNum = '';
     let assignedAgent = null;
     let slaHours = null;
@@ -388,9 +395,10 @@ export default function ChatSupport() {
         if (data.assigned_agent) { assignedAgent = data.assigned_agent; }
       } catch {}
     }
+    const header = prefaceHtml || `Your ticket is being raised now.`;
     addMessage({
       type: 'bot',
-      html: `Your ticket has been raised successfully!` +
+      html: `${header}<br><br>Your ticket has been raised successfully!` +
         (refNum ? `<br>Reference: <strong>${refNum}</strong>` : '') +
         (assignedAgent
           ? `<br><br>We are connecting you to our expert. Your dedicated support agent is:<br>
@@ -405,10 +413,6 @@ export default function ChatSupport() {
             (slaHours ? `<br><span style="color:#16a34a;font-weight:600;">Your issue will be resolved within ${slaHours} hour${slaHours !== 1 ? 's' : ''}</span>` : '')) +
         `<br>You can track your ticket from the dashboard.`,
     });
-    setTimeout(() => {
-      const actionGroupId = nextId();
-      addMessage({ type: 'post-feedback-actions', groupId: actionGroupId });
-    }, 1000);
     stateRef.current.step = 'escalated';
   }, [addMessage]);
 
@@ -481,7 +485,13 @@ export default function ChatSupport() {
     stateRef.current.attempt = 0;
     stateRef.current.previousSolutions = [];
     addMessage({ type: 'user', text: name });
-    await beginLocationFlow(name);
+    if (isMobileNetworkIssue(stateRef.current.sectorName, name)) {
+      await beginLocationFlow(name);
+      return;
+    }
+    addMessage({ type: 'bot', html: `Please <strong>describe your specific issue</strong> so I can provide the best resolution.` });
+    showInput('Describe your issue in any language...');
+    stateRef.current.step = 'query';
   }, [addMessage, disableGroup, beginLocationFlow]);
 
   const selectNetworkSubissue = useCallback(async (name, groupId) => {
@@ -493,7 +503,9 @@ export default function ChatSupport() {
     stateRef.current.attempt = 0;
     stateRef.current.previousSolutions = [];
     addMessage({ type: 'user', text: name });
-    await beginLocationFlow(finalSubprocessName);
+    addMessage({ type: 'bot', html: `Please <strong>describe your specific issue</strong> so I can provide the best resolution.` });
+    showInput('Describe your issue in any language...');
+    stateRef.current.step = 'query';
   }, [addMessage, disableGroup, beginLocationFlow]);
 
   const sendMessage = useCallback(async () => {
@@ -560,13 +572,11 @@ export default function ChatSupport() {
         }
         setTimeout(() => {
           addMessage({ type: 'bot', html: `What would you like to do next?` });
-          const actionGroupId = nextId();
-          addMessage({ type: 'post-feedback-actions', groupId: actionGroupId });
         }, 800);
         stateRef.current.step = 'resolved';
         return;
       }
-      if (classification.mentions_signal && isNetworkIssue(stateRef.current.subprocessName) && !stateRef.current.diagnosisRan) {
+      if (classification.mentions_signal && isMobileNetworkIssue(stateRef.current.sectorName, stateRef.current.subprocessName) && !stateRef.current.diagnosisRan) {
         addMessage({ type: 'bot', html: `It sounds like you're experiencing signal issues. Would you like to run a signal diagnosis?` });
         const diagGroupId = nextId();
         addMessage({ type: 'signal-offer', groupId: diagGroupId });
@@ -582,6 +592,18 @@ export default function ChatSupport() {
         stateRef.current.language = langData.language || 'English';
       } catch { stateRef.current.language = 'English'; }
       addMessage({ type: 'system', text: `Language detected: ${stateRef.current.language}` });
+    }
+
+    if (stateRef.current.attempt > 0 && !stateRef.current.diagnosisRan && isMobileNetworkIssue(stateRef.current.sectorName, stateRef.current.subprocessName)) {
+      let classification = { mentions_signal: false };
+      try { classification = await chatApiCall('/api/classify-response', { text }); } catch {}
+      if (classification.mentions_signal) {
+        addMessage({ type: 'bot', html: `It sounds like you're experiencing signal issues. Would you like to run a signal diagnosis?` });
+        const diagGroupId = nextId();
+        addMessage({ type: 'signal-offer', groupId: diagGroupId });
+        stateRef.current.step = 'signal-offer';
+        return;
+      }
     }
 
     await fetchSolution(text);
@@ -638,7 +660,8 @@ export default function ChatSupport() {
     }
     addMessage({
       type: 'bot',
-      html: `Your ticket has been raised successfully!` +
+      html: `Your ticket is being raised now.` +
+        `<br><br>Your ticket has been raised successfully!` +
         (refNum ? `<br>Reference: <strong>${refNum}</strong>` : '') +
         (assignedAgent
           ? `<br><br>We are connecting you to our expert. Your dedicated support agent is:<br>
@@ -694,11 +717,15 @@ export default function ChatSupport() {
 
   const handleScreenshotUpload = useCallback(async (file) => {
     if (!file || !file.type.startsWith('image/')) {
-      addMessage({ type: 'system', text: 'Please upload a valid image file (PNG, JPG).' });
+      addMessage({ type: 'system', text: 'Please upload a valid image file (PNG or JPG).' });
+      const uploadGroupId = nextId();
+      addMessage({ type: 'screenshot-upload', groupId: uploadGroupId });
       return;
     }
     if (file.size > 5 * 1024 * 1024) {
       addMessage({ type: 'system', text: 'Image is too large. Please upload a screenshot under 5MB.' });
+      const uploadGroupId = nextId();
+      addMessage({ type: 'screenshot-upload', groupId: uploadGroupId });
       return;
     }
     const reader = new FileReader();
@@ -724,8 +751,7 @@ export default function ChatSupport() {
           stateRef.current.diagnosisRan = true;
           setTimeout(() => {
             if (data.diagnosis.overall_status === 'red') {
-              addMessage({ type: 'bot', html: 'Your signal is poor. Please try using your phone in an open area or near a window to improve reception. I am now raising a ticket so our support team can assist you directly.' });
-              autoRaiseTicket();
+              autoRaiseTicket({ prefaceHtml: 'Your signal is really poor. Your ticket is being raised now.' });
               return;
             }
             addMessage({ type: 'bot', html: 'Thank you for uploading your signal screenshot. I have analyzed your network parameters and identified the issue. Let me suggest a solution based on your signal diagnosis...' });
@@ -796,10 +822,10 @@ export default function ChatSupport() {
         : `<br><br>Our support team will contact you shortly.` + (slaHours ? `<br><span style="color:#16a34a;font-weight:600;">⏱ Your issue will be resolved within ${slaHours} hour${slaHours !== 1 ? 's' : ''}</span>` : '');
       addMessage({
         type: 'bot',
-        html: `Your request has been submitted and a support ticket has been raised.` + agentCard +
+        html: `Your ticket is being raised now.` +
+          `<br><br>Your request has been submitted and a support ticket has been raised.` + agentCard +
           `<br>Reference: <strong>${refNum}</strong><br><br>The agent may send you messages below — please stay in this chat.<br><br>What would you like to do next?`,
       });
-      setTimeout(() => { const ag = nextId(); addMessage({ type: 'post-feedback-actions', groupId: ag }); }, 400);
     }, 1500);
     stateRef.current.step = 'human_handoff';
     agentResolvedShownRef.current = false;
@@ -932,10 +958,6 @@ export default function ChatSupport() {
     if (initialized.current) return;
     initialized.current = true;
     (async () => {
-      try {
-        const fbData = await apiGet('/api/customer/pending-feedback');
-        if (fbData?.sessions?.length > 0) { setPendingFeedback(fbData.sessions); setCurrentFbIdx(0); setInitPhase('feedback-gate'); return; }
-      } catch {}
       const resumeId = searchParams.get('resume');
       if (resumeId) {
         try {
@@ -1352,46 +1374,6 @@ export default function ChatSupport() {
     }
   };
 
-  const renderFeedbackGate = () => {
-    const session = pendingFeedback[currentFbIdx];
-    if (!session) return null;
-    return (
-      <div className="gate-overlay">
-        <div className="gate-card feedback-gate">
-          <div className="gate-icon">&#9733;</div>
-          <h2 className="gate-title">Feedback Required</h2>
-          <p className="gate-subtitle">
-            Please rate your previous chat session before starting a new one.
-            {pendingFeedback.length > 1 && <span className="gate-counter"> ({currentFbIdx + 1} of {pendingFeedback.length})</span>}
-          </p>
-          <div className="gate-session-info">
-            <div className="gate-session-row"><span className="gate-label">Category</span><span className="gate-value">{session.sector_name || 'N/A'}</span></div>
-            <div className="gate-session-row"><span className="gate-label">Issue</span><span className="gate-value">{session.subprocess_name || 'N/A'}</span></div>
-            <div className="gate-session-row"><span className="gate-label">Status</span><span className={`badge badge-${session.status}`}>{session.status}</span></div>
-            <div className="gate-session-row"><span className="gate-label">Date</span><span className="gate-value">{session.created_at ? new Date(session.created_at).toLocaleDateString() : 'N/A'}</span></div>
-            {session.summary && <div className="gate-summary"><span className="gate-label">Summary</span><p>{session.summary}</p></div>}
-          </div>
-          <div className="gate-rating">
-            <label>Rate your experience</label>
-            <div className="gate-stars">
-              {[1, 2, 3, 4, 5].map(n => (
-                <button key={n} type="button" className={`gate-star${n <= fbRating ? ' active' : ''}`} onClick={() => setFbRating(n)}>&#9733;</button>
-              ))}
-            </div>
-            <span className="gate-rating-label">{fbRating === 0 ? 'Click a star to rate' : `${fbRating}/5`}</span>
-          </div>
-          <div className="gate-comment">
-            <label>Comments (optional)</label>
-            <textarea placeholder="Tell us about your experience..." value={fbComment} onChange={e => setFbComment(e.target.value)} rows={3} />
-          </div>
-          <button className="gate-submit-btn" disabled={fbRating === 0 || fbSubmitting} onClick={handleFeedbackSubmit}>
-            {fbSubmitting ? 'Submitting...' : 'Submit Feedback'}
-          </button>
-        </div>
-      </div>
-    );
-  };
-
   const renderResumePrompt = () => {
     const session = activeSessionData;
     if (!session) return null;
@@ -1445,7 +1427,6 @@ export default function ChatSupport() {
             </div>
           </div>
         )}
-        {initPhase === 'feedback-gate' && <div className="chat-area">{renderFeedbackGate()}</div>}
         {initPhase === 'resume-prompt' && <div className="chat-area">{renderResumePrompt()}</div>}
 
         {initPhase === 'chat' && (
