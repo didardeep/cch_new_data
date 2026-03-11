@@ -36,6 +36,13 @@ function isNetworkIssue(subprocessName) {
   return name.includes('network') || name.includes('signal');
 }
 
+function isMobileNetworkIssue(sectorName, subprocessName) {
+  if (!sectorName || !subprocessName) return false;
+  const sector = sectorName.toLowerCase();
+  const sub = subprocessName.toLowerCase();
+  return sector.includes('mobile services') && sub.includes('network / signal problems');
+}
+
 function limitSubprocesses(subprocesses) {
   const entries = Object.entries(subprocesses);
   const others = entries.filter(([, v]) => v === 'Others' || v.toLowerCase().includes('other'));
@@ -388,7 +395,7 @@ export default function ChatSupport() {
         if (data.assigned_agent) { assignedAgent = data.assigned_agent; }
       } catch {}
     }
-    const header = prefaceHtml || `Sorry, I will raise a ticket for you.`;
+    const header = prefaceHtml || `Your ticket is being raised now.`;
     addMessage({
       type: 'bot',
       html: `${header}<br><br>Your ticket has been raised successfully!` +
@@ -408,8 +415,8 @@ export default function ChatSupport() {
     });
     setTimeout(() => {
       const actionGroupId = nextId();
-      addMessage({ type: 'post-feedback-actions', groupId: actionGroupId });
-    }, 1000);
+      addMessage({ type: 'post-actions', groupId: actionGroupId });
+    }, 600);
     stateRef.current.step = 'escalated';
   }, [addMessage]);
 
@@ -419,12 +426,15 @@ export default function ChatSupport() {
     if (!sessionIdRef.current) { await createSession(); }
     if (st.attempt === 1) { st.queryText = userQuery; }
     saveMessage('user', userQuery, { query_text: userQuery, sector_name: st.sectorName, subprocess_name: st.subprocessName });
+    const effectiveQuery = st.subprocessSubType
+      ? `${userQuery}\n\nIssue type: ${st.subprocessSubType}`
+      : userQuery;
     setIsTyping(true);
     const resolveData = await chatApiCall('/api/resolve-step', {
       sector_key: st.sectorKey,
       subprocess_key: st.subprocessKey,
       selected_subprocess: st.subprocessName || undefined,
-      query: userQuery,
+      query: effectiveQuery,
       language: st.language,
       previous_solutions: st.previousSolutions.slice(-10),
       attempt: st.attempt,
@@ -482,7 +492,13 @@ export default function ChatSupport() {
     stateRef.current.attempt = 0;
     stateRef.current.previousSolutions = [];
     addMessage({ type: 'user', text: name });
-    await beginLocationFlow(name);
+    if (isMobileNetworkIssue(stateRef.current.sectorName, name)) {
+      await beginLocationFlow(name);
+      return;
+    }
+    addMessage({ type: 'bot', html: `Please <strong>describe your specific issue</strong> so I can provide the best resolution.` });
+    showInput('Describe your issue in any language...');
+    stateRef.current.step = 'query';
   }, [addMessage, disableGroup, beginLocationFlow]);
 
   const selectNetworkSubissue = useCallback(async (name, groupId) => {
@@ -494,7 +510,13 @@ export default function ChatSupport() {
     stateRef.current.attempt = 0;
     stateRef.current.previousSolutions = [];
     addMessage({ type: 'user', text: name });
-    await beginLocationFlow(finalSubprocessName);
+    if (isMobileNetworkIssue(stateRef.current.sectorName, finalSubprocessName)) {
+      await beginLocationFlow(finalSubprocessName);
+      return;
+    }
+    addMessage({ type: 'bot', html: `Please <strong>describe your specific issue</strong> so I can provide the best resolution.` });
+    showInput('Describe your issue in any language...');
+    stateRef.current.step = 'query';
   }, [addMessage, disableGroup, beginLocationFlow]);
 
   const sendMessage = useCallback(async () => {
@@ -562,12 +584,12 @@ export default function ChatSupport() {
         setTimeout(() => {
           addMessage({ type: 'bot', html: `What would you like to do next?` });
           const actionGroupId = nextId();
-          addMessage({ type: 'post-feedback-actions', groupId: actionGroupId });
+          addMessage({ type: 'post-actions', groupId: actionGroupId });
         }, 800);
         stateRef.current.step = 'resolved';
         return;
       }
-      if (classification.mentions_signal && isNetworkIssue(stateRef.current.subprocessName) && !stateRef.current.diagnosisRan) {
+      if (classification.mentions_signal && isMobileNetworkIssue(stateRef.current.sectorName, stateRef.current.subprocessName) && !stateRef.current.diagnosisRan) {
         addMessage({ type: 'bot', html: `It sounds like you're experiencing signal issues. Would you like to run a signal diagnosis?` });
         const diagGroupId = nextId();
         addMessage({ type: 'signal-offer', groupId: diagGroupId });
@@ -585,7 +607,7 @@ export default function ChatSupport() {
       addMessage({ type: 'system', text: `Language detected: ${stateRef.current.language}` });
     }
 
-    if (stateRef.current.attempt > 0 && !stateRef.current.diagnosisRan && isNetworkIssue(stateRef.current.subprocessName)) {
+    if (stateRef.current.attempt > 0 && !stateRef.current.diagnosisRan && isMobileNetworkIssue(stateRef.current.sectorName, stateRef.current.subprocessName)) {
       let classification = { mentions_signal: false };
       try { classification = await chatApiCall('/api/classify-response', { text }); } catch {}
       if (classification.mentions_signal) {
@@ -651,7 +673,7 @@ export default function ChatSupport() {
     }
     addMessage({
       type: 'bot',
-      html: `Sorry, I will raise a ticket for you.` +
+      html: `Your ticket is being raised now.` +
         `<br><br>Your ticket has been raised successfully!` +
         (refNum ? `<br>Reference: <strong>${refNum}</strong>` : '') +
         (assignedAgent
@@ -667,7 +689,7 @@ export default function ChatSupport() {
             (slaHours ? `<br><span style="color:#16a34a;font-weight:600;">⏱ Your issue will be resolved within ${slaHours} hour${slaHours !== 1 ? 's' : ''}</span>` : '')) +
         `<br>You can track your ticket from the dashboard.`,
     });
-    setTimeout(() => { const ag = nextId(); addMessage({ type: 'post-feedback-actions', groupId: ag }); }, 1000);
+    setTimeout(() => { const ag = nextId(); addMessage({ type: 'post-actions', groupId: ag }); }, 1000);
     stateRef.current.step = 'escalated';
     agentResolvedShownRef.current = false;
     setHandoffActive(true);
@@ -742,9 +764,7 @@ export default function ChatSupport() {
           stateRef.current.diagnosisRan = true;
           setTimeout(() => {
             if (data.diagnosis.overall_status === 'red') {
-              autoRaiseTicket({
-                prefaceHtml: 'Your signal is really poor. I am raising a ticket now so our support team can assist you directly.'
-              });
+              autoRaiseTicket({ prefaceHtml: 'Your signal is really poor. Your ticket is being raised now.' });
               return;
             }
             addMessage({ type: 'bot', html: 'Thank you for uploading your signal screenshot. I have analyzed your network parameters and identified the issue. Let me suggest a solution based on your signal diagnosis...' });
@@ -815,11 +835,12 @@ export default function ChatSupport() {
         : `<br><br>Our support team will contact you shortly.` + (slaHours ? `<br><span style="color:#16a34a;font-weight:600;">⏱ Your issue will be resolved within ${slaHours} hour${slaHours !== 1 ? 's' : ''}</span>` : '');
       addMessage({
         type: 'bot',
-        html: `Sorry, I will raise a ticket for you.` +
+        html: `Your ticket is being raised now.` +
           `<br><br>Your request has been submitted and a support ticket has been raised.` + agentCard +
           `<br>Reference: <strong>${refNum}</strong><br><br>The agent may send you messages below — please stay in this chat.<br><br>What would you like to do next?`,
       });
-      setTimeout(() => { const ag = nextId(); addMessage({ type: 'post-feedback-actions', groupId: ag }); }, 400);
+      const actionGroupId = nextId();
+      addMessage({ type: 'post-actions', groupId: actionGroupId });
     }, 1500);
     stateRef.current.step = 'human_handoff';
     agentResolvedShownRef.current = false;
@@ -952,10 +973,6 @@ export default function ChatSupport() {
     if (initialized.current) return;
     initialized.current = true;
     (async () => {
-      try {
-        const fbData = await apiGet('/api/customer/pending-feedback');
-        if (fbData?.sessions?.length > 0) { setPendingFeedback(fbData.sessions); setCurrentFbIdx(0); setInitPhase('feedback-gate'); return; }
-      } catch {}
       const resumeId = searchParams.get('resume');
       if (resumeId) {
         try {
@@ -1068,7 +1085,7 @@ export default function ChatSupport() {
             <div className="ty-msg">We're glad we could help resolve your issue.<br />If you face any other telecom issues, feel free to come back anytime!</div>
           </div>
         );
-      case 'post-feedback-actions':
+      case 'post-actions':
         return (
           <div key={msg.id} className="post-feedback-actions">
             <button className={`action-btn menu-btn${isDisabled ? ' disabled' : ''}`} onClick={() => !isDisabled && handleBackToMenu(msg.groupId)}>Main Menu</button>
@@ -1372,46 +1389,6 @@ export default function ChatSupport() {
     }
   };
 
-  const renderFeedbackGate = () => {
-    const session = pendingFeedback[currentFbIdx];
-    if (!session) return null;
-    return (
-      <div className="gate-overlay">
-        <div className="gate-card feedback-gate">
-          <div className="gate-icon">&#9733;</div>
-          <h2 className="gate-title">Feedback Required</h2>
-          <p className="gate-subtitle">
-            Please rate your previous chat session before starting a new one.
-            {pendingFeedback.length > 1 && <span className="gate-counter"> ({currentFbIdx + 1} of {pendingFeedback.length})</span>}
-          </p>
-          <div className="gate-session-info">
-            <div className="gate-session-row"><span className="gate-label">Category</span><span className="gate-value">{session.sector_name || 'N/A'}</span></div>
-            <div className="gate-session-row"><span className="gate-label">Issue</span><span className="gate-value">{session.subprocess_name || 'N/A'}</span></div>
-            <div className="gate-session-row"><span className="gate-label">Status</span><span className={`badge badge-${session.status}`}>{session.status}</span></div>
-            <div className="gate-session-row"><span className="gate-label">Date</span><span className="gate-value">{session.created_at ? new Date(session.created_at).toLocaleDateString() : 'N/A'}</span></div>
-            {session.summary && <div className="gate-summary"><span className="gate-label">Summary</span><p>{session.summary}</p></div>}
-          </div>
-          <div className="gate-rating">
-            <label>Rate your experience</label>
-            <div className="gate-stars">
-              {[1, 2, 3, 4, 5].map(n => (
-                <button key={n} type="button" className={`gate-star${n <= fbRating ? ' active' : ''}`} onClick={() => setFbRating(n)}>&#9733;</button>
-              ))}
-            </div>
-            <span className="gate-rating-label">{fbRating === 0 ? 'Click a star to rate' : `${fbRating}/5`}</span>
-          </div>
-          <div className="gate-comment">
-            <label>Comments (optional)</label>
-            <textarea placeholder="Tell us about your experience..." value={fbComment} onChange={e => setFbComment(e.target.value)} rows={3} />
-          </div>
-          <button className="gate-submit-btn" disabled={fbRating === 0 || fbSubmitting} onClick={handleFeedbackSubmit}>
-            {fbSubmitting ? 'Submitting...' : 'Submit Feedback'}
-          </button>
-        </div>
-      </div>
-    );
-  };
-
   const renderResumePrompt = () => {
     const session = activeSessionData;
     if (!session) return null;
@@ -1465,7 +1442,6 @@ export default function ChatSupport() {
             </div>
           </div>
         )}
-        {initPhase === 'feedback-gate' && <div className="chat-area">{renderFeedbackGate()}</div>}
         {initPhase === 'resume-prompt' && <div className="chat-area">{renderResumePrompt()}</div>}
 
         {initPhase === 'chat' && (
