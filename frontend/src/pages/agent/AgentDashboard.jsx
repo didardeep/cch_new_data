@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+﻿import { useState, useEffect, useCallback } from 'react';
 import {
   LineChart, Line, BarChart, Bar, PieChart, Pie, Cell,
   XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
@@ -15,7 +15,7 @@ const PRIORITY_COLORS = {
   low: '#10b981',
 };
 
-/* ── Tiny SVG icons ─────────────────────────────────────────────────────────── */
+/* â”€â”€ Tiny SVG icons â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 const IC = {
   clock:  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>,
   check:  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>,
@@ -179,12 +179,12 @@ export default function AgentDashboard() {
             <span style={{ display: 'inline-block', animation: refreshing ? 'spin 1s linear infinite' : 'none' }}>
               {IC_REFRESH}
             </span>
-            {refreshing ? 'Refreshing…' : 'Refresh'}
+            {refreshing ? 'Refreshingâ€¦' : 'Refresh'}
           </button>
         </div>
       </div>
 
-      {/* ── Summary ribbon ───────────────────────────────────────────── */}
+      {/* â”€â”€ Summary ribbon â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 14, marginBottom: 28 }}>
         {[
           { label: 'Total Tickets',      value: summary.total_tickets ?? 0, icon: IC.clip,  desc: 'All assigned tickets' },
@@ -220,7 +220,7 @@ export default function AgentDashboard() {
         ))}
       </div>
 
-      {/* ── KPI Cards ────────────────────────────────────────────────── */}
+      {/* â”€â”€ KPI Cards â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */}
       <div style={{ marginBottom: 4 }}>
         <div style={{ fontSize: 10, fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: 1.2, marginBottom: 10, paddingLeft: 2 }}>
           Core Performance Metrics
@@ -354,3 +354,4 @@ export default function AgentDashboard() {
     </div>
   );
 }
+

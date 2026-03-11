@@ -1602,6 +1602,22 @@ def get_session_status(session_id):
     })
 
 
+@app.route("/api/chat/session/<int:session_id>/presence", methods=["POST"])
+@jwt_required()
+def session_presence(session_id):
+    """Update customer presence for a chat session."""
+    user_id = int(get_jwt_identity())
+    session = ChatSession.query.get(session_id)
+    if not session:
+        return jsonify({"error": "Session not found"}), 404
+    if session.user_id != user_id:
+        return jsonify({"error": "Unauthorized"}), 403
+    data = request.json or {}
+    session.customer_present = bool(data.get("present"))
+    db.session.commit()
+    return jsonify({"customer_present": session.customer_present})
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # CUSTOMER ROUTES
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1671,8 +1687,9 @@ def customer_active_session():
 @app.route("/api/customer/pending-feedback", methods=["GET"])
 @jwt_required()
 def customer_pending_feedback():
-    """Return resolved/escalated sessions that the user hasn't given feedback for."""
+    """Return resolved sessions that the user hasn't given feedback for."""
     user_id = int(get_jwt_identity())
+    cutoff = datetime.now(timezone.utc) - timedelta(days=7)
     # Subquery: session IDs that already have feedback from this user
     feedback_session_ids = db.session.query(Feedback.chat_session_id).filter(
         Feedback.user_id == user_id,
@@ -1681,9 +1698,10 @@ def customer_pending_feedback():
 
     sessions = ChatSession.query.filter(
         ChatSession.user_id == user_id,
-        ChatSession.status.in_(["resolved", "escalated"]),
+        ChatSession.status.in_(["resolved"]),
+        ChatSession.created_at >= cutoff,
         ~ChatSession.id.in_(feedback_session_ids),
-    ).order_by(ChatSession.created_at.desc()).all()
+    ).order_by(ChatSession.created_at.desc()).limit(1).all()
 
     return jsonify({
         "sessions": [s.to_dict() for s in sessions],
@@ -1719,9 +1737,17 @@ def customer_tickets():
 def submit_feedback():
     user_id = int(get_jwt_identity())
     data = request.json
+    chat_session_id = data.get("chat_session_id")
+    if chat_session_id:
+        existing = Feedback.query.filter_by(
+            user_id=user_id,
+            chat_session_id=chat_session_id,
+        ).first()
+        if existing:
+            return jsonify({"error": "Feedback already submitted"}), 409
     fb = Feedback(
         user_id=user_id,
-        chat_session_id=data.get("chat_session_id"),
+        chat_session_id=chat_session_id,
         rating=data.get("rating", 0),
         comment=data.get("comment", ""),
     )
@@ -3942,38 +3968,17 @@ def agent_root_cause(ticket_id):
     nearest_site_id = nearest["site_id"]
     nearest_zone = nearest.get("zone")
     dist_km = nearest["distance_km"]
+    site_status = nearest.get("status", "on_air")  # Get status from nearest site
+    alarms_text = nearest.get("alarm", "None")  # Get alarms from nearest site
+    solution_text = nearest.get("solution", "No action required")  # Get solution from nearest site
 
     problem_type = _detect_network_problem_type(ticket)
     problem_type_label = _problem_type_label(problem_type)
 
-    site_rows = KpiData.query.filter_by(site_id=nearest.site_id, data_level="site").all()
-    cell_rows = KpiData.query.filter_by(site_id=nearest.site_id, data_level="cell").all()
+    site_rows = KpiData.query.filter_by(site_id=nearest_site_id, data_level="site").all()
+    cell_rows = KpiData.query.filter_by(site_id=nearest_site_id, data_level="cell").all()
     all_kpis = {r.kpi_name for r in site_rows + cell_rows}
     selected_kpis = _filter_kpi_names_for_problem(all_kpis, problem_type)
-
-    site_kpi_text = _build_kpi_summary_text(site_rows, selected_kpis, "site-level")
-    cell_kpi_text = _build_kpi_summary_text(cell_rows, selected_kpis, "cell-level")
-    # Get site-level KPI data
-    site_rows = KpiData.query.filter_by(site_id=nearest_site_id, data_level="site").all()
-    site_summary = defaultdict(list)
-    for r in site_rows:
-        if r.value is not None:
-            site_summary[r.kpi_name].append(r.value)
-
-    site_kpi_text = ""
-    for kpi_name, vals in site_summary.items():
-        avg = round(sum(vals) / len(vals), 4)
-        mn = round(min(vals), 4)
-        mx = round(max(vals), 4)
-        site_kpi_text += f"- {kpi_name}: avg={avg}, min={mn}, max={mx} ({len(vals)} data points)\n"
-
-    # Get cell-level KPI data
-    cell_rows = KpiData.query.filter_by(site_id=nearest_site_id, data_level="cell").all()
-    cell_summary = defaultdict(lambda: defaultdict(list))
-    for r in cell_rows:
-        if r.value is not None:
-            cell_key = f"{r.cell_id}" if r.cell_id else "unknown"
-            cell_summary[r.kpi_name][cell_key].append(r.value)
 
     site_kpi_text = _build_kpi_summary_text(site_rows, selected_kpis, "site-level")
     cell_kpi_text = _build_kpi_summary_text(cell_rows, selected_kpis, "cell-level")
@@ -4042,14 +4047,14 @@ Be specific and reference actual KPI values in your analysis."""
         )
         analysis_raw = response.choices[0].message.content.strip()
         fallback_rca = [
-            f"**Site Status**: Nearest site {nearest.site_id} ({site_status.replace('_', ' ').upper()}) is the primary impact domain for this complaint.",
+            f"**Site Status**: Nearest site {nearest_site_id} ({site_status.replace('_', ' ').upper()}) is the primary impact domain for this complaint.",
             f"**Problem Classification**: Problem type is {problem_type_label}; only related KPI groups were considered for causality and trend correlation.",
             "**Trend Evidence**: Daily/hourly trend shift confirms a recent degradation window; weekly/monthly baseline indicates this is not normal behavior.",
             "**Cell-Site Correlation**: Cell-level variance aligns with site-level degradation, indicating a network-origin issue rather than isolated handset behavior.",
             "**Action Required**: Immediate technical validation on the identified degraded KPI path is required to close the fault and stabilize service.",
         ]
         if site_status == "off_air":
-            fallback_rca[0] = f"**Site Outage**: Nearest site {nearest.site_id} is OFF AIR and alarm state is the primary root trigger for outage impact."
+            fallback_rca[0] = f"**Site Outage**: Nearest site {nearest_site_id} is OFF AIR and alarm state is the primary root trigger for outage impact."
             fallback_rca[4] = "**Resolution Path**: Execute alarm-linked restoration steps first, then validate KPI recovery trend to confirm full service normalization."
         analysis = _force_numbered_points(
             analysis_raw,
@@ -4064,7 +4069,7 @@ Be specific and reference actual KPI values in your analysis."""
             max_points=5,
             fallback_points=[
                 f"**Model Error**: Root cause analysis could not be generated automatically: {str(e)}.",
-                f"**Focus Area**: Nearest site {nearest.site_id} and problem type {problem_type_label} remain the active technical focus.",
+                f"**Focus Area**: Nearest site {nearest_site_id} and problem type {problem_type_label} remain the active technical focus.",
                 "**Trend Review**: Review daily/hourly KPI movement against weekly/monthly baseline to isolate degradation start time.",
                 "**Fault Domain**: Correlate degraded cell-level indicators with site-level KPI shifts to validate fault domain.",
             ],
@@ -4076,11 +4081,9 @@ Be specific and reference actual KPI values in your analysis."""
     return jsonify({
         "analysis": analysis,
         "analysis_pdf": analysis_pdf,
-        "site_id": nearest.site_id,
-        "site_zone": nearest.zone,
-        "site_status": site_status,
         "site_id": nearest_site_id,
         "site_zone": nearest_zone,
+        "site_status": site_status,
         "distance_km": dist_km,
         "problem_type": problem_type_label,
         "selected_kpis": selected_kpis,
@@ -4523,5 +4526,5 @@ with app.app_context():
 
 if __name__ == "__main__":
     run_sla_checks()
-    app.run(debug=True, port=5500, use_reloader=False)
+    app.run(debug=True, host="0.0.0.0", port=5500, use_reloader=False)
 
