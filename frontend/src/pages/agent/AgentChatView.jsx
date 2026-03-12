@@ -413,6 +413,22 @@ export default function AgentChatView() {
                 </div>
               );
             }
+            if (typeof msg.content === 'string' && msg.content.startsWith('__IMAGE__:')) {
+              const imageSrc = msg.content.slice('__IMAGE__:'.length);
+              return (
+                <div key={msg.id} style={{ alignSelf: 'flex-start', maxWidth: '72%' }}>
+                  <div style={{
+                    background: '#f8fafc',
+                    border: '1px solid #e2e8f0',
+                    borderRadius: 10,
+                    padding: 10,
+                  }}>
+                    <div style={{ fontSize: 11, color: '#475569', marginBottom: 6 }}>Customer screenshot</div>
+                    <img src={imageSrc} alt="Customer screenshot" style={{ maxWidth: '100%', borderRadius: 8 }} />
+                  </div>
+                </div>
+              );
+            }
 
             const cfg = BUBBLE[msg.sender] || BUBBLE.customer;
             return (

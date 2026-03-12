@@ -1270,15 +1270,19 @@ def save_session_location(session_id):
 def analyze_signal(session_id):
     """Analyze a signal screenshot using Azure OpenAI Vision."""
     user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
     session = ChatSession.query.get(session_id)
 
     if not session:
         return jsonify({"error": "Session not found"}), 404
-    if session.user_id != user_id:
+    if not user:
+        return jsonify({"error": "Unauthorized"}), 401
+    if session.user_id != user_id and user.role != "human_agent":
         return jsonify({"error": "Unauthorized"}), 403
 
     data = request.json
     image_base64 = data.get("image")
+    image_data_url = data.get("image_data_url")
 
     if not image_base64:
         return jsonify({"error": "No image provided"}), 400
@@ -1288,6 +1292,16 @@ def analyze_signal(session_id):
         return jsonify({"error": "Image too large. Please upload a smaller screenshot."}), 400
 
     try:
+        # Send customer screenshot to agent view (if any)
+        if not image_data_url:
+            image_data_url = f"data:image/png;base64,{image_base64}"
+        image_msg = ChatMessage(
+            session_id=session_id,
+            sender="customer",
+            content=f"__IMAGE__:{image_data_url}",
+        )
+        db.session.add(image_msg)
+
         result = analyze_signal_screenshot(image_base64)
 
         # If signal is red (Poor), do not include nearest tower sites in user-facing diagnosis
@@ -1312,6 +1326,8 @@ def analyze_signal(session_id):
         # Mark that diagnosis has been completed for this session
         session.diagnosis_ran = True
         db.session.commit()
+        _emit_session_message(image_msg)
+        _emit_session_message(msg)
 
         return jsonify({"diagnosis": result}), 200
     except Exception as e:

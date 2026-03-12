@@ -846,10 +846,10 @@ export default function ChatSupport() {
       setIsTyping(true);
       try {
         const token = getToken();
-        const resp = await fetch(`${API_BASE}/api/chat/session/${sessionIdRef.current}/analyze-signal`, {
+      const resp = await fetch(`${API_BASE}/api/chat/session/${sessionIdRef.current}/analyze-signal`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-          body: JSON.stringify({ image: base64String }),
+          body: JSON.stringify({ image: base64String, image_data_url: reader.result }),
         });
         const data = await resp.json();
         setIsTyping(false);
