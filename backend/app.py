@@ -19,12 +19,14 @@ from flask_jwt_extended import (
     JWTManager, create_access_token, jwt_required, get_jwt_identity
 )
 from flask_mail import Mail, Message
+from flask_socketio import SocketIO, join_room, emit
 from openai import AzureOpenAI
 from dotenv import load_dotenv
 from types import SimpleNamespace
 import urllib.request
 import urllib.parse
 import urllib.error
+from flask_jwt_extended import decode_token
 
 from sqlalchemy import case as sql_case
 from sqlalchemy.orm import joinedload
@@ -57,6 +59,7 @@ db.init_app(app)
 bcrypt.init_app(app)
 jwt = JWTManager(app)
 mail = Mail(app)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
 
 # ─── Azure OpenAI Configuration ──────────────────────────────────────────────
@@ -308,6 +311,51 @@ def _format_points_for_pdf(raw_text: str) -> str:
     return "\n\n".join(plain_lines)
 
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+# ─── Socket.IO Helpers ───────────────────────────────────────────────────────
+
+def _emit_session_message(msg: ChatMessage):
+    try:
+        socketio.emit("new_message", msg.to_dict(), room=f"session_{msg.session_id}")
+    except Exception:
+        pass
+
+
+def _emit_session_update(session: ChatSession):
+    try:
+        socketio.emit("session_updated", {"session_id": session.id, "status": session.status}, room=f"session_{session.id}")
+    except Exception:
+        pass
+
+
+@socketio.on("join_session")
+def on_join_session(data):
+    data = data or {}
+    token = data.get("token")
+    session_id = data.get("session_id")
+    if not token or not session_id:
+        emit("error", {"error": "token and session_id required"})
+        return
+    try:
+        decoded = decode_token(token)
+        user_id = int(decoded.get("sub"))
+    except Exception:
+        emit("error", {"error": "invalid token"})
+        return
+    session = ChatSession.query.get(session_id)
+    if not session:
+        emit("error", {"error": "session not found"})
+        return
+    user = User.query.get(user_id)
+    if not user:
+        emit("error", {"error": "user not found"})
+        return
+    if user.role != "human_agent" and session.user_id != user_id:
+        emit("error", {"error": "unauthorized"})
+        return
+    join_room(f"session_{session_id}")
+    emit("joined", {"session_id": session_id})
 
 
 def find_nearest_sites(lat, lon, n=3):
@@ -1171,6 +1219,7 @@ def add_chat_message(session_id):
         session.language = data["language"]
 
     db.session.commit()
+    _emit_session_message(msg)
     return jsonify({"message": msg.to_dict()})
 # ═══════════════════════════════════════════════════════════════════
 # ADD THIS NEW ROUTE to app.py
@@ -1275,6 +1324,7 @@ def resolve_session(session_id):
     session.status = "resolved"
     session.resolved_at = datetime.now(timezone.utc)
     db.session.commit()
+    _emit_session_update(session)
 
     # Generate summary
     try:
@@ -4357,6 +4407,7 @@ def agent_send_message(session_id):
     )
     db.session.add(msg)
     db.session.commit()
+    _emit_session_message(msg)
     return jsonify({"message": msg.to_dict()}), 201
 
 
@@ -4382,6 +4433,7 @@ def agent_request_diagnosis(session_id):
     )
     db.session.add(msg)
     db.session.commit()
+    _emit_session_message(msg)
     return jsonify({"message": msg.to_dict()}), 201
 
 
@@ -4636,5 +4688,5 @@ with app.app_context():
 
 if __name__ == "__main__":
     run_sla_checks()
-    app.run(debug=True, port=5500, use_reloader=False)
+    socketio.run(app, debug=True, port=5500, use_reloader=False)
 

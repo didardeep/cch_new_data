@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { apiGet, apiPost } from '../../api';
+import { apiGet, apiPost, apiPut, getToken } from '../../api';
+import { io } from 'socket.io-client';
 
 /* ── SVG icon set ─────────────────────────────────────────────────────── */
 const IC = {
@@ -63,6 +64,8 @@ const IC = {
   ),
 };
 
+const SOCKET_URL = process.env.REACT_APP_API_URL || 'http://localhost:5500';
+
 /* ── Bubble style by sender ───────────────────────────────────────────── */
 const BUBBLE = {
   agent: {
@@ -112,6 +115,8 @@ export default function AgentChatView() {
   const [customer, setCustomer] = useState(null);
   const [newMessage, setNewMessage] = useState('');
   const [sending, setSending] = useState(false);
+  const [ending, setEnding] = useState(false);
+  const [wsConnected, setWsConnected] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [activePanel, setActivePanel] = useState(null);
@@ -119,6 +124,7 @@ export default function AgentChatView() {
   const [diagnosisRequestSent, setDiagnosisRequestSent] = useState(false);
   const bottomRef = useRef(null);
   const pollingRef = useRef(null);
+  const socketRef = useRef(null);
 
   const stopPolling = () => {
     if (pollingRef.current) {
@@ -161,11 +167,42 @@ export default function AgentChatView() {
     }
   }, [sessionId]);
 
+  const appendMessageIfNew = useCallback((msg) => {
+    if (!msg || !msg.id) return;
+    setMessages(prev => (prev.some(m => m.id === msg.id) ? prev : [...prev, msg]));
+  }, []);
+
   useEffect(() => {
     fetchChat();
-    pollingRef.current = setInterval(fetchChat, 8000); // poll every 8 s
+    if (!wsConnected) {
+      pollingRef.current = setInterval(fetchChat, 8000); // poll every 8 s
+    }
     return () => stopPolling();
-  }, [fetchChat]);
+  }, [fetchChat, wsConnected]);
+
+  useEffect(() => {
+    const token = getToken();
+    if (!token) return;
+    const s = io(SOCKET_URL, { transports: ['websocket', 'polling'] });
+    socketRef.current = s;
+    s.on('connect', () => {
+      setWsConnected(true);
+      s.emit('join_session', { session_id: parseInt(sessionId, 10), token });
+    });
+    s.on('disconnect', () => setWsConnected(false));
+    s.on('new_message', (m) => {
+      if (!m || m.session_id !== parseInt(sessionId, 10)) return;
+      appendMessageIfNew(m);
+    });
+    s.on('session_updated', (payload) => {
+      if (!payload || payload.session_id !== parseInt(sessionId, 10)) return;
+      setSession(prev => prev ? { ...prev, status: payload.status } : prev);
+    });
+    return () => {
+      s.disconnect();
+      socketRef.current = null;
+    };
+  }, [appendMessageIfNew, sessionId]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -191,6 +228,20 @@ export default function AgentChatView() {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       handleSend();
+    }
+  };
+
+  const handleEndChat = async () => {
+    if (ending || session?.status === 'resolved') return;
+    if (!window.confirm('End this chat now? This will mark the session as resolved.')) return;
+    setEnding(true);
+    try {
+      await apiPut(`/api/chat/session/${sessionId}/resolve`, {});
+      await fetchChat();
+    } catch {
+      alert('Failed to end chat.');
+    } finally {
+      setEnding(false);
     }
   };
 
