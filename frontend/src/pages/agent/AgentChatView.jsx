@@ -190,6 +190,31 @@ export default function AgentChatView() {
     }
   };
 
+  const renderAgentTicks = (msg) => {
+    if (msg.sender !== 'agent') return null;
+    const isSeen = !!msg.seen_at;
+    const isDelivered = !!msg.delivered_at;
+    const color = isSeen ? '#2563eb' : isDelivered ? '#94a3b8' : '#cbd5e1';
+    const title = isSeen ? 'Seen' : isDelivered ? 'Delivered' : 'Sent';
+    return (
+      <span
+        title={title}
+        style={{ display: 'inline-flex', alignItems: 'center', marginLeft: 6, color }}
+      >
+        {isDelivered || isSeen ? (
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <polyline points="3 12 7 16 13 9" />
+            <polyline points="10 12 14 16 21 7" />
+          </svg>
+        ) : (
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <polyline points="20 6 9 17 4 12" />
+          </svg>
+        )}
+      </span>
+    );
+  };
+
   /* ── Loading / Error states ─────────────────────────────────────── */
   if (loading) return (
     <div className="empty-state" style={{ height: 400 }}>
@@ -321,6 +346,7 @@ export default function AgentChatView() {
                       ? new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
                       : ''}
                   </span>
+                  {renderAgentTicks(msg)}
                 </div>
 
                 {/* Bubble */}

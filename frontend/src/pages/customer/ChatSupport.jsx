@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { useSearchParams, useNavigate } from 'react-router-dom';
-import { getToken, apiGet, apiPost } from '../../api';
+import { getToken, apiGet } from '../../api';
 import { useAuth } from '../../AuthContext';
 import '../../styles/chatbot.css';
 
@@ -73,13 +73,8 @@ export default function ChatSupport() {
   const agentResolvedShownRef = useRef(false);
 
   const [initPhase, setInitPhase] = useState('loading');
-  const [pendingFeedback, setPendingFeedback] = useState([]);
-  const [currentFbIdx, setCurrentFbIdx] = useState(0);
   const [activeSessionData, setActiveSessionData] = useState(null);
   const [activeSessionMsgs, setActiveSessionMsgs] = useState([]);
-  const [fbRating, setFbRating] = useState(0);
-  const [fbComment, setFbComment] = useState('');
-  const [fbSubmitting, setFbSubmitting] = useState(false);
 
   const [messages, setMessages] = useState([]);
   const [inputVisible, setInputVisible] = useState(false);
@@ -151,6 +146,22 @@ export default function ChatSupport() {
     try {
       await chatApiCall(`/api/chat/session/${sessionIdRef.current}/message`, {
         sender, content, ...meta,
+      });
+    } catch (e) {}
+  }, []);
+
+  const markAgentMessagesSeen = useCallback(async (messageIds) => {
+    if (!sessionIdRef.current) return;
+    if (!Array.isArray(messageIds) || messageIds.length === 0) return;
+    try {
+      const token = getToken();
+      await fetch(`${API_BASE}/api/chat/session/${sessionIdRef.current}/seen`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+        },
+        body: JSON.stringify({ message_ids: messageIds }),
       });
     } catch (e) {}
   }, []);
@@ -271,6 +282,10 @@ export default function ChatSupport() {
           lastSeenMsgIdRef.current = Math.max(lastSeenMsgIdRef.current, m.id);
           addMessage({ type: 'live-agent-message', text: m.content, timestamp: m.created_at });
         });
+        if (newAgentMsgs.length > 0) {
+          markAgentMessagesSeen(newAgentMsgs.map(m => m.id));
+          showInput('Type your reply to the agent...');
+        }
         const s = data.session || {};
         if (s.status === 'resolved' && !agentResolvedShownRef.current) {
           agentResolvedShownRef.current = true;
@@ -285,7 +300,7 @@ export default function ChatSupport() {
     };
     const iv = setInterval(poll, 6000);
     return () => clearInterval(iv);
-  }, [handoffActive, addMessage]);
+  }, [handoffActive, addMessage, markAgentMessagesSeen, showInput]);
 
   const startChat = useCallback(async () => {
     setMessages([]);
@@ -311,11 +326,16 @@ export default function ChatSupport() {
     const token = getToken();
     const headers = {};
     if (token) headers['Authorization'] = `Bearer ${token}`;
-    const resp = await fetch(`${API_BASE}/api/menu`, { headers });
-    const data = await resp.json();
-    const groupId = nextId();
-    addMessage({ type: 'sector-menu', menu: data.menu, groupId });
-    stateRef.current.step = 'sector';
+    setIsTyping(true);
+    try {
+      const resp = await fetch(`${API_BASE}/api/menu`, { headers });
+      const data = await resp.json();
+      const groupId = nextId();
+      addMessage({ type: 'sector-menu', menu: data.menu, groupId });
+      stateRef.current.step = 'sector';
+    } finally {
+      setIsTyping(false);
+    }
   }, [addMessage]);
 
   const selectSector = useCallback(async (key, name, groupId) => {
@@ -368,11 +388,7 @@ export default function ChatSupport() {
         stateRef.current.step = 'location';
       },
       onNo: () => {
-        disableGroup(locQGroupId);
-        addMessage({ type: 'user', text: "No, I'm at a different location" });
-        addMessage({ type: 'bot', html: `Please describe the location where you're experiencing this issue (e.g., area, address, landmark):` });
-        showInput('Describe your issue location...');
-        stateRef.current.step = 'location-describe';
+        // No alternate location flow for now
       },
     });
     stateRef.current.step = 'location-question';
@@ -385,6 +401,7 @@ export default function ChatSupport() {
     let slaHours = null;
     if (sessionIdRef.current) {
       try {
+        setIsTyping(true);
         const token = getToken();
         const resp = await fetch(`${API_BASE}/api/chat/session/${sessionIdRef.current}/escalate`, {
           method: 'PUT',
@@ -393,7 +410,7 @@ export default function ChatSupport() {
         const data = await resp.json();
         if (data.ticket) { refNum = data.ticket.reference_number; slaHours = data.ticket.sla_hours || null; }
         if (data.assigned_agent) { assignedAgent = data.assigned_agent; }
-      } catch {}
+      } catch {} finally { setIsTyping(false); }
     }
     const header = prefaceHtml || `Your ticket is being raised now.`;
     addMessage({
@@ -409,16 +426,13 @@ export default function ChatSupport() {
                ${assignedAgent.employee_id ? `<div style="font-size:11px;color:#64748b;margin-top:2px;">ID: ${assignedAgent.employee_id}</div>` : ''}
                ${slaHours ? `<div style="font-size:12px;color:#16a34a;margin-top:6px;font-weight:600;">Your issue will be resolved within ${slaHours} hour${slaHours !== 1 ? 's' : ''}</div>` : ''}
              </div>`
-          : `<br><br>Our support team will reach out to you shortly.` +
+          : `<br><br>We are connecting you to a human agent. Our support team will reach out to you shortly.` +
             (slaHours ? `<br><span style="color:#16a34a;font-weight:600;">Your issue will be resolved within ${slaHours} hour${slaHours !== 1 ? 's' : ''}</span>` : '')) +
-        `<br>You can track your ticket from the dashboard.`,
+        `<br><br>The agent may send you messages below - please stay in this chat.<br>You can track your ticket from the dashboard.`,
     });
-    setTimeout(() => {
-      const actionGroupId = nextId();
-      addMessage({ type: 'post-actions', groupId: actionGroupId });
-    }, 600);
+    setHandoffActive(true);
     stateRef.current.step = 'escalated';
-  }, [addMessage]);
+  }, [addMessage, setHandoffActive]);
 
   const fetchSolution = useCallback(async (userQuery) => {
     const st = stateRef.current;
@@ -526,6 +540,12 @@ export default function ChatSupport() {
     setInputValue('');
     hideInput();
 
+    if (handoffActive || stateRef.current.step === 'human_handoff' || stateRef.current.step === 'escalated') {
+      saveMessage('user', text);
+      showInput('Type your reply to the agent...');
+      return;
+    }
+
     if (stateRef.current.step === 'greeting') {
       setIsTyping(true);
       let isGreeting = true;
@@ -546,22 +566,6 @@ export default function ChatSupport() {
       addMessage({ type: 'bot', html: `Hi dear ${userName}! Hope you're doing well. I'm your AI-powered telecom support assistant. How can I help you today? Please choose one of the options below to get started:` });
       setTimeout(() => loadSectorMenu(), 600);
       stateRef.current.step = 'sector';
-      return;
-    }
-
-    if (stateRef.current.step === 'location-describe') {
-      if (sessionIdRef.current) {
-        try {
-          const token = getToken();
-          await fetch(`${API_BASE}/api/chat/session/${sessionIdRef.current}/location`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-            body: JSON.stringify({ location_description: text }),
-          });
-        } catch (e) {}
-      }
-      addMessage({ type: 'bot', html: `Thank you! Location noted: <strong>${text}</strong>` });
-      afterLocationCaptured(stateRef.current.subprocessName);
       return;
     }
 
@@ -620,13 +624,14 @@ export default function ChatSupport() {
     }
 
     await fetchSolution(text);
-  }, [inputValue, addMessage, hideInput, fetchSolution, loadSectorMenu, user, afterLocationCaptured]);
+  }, [inputValue, addMessage, hideInput, fetchSolution, loadSectorMenu, user, afterLocationCaptured, handoffActive, saveMessage, showInput]);
 
   const handleSendEmail = useCallback(async (groupId) => {
     disableGroup(groupId);
     if (!sessionIdRef.current) return;
     addMessage({ type: 'system', text: 'Sending summary to your email...' });
     try {
+      setIsTyping(true);
       const token = getToken();
       const resp = await fetch(`${API_BASE}/api/chat/session/${sessionIdRef.current}/send-summary-email`, {
         method: 'POST',
@@ -636,6 +641,7 @@ export default function ChatSupport() {
       if (resp.ok) { addMessage({ type: 'email-sent', message: data.message }); }
       else { addMessage({ type: 'system', text: data.error || 'Failed to send email.' }); }
     } catch { addMessage({ type: 'system', text: 'Failed to send email. Please try again later.' }); }
+    finally { setIsTyping(false); }
   }, [addMessage, disableGroup]);
 
   const handleSignalDiagnosis = useCallback((groupId) => {
@@ -661,6 +667,7 @@ export default function ChatSupport() {
     let slaHours = null;
     if (sessionIdRef.current) {
       try {
+        setIsTyping(true);
         const token = getToken();
         const resp = await fetch(`${API_BASE}/api/chat/session/${sessionIdRef.current}/escalate`, {
           method: 'PUT',
@@ -669,7 +676,7 @@ export default function ChatSupport() {
         const data = await resp.json();
         if (data.ticket) { refNum = data.ticket.reference_number; slaHours = data.ticket.sla_hours || null; }
         if (data.assigned_agent) { assignedAgent = data.assigned_agent; }
-      } catch {}
+      } catch {} finally { setIsTyping(false); }
     }
     addMessage({
       type: 'bot',
@@ -685,11 +692,10 @@ export default function ChatSupport() {
                ${assignedAgent.employee_id ? `<div style="font-size:11px;color:#64748b;margin-top:2px;">ID: ${assignedAgent.employee_id}</div>` : ''}
                ${slaHours ? `<div style="font-size:12px;color:#16a34a;margin-top:6px;font-weight:600;">⏱ Your issue will be resolved within ${slaHours} hour${slaHours !== 1 ? 's' : ''}</div>` : ''}
              </div>`
-          : `<br><br>Our support team will reach out to you shortly.` +
+          : `<br><br>We are connecting you to a human agent. Our support team will reach out to you shortly.` +
             (slaHours ? `<br><span style="color:#16a34a;font-weight:600;">⏱ Your issue will be resolved within ${slaHours} hour${slaHours !== 1 ? 's' : ''}</span>` : '')) +
-        `<br>You can track your ticket from the dashboard.`,
+        `<br><br>The agent may send you messages below - please stay in this chat.<br>You can track your ticket from the dashboard.`,
     });
-    setTimeout(() => { const ag = nextId(); addMessage({ type: 'post-actions', groupId: ag }); }, 1000);
     stateRef.current.step = 'escalated';
     agentResolvedShownRef.current = false;
     setHandoffActive(true);
@@ -721,12 +727,21 @@ export default function ChatSupport() {
         const data = await resp.json();
         if (resp.ok) { addMessage({ type: 'email-sent', message: data.message }); }
       } catch {}
+      if (!handoffActive) {
+        try {
+          const token = getToken();
+          await fetch(`${API_BASE}/api/chat/session/${currentSessionId}/resolve`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+          });
+        } catch {}
+      }
     }
     stateRef.current.step = 'exited';
     setTimeout(() => {
       navigate(`/customer/feedback${currentSessionId ? `?session=${currentSessionId}` : ''}`);
     }, 1500);
-  }, [addMessage, disableGroup, hideInput, navigate]);
+  }, [addMessage, disableGroup, hideInput, navigate, handoffActive]);
 
   const handleScreenshotUpload = useCallback(async (file) => {
     if (!file || !file.type.startsWith('image/')) {
@@ -803,6 +818,7 @@ export default function ChatSupport() {
     let slaHours = null;
     if (sessionIdRef.current) {
       try {
+        setIsTyping(true);
         const token = getToken();
         const resp = await fetch(`${API_BASE}/api/chat/session/${sessionIdRef.current}/escalate`, {
           method: 'PUT',
@@ -811,7 +827,7 @@ export default function ChatSupport() {
         const data = await resp.json();
         if (data.ticket) { refNum = data.ticket.reference_number; slaHours = data.ticket.sla_hours || null; }
         if (data.assigned_agent) { assignedAgent = data.assigned_agent; }
-      } catch {}
+      } catch {} finally { setIsTyping(false); }
     }
     addMessage({
       type: 'handoff',
@@ -837,10 +853,8 @@ export default function ChatSupport() {
         type: 'bot',
         html: `Your ticket is being raised now.` +
           `<br><br>Your request has been submitted and a support ticket has been raised.` + agentCard +
-          `<br>Reference: <strong>${refNum}</strong><br><br>The agent may send you messages below — please stay in this chat.<br><br>What would you like to do next?`,
+          `<br>Reference: <strong>${refNum}</strong><br><br>The agent may send you messages below - please stay in this chat.<br><br>What would you like to do next?`,
       });
-      const actionGroupId = nextId();
-      addMessage({ type: 'post-actions', groupId: actionGroupId });
     }, 1500);
     stateRef.current.step = 'human_handoff';
     agentResolvedShownRef.current = false;
@@ -863,6 +877,10 @@ export default function ChatSupport() {
     setDisabledGroups(new Set());
     hideInput();
     sessionIdRef.current = session.id;
+    const agentMsgIds = (msgs || []).filter(m => m.sender === 'agent').map(m => m.id);
+    if (agentMsgIds.length > 0) {
+      markAgentMessagesSeen(agentMsgIds);
+    }
     stateRef.current.sectorName = session.sector_name || null;
     stateRef.current.subprocessName = session.subprocess_name || null;
     stateRef.current.language = session.language || 'English';
@@ -940,33 +958,7 @@ export default function ChatSupport() {
         stateRef.current.step = 'query';
       }
     }, 400);
-  }, [addMessage, hideInput, loadSectorMenu, scrollToBottom, showInput]);
-
-  const handleFeedbackSubmit = useCallback(async () => {
-    if (fbRating === 0) return;
-    const session = pendingFeedback[currentFbIdx];
-    if (!session) return;
-    setFbSubmitting(true);
-    await apiPost('/api/feedback', { chat_session_id: session.id, rating: fbRating, comment: fbComment });
-    setFbSubmitting(false);
-    setFbRating(0);
-    setFbComment('');
-    if (currentFbIdx + 1 < pendingFeedback.length) { setCurrentFbIdx(prev => prev + 1); }
-    else { proceedAfterFeedback(); }
-  }, [fbRating, fbComment, pendingFeedback, currentFbIdx]);
-
-  const proceedAfterFeedback = useCallback(async () => {
-    const resumeId = searchParams.get('resume');
-    if (resumeId) {
-      try {
-        const data = await apiGet(`/api/chat/session/${resumeId}`);
-        if (data?.session) { setActiveSessionData(data.session); setActiveSessionMsgs(data.messages || []); setInitPhase('resume-prompt'); return; }
-      } catch {}
-    }
-    const activeData = await apiGet('/api/customer/active-session');
-    if (activeData?.session) { setActiveSessionData(activeData.session); setActiveSessionMsgs(activeData.messages || []); setInitPhase('resume-prompt'); return; }
-    startChat();
-  }, [searchParams, startChat]);
+  }, [addMessage, hideInput, loadSectorMenu, scrollToBottom, showInput, markAgentMessagesSeen]);
 
   const initialized = useRef(false);
   useEffect(() => {
@@ -1171,20 +1163,29 @@ export default function ChatSupport() {
         );
 
       // ── LOCATION SUCCESS ──
-      case 'location-success':
+      case 'location-success': {
+        const hasCoords = typeof msg.latitude === 'number' && typeof msg.longitude === 'number';
         return (
           <div key={msg.id} style={{ background: '#ffffff', border: '1px solid #d8e0ec', borderLeft: '3px solid #00875a', borderRadius: '10px', padding: '14px 18px', margin: '6px 0', display: 'flex', alignItems: 'center', gap: '14px', boxShadow: '0 1px 2px rgba(0, 20, 60, 0.04)' }}>
             <div style={{ fontSize: '18px', color: '#00875a', fontWeight: 700 }}>&#10003;</div>
             <div>
               <div style={{ fontWeight: '700', fontSize: '13px', color: '#00875a' }}>Location Captured Successfully</div>
-              <div style={{ fontSize: '12px', color: '#3d5068', marginTop: '4px' }}>
-                Lat: <strong style={{ color: '#0f1d33' }}>{msg.latitude?.toFixed(6)}</strong> &nbsp;|&nbsp;
-                Long: <strong style={{ color: '#0f1d33' }}>{msg.longitude?.toFixed(6)}</strong>
-              </div>
+              {hasCoords && (
+                <div style={{ fontSize: '12px', color: '#3d5068', marginTop: '4px' }}>
+                  Lat: <strong style={{ color: '#0f1d33' }}>{msg.latitude?.toFixed(6)}</strong> &nbsp;|&nbsp;
+                  Long: <strong style={{ color: '#0f1d33' }}>{msg.longitude?.toFixed(6)}</strong>
+                </div>
+              )}
+              {msg.description && (
+                <div style={{ fontSize: '12px', color: '#3d5068', marginTop: '4px' }}>
+                  Location: <strong style={{ color: '#0f1d33' }}>{msg.description}</strong>
+                </div>
+              )}
               <div style={{ fontSize: '11px', color: '#8596ab', marginTop: '2px' }}>Stored securely for network diagnostics</div>
             </div>
           </div>
         );
+      }
 
       case 'signal-codes':
         return (
@@ -1486,6 +1487,9 @@ export default function ChatSupport() {
     </div>
   );
 }
+
+
+
 
 
 

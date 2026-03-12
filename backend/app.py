@@ -1169,6 +1169,10 @@ def save_session_location(session_id):
     if session.user_id != user_id:
         return jsonify({"error": "Unauthorized"}), 403
 
+    data = request.json or {}
+    if data.get("location_description"):
+        session.location_description = data.get("location_description")
+
     # ── Default coordinates (Gurgaon, Haryana) ────────────────────────────────
     DEFAULT_LATITUDE  = 28.4595
     DEFAULT_LONGITUDE = 77.0266
@@ -1574,10 +1578,54 @@ def get_chat_session(session_id):
         return jsonify({"error": "Session not found"}), 404
     if session.user_id != user_id:
         return jsonify({"error": "Unauthorized"}), 403
+    now_utc = datetime.now(timezone.utc)
+    updated = False
+    for m in session.messages:
+        if m.sender == "agent" and m.delivered_at is None:
+            m.delivered_at = now_utc
+            updated = True
+    if updated:
+        db.session.commit()
     return jsonify({
         "session": session.to_dict(),
         "messages": [m.to_dict() for m in session.messages],
     })
+
+
+@app.route("/api/chat/session/<int:session_id>/seen", methods=["POST"])
+@jwt_required()
+def mark_chat_seen(session_id):
+    user_id = int(get_jwt_identity())
+    session = ChatSession.query.get(session_id)
+    if not session:
+        return jsonify({"error": "Session not found"}), 404
+    if session.user_id != user_id:
+        return jsonify({"error": "Unauthorized"}), 403
+
+    data = request.json or {}
+    message_ids = data.get("message_ids") or []
+    if message_ids and not isinstance(message_ids, list):
+        return jsonify({"error": "message_ids must be a list"}), 400
+
+    q = ChatMessage.query.filter(
+        ChatMessage.session_id == session_id,
+        ChatMessage.sender == "agent",
+    )
+    if message_ids:
+        q = q.filter(ChatMessage.id.in_(message_ids))
+
+    now_utc = datetime.now(timezone.utc)
+    updated = 0
+    for m in q.all():
+        if m.seen_at is None:
+            m.seen_at = now_utc
+            if m.delivered_at is None:
+                m.delivered_at = now_utc
+            updated += 1
+    if updated:
+        db.session.commit()
+
+    return jsonify({"updated": updated})
 
 
 @app.route("/api/chat/session/<int:session_id>/status", methods=["GET"])
@@ -4490,6 +4538,17 @@ with app.app_context():
                 conn.execute(sa_text("ALTER TABLE kpi_data ADD COLUMN cell_site_id VARCHAR(100)"))
                 conn.commit()
                 print(">>> Added cell_site_id column to kpi_data")
+    if insp.has_table("chat_messages"):
+        existing_cols = [c["name"] for c in insp.get_columns("chat_messages")]
+        with db.engine.connect() as conn:
+            if "delivered_at" not in existing_cols:
+                conn.execute(sa_text("ALTER TABLE chat_messages ADD COLUMN delivered_at TIMESTAMP"))
+                conn.commit()
+                print(">>> Added delivered_at column to chat_messages")
+            if "seen_at" not in existing_cols:
+                conn.execute(sa_text("ALTER TABLE chat_messages ADD COLUMN seen_at TIMESTAMP"))
+                conn.commit()
+                print(">>> Added seen_at column to chat_messages")
 
     # Seed default admin if none exists
     if not User.query.filter_by(role="admin").first():
