@@ -115,6 +115,8 @@ export default function AgentChatView() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [activePanel, setActivePanel] = useState(null);
+  const [diagnosisRequesting, setDiagnosisRequesting] = useState(false);
+  const [diagnosisRequestSent, setDiagnosisRequestSent] = useState(false);
   const bottomRef = useRef(null);
   const pollingRef = useRef(null);
 
@@ -142,6 +144,8 @@ export default function AgentChatView() {
 
       setSession(data.session);
       setMessages(data.messages || []);
+      // Sync diagnosis state from session
+      if (data.session?.diagnosis_ran) setDiagnosisRequestSent(true);
       // Merge customer object with session-embedded user fields as fallback
       const s = data.session || {};
       setCustomer({
@@ -187,6 +191,19 @@ export default function AgentChatView() {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       handleSend();
+    }
+  };
+
+  const handleRequestDiagnosis = async () => {
+    setDiagnosisRequesting(true);
+    try {
+      await apiPost(`/api/agent/chat/${sessionId}/request-diagnosis`, {});
+      setDiagnosisRequestSent(true);
+      fetchChat(); // refresh to show the trigger message
+    } catch {
+      alert('Failed to send diagnosis request.');
+    } finally {
+      setDiagnosisRequesting(false);
     }
   };
 
@@ -323,6 +340,28 @@ export default function AgentChatView() {
           )}
 
           {messages.map((msg) => {
+            // Special internal trigger — show as a clean system note in agent view
+            if (msg.content === '__AGENT_REQUEST_DIAGNOSIS__') {
+              return (
+                <div key={msg.id} style={{
+                  alignSelf: 'center',
+                  background: '#fffbeb',
+                  border: '1px solid #fde68a',
+                  borderRadius: 8,
+                  padding: '7px 14px',
+                  fontSize: 11,
+                  color: '#92400e',
+                  fontWeight: 600,
+                  display: 'flex', alignItems: 'center', gap: 6,
+                }}>
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                    <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
+                  </svg>
+                  Signal diagnosis requested — waiting for customer to complete
+                </div>
+              );
+            }
+
             const cfg = BUBBLE[msg.sender] || BUBBLE.customer;
             return (
               <div key={msg.id} style={{
@@ -365,6 +404,79 @@ export default function AgentChatView() {
           })}
           <div ref={bottomRef} />
         </div>
+
+        {/* Diagnosis request banner — only when session is mobile network issue and diagnosis not yet done */}
+        {session && !session.diagnosis_ran && !diagnosisRequestSent &&
+          session.subprocess_name?.toLowerCase().includes('network') && (
+          <div style={{
+            borderTop: '1px solid #fde68a',
+            background: '#fffbeb',
+            padding: '10px 20px',
+            display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+            gap: 12, flexShrink: 0,
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#b45309" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
+              </svg>
+              <span style={{ fontSize: 12, color: '#92400e', fontWeight: 600 }}>
+                No signal diagnosis was run during bot chat
+              </span>
+            </div>
+            <button
+              onClick={handleRequestDiagnosis}
+              disabled={diagnosisRequesting}
+              style={{
+                background: diagnosisRequesting ? '#fde68a' : '#f59e0b',
+                color: '#1c1917',
+                border: 'none',
+                borderRadius: 7,
+                padding: '7px 14px',
+                fontSize: 12,
+                fontWeight: 700,
+                cursor: diagnosisRequesting ? 'not-allowed' : 'pointer',
+                display: 'flex', alignItems: 'center', gap: 6,
+                whiteSpace: 'nowrap',
+                transition: 'background 0.15s',
+              }}
+            >
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M22 12h-4l-3 9L9 3l-3 9H2"/>
+              </svg>
+              {diagnosisRequesting ? 'Requesting…' : 'Ask Customer for Diagnosis'}
+            </button>
+          </div>
+        )}
+
+        {diagnosisRequestSent && !session?.diagnosis_ran && (
+          <div style={{
+            borderTop: '1px solid #fde68a',
+            background: '#fffbeb',
+            padding: '9px 20px',
+            fontSize: 12, color: '#92400e', fontWeight: 600,
+            display: 'flex', alignItems: 'center', gap: 7, flexShrink: 0,
+          }}>
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#b45309" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <polyline points="20 6 9 17 4 12"/>
+            </svg>
+            Diagnosis request sent — waiting for customer to complete
+          </div>
+        )}
+
+        {session?.diagnosis_ran && (
+          <div style={{
+            borderTop: '1px solid #bbf7d0',
+            background: '#f0fdf4',
+            padding: '9px 20px',
+            fontSize: 12, color: '#15803d', fontWeight: 600,
+            display: 'flex', alignItems: 'center', gap: 7, flexShrink: 0,
+          }}>
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#15803d" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+              <polyline points="20 6 9 17 4 12"/>
+            </svg>
+            Signal diagnosis completed — results visible in chat
+          </div>
+        )}
 
         {/* Input row */}
         <div style={{
@@ -420,6 +532,22 @@ export default function AgentChatView() {
         display: 'flex', flexDirection: 'column',
         gap: 8,
       }}>
+        <button
+          onClick={handleEndChat}
+          disabled={ending || session?.status === 'resolved'}
+          style={{
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            gap: 8, padding: '10px 12px', borderRadius: 10,
+            background: ending || session?.status === 'resolved' ? '#f1f5f9' : '#fee2e2',
+            color: ending || session?.status === 'resolved' ? '#94a3b8' : '#b91c1c',
+            border: '1px solid #fecaca',
+            fontSize: 12, fontWeight: 700,
+            cursor: ending || session?.status === 'resolved' ? 'not-allowed' : 'pointer',
+          }}
+          title={session?.status === 'resolved' ? 'Chat already ended' : 'End chat'}
+        >
+          End Chat
+        </button>
         <div style={{
           fontSize: 9, fontWeight: 700, color: '#94a3b8',
           textTransform: 'uppercase', letterSpacing: 1.2,

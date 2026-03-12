@@ -263,7 +263,6 @@ export default function ChatSupport() {
   const lastSeenMsgIdRef = useRef(0);
 
   useEffect(() => {
-    if (!handoffActive) return;
     const poll = async () => {
       if (!sessionIdRef.current) return;
       try {
@@ -278,15 +277,31 @@ export default function ChatSupport() {
         const newAgentMsgs = allMsgs.filter(
           m => m.sender === 'agent' && m.id > lastSeenMsgIdRef.current
         );
+        const s = data.session || {};
+        if (!handoffActive && (newAgentMsgs.length > 0 || s.status === 'escalated')) {
+          setHandoffActive(true);
+        }
         newAgentMsgs.forEach(m => {
           lastSeenMsgIdRef.current = Math.max(lastSeenMsgIdRef.current, m.id);
+
+          // Intercept agent-triggered diagnosis request — don't show as a chat bubble
+          if (m.content === '__AGENT_REQUEST_DIAGNOSIS__') {
+            addMessage({
+              type: 'bot',
+              html: 'Your support agent has requested a <strong>signal diagnosis</strong> to better assist you. Please run it now:',
+            });
+            addMessage({ type: 'signal-offer', groupId: m.id });
+            return;
+          }
+
           addMessage({ type: 'live-agent-message', text: m.content, timestamp: m.created_at });
         });
         if (newAgentMsgs.length > 0) {
           markAgentMessagesSeen(newAgentMsgs.map(m => m.id));
+          // Mark all customer user-messages as seen (agent has responded)
+          setMessages(prev => prev.map(m => m.type === 'user' ? { ...m, seen: true } : m));
           showInput('Type your reply to the agent...');
         }
-        const s = data.session || {};
         if (s.status === 'resolved' && !agentResolvedShownRef.current) {
           agentResolvedShownRef.current = true;
           setHandoffActive(false);
@@ -541,6 +556,17 @@ export default function ChatSupport() {
     hideInput();
 
     if (handoffActive || stateRef.current.step === 'human_handoff' || stateRef.current.step === 'escalated') {
+      // Mark the message we just added as liveChat so ticks show
+      setMessages(prev => {
+        const updated = [...prev];
+        for (let i = updated.length - 1; i >= 0; i--) {
+          if (updated[i].type === 'user' && updated[i].text === text) {
+            updated[i] = { ...updated[i], liveChat: true };
+            break;
+          }
+        }
+        return updated;
+      });
       saveMessage('user', text);
       showInput('Type your reply to the agent...');
       return;
@@ -987,7 +1013,18 @@ export default function ChatSupport() {
       case 'bot':
         return <div key={msg.id} className="message bot" dangerouslySetInnerHTML={{ __html: msg.html }} />;
       case 'user':
-        return <div key={msg.id} className="message user">{msg.text}</div>;
+        return (
+          <div key={msg.id} className="message user">
+            <span>{msg.text}</span>
+            {msg.liveChat && (
+              <span className={`msg-tick ${msg.seen ? 'msg-tick--seen' : 'msg-tick--sent'}`} title={msg.seen ? 'Seen' : 'Sent'}>
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                  <polyline points="20 6 9 17 4 12" />
+                </svg>
+              </span>
+            )}
+          </div>
+        );
       case 'system':
         return <div key={msg.id} className="message system">{msg.text}</div>;
       case 'sector-menu':

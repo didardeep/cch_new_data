@@ -64,6 +64,7 @@ class ChatSession(db.Model):
     latitude = db.Column(db.Float, nullable=True)
     longitude = db.Column(db.Float, nullable=True)
     location_description = db.Column(db.Text, nullable=True)
+    diagnosis_ran = db.Column(db.Boolean, default=False, nullable=False)
 
     messages = db.relationship("ChatMessage", backref="session", lazy=True, order_by="ChatMessage.created_at")
     ticket = db.relationship("Ticket", backref="chat_session", uselist=False, lazy=True)
@@ -87,6 +88,7 @@ class ChatSession(db.Model):
             "latitude": self.latitude,
             "longitude": self.longitude,
             "location_description": self.location_description,
+            "diagnosis_ran": bool(self.diagnosis_ran),
         }
 
 

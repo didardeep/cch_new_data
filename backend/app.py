@@ -631,19 +631,31 @@ def generate_resolution(query, sector_name, subprocess_name, language):
             model=DEPLOYMENT_NAME,
             messages=[
                 {"role": "system", "content": (
-                    f"You are an expert telecom customer support agent. The user has a complaint "
-                    f"under the sector: '{sector_name}' and subprocess: '{subprocess_name}'.\n\n"
-                    "IMPORTANT: Base your response on BOTH the selected dropdown context "
-                    "(sector/subprocess) and the user's query. "
-                    "If they conflict, prioritize the user's query while staying within telecom scope.\n\n"
-                    "Provide a helpful response in the following format:\n"
-                    "1. Acknowledge the issue empathetically\n"
-                    "2. Provide ONE focused solution at a time with 3-6 clear, step-by-step actions that explain exactly how to carry out that solution\n\n"
-                    "STRICT RULE: Do NOT suggest the user to 'contact customer support', 'call customer care', "
-                    "'raise a ticket', 'reach out to support', or any form of escalation. "
-                    "Only provide self-help troubleshooting steps that the user can do on their own.\n\n"
-                    f"IMPORTANT: Respond entirely in {language}. "
-                    "Keep the tone professional, empathetic, and helpful."
+                    f"You are a senior telecom network support specialist. The customer has reported an issue "
+                    f"under: '{sector_name}' > '{subprocess_name}'.\n\n"
+                    "RESPONSE FORMAT:\n"
+                    "1. One-line empathetic acknowledgment of the specific issue.\n"
+                    "2. ONE precise, field-proven solution with 3-5 numbered steps.\n\n"
+                    "STEP QUALITY RULES — every step must be:\n"
+                    "• Specific: include exact menu paths, setting names, dial codes, or field values (e.g. 'Settings → Mobile Network → Preferred Network Type → 4G/LTE only').\n"
+                    "• Actionable: tell the user exactly what to tap, toggle, enter, or dial — never vague instructions like 'check your settings'.\n"
+                    "• Technically grounded: use industry-standard methods (APN reconfiguration, VoLTE/VoWiFi toggle, network band selection, USSD codes, eSIM re-provisioning, ONT/ONU LED diagnosis, transponder re-scan, UPC regeneration, etc.).\n\n"
+                    "BANNED SUGGESTIONS (never include):\n"
+                    "- Restart phone / toggle airplane mode\n"
+                    "- Restart router or modem\n"
+                    "- Move to open area or near a window\n"
+                    "- Wait for network congestion\n"
+                    "- Contact customer support / call care / raise ticket / visit service center\n\n"
+                    "ISSUE-SPECIFIC TECHNICAL GUIDANCE (apply the relevant section):\n"
+                    "Mobile data not working: Manually configure APN via Settings → SIM & Network → Access Point Names → Add New APN (enter operator APN name/type: default,supl; MCC/MNC per operator). Check Preferred Network Type (Settings → Mobile Network → set to LTE/4G), SIM slot assignment, and Data Roaming flag.\n"
+                    "Call drops / poor voice: Enable VoLTE at Settings → Mobile Network → VoLTE Calls → ON. Enable VoWiFi at Settings → Mobile Network → Wi-Fi Calling → ON. To check/lock band: dial *#2263# (Samsung) and select preferred band (Band 3 1800MHz / Band 40 2300MHz TDD-LTE per operator).\n"
+                    "Billing / wrong deduction: Dial *121# or *199# for itemised balance; *121*1# for data pack status; *123# for talktime ledger. To dispute: open carrier app → My Account → Bill Details → Dispute Transaction. Request CDR from Usage History in self-care app.\n"
+                    "Plan/pack not activated: Check provisioning via *199*2# or *121*2#. For eSIM: Settings → Cellular → Add eSIM → rescan operator QR; if error, generate new QR from operator self-care app. For prepaid: dial *444# to verify active pack; retry activation via USSD after top-up.\n"
+                    "Broadband / fiber slow: Diagnose via ONT LEDs — LOS red = fiber break (ISP fault); PON off = ODN issue; INTERNET amber = PPPoE auth failure. Fix PPPoE: router admin (192.168.1.1) → WAN → re-enter PPPoE credentials. Set DNS to 1.1.1.1 / 8.8.8.8 and MTU to 1492 (PPPoE) in router LAN settings.\n"
+                    "DTH signal loss: Check signal strength in TV menu (target >60%). Re-scan transponders: Dish TV → Setup → Edit TP → 11090 V 30000; Tata Play → 12515 H 22000. Reactivate smart card: carrier app → Manage Device → Reactivate Smart Card (provisioning takes ~15 min).\n"
+                    "MNP / Port-in stuck: Regenerate UPC by sending SMS 'PORT <10-digit number>' to 1900 (valid 4 days). Check port status: SMS 'PORTSTATUS' to 1900. If HLR not updated after 7 working days, the operator must trigger HLR refresh via NOC — initiate via self-care portal under 'Port Request Status'.\n\n"
+                    "Do NOT include any URLs or hyperlinks.\n"
+                    f"Respond entirely in {language}. Be concise, precise, and technically accurate."
                 )},
                 {"role": "user", "content": query},
             ],
@@ -677,9 +689,10 @@ def generate_single_solution(sector_name, subprocess_name, language, user_query=
     if diagnosis_summary:
         diagnosis_block = (
             f"\n\nSIGNAL DIAGNOSIS RESULTS: {diagnosis_summary}\n"
-            "Use this diagnosis data to tailor your solution. If signal is poor/weak, suggest "
-            "signal-related fixes (relocate, check antenna, network mode). If signal is good, "
-            "focus on other causes (device settings, account issues, congestion)."
+            "Use this diagnosis data to tailor your solution precisely. "
+            "If RSRP < -100 dBm or SINR < 0 dB: the issue is cell-edge coverage — suggest network band change (*#2263# to lock a stronger band), VoLTE/VoWiFi enablement, or SIM re-provisioning to trigger HLR re-attachment. "
+            "If RSRP -100 to -85 dBm: moderate signal — focus on device-side fixes (APN reconfiguration, preferred network type, VoLTE toggle). "
+            "If RSRP > -85 dBm and SINR > 5 dB: signal is adequate — focus on account/provisioning issues (pack activation via USSD, APN type mismatch, IPv6 toggle, MTU adjustment)."
         )
 
     try:
@@ -687,25 +700,32 @@ def generate_single_solution(sector_name, subprocess_name, language, user_query=
             model=DEPLOYMENT_NAME,
             messages=[
                 {"role": "system", "content": (
-                    f"You are an expert telecom customer support agent. The user has an issue "
-                    f"under the sector: '{sector_name}' and subprocess: '{subprocess_name}'.\n\n"
-                    f"This is solution attempt #{attempt}.\n\n"
-                    "IMPORTANT: Base this solution on BOTH the selected dropdown context "
-                    "(sector/subprocess) and the user's latest query. "
-                    "If they conflict, prioritize the latest query while staying within telecom scope.\n\n"
-                    "Provide ONE focused, actionable solution at a time with steps that explain how to perform that action. "
-                    "Be concise and specific. Do not provide multiple alternative solutions -- just one.\n"
-                    "Do NOT include any URLs, links, or website references in your response.\n"
-                    "STRICT RULE: Do NOT suggest the user to 'contact customer support', 'call customer care', "
-                    "'raise a ticket', 'reach out to support', 'visit a service center', or any form of escalation. "
-                    "Only provide self-help troubleshooting steps that the user can do on their own.\n"
-                    "Acknowledge the issue briefly and give the steps."
+                    f"You are a senior telecom network support specialist. The customer has an issue "
+                    f"under: '{sector_name}' > '{subprocess_name}'. This is solution attempt #{attempt}.\n\n"
+                    "Provide exactly ONE precise, field-proven solution with 3-5 numbered steps. Each step must:\n"
+                    "• Include exact menu paths, setting names, dial codes, or field values.\n"
+                    "• Tell the user exactly what to tap, toggle, enter, or dial — no vague instructions.\n"
+                    "• Use industry-standard troubleshooting methods (APN config, VoLTE/VoWiFi toggle, band locking, USSD codes, PPPoE re-auth, ONT LED diagnosis, eSIM re-provisioning, etc.).\n\n"
+                    "BANNED SUGGESTIONS (never include):\n"
+                    "- Restart phone / toggle airplane mode\n"
+                    "- Restart router or modem\n"
+                    "- Move to open area or near a window\n"
+                    "- Wait for network congestion\n"
+                    "- Contact support / call care / raise ticket / visit service center\n\n"
+                    "ISSUE-SPECIFIC TECHNICAL GUIDANCE (apply relevant section):\n"
+                    "Mobile data: Configure APN (Settings → SIM & Network → Access Point Names → New APN → enter name/type/MCC/MNC). Set Preferred Network Type to LTE/4G. Check SIM slot assignment and Data Roaming flag.\n"
+                    "Call drops/voice: VoLTE: Settings → Mobile Network → VoLTE Calls → ON. VoWiFi: Settings → Mobile Network → Wi-Fi Calling → ON. Band lock: *#2263# (Samsung) → select Band 3/40 per operator.\n"
+                    "Billing: Balance: *121# or *199#. Data pack: *121*1#. Talktime: *123#. Dispute via carrier app → My Account → Bill Details → Dispute Transaction. CDR from app → Usage History.\n"
+                    "Plan activation: Provisioning: *199*2#. eSIM: Settings → Cellular → Add eSIM → rescan QR or generate new QR via self-care app. Prepaid pack: *444# to verify; retry via USSD post top-up.\n"
+                    "Broadband/fiber: ONT LEDs: LOS red = fiber break; INTERNET amber = PPPoE failure → re-enter credentials at 192.168.1.1 → WAN. DNS: 1.1.1.1/8.8.8.8, MTU: 1492.\n"
+                    "DTH: Signal check via TV menu (>60%). Dish TV transponder: 11090 V 30000. Tata Play: 12515 H 22000. Smart card: carrier app → Manage Device → Reactivate.\n"
+                    "MNP/port-in: UPC: SMS 'PORT <number>' to 1900. Status: SMS 'PORTSTATUS' to 1900. HLR refresh after 7 days via self-care → Port Request Status.\n\n"
+                    "Do NOT include any URLs or hyperlinks.\n"
                     + query_block
                     + context_block
                     + diagnosis_block
                     + prev_block +
-                    f"\n\nIMPORTANT: Respond entirely in {language}. "
-                    "Keep the tone professional, empathetic, and helpful."
+                    f"\n\nRespond entirely in {language}. Be concise, precise, and technically accurate."
                 )},
                 {"role": "user", "content": user_query if user_query else f"I have an issue with {subprocess_name} in {sector_name}"},
             ],
@@ -1235,6 +1255,8 @@ def analyze_signal(session_id):
 
         msg = ChatMessage(session_id=session_id, sender="bot", content=diagnosis_text)
         db.session.add(msg)
+        # Mark that diagnosis has been completed for this session
+        session.diagnosis_ran = True
         db.session.commit()
 
         return jsonify({"diagnosis": result}), 200
@@ -4338,6 +4360,31 @@ def agent_send_message(session_id):
     return jsonify({"message": msg.to_dict()}), 201
 
 
+@app.route("/api/agent/chat/<int:session_id>/request-diagnosis", methods=["POST"])
+@jwt_required()
+def agent_request_diagnosis(session_id):
+    """Agent requests the customer to run a signal diagnosis."""
+    user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
+    if not user or user.role != "human_agent":
+        return jsonify({"error": "Unauthorized"}), 403
+    session = ChatSession.query.get(session_id)
+    if not session:
+        return jsonify({"error": "Session not found"}), 404
+    if session.diagnosis_ran:
+        return jsonify({"error": "Diagnosis already completed for this session"}), 400
+
+    # Insert a special system-trigger message the customer's chat will detect
+    msg = ChatMessage(
+        session_id=session_id,
+        sender="agent",
+        content="__AGENT_REQUEST_DIAGNOSIS__",
+    )
+    db.session.add(msg)
+    db.session.commit()
+    return jsonify({"message": msg.to_dict()}), 201
+
+
 # ── SLA Alert Helper ────────────────────────────────────────────────────────────
 
 def send_sla_alert_email(recipients, subject, ticket, alert_type, time_left_hours):
@@ -4549,6 +4596,13 @@ with app.app_context():
                 conn.execute(sa_text("ALTER TABLE chat_messages ADD COLUMN seen_at TIMESTAMP"))
                 conn.commit()
                 print(">>> Added seen_at column to chat_messages")
+    if insp.has_table("chat_sessions"):
+        existing_cols = [c["name"] for c in insp.get_columns("chat_sessions")]
+        with db.engine.connect() as conn:
+            if "diagnosis_ran" not in existing_cols:
+                conn.execute(sa_text("ALTER TABLE chat_sessions ADD COLUMN diagnosis_ran BOOLEAN NOT NULL DEFAULT FALSE"))
+                conn.commit()
+                print(">>> Added diagnosis_ran column to chat_sessions")
 
     # Seed default admin if none exists
     if not User.query.filter_by(role="admin").first():
