@@ -194,7 +194,7 @@ export default function DataUpload() {
             </div>
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
-            <input type="file" accept=".xlsx,.xls"
+            <input type="file" accept=".xlsx,.xlsm"
               onChange={e => { setSiteFile(e.target.files[0]); setSiteResult(null); setError(''); setSuccess(''); }}
               style={{ fontSize: 13 }} />
             <button className="btn btn-primary btn-sm" onClick={uploadSites}
@@ -234,14 +234,14 @@ export default function DataUpload() {
           </div>
           <div className="section-card-body">
             <p style={{ fontSize: 13, color: '#64748b', marginBottom: 12 }}>
-              Upload an Excel workbook (.xlsx) with <strong>27 sheets</strong>. Each sheet name = KPI name.<br/>
+            Upload an Excel workbook (.xlsx/.xlsm) with <strong>27 sheets</strong>. Each sheet name = KPI name.<br/>
               Sheet columns: <strong>Site_ID</strong>, then <strong>date columns</strong> with values.
             </p>
             <div style={{ background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 8, padding: '10px 14px', marginBottom: 12 }}>
               <div style={{ fontSize: 12, color: '#64748b' }}>Site-level KPIs uploaded: <strong style={{ color: '#00338D' }}>{siteKpiList.length}</strong></div>
               <div style={{ fontSize: 12, color: '#64748b' }}>Total records: <strong style={{ color: '#00338D' }}>{totalSiteRows.toLocaleString()}</strong></div>
             </div>
-            <input type="file" accept=".xlsx,.xls"
+            <input type="file" accept=".xlsx,.xlsm"
               onChange={e => { setSiteLevelFile(e.target.files[0]); setSiteLevelResult(null); setError(''); setSuccess(''); }}
               style={{ display: 'block', marginBottom: 12, fontSize: 13 }} />
             <div style={{ display: 'flex', gap: 8 }}>
@@ -278,14 +278,14 @@ export default function DataUpload() {
           </div>
           <div className="section-card-body">
             <p style={{ fontSize: 13, color: '#64748b', marginBottom: 12 }}>
-              Upload an Excel workbook (.xlsx) with <strong>27 sheets</strong>. Each sheet name = KPI name.<br/>
+            Upload an Excel workbook (.xlsx/.xlsm) with <strong>27 sheets</strong>. Each sheet name = KPI name.<br/>
               Sheet columns: <strong>Site_ID, Cell_ID, Cell_Site_ID</strong>, then <strong>date columns</strong> with values.
             </p>
             <div style={{ background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 8, padding: '10px 14px', marginBottom: 12 }}>
               <div style={{ fontSize: 12, color: '#64748b' }}>Cell-level KPIs uploaded: <strong style={{ color: '#00338D' }}>{cellKpiList.length}</strong></div>
               <div style={{ fontSize: 12, color: '#64748b' }}>Total records: <strong style={{ color: '#00338D' }}>{totalCellRows.toLocaleString()}</strong></div>
             </div>
-            <input type="file" accept=".xlsx,.xls"
+            <input type="file" accept=".xlsx,.xlsm"
               onChange={e => { setCellLevelFile(e.target.files[0]); setCellLevelResult(null); setError(''); setSuccess(''); }}
               style={{ display: 'block', marginBottom: 12, fontSize: 13 }} />
             <div style={{ display: 'flex', gap: 8 }}>

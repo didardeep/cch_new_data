@@ -712,6 +712,9 @@ function NetworkDiagnosisModal({ ticket, onClose }) {
       }
 
       doc.save(`Diagnosis_${ticket.reference_number}.pdf`);
+      
+      // Show alert that report has been downloaded
+      alert('Report has been downloaded successfully');
     } catch (e) {
       alert('PDF generation failed: ' + e.message);
     }

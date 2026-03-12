@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+﻿import { useState, useEffect } from 'react';
 import { useSearchParams, useNavigate } from 'react-router-dom';
 import { apiPost, apiGet } from '../../api';
 
@@ -11,14 +11,7 @@ export default function FeedbackPage() {
   const [rating, setRating] = useState(0);
   const [comment, setComment] = useState('');
   const [submitted, setSubmitted] = useState(false);
-  const [feedbacks, setFeedbacks] = useState([]);
   const [loading, setLoading] = useState(false);
-
-  useEffect(() => {
-    apiGet('/api/feedback/list').then(d => {
-      if (d?.feedbacks) setFeedbacks(d.feedbacks);
-    });
-  }, [submitted]);
 
   // Load session details if session ID is provided
   useEffect(() => {
@@ -42,11 +35,11 @@ export default function FeedbackPage() {
     setComment('');
     setSubmitted(true);
     setLoading(false);
-    // Clear session param after submitting so the form resets to general
+    // After session feedback, return to chat with a start-new-chat gate
     if (sessionId) {
       setTimeout(() => {
-        navigate('/customer/feedback', { replace: true });
-      }, 2000);
+        navigate('/customer/chat?afterFeedback=1', { replace: true });
+      }, 1500);
     } else {
       setTimeout(() => setSubmitted(false), 3000);
     }
@@ -115,28 +108,7 @@ export default function FeedbackPage() {
         </div>
       )}
 
-      {feedbacks.length > 0 && (
-        <div className="feedback-list">
-          <h3 style={{ fontSize: 16, fontWeight: 700, marginBottom: 14, color: '#1e293b' }}>
-            Your Past Feedback
-          </h3>
-          {feedbacks.map(fb => (
-            <div key={fb.id} className="feedback-item">
-              <div className="feedback-item-header">
-                <div className="feedback-item-stars">
-                  {'★'.repeat(fb.rating)}{'☆'.repeat(5 - fb.rating)}
-                </div>
-                <div className="feedback-item-date">
-                  {fb.created_at ? new Date(fb.created_at).toLocaleDateString() : ''}
-                </div>
-              </div>
-              {fb.comment && (
-                <div className="feedback-item-comment">{fb.comment}</div>
-              )}
-            </div>
-          ))}
-        </div>
-      )}
     </div>
   );
 }
+
