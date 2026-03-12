@@ -17,6 +17,7 @@ import ManagerAlertBox from './pages/manager/ManagerAlertBox';
 import CTOLayout from './pages/cto/CTOLayout';
 import CTODashboard from './pages/cto/CTODashboard';
 import CTOAlertBox from './pages/cto/CTOAlertBox';
+import CTODutyRoster from './pages/cto/CTODutyRoster';
 import AdminLayout from './pages/admin/AdminLayout';
 import AdminDashboard from './pages/admin/AdminDashboard';
 import UserManagement from './pages/admin/UserManagement';
@@ -81,6 +82,7 @@ export default function App() {
         <Route path="tracking" element={<IssueTracking />} />
         <Route path="chat-detail/:id" element={<ChatDetail />} />
         <Route path="alerts" element={<CTOAlertBox />} />
+        <Route path="roster" element={<CTODutyRoster />} />
       </Route>
 
       {/* Admin Routes */}

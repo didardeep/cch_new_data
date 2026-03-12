@@ -1,12 +1,30 @@
+import { useState } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { useAuth } from '../AuthContext';
+import { apiPut } from '../api';
 
-export default function Sidebar({ links }) {
+export default function Sidebar({ links, statusToggle }) {
   const navigate = useNavigate();
   const location = useLocation();
   const { user, logout } = useAuth();
+  const [isOnline, setIsOnline] = useState(user?.is_online || false);
+  const [toggling, setToggling] = useState(false);
+  const showToggle = !!statusToggle?.endpoint;
 
-  const handleLogout = () => {
+  const handleToggle = async () => {
+    if (!showToggle) return;
+    setToggling(true);
+    try {
+      const res = await apiPut(statusToggle.endpoint, { is_online: !isOnline });
+      setIsOnline(res.is_online);
+    } catch (_) {}
+    finally { setToggling(false); }
+  };
+
+  const handleLogout = async () => {
+    if (showToggle) {
+      try { await apiPut(statusToggle.endpoint, { is_online: false }); } catch (_) {}
+    }
     logout();
     navigate('/');
   };
@@ -22,6 +40,49 @@ export default function Sidebar({ links }) {
           </div>
         </div>
       </div>
+
+      {showToggle && (
+        <div style={{
+          padding: '14px 20px',
+          borderBottom: '1px solid rgba(255,255,255,0.08)',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span style={{
+              width: 8, height: 8, borderRadius: '50%',
+              background: isOnline ? '#22c55e' : '#64748b',
+              display: 'inline-block',
+              boxShadow: isOnline ? '0 0 0 3px rgba(34,197,94,0.25)' : 'none',
+              transition: 'all 0.3s',
+            }} />
+            <span style={{ fontSize: 12, color: 'rgba(255,255,255,0.7)', fontWeight: 500 }}>
+              {isOnline ? 'Online' : 'Offline'}
+            </span>
+          </div>
+          <button
+            onClick={handleToggle}
+            disabled={toggling}
+            title={isOnline ? 'Go Offline' : 'Go Online'}
+            style={{
+              position: 'relative', width: 40, height: 22,
+              borderRadius: 11, border: 'none', cursor: toggling ? 'not-allowed' : 'pointer',
+              background: isOnline ? '#22c55e' : 'rgba(255,255,255,0.2)',
+              transition: 'background 0.3s', padding: 0, flexShrink: 0,
+            }}
+          >
+            <span style={{
+              position: 'absolute', top: 3,
+              left: isOnline ? 21 : 3,
+              width: 16, height: 16, borderRadius: '50%',
+              background: '#fff',
+              transition: 'left 0.25s',
+              boxShadow: '0 1px 3px rgba(0,0,0,0.3)',
+            }} />
+          </button>
+        </div>
+      )}
 
       <nav className="sidebar-nav">
         <div className="sidebar-section-label">Navigation</div>

@@ -55,7 +55,7 @@ export default function CTODashboard() {
   const priorities = data?.priority_breakdown || [];
   const resRate = data?.resolution_rate || 0;
   const avgRating = data?.avg_rating || 0;
-  
+
   const unreadAlerts = alerts.filter(a => !a.is_read);
   const unreadCount = unreadAlerts.length;
 

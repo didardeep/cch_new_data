@@ -72,6 +72,103 @@ client = OpenAI(
 
 DEPLOYMENT_NAME =  "gemini-3-flash-preview"
 
+def _user_brief(u, off_days=None):
+    return {
+        "id": u.id,
+        "name": u.name,
+        "email": u.email,
+        "phone": u.phone_number,
+        "role": u.role,
+        "employee_id": u.employee_id,
+        "is_online": bool(u.is_online),
+        "off_days": off_days or [],
+    }
+
+
+def _build_duty_roster(target_date):
+    managers = User.query.filter_by(role="manager").order_by(User.name.asc(), User.id.asc()).all()
+    agents = User.query.filter_by(role="human_agent").order_by(User.name.asc(), User.id.asc()).all()
+
+    if len(managers) < 3:
+        return None, "At least 3 managers are required to form 3 teams"
+
+    resources = managers + agents
+    total = len(resources)
+    if total % 3 != 0:
+        return None, "Total resources must be divisible by 3 to keep equal team size and two-day-off rotation"
+
+    day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    weekday_idx = target_date.weekday()  # Mon=0
+
+    off_days_map = {}
+    group_count = total // 3
+    for g in range(group_count):
+        off1 = (g * 2) % 7
+        off2 = (off1 + 3) % 7
+        names = [day_names[off1], day_names[off2]]
+        for member in resources[g * 3:(g + 1) * 3]:
+            off_days_map[member.id] = names
+
+    available = [u for u in resources if day_names[weekday_idx] not in off_days_map.get(u.id, [])]
+    managers_available = [u for u in available if u.role == "manager"]
+    if len(managers_available) < 3:
+        return None, "Not enough managers available today to cover 3 shifts. Adjust admin resources."
+
+    total_available = len(available)
+    if total_available % 3 != 0:
+        return None, "Available resources today are not divisible by 3. Adjust admin resources."
+
+    team_size = total_available // 3
+    rotation = target_date.timetuple().tm_yday % len(managers_available)
+    rotated = managers_available[rotation:] + managers_available[:rotation]
+    lead_managers = rotated[:3]
+    lead_ids = {m.id for m in lead_managers}
+    pool = [u for u in available if u.id not in lead_ids]
+
+    teams = []
+    for m in lead_managers:
+        teams.append({
+            "id": f"team-{m.id}",
+            "name": f"Team {m.name}",
+            "manager": _user_brief(m, off_days_map.get(m.id, [])),
+            "agents": [],
+        })
+
+    for idx, member in enumerate(pool):
+        teams[idx % 3]["agents"].append(_user_brief(member, off_days_map.get(member.id, [])))
+
+    off_today = [
+        _user_brief(u, off_days_map.get(u.id, []))
+        for u in resources
+        if day_names[weekday_idx] in off_days_map.get(u.id, [])
+    ]
+
+    rotation_mod = target_date.timetuple().tm_yday % 3
+    shift_times = [
+        {"name": "Shift 1", "time": "00:00-08:00"},
+        {"name": "Shift 2", "time": "08:00-16:00"},
+        {"name": "Shift 3", "time": "16:00-00:00"},
+    ]
+    shifts = []
+    for i in range(3):
+        team = teams[(i + rotation_mod) % 3]
+        shifts.append({"shift": shift_times[i], "team": team})
+
+    return {
+        "shift_times": shift_times,
+        "teams": teams,
+        "shifts": shifts,
+        "meta": {
+            "total_resources": total,
+            "team_size": team_size,
+            "managers": len(managers),
+            "agents": len(agents),
+            "rotation_index": rotation_mod,
+            "off_today_count": len(off_today),
+            "off_today": off_today,
+        },
+    }, None
+
 
 
 
@@ -1944,6 +2041,33 @@ def cto_overview():
     })
 
 
+@app.route("/api/cto/duty-roster", methods=["GET"])
+@jwt_required()
+def cto_duty_roster():
+    user = db.session.get(User, int(get_jwt_identity()))
+    if user.role != "cto":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    date_str = request.args.get("date")
+    try:
+        target_date = date.fromisoformat(date_str) if date_str else datetime.now().date()
+    except Exception:
+        return jsonify({"error": "Invalid date format. Use YYYY-MM-DD"}), 400
+
+    roster, err = _build_duty_roster(target_date)
+    if err:
+        return jsonify({"error": err}), 400
+
+    return jsonify({
+        "date": target_date.isoformat(),
+        "day": target_date.strftime("%A"),
+        "shift_times": roster["shift_times"],
+        "shifts": roster["shifts"],
+        "teams": roster["teams"],
+        "meta": roster["meta"],
+    })
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # SLA ALERT DASHBOARD ENDPOINTS
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2129,6 +2253,7 @@ def admin_dashboard():
         "user_breakdown": [{"role": r[0], "count": r[1]} for r in user_counts],
         "category_breakdown": [{"name": c[0] or "Unknown", "count": c[1]} for c in categories],
     })
+
 
 
 @app.route("/api/admin/users", methods=["GET"])
@@ -2635,7 +2760,7 @@ def admin_upload_sites():
 @app.route("/api/admin/upload-kpi-site-level", methods=["POST"])
 @jwt_required()
 def admin_upload_kpi_site_level():
-    """Maximum-speed upload: DROP indexes → COPY FROM STDIN → recreate indexes."""
+
     user = db.session.get(User, int(get_jwt_identity()))
     if not user or user.role != "admin":
         return jsonify({"error": "Unauthorized"}), 403
@@ -2658,13 +2783,7 @@ def admin_upload_kpi_site_level():
         with os.fdopen(fd, 'wb') as tmp:
             file.save(tmp)
 
-        try:
-            wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
-        except Exception as e:
-            return jsonify({"error": f"Invalid Excel file: {str(e)}"}), 400
-
-        db.session.execute(sa_text("DELETE FROM kpi_data WHERE data_level = 'site'"))
-        db.session.commit()
+        wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
 
         KPI_INDEXES = [
             "idx_kpi_site_name_date",
@@ -2672,11 +2791,18 @@ def admin_upload_kpi_site_level():
             "ix_kpi_data_site_id",
             "ix_kpi_data_kpi_name",
         ]
-        COPY_SQL = "COPY kpi_data (site_id, kpi_name, date, hour, value, data_level) FROM STDIN WITH (FORMAT CSV, NULL '')"
-        FLUSH_AT = 200_000
+
+        COPY_SQL = """COPY kpi_data
+        (site_id, kpi_name, date, hour, value, data_level)
+        FROM STDIN WITH (FORMAT CSV, NULL '')"""
+
+        FLUSH_AT = 1_000_000
 
         raw_conn = db.engine.raw_connection()
         cur = raw_conn.cursor()
+
+        cur.execute("SET synchronous_commit TO OFF")
+
         try:
             for idx in KPI_INDEXES:
                 cur.execute(f"DROP INDEX IF EXISTS {idx}")
@@ -2684,12 +2810,15 @@ def admin_upload_kpi_site_level():
 
             buf = io.StringIO()
             writer = csv.writer(buf)
+
             row_count = 0
             total_inserted = 0
 
             for sheet_name in wb.sheetnames:
+
                 ws = wb[sheet_name]
                 rows_iter = ws.iter_rows(values_only=True)
+
                 headers = next(rows_iter, None)
                 if not headers:
                     continue
@@ -2697,11 +2826,14 @@ def admin_upload_kpi_site_level():
                 kpi_name = sheet_name.strip()
 
                 date_map = []
+
                 for i in range(1, len(headers)):
                     h = headers[i]
                     if h is None:
                         continue
+
                     parsed_date = None
+
                     if isinstance(h, datetime):
                         parsed_date = h.date()
                     elif isinstance(h, date):
@@ -2711,35 +2843,47 @@ def admin_upload_kpi_site_level():
                             try:
                                 parsed_date = datetime.strptime(str(h).strip(), fmt).date()
                                 break
-                            except (ValueError, TypeError):
-                                continue
+                            except:
+                                pass
+
                     if parsed_date is None:
                         parsed_date = datetime.now().date()
+
                     date_map.append((i, parsed_date))
 
                 if not date_map:
                     continue
 
                 for row in rows_iter:
+
                     if not row or row[0] is None:
                         continue
-                    site_id = str(row[0]).strip()
+
+                    site_id = row[0]
+
                     row_len = len(row)
+
                     for col_idx, col_date in date_map:
+
                         if col_idx < row_len and row[col_idx] is not None:
+
                             try:
                                 writer.writerow((site_id, kpi_name, col_date, 0, float(row[col_idx]), "site"))
                                 row_count += 1
-                            except (ValueError, TypeError):
+                            except:
                                 continue
 
                     if row_count >= FLUSH_AT:
+
                         buf.seek(0)
                         cur.copy_expert(COPY_SQL, buf)
+
                         total_inserted += row_count
                         raw_conn.commit()
-                        buf = io.StringIO()
-                        writer = csv.writer(buf)
+
+                        buf.truncate(0)
+                        buf.seek(0)
+
                         row_count = 0
 
             if row_count > 0:
@@ -2749,6 +2893,7 @@ def admin_upload_kpi_site_level():
                 raw_conn.commit()
 
         finally:
+
             for stmt in [
                 "CREATE INDEX IF NOT EXISTS idx_kpi_site_name_date ON kpi_data (site_id, kpi_name, date)",
                 "CREATE INDEX IF NOT EXISTS idx_kpi_data_level ON kpi_data (data_level, kpi_name)",
@@ -2757,28 +2902,28 @@ def admin_upload_kpi_site_level():
             ]:
                 try:
                     cur.execute(stmt)
-                except Exception:
+                except:
                     pass
+
             raw_conn.commit()
             cur.close()
             raw_conn.close()
 
-        wb.close()
         return jsonify({"message": f"Successfully uploaded {total_inserted} site-level KPI records."}), 200
 
     except Exception as e:
-        return jsonify({"error": f"Internal Server Error: {str(e)}"}), 500
+        return jsonify({"error": str(e)}), 500
+
     finally:
         if wb:
             wb.close()
         if os.path.exists(path):
             os.remove(path)
 
-
 @app.route("/api/admin/upload-kpi-cell-level", methods=["POST"])
 @jwt_required()
 def admin_upload_kpi_cell_level():
-    """Maximum-speed upload: DROP indexes → COPY FROM STDIN → recreate indexes."""
+
     user = db.session.get(User, int(get_jwt_identity()))
     if not user or user.role != "admin":
         return jsonify({"error": "Unauthorized"}), 403
@@ -2789,26 +2934,19 @@ def admin_upload_kpi_cell_level():
     file = request.files["file"]
 
     if not file.filename.lower().endswith(('.xlsx', '.xlsm')):
-        return jsonify({"error": "Invalid file format. Please upload a .xlsx or .xlsm file."}), 400
+        return jsonify({"error": "Invalid file format."}), 400
 
     import openpyxl, tempfile, io, csv
     from sqlalchemy import text as sa_text
 
-    suffix = ".xlsx" if file.filename.lower().endswith(".xlsx") else ".xlsm"
-    fd, path = tempfile.mkstemp(suffix=suffix)
+    fd, path = tempfile.mkstemp(suffix=".xlsx")
     wb = None
 
     try:
         with os.fdopen(fd, 'wb') as tmp:
             file.save(tmp)
 
-        try:
-            wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
-        except Exception as e:
-            return jsonify({"error": f"Excel file is corrupted or not a valid XLSX: {str(e)}"}), 400
-
-        db.session.execute(sa_text("DELETE FROM kpi_data WHERE data_level = 'cell'"))
-        db.session.commit()
+        wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
 
         KPI_INDEXES = [
             "idx_kpi_site_name_date",
@@ -2816,11 +2954,18 @@ def admin_upload_kpi_cell_level():
             "ix_kpi_data_site_id",
             "ix_kpi_data_kpi_name",
         ]
-        COPY_SQL = "COPY kpi_data (site_id, cell_id, cell_site_id, kpi_name, date, hour, value, data_level) FROM STDIN WITH (FORMAT CSV, NULL '')"
-        FLUSH_AT = 200_000
+
+        COPY_SQL = """COPY kpi_data
+        (site_id, cell_id, cell_site_id, kpi_name, date, hour, value, data_level)
+        FROM STDIN WITH (FORMAT CSV, NULL '')"""
+
+        FLUSH_AT = 1_000_000
 
         raw_conn = db.engine.raw_connection()
         cur = raw_conn.cursor()
+
+        cur.execute("SET synchronous_commit TO OFF")
+
         try:
             for idx in KPI_INDEXES:
                 cur.execute(f"DROP INDEX IF EXISTS {idx}")
@@ -2828,24 +2973,31 @@ def admin_upload_kpi_cell_level():
 
             buf = io.StringIO()
             writer = csv.writer(buf)
+
             row_count = 0
             total_inserted = 0
 
             for sheet_name in wb.sheetnames:
+
                 ws = wb[sheet_name]
                 rows_iter = ws.iter_rows(values_only=True)
+
                 headers = next(rows_iter, None)
                 if not headers:
                     continue
 
                 kpi_name = sheet_name.strip()
 
-                date_col_map = []
+                date_map = []
+
                 for i in range(3, len(headers)):
+
                     h = headers[i]
                     if h is None:
                         continue
+
                     parsed_date = None
+
                     if isinstance(h, datetime):
                         parsed_date = h.date()
                     elif isinstance(h, date):
@@ -2855,37 +3007,49 @@ def admin_upload_kpi_cell_level():
                             try:
                                 parsed_date = datetime.strptime(str(h).strip(), fmt).date()
                                 break
-                            except (ValueError, TypeError):
-                                continue
+                            except:
+                                pass
+
                     if parsed_date is None:
                         parsed_date = datetime.now().date()
-                    date_col_map.append((i, parsed_date))
 
-                if not date_col_map:
+                    date_map.append((i, parsed_date))
+
+                if not date_map:
                     continue
 
                 for row in rows_iter:
+
                     if not row or not row[0]:
                         continue
-                    site_id = str(row[0])
-                    cell_id = str(row[1]) if len(row) > 1 and row[1] else None
-                    cell_site_id = str(row[2]) if len(row) > 2 and row[2] else None
+
+                    site_id = row[0]
+                    cell_id = row[1] if len(row) > 1 else None
+                    cell_site_id = row[2] if len(row) > 2 else None
+
                     row_len = len(row)
-                    for col_idx, col_date in date_col_map:
+
+                    for col_idx, col_date in date_map:
+
                         if col_idx < row_len and row[col_idx] is not None:
+
                             try:
                                 writer.writerow((site_id, cell_id, cell_site_id, kpi_name, col_date, 0, float(row[col_idx]), "cell"))
                                 row_count += 1
-                            except (ValueError, TypeError):
+                            except:
                                 continue
 
                     if row_count >= FLUSH_AT:
+
                         buf.seek(0)
                         cur.copy_expert(COPY_SQL, buf)
+
                         total_inserted += row_count
                         raw_conn.commit()
-                        buf = io.StringIO()
-                        writer = csv.writer(buf)
+
+                        buf.truncate(0)
+                        buf.seek(0)
+
                         row_count = 0
 
             if row_count > 0:
@@ -2895,6 +3059,7 @@ def admin_upload_kpi_cell_level():
                 raw_conn.commit()
 
         finally:
+
             for stmt in [
                 "CREATE INDEX IF NOT EXISTS idx_kpi_site_name_date ON kpi_data (site_id, kpi_name, date)",
                 "CREATE INDEX IF NOT EXISTS idx_kpi_data_level ON kpi_data (data_level, kpi_name)",
@@ -2903,22 +3068,23 @@ def admin_upload_kpi_cell_level():
             ]:
                 try:
                     cur.execute(stmt)
-                except Exception:
+                except:
                     pass
+
             raw_conn.commit()
             cur.close()
             raw_conn.close()
 
-        return jsonify({"message": f"Successfully uploaded {total_inserted} cell-level KPI records from {len(wb.sheetnames)} sheets."}), 200
+        return jsonify({"message": f"Successfully uploaded {total_inserted} cell-level KPI records."}), 200
 
     except Exception as e:
-        return jsonify({"error": f"Internal Server Error: {str(e)}"}), 500
+        return jsonify({"error": str(e)}), 500
+
     finally:
         if wb:
             wb.close()
         if os.path.exists(path):
             os.remove(path)
-
 
 @app.route("/api/admin/delete-sites", methods=["DELETE"])
 @jwt_required()
@@ -3532,6 +3698,22 @@ def agent_toggle_status():
     user_id = int(get_jwt_identity())
     user = db.session.get(User, user_id)
     if not user or user.role != "human_agent":
+        return jsonify({"error": "Unauthorized"}), 403
+    data = request.json or {}
+    if "is_online" in data:
+        user.is_online = bool(data["is_online"])
+    else:
+        user.is_online = not user.is_online
+    db.session.commit()
+    return jsonify({"is_online": user.is_online, "message": f"Status set to {'online' if user.is_online else 'offline'}"})
+
+
+@app.route("/api/manager/status", methods=["PUT"])
+@jwt_required()
+def manager_toggle_status():
+    user_id = int(get_jwt_identity())
+    user = db.session.get(User, user_id)
+    if not user or user.role != "manager":
         return jsonify({"error": "Unauthorized"}), 403
     data = request.json or {}
     if "is_online" in data:

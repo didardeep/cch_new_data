@@ -15,7 +15,7 @@ const links = [
 export default function ManagerLayout() {
   return (
     <div className="dashboard-layout">
-      <Sidebar links={links} />
+      <Sidebar links={links} statusToggle={{ endpoint: '/api/manager/status' }} />
       <main className="main-content">
         <Outlet />
       </main>
