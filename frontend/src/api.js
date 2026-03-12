@@ -1,4 +1,4 @@
-export const API_BASE = process.env.REACT_APP_API_URL || '';
+export const API_BASE = process.env.REACT_APP_API_URL || 'http://localhost:5500';
 
 export function getToken() {
   return localStorage.getItem('token');

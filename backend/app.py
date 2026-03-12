@@ -60,6 +60,11 @@ bcrypt.init_app(app)
 jwt = JWTManager(app)
 mail = Mail(app)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
+CORS(
+    app,
+    resources={r"/api/*": {"origins": ["http://localhost:3000"]}},
+    supports_credentials=True,
+)
 
 
 # ─── Azure OpenAI Configuration ──────────────────────────────────────────────

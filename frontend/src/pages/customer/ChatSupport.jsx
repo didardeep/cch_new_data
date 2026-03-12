@@ -1,11 +1,10 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { getToken, apiGet } from '../../api';
+import { getToken, apiGet, API_BASE } from '../../api';
 import { useAuth } from '../../AuthContext';
 import '../../styles/chatbot.css';
 import { io } from 'socket.io-client';
 
-const API_BASE = '';
 const SOCKET_URL = process.env.REACT_APP_API_URL || 'http://localhost:5500';
 
 // ── DEFAULT LOCATION (used instead of real GPS) ──────────────────────────────

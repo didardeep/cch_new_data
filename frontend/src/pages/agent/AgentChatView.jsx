@@ -168,8 +168,9 @@ export default function AgentChatView() {
   }, [sessionId]);
 
   const appendMessageIfNew = useCallback((msg) => {
-    if (!msg || !msg.id) return;
-    setMessages(prev => (prev.some(m => m.id === msg.id) ? prev : [...prev, msg]));
+    if (!msg || msg.id == null) return;
+    const idKey = String(msg.id);
+    setMessages(prev => (prev.some(m => String(m.id) === idKey) ? prev : [...prev, msg]));
   }, []);
 
   useEffect(() => {
@@ -215,7 +216,7 @@ export default function AgentChatView() {
       const data = await apiPost(`/api/agent/chat/${sessionId}/message`, {
         content: newMessage.trim(),
       });
-      setMessages(prev => [...prev, data.message]);
+      appendMessageIfNew(data.message);
       setNewMessage('');
     } catch {
       alert('Failed to send message.');
