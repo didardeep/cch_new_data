@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+﻿import { useState, useEffect } from 'react';
 import { apiGet } from '../../api';
 
 export default function AdminFeedback() {
@@ -57,7 +57,7 @@ export default function AdminFeedback() {
                         <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12, color: '#00338D', fontWeight: 600 }}>
                           #{f.chat_session_id}
                         </span>
-                      ) : '—'}
+                      ) : 'â€”'}
                     </td>
                     <td style={{ fontSize: 13 }}>{f.session_sector || '—'}</td>
                     <td>
@@ -81,3 +81,4 @@ export default function AdminFeedback() {
     </div>
   );
 }
+

@@ -161,8 +161,7 @@ export default function ChatSupport() {
   const chatAreaRef = useRef(null);
   const inputRef = useRef(null);
   const sessionIdRef = useRef(null);
-  const socketRef = useRef(null);
-  const resumeNeededRef = useRef(false);
+  const agentJoinedRef = useRef(false);
   const stateRef = useRef({
     step: 'welcome',
     sectorKey: null,
@@ -180,6 +179,14 @@ export default function ChatSupport() {
   });
   const msgIdCounter = useRef(0);
   const nextId = () => ++msgIdCounter.current;
+
+  const isRecentSession = useCallback((session) => {
+    if (!session?.created_at) return false;
+    const created = new Date(session.created_at).getTime();
+    if (Number.isNaN(created)) return false;
+    const hours = (Date.now() - created) / (1000 * 60 * 60);
+    return hours <= 24;
+  }, []);
 
   const scrollToBottom = useCallback(() => {
     setTimeout(() => {
@@ -555,7 +562,10 @@ export default function ChatSupport() {
   const lastSeenMsgIdRef = useRef(0);
 
   useEffect(() => {
-    if (wsConnected) return;
+    if (!handoffActive) return;
+    if (sessionIdRef.current) {
+      chatApiCall(`/api/chat/session/${sessionIdRef.current}/presence`, { present: true });
+    }
     const poll = async () => {
       if (!sessionIdRef.current) return;
       try {
@@ -589,15 +599,18 @@ export default function ChatSupport() {
 
           addMessage({ type: 'live-agent-message', text: m.content, timestamp: m.created_at });
         });
-        if (newAgentMsgs.length > 0) {
-          markAgentMessagesSeen(newAgentMsgs.map(m => m.id));
-          // Mark all customer user-messages as seen (agent has responded)
-          setMessages(prev => prev.map(m => m.type === 'user' ? { ...m, seen: true } : m));
-          showInput('Type your reply to the agent...');
+        if (newAgentMsgs.length > 0 && !agentJoinedRef.current) {
+          agentJoinedRef.current = true;
+          addMessage({ type: 'system', text: 'Agent connected. You can now chat below.' });
+          showInput('Type your message for the agent...');
+          stateRef.current.step = 'live-agent';
         }
+        const s = data.session || {};
         if (s.status === 'resolved' && !agentResolvedShownRef.current) {
           agentResolvedShownRef.current = true;
           setHandoffActive(false);
+          hideInput();
+          stateRef.current.step = 'agent-resolved';
           const lastBot = [...allMsgs].reverse().find(m => m.sender === 'bot');
           addMessage({
             type: 'agent-resolved',
@@ -607,8 +620,13 @@ export default function ChatSupport() {
       } catch {}
     };
     const iv = setInterval(poll, 6000);
-    return () => clearInterval(iv);
-  }, [handoffActive, addMessage, markAgentMessagesSeen, showInput, wsConnected]);
+    return () => {
+      clearInterval(iv);
+      if (sessionIdRef.current) {
+        chatApiCall(`/api/chat/session/${sessionIdRef.current}/presence`, { present: false });
+      }
+    };
+  }, [handoffActive, addMessage, hideInput, showInput]);
 
   useEffect(() => {
     const token = getToken();
@@ -668,7 +686,7 @@ export default function ChatSupport() {
     };
     sessionIdRef.current = null;
     agentResolvedShownRef.current = false;
-    resumeNeededRef.current = false;
+    agentJoinedRef.current = false;
     setHandoffActive(false);
     hideInput();
     setInitPhase('chat');
@@ -679,6 +697,18 @@ export default function ChatSupport() {
       showInput('Type your greeting here...');
     }, 500);
   }, [addMessage, hideInput, showInput, ensureSession]);
+
+  const beginNewChat = useCallback(async () => {
+    try {
+      const pending = await apiGet('/api/customer/pending-feedback');
+      const sessions = pending?.sessions || [];
+      if (sessions.length > 0) {
+        navigate(`/customer/feedback?session=${sessions[0].id}&return=1`);
+        return;
+      }
+    } catch {}
+    startChat();
+  }, [navigate, startChat]);
 
   const loadSectorMenu = useCallback(async () => {
     const token = getToken();
@@ -795,9 +825,13 @@ export default function ChatSupport() {
             (slaHours ? `<br><span style="color:#16a34a;font-weight:600;">Your issue will be resolved within ${slaHours} hour${slaHours !== 1 ? 's' : ''}</span>` : '')) +
         `<br><br>The agent may send you messages below - please stay in this chat.<br>You can track your ticket from the dashboard.`,
     });
+    addMessage({ type: 'system', text: 'Please wait — we are connecting you to a human agent.' });
+    stateRef.current.step = 'live-agent';
+    agentResolvedShownRef.current = false;
+    agentJoinedRef.current = false;
     setHandoffActive(true);
-    stateRef.current.step = 'escalated';
-  }, [addMessage, setHandoffActive]);
+    hideInput();
+  }, [addMessage, setHandoffActive, hideInput]);
 
   const fetchSolution = useCallback(async (userQuery) => {
     const st = stateRef.current;
@@ -906,6 +940,10 @@ export default function ChatSupport() {
     if (!text) return;
     addMessage({ type: 'user', text });
     setInputValue('');
+    if (handoffActive || ['human_handoff', 'escalated', 'live-agent'].includes(stateRef.current.step)) {
+      saveMessage('user', text);
+      return;
+    }
     hideInput();
 
     let userSaved = false;
@@ -1013,7 +1051,7 @@ export default function ChatSupport() {
     }
 
     await fetchSolution(text);
-  }, [inputValue, addMessage, hideInput, fetchSolution, loadSectorMenu, user, afterLocationCaptured, handoffActive, saveMessage, showInput]);
+  }, [inputValue, addMessage, hideInput, fetchSolution, loadSectorMenu, user, afterLocationCaptured, handoffActive, saveMessage]);
 
   const handleSendEmail = useCallback(async (groupId) => {
     disableGroup(groupId);
@@ -1076,14 +1114,14 @@ export default function ChatSupport() {
           ? `<br><br>We are connecting you to our expert. Your dedicated support agent is:<br>
              <div style="background:#eff6ff;border:1px solid #93c5fd;border-radius:8px;padding:10px 14px;margin:8px 0;display:inline-block;min-width:220px;">
                <div style="font-size:13px;font-weight:700;color:#1e40af;">${assignedAgent.name}</div>
-               ${assignedAgent.phone ? `<div style="font-size:12px;color:#0ea5e9;margin-top:4px;">📞 ${assignedAgent.phone}</div>` : ''}
-               ${assignedAgent.email ? `<div style="font-size:12px;color:#0ea5e9;margin-top:4px;">✉️ ${assignedAgent.email}</div>` : ''}
+               ${assignedAgent.phone ? `<div style="font-size:12px;color:#0ea5e9;margin-top:4px;">Phone: ${assignedAgent.phone}</div>` : ''}
+               ${assignedAgent.email ? `<div style="font-size:12px;color:#0ea5e9;margin-top:4px;">Email: ${assignedAgent.email}</div>` : ''}
                ${assignedAgent.employee_id ? `<div style="font-size:11px;color:#64748b;margin-top:2px;">ID: ${assignedAgent.employee_id}</div>` : ''}
-               ${slaHours ? `<div style="font-size:12px;color:#16a34a;margin-top:6px;font-weight:600;">⏱ Your issue will be resolved within ${slaHours} hour${slaHours !== 1 ? 's' : ''}</div>` : ''}
+               ${slaHours ? `<div style="font-size:12px;color:#16a34a;margin-top:6px;font-weight:600;">SLA: Your issue will be resolved within ${slaHours} hour${slaHours !== 1 ? 's' : ''}</div>` : ''}
              </div>`
-          : `<br><br>We are connecting you to a human agent. Our support team will reach out to you shortly.` +
-            (slaHours ? `<br><span style="color:#16a34a;font-weight:600;">⏱ Your issue will be resolved within ${slaHours} hour${slaHours !== 1 ? 's' : ''}</span>` : '')) +
-        `<br><br>The agent may send you messages below - please stay in this chat.<br>You can track your ticket from the dashboard.`,
+          : `<br><br>Our support team will reach out to you shortly.` +
+            (slaHours ? `<br><span style="color:#16a34a;font-weight:600;">SLA: Your issue will be resolved within ${slaHours} hour${slaHours !== 1 ? 's' : ''}</span>` : '')) +
+        `<br>You can track your ticket from the dashboard.`,
     });
     stateRef.current.step = 'escalated';
     agentResolvedShownRef.current = false;
@@ -1092,17 +1130,38 @@ export default function ChatSupport() {
 
   const handleBackToMenu = useCallback((groupId) => {
     disableGroup(groupId);
+    if (['resolved', 'agent-resolved'].includes(stateRef.current.step)) {
+      addMessage({ type: 'user', text: 'Main Menu' });
+      beginNewChat();
+      return;
+    }
     stateRef.current.attempt = 0;
     stateRef.current.previousSolutions = [];
     addMessage({ type: 'user', text: 'Main Menu' });
     addMessage({ type: 'bot', html: `Sure! Please select your <strong>telecom service category</strong>:` });
     setTimeout(() => loadSectorMenu(), 400);
     stateRef.current.step = 'sector';
-  }, [addMessage, disableGroup, loadSectorMenu]);
+  }, [addMessage, beginNewChat, disableGroup, loadSectorMenu]);
 
   const handleExit = useCallback(async (groupId) => {
     disableGroup(groupId);
     addMessage({ type: 'user', text: 'Exit' });
+    const isHandoffMode = handoffActive || ['human_handoff', 'escalated', 'live-agent'].includes(stateRef.current.step);
+    if (isHandoffMode) {
+      addMessage({
+        type: 'system',
+        text: agentJoinedRef.current
+          ? 'A human agent is connected to this ticket. Please stay here to continue the live chat.'
+          : 'Please wait — we are connecting you to a human agent.',
+      });
+      if (agentJoinedRef.current) {
+        showInput('Type your message for the agent...');
+      } else {
+        hideInput();
+      }
+      stateRef.current.step = 'live-agent';
+      return;
+    }
     hideInput();
     const currentSessionId = sessionIdRef.current;
     if (currentSessionId) {
@@ -1128,9 +1187,9 @@ export default function ChatSupport() {
     }
     stateRef.current.step = 'exited';
     setTimeout(() => {
-      navigate(`/customer/feedback${currentSessionId ? `?session=${currentSessionId}` : ''}`);
-    }, 1500);
-  }, [addMessage, disableGroup, hideInput, navigate, handoffActive]);
+      addMessage({ type: 'exit-box' });
+    }, 800);
+  }, [addMessage, disableGroup, hideInput, handoffActive, showInput]);
 
   const handleScreenshotUpload = useCallback(async (file) => {
     if (!file || !file.type.startsWith('image/')) {
@@ -1149,6 +1208,7 @@ export default function ChatSupport() {
     reader.onload = async () => {
       const base64String = reader.result.split(',')[1];
       addMessage({ type: 'user-image', imageSrc: reader.result });
+      saveMessage('user', reader.result);
       setScreenshotUploading(true);
       setIsTyping(true);
       try {
@@ -1227,17 +1287,17 @@ export default function ChatSupport() {
       assignedAgent,
     });
     setTimeout(() => {
-      const slaLine = slaHours ? `<div style="font-size:12px;color:#16a34a;margin-top:6px;font-weight:600;">⏱ Your issue will be resolved within ${slaHours} hour${slaHours !== 1 ? 's' : ''}</div>` : '';
+      const slaLine = slaHours ? `<div style="font-size:12px;color:#16a34a;margin-top:6px;font-weight:600;">SLA: Your issue will be resolved within ${slaHours} hour${slaHours !== 1 ? 's' : ''}</div>` : '';
       const agentCard = assignedAgent
         ? `<br><br>We are connecting you to your dedicated support expert:<br>
            <div style="background:#eff6ff;border:1px solid #93c5fd;border-radius:8px;padding:10px 14px;margin:8px 0;display:inline-block;min-width:220px;">
              <div style="font-size:13px;font-weight:700;color:#1e40af;">${assignedAgent.name}</div>
-             ${assignedAgent.phone ? `<div style="font-size:12px;color:#0ea5e9;margin-top:4px;">📞 ${assignedAgent.phone}</div>` : ''}
-             ${assignedAgent.email ? `<div style="font-size:12px;color:#0ea5e9;margin-top:4px;">✉️ ${assignedAgent.email}</div>` : ''}
+             ${assignedAgent.phone ? `<div style="font-size:12px;color:#0ea5e9;margin-top:4px;">Phone: ${assignedAgent.phone}</div>` : ''}
+             ${assignedAgent.email ? `<div style="font-size:12px;color:#0ea5e9;margin-top:4px;">Email: ${assignedAgent.email}</div>` : ''}
              ${assignedAgent.employee_id ? `<div style="font-size:11px;color:#64748b;margin-top:2px;">ID: ${assignedAgent.employee_id}</div>` : ''}
              ${slaLine}
            </div>`
-        : `<br><br>Our support team will contact you shortly.` + (slaHours ? `<br><span style="color:#16a34a;font-weight:600;">⏱ Your issue will be resolved within ${slaHours} hour${slaHours !== 1 ? 's' : ''}</span>` : '');
+        : `<br><br>Our support team will contact you shortly.` + (slaHours ? `<br><span style="color:#16a34a;font-weight:600;">SLA: Your issue will be resolved within ${slaHours} hour${slaHours !== 1 ? 's' : ''}</span>` : '');
       addMessage({
         type: 'bot',
         html: `Your ticket is being raised now.` +
@@ -1245,10 +1305,13 @@ export default function ChatSupport() {
           `<br>Reference: <strong>${refNum}</strong><br><br>The agent may send you messages below - please stay in this chat.<br><br>What would you like to do next?`,
       });
     }, 1500);
-    stateRef.current.step = 'human_handoff';
+    addMessage({ type: 'system', text: 'Please wait — we are connecting you to a human agent.' });
+    stateRef.current.step = 'live-agent';
     agentResolvedShownRef.current = false;
+    agentJoinedRef.current = false;
     setHandoffActive(true);
-  }, [addMessage, disableGroup, saveMessage, setHandoffActive]);
+    hideInput();
+  }, [addMessage, disableGroup, saveMessage, setHandoffActive, hideInput]);
 
   const handleKeyDown = useCallback((e) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
@@ -1260,6 +1323,140 @@ export default function ChatSupport() {
     e.target.style.height = Math.min(e.target.scrollHeight, 120) + 'px';
   }, []);
 
+  const resumeChat = useCallback(async (session, msgs) => {
+    setInitPhase('chat');
+    setMessages([]);
+    setDisabledGroups(new Set());
+    hideInput();
+    sessionIdRef.current = session.id;
+    stateRef.current.sectorName = session.sector_name || null;
+    stateRef.current.subprocessName = session.subprocess_name || null;
+    stateRef.current.language = session.language || 'English';
+    stateRef.current.queryText = session.query_text || '';
+    stateRef.current.resolution = session.resolution || '';
+    try {
+      const token = getToken();
+      const headers = {};
+      if (token) headers['Authorization'] = `Bearer ${token}`;
+      const menuResp = await fetch(`${API_BASE}/api/menu`, { headers });
+      const menuData = await menuResp.json();
+      for (const [key, sector] of Object.entries(menuData.menu)) {
+        if (sector.name === session.sector_name) { stateRef.current.sectorKey = key; break; }
+      }
+      if (stateRef.current.sectorKey && session.subprocess_name) {
+        const spData = await chatApiCall('/api/subprocesses', { sector_key: stateRef.current.sectorKey, language: 'English' });
+        for (const [key, name] of Object.entries(spData.subprocesses)) {
+          if (name === session.subprocess_name || session.subprocess_name.startsWith(`${name} - `)) {
+            stateRef.current.subprocessKey = key;
+            break;
+          }
+        }
+      }
+    } catch {}
+    const resumeMsg = { type: 'system', text: `Resuming your previous chat session #${session.id}` };
+    setMessages([{ ...resumeMsg, id: nextId(), groupId: nextId() }]);
+    const botResolutions = [];
+    const newMsgs = [];
+    for (const m of msgs) {
+      const id = nextId();
+      if (m.sender === 'user') {
+        if (m.content && m.content.startsWith('data:image/')) {
+          newMsgs.push({ type: 'user-image', imageSrc: m.content, id, groupId: id });
+        } else {
+          newMsgs.push({ type: 'user', text: m.content, id, groupId: id });
+        }
+      } else if (m.sender === 'bot') {
+        if (m.content.length > 150) {
+          botResolutions.push(m.content);
+          newMsgs.push({ type: 'resolution', html: formatResolution(m.content), id, groupId: id });
+        } else {
+          newMsgs.push({ type: 'bot', html: formatResolution(m.content), id, groupId: id });
+        }
+      } else {
+        newMsgs.push({ type: 'system', text: m.content, id, groupId: id });
+      }
+    }
+    stateRef.current.previousSolutions = botResolutions;
+    stateRef.current.attempt = botResolutions.length;
+    setMessages(prev => [...prev, ...newMsgs]);
+    scrollToBottom();
+    if (!msgs.length && session.status === 'active') {
+      addMessage({ type: 'bot', html: `<strong>Welcome to TeleBot Support!</strong><br>Say hello to get started!` });
+      showInput('Type your greeting here...');
+      stateRef.current.step = 'greeting';
+      return;
+    }
+    setTimeout(async () => {
+      if (session.status === 'resolved') {
+        addMessage({
+          type: 'bot',
+          html: `This chat session is <strong>${session.status}</strong>. You are viewing the complete chat history.`,
+        });
+        addMessage({ type: 'bot', html: `Start a new chat if you need more help.` });
+        hideInput();
+        stateRef.current.step = 'view-only';
+        return;
+      }
+      if (session.status === 'escalated') {
+        addMessage({
+          type: 'bot',
+          html: `Please wait — we are connecting you to a human agent.`,
+        });
+        agentResolvedShownRef.current = false;
+        agentJoinedRef.current = false;
+        setHandoffActive(true);
+        hideInput();
+        stateRef.current.step = 'live-agent';
+        return;
+      }
+      if (!session.sector_name) {
+        addMessage({ type: 'bot', html: 'Please select your <strong>telecom service category</strong>:' });
+        loadSectorMenu();
+      } else if (!session.subprocess_name) {
+        addMessage({ type: 'bot', html: `Please select the <strong>type of issue</strong> you're facing with <strong>${session.sector_name}</strong>:` });
+        const data = await chatApiCall('/api/subprocesses', { sector_key: stateRef.current.sectorKey, language: stateRef.current.language });
+        const spGroupId = nextId();
+        addMessage({ type: 'subprocess-grid', subprocesses: limitSubprocesses(data.subprocesses), groupId: spGroupId });
+        stateRef.current.step = 'subprocess';
+      } else if (session.resolution) {
+        addMessage({ type: 'bot', html: `Did this help? If not, please describe what's still not working.` });
+        showInput('Type your response...');
+        stateRef.current.step = 'conversation';
+      } else {
+        addMessage({ type: 'bot', html: 'Please <strong>describe your specific issue</strong> so I can provide the best resolution.' });
+        showInput('Describe your issue in any language...');
+        stateRef.current.step = 'query';
+      }
+    }, 400);
+  }, [addMessage, hideInput, loadSectorMenu, scrollToBottom, showInput, setHandoffActive]);
+
+  const handleFeedbackSubmit = useCallback(async () => {
+    if (fbRating === 0) return;
+    const session = pendingFeedback[currentFbIdx];
+    if (!session) return;
+    setFbSubmitting(true);
+    await apiPost('/api/feedback', { chat_session_id: session.id, rating: fbRating, comment: fbComment });
+    setFbSubmitting(false);
+    setFbRating(0);
+    setFbComment('');
+    if (currentFbIdx + 1 < pendingFeedback.length) { setCurrentFbIdx(prev => prev + 1); }
+    else { proceedAfterFeedback(); }
+  }, [fbRating, fbComment, pendingFeedback, currentFbIdx]);
+
+  const proceedAfterFeedback = useCallback(async () => {
+    const resumeId = searchParams.get('resume');
+    if (resumeId) {
+      try {
+        const data = await apiGet(`/api/chat/session/${resumeId}`);
+        if (data?.session) {
+          resumeChat(data.session, data.messages || []);
+          return;
+        }
+      } catch {}
+    }
+    setInitPhase('start-gate');
+  }, [searchParams, resumeChat]);
+
   const initialized = useRef(false);
   useEffect(() => {
     if (initialized.current) return;
@@ -1268,16 +1465,17 @@ export default function ChatSupport() {
       const params = new URLSearchParams(window.location.search);
       const resumeId = params.get('resume');
       if (resumeId) {
-        const restored = await restoreSession({ sessionId: resumeId, allowResolved: true });
-        if (!restored) startChat(true);
-        else setTimeout(scrollToBottom, 200);
-        return;
+        try {
+          const data = await apiGet(`/api/chat/session/${resumeId}`);
+          if (data?.session) {
+            resumeChat(data.session, data.messages || []);
+            return;
+          }
+        } catch {}
       }
-      // Show start choice UI; defer restore/new until user picks
-      setInitPhase('choice');
-      setStartChoice(true);
+      setInitPhase('start-gate');
     })();
-  }, [restoreSession, startChat, scrollToBottom]);
+  }, [searchParams, resumeChat]);
 
   // ══════════════════════════════════════════════════════════════════
   // RENDER MESSAGES
@@ -1646,11 +1844,11 @@ export default function ChatSupport() {
             <div className="handoff-row"><span className="h-label">Complaint</span><span className="h-value">{msg.queryText}</span></div>
             {msg.assignedAgent ? (
               <>
-                <div className="handoff-row"><span className="h-label">Status</span><span className="h-value" style={{ color: '#22c55e', fontWeight: 700 }}>✅ Agent Assigned</span></div>
+                <div className="handoff-row"><span className="h-label">Status</span><span className="h-value" style={{ color: '#22c55e', fontWeight: 700 }}>Agent Assigned</span></div>
                 <div style={{ background: '#eff6ff', border: '1px solid #bfdbfe', borderRadius: 8, padding: '10px 14px', margin: '10px 0 6px' }}>
-                  <div style={{ fontSize: 12, color: '#1d4ed8', fontWeight: 700, marginBottom: 6 }}>🧑‍💼 Your Expert</div>
+                  <div style={{ fontSize: 12, color: '#1d4ed8', fontWeight: 700, marginBottom: 6 }}>Your Expert</div>
                   <div style={{ fontSize: 14, fontWeight: 700, color: '#1e293b' }}>{msg.assignedAgent.name}</div>
-                  {msg.assignedAgent.phone && <div style={{ fontSize: 13, color: '#0ea5e9', marginTop: 4 }}>📞 {msg.assignedAgent.phone}</div>}
+                  {msg.assignedAgent.phone && <div style={{ fontSize: 13, color: '#0ea5e9', marginTop: 4 }}>Phone: {msg.assignedAgent.phone}</div>}
                   {msg.assignedAgent.employee_id && <div style={{ fontSize: 11, color: '#64748b', marginTop: 2 }}>ID: {msg.assignedAgent.employee_id}</div>}
                 </div>
               </>
@@ -1702,6 +1900,52 @@ export default function ChatSupport() {
     }
   };
 
+  const renderResumePrompt = () => {
+    const session = activeSessionData;
+    if (!session) return null;
+    const lastMsg = activeSessionMsgs.length > 0 ? activeSessionMsgs[activeSessionMsgs.length - 1] : null;
+    const isActiveSession = session.status === 'active';
+    return (
+      <div className="gate-overlay">
+        <div className="gate-card resume-gate">
+          <div className="gate-icon">&#128172;</div>
+          <h2 className="gate-title">{isActiveSession ? 'Active Chat Found' : 'Previous Chat Found'}</h2>
+          <p className="gate-subtitle">
+            {isActiveSession
+              ? 'You have an active chat session. Would you like to continue or start a new one?'
+              : 'Would you like to open this chat history or start a new chat?'}
+          </p>
+          <div className="gate-session-info">
+            <div className="gate-session-row"><span className="gate-label">Session</span><span className="gate-value">#{session.id}</span></div>
+            {session.sector_name && <div className="gate-session-row"><span className="gate-label">Category</span><span className="gate-value">{session.sector_name}</span></div>}
+            {session.subprocess_name && <div className="gate-session-row"><span className="gate-label">Issue Type</span><span className="gate-value">{session.subprocess_name}</span></div>}
+            <div className="gate-session-row"><span className="gate-label">Started</span><span className="gate-value">{session.created_at ? new Date(session.created_at).toLocaleString() : 'N/A'}</span></div>
+            {lastMsg && <div className="gate-summary"><span className="gate-label">Last message</span><p>{lastMsg.content.length > 120 ? lastMsg.content.slice(0, 120) + '...' : lastMsg.content}</p></div>}
+          </div>
+          <div className="gate-actions">
+            <button className="gate-btn gate-btn-primary" onClick={() => resumeChat(activeSessionData, activeSessionMsgs)}>
+              {isActiveSession ? 'Continue Chat' : 'Open Chat'}
+            </button>
+            <button className="gate-btn gate-btn-secondary" onClick={() => beginNewChat()}>Start New Chat</button>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  const renderStartGate = () => (
+    <div className="gate-overlay">
+      <div className="gate-card resume-gate">
+        <h2 className="gate-title">Start a New Chat</h2>
+        <p className="gate-subtitle">Begin a fresh support conversation whenever you are ready.</p>
+        <div className="gate-actions">
+          <button className="gate-btn gate-btn-primary" onClick={() => beginNewChat()}>
+            Start New Chat
+          </button>
+        </div>
+      </div>
+    </div>
+  );
 
   return (
     <div className="chat-support-page">
@@ -1713,7 +1957,7 @@ export default function ChatSupport() {
             <p>AI-powered multilingual support</p>
           </div>
           <div className="status-dot" />
-          {initPhase === 'chat' && <button className="restart-btn" onClick={() => startChat(true)}>Restart</button>}
+          {initPhase === 'chat' && <button className="restart-btn" onClick={beginNewChat}>Restart</button>}
         </div>
 
         {initPhase === 'loading' && (
@@ -1723,26 +1967,9 @@ export default function ChatSupport() {
             </div>
           </div>
         )}
-        {initPhase === 'choice' && (
-          <div className="chat-area" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-            <div style={{ background: '#fff', border: '1px solid #e2e8f0', borderRadius: 12, padding: '28px 32px', boxShadow: '0 6px 20px rgba(15,23,42,0.08)', maxWidth: 420, width: '100%', textAlign: 'center' }}>
-              <h3 style={{ margin: '0 0 12px', color: '#0f172a' }}>What would you like to do?</h3>
-              <p style={{ margin: '0 0 20px', color: '#475569', fontSize: 14 }}>Resume your last chat or start a new one.</p>
-              <div style={{ display: 'flex', gap: 12, justifyContent: 'center' }}>
-                <button className="btn btn-primary" onClick={async () => {
-                  setInitPhase('loading');
-                  const ok = await restoreSession(null);
-                  if (!ok) startChat(true); else setStartChoice(false);
-                }}>Resume Last Chat</button>
-                <button className="btn btn-secondary" onClick={async () => {
-                  setInitPhase('loading');
-                  setStartChoice(false);
-                  await startChat(true);
-                }}>Start New Chat</button>
-              </div>
-            </div>
-          </div>
-        )}
+        {initPhase === 'resume-prompt' && <div className="chat-area">{renderResumePrompt()}</div>}
+        {initPhase === 'start-gate' && <div className="chat-area">{renderStartGate()}</div>}
+
         {initPhase === 'chat' && (
           <>
             <div className="chat-area" ref={chatAreaRef}>

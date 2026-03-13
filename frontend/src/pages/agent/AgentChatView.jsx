@@ -1,7 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
-import { apiGet, apiPost, apiPut, getToken } from '../../api';
-import { io } from 'socket.io-client';
+import { useParams, useNavigate, useSearchParams } from 'react-router-dom';
+import { apiGet, apiPost, apiPut } from '../../api';
 
 /* ── SVG icon set ─────────────────────────────────────────────────────── */
 const IC = {
@@ -62,6 +61,11 @@ const IC = {
       <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" />
     </svg>
   ),
+  check: (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <polyline points="20 6 9 17 4 12" />
+    </svg>
+  ),
 };
 
 const SOCKET_URL = process.env.REACT_APP_API_URL || 'http://localhost:5500';
@@ -109,14 +113,15 @@ const BUBBLE = {
 export default function AgentChatView() {
   const { sessionId } = useParams();
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  const ticketId = searchParams.get('ticketId');
 
   const [session, setSession] = useState(null);
   const [messages, setMessages] = useState([]);
   const [customer, setCustomer] = useState(null);
   const [newMessage, setNewMessage] = useState('');
   const [sending, setSending] = useState(false);
-  const [ending, setEnding] = useState(false);
-  const [wsConnected, setWsConnected] = useState(false);
+  const [resolving, setResolving] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [activePanel, setActivePanel] = useState(null);
@@ -222,6 +227,21 @@ export default function AgentChatView() {
       alert('Failed to send message.');
     } finally {
       setSending(false);
+    }
+  };
+
+  const handleResolve = async () => {
+    if (!ticketId || resolving) return;
+    const confirmEnd = window.confirm('End this chat and mark the ticket as resolved?');
+    if (!confirmEnd) return;
+    setResolving(true);
+    try {
+      await apiPut(`/api/agent/tickets/${ticketId}/resolve`, { resolution_notes: '' });
+      await fetchChat();
+    } catch {
+      alert('Failed to end the chat. Please try again.');
+    } finally {
+      setResolving(false);
     }
   };
 
@@ -377,7 +397,49 @@ export default function AgentChatView() {
           >
             {IC.refresh} Refresh
           </button>
+
+          <button
+            onClick={handleResolve}
+            className="btn btn-ghost btn-sm"
+            disabled={!ticketId || session?.status === 'resolved' || resolving}
+            style={{
+              color: '#fff',
+              borderColor: 'rgba(255,255,255,0.35)',
+              background: 'rgba(34,197,94,0.25)',
+              display: 'flex', alignItems: 'center', gap: 5,
+              opacity: !ticketId || session?.status === 'resolved' || resolving ? 0.6 : 1,
+              cursor: !ticketId || session?.status === 'resolved' || resolving ? 'not-allowed' : 'pointer',
+            }}
+            title={!ticketId ? 'Ticket ID missing' : session?.status === 'resolved' ? 'Already resolved' : 'End chat'}
+          >
+            {IC.check} {resolving ? 'Ending…' : 'End Chat'}
+          </button>
         </div>
+
+        {session?.status === 'escalated' && (
+          <div style={{
+            background: '#ecfeff',
+            borderBottom: '1px solid #a5f3fc',
+            color: '#0e7490',
+            padding: '8px 16px',
+            fontSize: 12,
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+          }}>
+            <span style={{
+              width: 8,
+              height: 8,
+              borderRadius: '50%',
+              background: session?.customer_present ? '#22c55e' : '#94a3b8',
+              boxShadow: session?.customer_present
+                ? '0 0 0 4px rgba(34, 197, 94, 0.2)'
+                : '0 0 0 4px rgba(148, 163, 184, 0.2)',
+              display: 'inline-block',
+            }} />
+            {session?.customer_present ? 'Customer is online in chat.' : 'Customer is offline.'}
+          </div>
+        )}
 
         {/* Message list */}
         <div style={{
@@ -431,6 +493,7 @@ export default function AgentChatView() {
             }
 
             const cfg = BUBBLE[msg.sender] || BUBBLE.customer;
+            const isImage = typeof msg.content === 'string' && msg.content.startsWith('data:image/');
             return (
               <div key={msg.id} style={{
                 display: 'flex', flexDirection: 'column',
@@ -465,7 +528,15 @@ export default function AgentChatView() {
                   boxShadow: '0 1px 3px rgba(0,0,0,0.06)',
                   ...cfg.bubble,
                 }}>
-                  {msg.content}
+                  {isImage ? (
+                    <img
+                      src={msg.content}
+                      alt="Customer screenshot"
+                      style={{ maxWidth: '220px', borderRadius: 8, display: 'block' }}
+                    />
+                  ) : (
+                    msg.content
+                  )}
                 </div>
               </div>
             );
