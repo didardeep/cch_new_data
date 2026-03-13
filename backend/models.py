@@ -65,6 +65,9 @@ class ChatSession(db.Model):
     longitude = db.Column(db.Float, nullable=True)
     location_description = db.Column(db.Text, nullable=True)
     customer_present = db.Column(db.Boolean, default=False)
+    diagnosis_ran = db.Column(db.Boolean, default=False, nullable=False)
+    current_step = db.Column(db.String(50), default="greeting")
+    last_message_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
 
     messages = db.relationship("ChatMessage", backref="session", lazy=True, order_by="ChatMessage.created_at")
     ticket = db.relationship("Ticket", backref="chat_session", uselist=False, lazy=True)
@@ -89,6 +92,9 @@ class ChatSession(db.Model):
             "longitude": self.longitude,
             "location_description": self.location_description,
             "customer_present": self.customer_present,
+            "diagnosis_ran": bool(self.diagnosis_ran),
+            "current_step": self.current_step or "greeting",
+            "last_message_at": self.last_message_at.isoformat() if self.last_message_at else None,
         }
 
 
@@ -99,7 +105,10 @@ class ChatMessage(db.Model):
     session_id = db.Column(db.Integer, db.ForeignKey("chat_sessions.id"), nullable=False)
     sender = db.Column(db.String(20), nullable=False)
     content = db.Column(db.Text, nullable=False)
+    content_json = db.Column(db.JSON, nullable=True)
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+    delivered_at = db.Column(db.DateTime, nullable=True)
+    seen_at = db.Column(db.DateTime, nullable=True)
 
     def to_dict(self):
         return {
@@ -107,7 +116,10 @@ class ChatMessage(db.Model):
             "session_id": self.session_id,
             "sender": self.sender,
             "content": self.content,
+            "payload": self.content_json,
             "created_at": self.created_at.isoformat() if self.created_at else None,
+            "delivered_at": self.delivered_at.isoformat() if self.delivered_at else None,
+            "seen_at": self.seen_at.isoformat() if self.seen_at else None,
         }
 
 
