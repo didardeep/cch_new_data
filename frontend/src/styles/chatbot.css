@@ -229,6 +229,38 @@
   letter-spacing: 0.01em;
 }
 
+
+/* ─── Message Ticks (live agent handoff only) ────────────────────────────────── */
+.msg-tick {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 5px;
+  vertical-align: middle;
+  flex-shrink: 0;
+}
+
+/* Single grey tick — message sent, agent not yet responded */
+.msg-tick--sent {
+  color: rgba(255, 255, 255, 0.55);
+}
+
+/* Blue tick — agent has seen/responded to the message */
+.msg-tick--seen {
+  color: #60c8ff;
+}
+
+/* Flex layout for user messages so tick sits inline at end */
+.message.user {
+  display: flex;
+  align-items: flex-end;
+  gap: 4px;
+}
+
+.message.user > span:first-child {
+  flex: 1;
+  min-width: 0;
+  word-break: break-word;
+}
 /* ─── Typing Indicator ──────────────────────────────────────────────────────── */
 .typing-indicator {
   display: none;

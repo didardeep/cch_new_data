@@ -19,12 +19,14 @@ from flask_jwt_extended import (
     JWTManager, create_access_token, jwt_required, get_jwt_identity
 )
 from flask_mail import Mail, Message
+from flask_socketio import SocketIO, join_room, emit
 from openai import AzureOpenAI
 from dotenv import load_dotenv
 from types import SimpleNamespace
 import urllib.request
 import urllib.parse
 import urllib.error
+from flask_jwt_extended import decode_token
 
 from sqlalchemy import case as sql_case
 from sqlalchemy.orm import joinedload
@@ -57,6 +59,12 @@ db.init_app(app)
 bcrypt.init_app(app)
 jwt = JWTManager(app)
 mail = Mail(app)
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
+CORS(
+    app,
+    resources={r"/api/*": {"origins": ["http://localhost:3000"]}},
+    supports_credentials=True,
+)
 
 
 # ─── Azure OpenAI Configuration ──────────────────────────────────────────────
@@ -308,6 +316,51 @@ def _format_points_for_pdf(raw_text: str) -> str:
     return "\n\n".join(plain_lines)
 
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+# ─── Socket.IO Helpers ───────────────────────────────────────────────────────
+
+def _emit_session_message(msg: ChatMessage):
+    try:
+        socketio.emit("new_message", msg.to_dict(), room=f"session_{msg.session_id}")
+    except Exception:
+        pass
+
+
+def _emit_session_update(session: ChatSession):
+    try:
+        socketio.emit("session_updated", {"session_id": session.id, "status": session.status}, room=f"session_{session.id}")
+    except Exception:
+        pass
+
+
+@socketio.on("join_session")
+def on_join_session(data):
+    data = data or {}
+    token = data.get("token")
+    session_id = data.get("session_id")
+    if not token or not session_id:
+        emit("error", {"error": "token and session_id required"})
+        return
+    try:
+        decoded = decode_token(token)
+        user_id = int(decoded.get("sub"))
+    except Exception:
+        emit("error", {"error": "invalid token"})
+        return
+    session = ChatSession.query.get(session_id)
+    if not session:
+        emit("error", {"error": "session not found"})
+        return
+    user = User.query.get(user_id)
+    if not user:
+        emit("error", {"error": "user not found"})
+        return
+    if user.role != "human_agent" and session.user_id != user_id:
+        emit("error", {"error": "unauthorized"})
+        return
+    join_room(f"session_{session_id}")
+    emit("joined", {"session_id": session_id})
 
 
 def find_nearest_sites(lat, lon, n=3):
@@ -631,19 +684,31 @@ def generate_resolution(query, sector_name, subprocess_name, language):
             model=DEPLOYMENT_NAME,
             messages=[
                 {"role": "system", "content": (
-                    f"You are an expert telecom customer support agent. The user has a complaint "
-                    f"under the sector: '{sector_name}' and subprocess: '{subprocess_name}'.\n\n"
-                    "IMPORTANT: Base your response on BOTH the selected dropdown context "
-                    "(sector/subprocess) and the user's query. "
-                    "If they conflict, prioritize the user's query while staying within telecom scope.\n\n"
-                    "Provide a helpful response in the following format:\n"
-                    "1. Acknowledge the issue empathetically\n"
-                    "2. Provide ONE focused solution at a time with 3-6 clear, step-by-step actions that explain exactly how to carry out that solution\n\n"
-                    "STRICT RULE: Do NOT suggest the user to 'contact customer support', 'call customer care', "
-                    "'raise a ticket', 'reach out to support', or any form of escalation. "
-                    "Only provide self-help troubleshooting steps that the user can do on their own.\n\n"
-                    f"IMPORTANT: Respond entirely in {language}. "
-                    "Keep the tone professional, empathetic, and helpful."
+                    f"You are a senior telecom network support specialist. The customer has reported an issue "
+                    f"under: '{sector_name}' > '{subprocess_name}'.\n\n"
+                    "RESPONSE FORMAT:\n"
+                    "1. One-line empathetic acknowledgment of the specific issue.\n"
+                    "2. ONE precise, field-proven solution with 3-5 numbered steps.\n\n"
+                    "STEP QUALITY RULES — every step must be:\n"
+                    "• Specific: include exact menu paths, setting names, dial codes, or field values (e.g. 'Settings → Mobile Network → Preferred Network Type → 4G/LTE only').\n"
+                    "• Actionable: tell the user exactly what to tap, toggle, enter, or dial — never vague instructions like 'check your settings'.\n"
+                    "• Technically grounded: use industry-standard methods (APN reconfiguration, VoLTE/VoWiFi toggle, network band selection, USSD codes, eSIM re-provisioning, ONT/ONU LED diagnosis, transponder re-scan, UPC regeneration, etc.).\n\n"
+                    "BANNED SUGGESTIONS (never include):\n"
+                    "- Restart phone / toggle airplane mode\n"
+                    "- Restart router or modem\n"
+                    "- Move to open area or near a window\n"
+                    "- Wait for network congestion\n"
+                    "- Contact customer support / call care / raise ticket / visit service center\n\n"
+                    "ISSUE-SPECIFIC TECHNICAL GUIDANCE (apply the relevant section):\n"
+                    "Mobile data not working: Manually configure APN via Settings → SIM & Network → Access Point Names → Add New APN (enter operator APN name/type: default,supl; MCC/MNC per operator). Check Preferred Network Type (Settings → Mobile Network → set to LTE/4G), SIM slot assignment, and Data Roaming flag.\n"
+                    "Call drops / poor voice: Enable VoLTE at Settings → Mobile Network → VoLTE Calls → ON. Enable VoWiFi at Settings → Mobile Network → Wi-Fi Calling → ON. To check/lock band: dial *#2263# (Samsung) and select preferred band (Band 3 1800MHz / Band 40 2300MHz TDD-LTE per operator).\n"
+                    "Billing / wrong deduction: Dial *121# or *199# for itemised balance; *121*1# for data pack status; *123# for talktime ledger. To dispute: open carrier app → My Account → Bill Details → Dispute Transaction. Request CDR from Usage History in self-care app.\n"
+                    "Plan/pack not activated: Check provisioning via *199*2# or *121*2#. For eSIM: Settings → Cellular → Add eSIM → rescan operator QR; if error, generate new QR from operator self-care app. For prepaid: dial *444# to verify active pack; retry activation via USSD after top-up.\n"
+                    "Broadband / fiber slow: Diagnose via ONT LEDs — LOS red = fiber break (ISP fault); PON off = ODN issue; INTERNET amber = PPPoE auth failure. Fix PPPoE: router admin (192.168.1.1) → WAN → re-enter PPPoE credentials. Set DNS to 1.1.1.1 / 8.8.8.8 and MTU to 1492 (PPPoE) in router LAN settings.\n"
+                    "DTH signal loss: Check signal strength in TV menu (target >60%). Re-scan transponders: Dish TV → Setup → Edit TP → 11090 V 30000; Tata Play → 12515 H 22000. Reactivate smart card: carrier app → Manage Device → Reactivate Smart Card (provisioning takes ~15 min).\n"
+                    "MNP / Port-in stuck: Regenerate UPC by sending SMS 'PORT <10-digit number>' to 1900 (valid 4 days). Check port status: SMS 'PORTSTATUS' to 1900. If HLR not updated after 7 working days, the operator must trigger HLR refresh via NOC — initiate via self-care portal under 'Port Request Status'.\n\n"
+                    "Do NOT include any URLs or hyperlinks.\n"
+                    f"Respond entirely in {language}. Be concise, precise, and technically accurate."
                 )},
                 {"role": "user", "content": query},
             ],
@@ -677,9 +742,10 @@ def generate_single_solution(sector_name, subprocess_name, language, user_query=
     if diagnosis_summary:
         diagnosis_block = (
             f"\n\nSIGNAL DIAGNOSIS RESULTS: {diagnosis_summary}\n"
-            "Use this diagnosis data to tailor your solution. If signal is poor/weak, suggest "
-            "signal-related fixes (relocate, check antenna, network mode). If signal is good, "
-            "focus on other causes (device settings, account issues, congestion)."
+            "Use this diagnosis data to tailor your solution precisely. "
+            "If RSRP < -100 dBm or SINR < 0 dB: the issue is cell-edge coverage — suggest network band change (*#2263# to lock a stronger band), VoLTE/VoWiFi enablement, or SIM re-provisioning to trigger HLR re-attachment. "
+            "If RSRP -100 to -85 dBm: moderate signal — focus on device-side fixes (APN reconfiguration, preferred network type, VoLTE toggle). "
+            "If RSRP > -85 dBm and SINR > 5 dB: signal is adequate — focus on account/provisioning issues (pack activation via USSD, APN type mismatch, IPv6 toggle, MTU adjustment)."
         )
 
     try:
@@ -687,25 +753,32 @@ def generate_single_solution(sector_name, subprocess_name, language, user_query=
             model=DEPLOYMENT_NAME,
             messages=[
                 {"role": "system", "content": (
-                    f"You are an expert telecom customer support agent. The user has an issue "
-                    f"under the sector: '{sector_name}' and subprocess: '{subprocess_name}'.\n\n"
-                    f"This is solution attempt #{attempt}.\n\n"
-                    "IMPORTANT: Base this solution on BOTH the selected dropdown context "
-                    "(sector/subprocess) and the user's latest query. "
-                    "If they conflict, prioritize the latest query while staying within telecom scope.\n\n"
-                    "Provide ONE focused, actionable solution at a time with steps that explain how to perform that action. "
-                    "Be concise and specific. Do not provide multiple alternative solutions -- just one.\n"
-                    "Do NOT include any URLs, links, or website references in your response.\n"
-                    "STRICT RULE: Do NOT suggest the user to 'contact customer support', 'call customer care', "
-                    "'raise a ticket', 'reach out to support', 'visit a service center', or any form of escalation. "
-                    "Only provide self-help troubleshooting steps that the user can do on their own.\n"
-                    "Acknowledge the issue briefly and give the steps."
+                    f"You are a senior telecom network support specialist. The customer has an issue "
+                    f"under: '{sector_name}' > '{subprocess_name}'. This is solution attempt #{attempt}.\n\n"
+                    "Provide exactly ONE precise, field-proven solution with 3-5 numbered steps. Each step must:\n"
+                    "• Include exact menu paths, setting names, dial codes, or field values.\n"
+                    "• Tell the user exactly what to tap, toggle, enter, or dial — no vague instructions.\n"
+                    "• Use industry-standard troubleshooting methods (APN config, VoLTE/VoWiFi toggle, band locking, USSD codes, PPPoE re-auth, ONT LED diagnosis, eSIM re-provisioning, etc.).\n\n"
+                    "BANNED SUGGESTIONS (never include):\n"
+                    "- Restart phone / toggle airplane mode\n"
+                    "- Restart router or modem\n"
+                    "- Move to open area or near a window\n"
+                    "- Wait for network congestion\n"
+                    "- Contact support / call care / raise ticket / visit service center\n\n"
+                    "ISSUE-SPECIFIC TECHNICAL GUIDANCE (apply relevant section):\n"
+                    "Mobile data: Configure APN (Settings → SIM & Network → Access Point Names → New APN → enter name/type/MCC/MNC). Set Preferred Network Type to LTE/4G. Check SIM slot assignment and Data Roaming flag.\n"
+                    "Call drops/voice: VoLTE: Settings → Mobile Network → VoLTE Calls → ON. VoWiFi: Settings → Mobile Network → Wi-Fi Calling → ON. Band lock: *#2263# (Samsung) → select Band 3/40 per operator.\n"
+                    "Billing: Balance: *121# or *199#. Data pack: *121*1#. Talktime: *123#. Dispute via carrier app → My Account → Bill Details → Dispute Transaction. CDR from app → Usage History.\n"
+                    "Plan activation: Provisioning: *199*2#. eSIM: Settings → Cellular → Add eSIM → rescan QR or generate new QR via self-care app. Prepaid pack: *444# to verify; retry via USSD post top-up.\n"
+                    "Broadband/fiber: ONT LEDs: LOS red = fiber break; INTERNET amber = PPPoE failure → re-enter credentials at 192.168.1.1 → WAN. DNS: 1.1.1.1/8.8.8.8, MTU: 1492.\n"
+                    "DTH: Signal check via TV menu (>60%). Dish TV transponder: 11090 V 30000. Tata Play: 12515 H 22000. Smart card: carrier app → Manage Device → Reactivate.\n"
+                    "MNP/port-in: UPC: SMS 'PORT <number>' to 1900. Status: SMS 'PORTSTATUS' to 1900. HLR refresh after 7 days via self-care → Port Request Status.\n\n"
+                    "Do NOT include any URLs or hyperlinks.\n"
                     + query_block
                     + context_block
                     + diagnosis_block
                     + prev_block +
-                    f"\n\nIMPORTANT: Respond entirely in {language}. "
-                    "Keep the tone professional, empathetic, and helpful."
+                    f"\n\nRespond entirely in {language}. Be concise, precise, and technically accurate."
                 )},
                 {"role": "user", "content": user_query if user_query else f"I have an issue with {subprocess_name} in {sector_name}"},
             ],
@@ -1115,30 +1188,101 @@ def classify_response_route():
 @app.route("/api/chat/session", methods=["POST"])
 @jwt_required()
 def create_chat_session():
+    """Create a new chat session or reuse the latest active one for the user."""
     user_id = int(get_jwt_identity())
-    session = ChatSession(user_id=user_id, status="active")
+    data = request.json or {}
+    force_new = bool(data.get("force_new"))
+    current_step = data.get("current_step") or "greeting"
+
+    if not force_new:
+        existing = ChatSession.query.filter(
+            ChatSession.user_id == user_id,
+            ChatSession.status.in_(["active", "escalated"])
+        ).order_by(ChatSession.last_message_at.desc()).first()
+        if existing:
+            return jsonify({
+                "session": existing.to_dict(),
+                "messages": [m.to_dict() for m in existing.messages],
+                "reused": True,
+            }), 200
+
+    session = ChatSession(
+        user_id=user_id,
+        status="active",
+        current_step=current_step,
+        last_message_at=datetime.now(timezone.utc),
+    )
     db.session.add(session)
     db.session.commit()
-    return jsonify({"session": session.to_dict()}), 201
+    return jsonify({"session": session.to_dict(), "messages": []}), 201
+
+
+@app.route("/api/chat/session/active", methods=["GET"])
+@jwt_required()
+def get_active_session():
+    """Return the most recent active (or latest) session with full message history."""
+    user_id = int(get_jwt_identity())
+    session = ChatSession.query.filter(
+        ChatSession.user_id == user_id,
+        ChatSession.status.in_(["active", "escalated"])
+    ).order_by(ChatSession.last_message_at.desc()).first()
+
+    if not session:
+        session = ChatSession.query.filter_by(user_id=user_id).order_by(ChatSession.last_message_at.desc()).first()
+
+    if not session:
+        return jsonify({"session": None, "messages": []}), 200
+
+    now_utc = datetime.now(timezone.utc)
+    updated = False
+    for m in session.messages:
+        if m.sender == "agent" and m.delivered_at is None:
+            m.delivered_at = now_utc
+            updated = True
+    if updated:
+        db.session.commit()
+
+    return jsonify({
+        "session": session.to_dict(),
+        "messages": [m.to_dict() for m in session.messages],
+    }), 200
+
+
+@app.route("/api/chat/sessions", methods=["GET"])
+@jwt_required()
+def list_sessions():
+    """List all chat sessions for the logged-in customer (most recent first)."""
+    user_id = int(get_jwt_identity())
+    sessions = ChatSession.query.filter_by(user_id=user_id).order_by(ChatSession.last_message_at.desc()).all()
+    return jsonify({
+        "sessions": [s.to_dict() for s in sessions]
+    })
 
 
 @app.route("/api/chat/session/<int:session_id>/message", methods=["POST"])
 @jwt_required()
 def add_chat_message(session_id):
     user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
     session = ChatSession.query.get(session_id)
     if not session:
         return jsonify({"error": "Session not found"}), 404
+    if session.user_id != user_id and (not user or user.role != "human_agent"):
+        return jsonify({"error": "Unauthorized"}), 403
 
     data = request.json
+    payload = data.get("payload")
     msg = ChatMessage(
         session_id=session_id,
         sender=data.get("sender", "user"),
-        content=data.get("content", ""),
+        content=data.get("content", "") or "",
+        content_json=payload if isinstance(payload, dict) else None,
     )
     db.session.add(msg)
 
     # Update session metadata
+    if data.get("current_step"):
+        session.current_step = data["current_step"]
     if data.get("sector_name"):
         session.sector_name = data["sector_name"]
     if data.get("subprocess_name"):
@@ -1149,8 +1293,10 @@ def add_chat_message(session_id):
         session.resolution = data["resolution"]
     if data.get("language"):
         session.language = data["language"]
+    session.last_message_at = datetime.now(timezone.utc)
 
     db.session.commit()
+    _emit_session_message(msg)
     return jsonify({"message": msg.to_dict()})
 # ═══════════════════════════════════════════════════════════════════
 # ADD THIS NEW ROUTE to app.py
@@ -1168,6 +1314,10 @@ def save_session_location(session_id):
         return jsonify({"error": "Session not found"}), 404
     if session.user_id != user_id:
         return jsonify({"error": "Unauthorized"}), 403
+
+    data = request.json or {}
+    if data.get("location_description"):
+        session.location_description = data.get("location_description")
 
     # ── Default coordinates (Gurgaon, Haryana) ────────────────────────────────
     DEFAULT_LATITUDE  = 28.4595
@@ -1192,15 +1342,19 @@ def save_session_location(session_id):
 def analyze_signal(session_id):
     """Analyze a signal screenshot using Azure OpenAI Vision."""
     user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
     session = ChatSession.query.get(session_id)
 
     if not session:
         return jsonify({"error": "Session not found"}), 404
-    if session.user_id != user_id:
+    if not user:
+        return jsonify({"error": "Unauthorized"}), 401
+    if session.user_id != user_id and user.role != "human_agent":
         return jsonify({"error": "Unauthorized"}), 403
 
     data = request.json
     image_base64 = data.get("image")
+    image_data_url = data.get("image_data_url")
 
     if not image_base64:
         return jsonify({"error": "No image provided"}), 400
@@ -1210,6 +1364,16 @@ def analyze_signal(session_id):
         return jsonify({"error": "Image too large. Please upload a smaller screenshot."}), 400
 
     try:
+        # Send customer screenshot to agent view (if any)
+        if not image_data_url:
+            image_data_url = f"data:image/png;base64,{image_base64}"
+        image_msg = ChatMessage(
+            session_id=session_id,
+            sender="customer",
+            content=f"__IMAGE__:{image_data_url}",
+        )
+        db.session.add(image_msg)
+
         result = analyze_signal_screenshot(image_base64)
 
         # If signal is red (Poor), do not include nearest tower sites in user-facing diagnosis
@@ -1231,7 +1395,12 @@ def analyze_signal(session_id):
 
         msg = ChatMessage(session_id=session_id, sender="bot", content=diagnosis_text)
         db.session.add(msg)
+        # Mark that diagnosis has been completed for this session
+        session.diagnosis_ran = True
+        session.last_message_at = datetime.now(timezone.utc)
         db.session.commit()
+        _emit_session_message(image_msg)
+        _emit_session_message(msg)
 
         return jsonify({"diagnosis": result}), 200
     except Exception as e:
@@ -1248,7 +1417,10 @@ def resolve_session(session_id):
 
     session.status = "resolved"
     session.resolved_at = datetime.now(timezone.utc)
+    session.current_step = "resolved"
+    session.last_message_at = datetime.now(timezone.utc)
     db.session.commit()
+    _emit_session_update(session)
 
     # Generate summary
     try:
@@ -1338,6 +1510,8 @@ def escalate_session(session_id):
         return jsonify({"error": "Session not found"}), 404
 
     session.status = "escalated"
+    session.current_step = "human_handoff"
+    session.last_message_at = datetime.now(timezone.utc)
 
     # Generate summary
     msgs = [{"sender": m.sender, "content": m.content} for m in session.messages]
@@ -1574,10 +1748,54 @@ def get_chat_session(session_id):
         return jsonify({"error": "Session not found"}), 404
     if session.user_id != user_id:
         return jsonify({"error": "Unauthorized"}), 403
+    now_utc = datetime.now(timezone.utc)
+    updated = False
+    for m in session.messages:
+        if m.sender == "agent" and m.delivered_at is None:
+            m.delivered_at = now_utc
+            updated = True
+    if updated:
+        db.session.commit()
     return jsonify({
         "session": session.to_dict(),
         "messages": [m.to_dict() for m in session.messages],
     })
+
+
+@app.route("/api/chat/session/<int:session_id>/seen", methods=["POST"])
+@jwt_required()
+def mark_chat_seen(session_id):
+    user_id = int(get_jwt_identity())
+    session = ChatSession.query.get(session_id)
+    if not session:
+        return jsonify({"error": "Session not found"}), 404
+    if session.user_id != user_id:
+        return jsonify({"error": "Unauthorized"}), 403
+
+    data = request.json or {}
+    message_ids = data.get("message_ids") or []
+    if message_ids and not isinstance(message_ids, list):
+        return jsonify({"error": "message_ids must be a list"}), 400
+
+    q = ChatMessage.query.filter(
+        ChatMessage.session_id == session_id,
+        ChatMessage.sender == "agent",
+    )
+    if message_ids:
+        q = q.filter(ChatMessage.id.in_(message_ids))
+
+    now_utc = datetime.now(timezone.utc)
+    updated = 0
+    for m in q.all():
+        if m.seen_at is None:
+            m.seen_at = now_utc
+            if m.delivered_at is None:
+                m.delivered_at = now_utc
+            updated += 1
+    if updated:
+        db.session.commit()
+
+    return jsonify({"updated": updated})
 
 
 @app.route("/api/chat/session/<int:session_id>/status", methods=["GET"])
@@ -4290,6 +4508,33 @@ def agent_send_message(session_id):
     )
     db.session.add(msg)
     db.session.commit()
+    _emit_session_message(msg)
+    return jsonify({"message": msg.to_dict()}), 201
+
+
+@app.route("/api/agent/chat/<int:session_id>/request-diagnosis", methods=["POST"])
+@jwt_required()
+def agent_request_diagnosis(session_id):
+    """Agent requests the customer to run a signal diagnosis."""
+    user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
+    if not user or user.role != "human_agent":
+        return jsonify({"error": "Unauthorized"}), 403
+    session = ChatSession.query.get(session_id)
+    if not session:
+        return jsonify({"error": "Session not found"}), 404
+    if session.diagnosis_ran:
+        return jsonify({"error": "Diagnosis already completed for this session"}), 400
+
+    # Insert a special system-trigger message the customer's chat will detect
+    msg = ChatMessage(
+        session_id=session_id,
+        sender="agent",
+        content="__AGENT_REQUEST_DIAGNOSIS__",
+    )
+    db.session.add(msg)
+    db.session.commit()
+    _emit_session_message(msg)
     return jsonify({"message": msg.to_dict()}), 201
 
 
@@ -4493,6 +4738,36 @@ with app.app_context():
                 conn.execute(sa_text("ALTER TABLE kpi_data ADD COLUMN cell_site_id VARCHAR(100)"))
                 conn.commit()
                 print(">>> Added cell_site_id column to kpi_data")
+    if insp.has_table("chat_messages"):
+        existing_cols = [c["name"] for c in insp.get_columns("chat_messages")]
+        with db.engine.connect() as conn:
+            if "delivered_at" not in existing_cols:
+                conn.execute(sa_text("ALTER TABLE chat_messages ADD COLUMN delivered_at TIMESTAMP"))
+                conn.commit()
+                print(">>> Added delivered_at column to chat_messages")
+            if "seen_at" not in existing_cols:
+                conn.execute(sa_text("ALTER TABLE chat_messages ADD COLUMN seen_at TIMESTAMP"))
+                conn.commit()
+                print(">>> Added seen_at column to chat_messages")
+            if "content_json" not in existing_cols:
+                conn.execute(sa_text("ALTER TABLE chat_messages ADD COLUMN content_json JSON"))
+                conn.commit()
+                print(">>> Added content_json column to chat_messages")
+    if insp.has_table("chat_sessions"):
+        existing_cols = [c["name"] for c in insp.get_columns("chat_sessions")]
+        with db.engine.connect() as conn:
+            if "diagnosis_ran" not in existing_cols:
+                conn.execute(sa_text("ALTER TABLE chat_sessions ADD COLUMN diagnosis_ran BOOLEAN NOT NULL DEFAULT FALSE"))
+                conn.commit()
+                print(">>> Added diagnosis_ran column to chat_sessions")
+            if "current_step" not in existing_cols:
+                conn.execute(sa_text("ALTER TABLE chat_sessions ADD COLUMN current_step VARCHAR(50) NOT NULL DEFAULT 'greeting'"))
+                conn.commit()
+                print(">>> Added current_step column to chat_sessions")
+            if "last_message_at" not in existing_cols:
+                conn.execute(sa_text("ALTER TABLE chat_sessions ADD COLUMN last_message_at TIMESTAMP DEFAULT NOW()"))
+                conn.commit()
+                print(">>> Added last_message_at column to chat_sessions")
 
     # Seed default admin if none exists
     if not User.query.filter_by(role="admin").first():

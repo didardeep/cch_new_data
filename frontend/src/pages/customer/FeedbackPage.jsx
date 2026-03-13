@@ -12,13 +12,16 @@ export default function FeedbackPage() {
   const [comment, setComment] = useState('');
   const [submitted, setSubmitted] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [sessionChecked, setSessionChecked] = useState(false);
 
   // Load session details if session ID is provided
   useEffect(() => {
     if (sessionId) {
-      apiGet(`/api/chat/session/${sessionId}`).then(d => {
-        if (d?.session) setSession(d.session);
-      });
+      apiGet(`/api/chat/session/${sessionId}`)
+        .then(d => { if (d?.session) setSession(d.session); })
+        .finally(() => setSessionChecked(true));
+    } else {
+      setSessionChecked(true);
     }
   }, [sessionId]);
 
@@ -45,18 +48,34 @@ export default function FeedbackPage() {
     }
   };
 
+  const canShowForm = !!sessionId && sessionChecked && session?.status === 'resolved';
+  const showBlocked = sessionChecked && (!sessionId || !session || session.status !== 'resolved');
+
   return (
     <div>
       <div className="page-header">
         <h1>Provide Feedback</h1>
-        <p>{sessionId ? 'Rate your recent support experience' : 'Help us improve our service by sharing your experience'}</p>
+        <p>{sessionId ? 'Rate your recent support experience' : 'Feedback is available after a chat ends'}</p>
       </div>
 
       {submitted && (
         <div className="toast-success">Thank you for your feedback!</div>
       )}
 
-      {!submitted && (
+      {showBlocked && (
+        <div className="feedback-card" style={{ background: '#fff7ed', borderColor: '#fed7aa' }}>
+          <div style={{ fontSize: 14, fontWeight: 700, color: '#9a3412', marginBottom: 6 }}>
+            Feedback available after chat ends
+          </div>
+          <div style={{ fontSize: 13, color: '#7c2d12', lineHeight: 1.6 }}>
+            {sessionId
+              ? 'This chat is still active or not yet resolved. End the chat with the bot to provide feedback.'
+              : 'Open a completed chat session to provide feedback.'}
+          </div>
+        </div>
+      )}
+
+      {!submitted && canShowForm && (
         <div className="feedback-card">
           {session && (
             <div style={{

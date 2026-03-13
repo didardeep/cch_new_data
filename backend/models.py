@@ -99,7 +99,10 @@ class ChatMessage(db.Model):
     session_id = db.Column(db.Integer, db.ForeignKey("chat_sessions.id"), nullable=False)
     sender = db.Column(db.String(20), nullable=False)
     content = db.Column(db.Text, nullable=False)
+    content_json = db.Column(db.JSON, nullable=True)
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+    delivered_at = db.Column(db.DateTime, nullable=True)
+    seen_at = db.Column(db.DateTime, nullable=True)
 
     def to_dict(self):
         return {
@@ -107,7 +110,10 @@ class ChatMessage(db.Model):
             "session_id": self.session_id,
             "sender": self.sender,
             "content": self.content,
+            "payload": self.content_json,
             "created_at": self.created_at.isoformat() if self.created_at else None,
+            "delivered_at": self.delivered_at.isoformat() if self.delivered_at else None,
+            "seen_at": self.seen_at.isoformat() if self.seen_at else None,
         }
 
 
