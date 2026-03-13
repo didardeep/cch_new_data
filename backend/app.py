@@ -692,7 +692,9 @@ def generate_resolution(query, sector_name, subprocess_name, language):
             messages=[
                 {"role": "system", "content": (
                     f"You are a senior telecom network support specialist. The customer has reported an issue "
-                    f"under: '{sector_name}' > '{subprocess_name}'.\n\n"
+                    f"under: '{sector_name}' > '{subprocess_name}'.\n"
+                    "You must scope all solutions strictly to this subprocess. Do NOT mix solutions from sibling subprocesses. "
+                    "For example, if subprocess is 'Network / Signal Problems – Internet / Mobile Data', do NOT mention call drop or call failure steps.\n\n"
                     "RESPONSE FORMAT:\n"
                     "1. One-line empathetic acknowledgment of the specific issue.\n"
                     "2. ONE precise, field-proven solution with 3-5 numbered steps.\n\n"
@@ -761,7 +763,9 @@ def generate_single_solution(sector_name, subprocess_name, language, user_query=
             messages=[
                 {"role": "system", "content": (
                     f"You are a senior telecom network support specialist. The customer has an issue "
-                    f"under: '{sector_name}' > '{subprocess_name}'. This is solution attempt #{attempt}.\n\n"
+                    f"under: '{sector_name}' > '{subprocess_name}'. This is solution attempt #{attempt}.\n"
+                    "Stay strictly within this subprocess. Do NOT mix steps from sibling subprocesses "
+                    "(e.g., if subprocess is 'Network / Signal Problems – Internet / Mobile Data', do not mention call-drop or call-failure steps).\n\n"
                     "Provide exactly ONE precise, field-proven solution with 3-5 numbered steps. Each step must:\n"
                     "• Include exact menu paths, setting names, dial codes, or field values.\n"
                     "• Tell the user exactly what to tap, toggle, enter, or dial — no vague instructions.\n"
@@ -4775,6 +4779,10 @@ with app.app_context():
                 conn.execute(sa_text("ALTER TABLE chat_sessions ADD COLUMN last_message_at TIMESTAMP DEFAULT NOW()"))
                 conn.commit()
                 print(">>> Added last_message_at column to chat_sessions")
+            if "customer_present" not in existing_cols:
+                conn.execute(sa_text("ALTER TABLE chat_sessions ADD COLUMN customer_present BOOLEAN NOT NULL DEFAULT FALSE"))
+                conn.commit()
+                print(">>> Added customer_present column to chat_sessions")
 
     # Seed default admin if none exists
     if not User.query.filter_by(role="admin").first():
