@@ -22,8 +22,7 @@ export async function apiCall(endpoint, options = {}) {
 
   if (resp.status === 401 && !endpoint.startsWith('/api/auth/')) {
     clearToken();
-    window.location.href = '/login';
-    return null;
+    return Promise.reject(new Error('unauthorized'));
   }
 
   return resp.json();

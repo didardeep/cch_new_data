@@ -1188,30 +1188,101 @@ def classify_response_route():
 @app.route("/api/chat/session", methods=["POST"])
 @jwt_required()
 def create_chat_session():
+    """Create a new chat session or reuse the latest active one for the user."""
     user_id = int(get_jwt_identity())
-    session = ChatSession(user_id=user_id, status="active")
+    data = request.json or {}
+    force_new = bool(data.get("force_new"))
+    current_step = data.get("current_step") or "greeting"
+
+    if not force_new:
+        existing = ChatSession.query.filter(
+            ChatSession.user_id == user_id,
+            ChatSession.status.in_(["active", "escalated"])
+        ).order_by(ChatSession.last_message_at.desc()).first()
+        if existing:
+            return jsonify({
+                "session": existing.to_dict(),
+                "messages": [m.to_dict() for m in existing.messages],
+                "reused": True,
+            }), 200
+
+    session = ChatSession(
+        user_id=user_id,
+        status="active",
+        current_step=current_step,
+        last_message_at=datetime.now(timezone.utc),
+    )
     db.session.add(session)
     db.session.commit()
-    return jsonify({"session": session.to_dict()}), 201
+    return jsonify({"session": session.to_dict(), "messages": []}), 201
+
+
+@app.route("/api/chat/session/active", methods=["GET"])
+@jwt_required()
+def get_active_session():
+    """Return the most recent active (or latest) session with full message history."""
+    user_id = int(get_jwt_identity())
+    session = ChatSession.query.filter(
+        ChatSession.user_id == user_id,
+        ChatSession.status.in_(["active", "escalated"])
+    ).order_by(ChatSession.last_message_at.desc()).first()
+
+    if not session:
+        session = ChatSession.query.filter_by(user_id=user_id).order_by(ChatSession.last_message_at.desc()).first()
+
+    if not session:
+        return jsonify({"session": None, "messages": []}), 200
+
+    now_utc = datetime.now(timezone.utc)
+    updated = False
+    for m in session.messages:
+        if m.sender == "agent" and m.delivered_at is None:
+            m.delivered_at = now_utc
+            updated = True
+    if updated:
+        db.session.commit()
+
+    return jsonify({
+        "session": session.to_dict(),
+        "messages": [m.to_dict() for m in session.messages],
+    }), 200
+
+
+@app.route("/api/chat/sessions", methods=["GET"])
+@jwt_required()
+def list_sessions():
+    """List all chat sessions for the logged-in customer (most recent first)."""
+    user_id = int(get_jwt_identity())
+    sessions = ChatSession.query.filter_by(user_id=user_id).order_by(ChatSession.last_message_at.desc()).all()
+    return jsonify({
+        "sessions": [s.to_dict() for s in sessions]
+    })
 
 
 @app.route("/api/chat/session/<int:session_id>/message", methods=["POST"])
 @jwt_required()
 def add_chat_message(session_id):
     user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
     session = ChatSession.query.get(session_id)
     if not session:
         return jsonify({"error": "Session not found"}), 404
+    if session.user_id != user_id and (not user or user.role != "human_agent"):
+        return jsonify({"error": "Unauthorized"}), 403
 
     data = request.json
+    payload = data.get("payload")
     msg = ChatMessage(
         session_id=session_id,
         sender=data.get("sender", "user"),
-        content=data.get("content", ""),
+        content=data.get("content", "") or "",
+        content_json=payload if isinstance(payload, dict) else None,
     )
     db.session.add(msg)
 
     # Update session metadata
+    if data.get("current_step"):
+        session.current_step = data["current_step"]
     if data.get("sector_name"):
         session.sector_name = data["sector_name"]
     if data.get("subprocess_name"):
@@ -1222,6 +1293,7 @@ def add_chat_message(session_id):
         session.resolution = data["resolution"]
     if data.get("language"):
         session.language = data["language"]
+    session.last_message_at = datetime.now(timezone.utc)
 
     db.session.commit()
     _emit_session_message(msg)
@@ -1325,6 +1397,7 @@ def analyze_signal(session_id):
         db.session.add(msg)
         # Mark that diagnosis has been completed for this session
         session.diagnosis_ran = True
+        session.last_message_at = datetime.now(timezone.utc)
         db.session.commit()
         _emit_session_message(image_msg)
         _emit_session_message(msg)
@@ -1344,6 +1417,8 @@ def resolve_session(session_id):
 
     session.status = "resolved"
     session.resolved_at = datetime.now(timezone.utc)
+    session.current_step = "resolved"
+    session.last_message_at = datetime.now(timezone.utc)
     db.session.commit()
     _emit_session_update(session)
 
@@ -1435,6 +1510,8 @@ def escalate_session(session_id):
         return jsonify({"error": "Session not found"}), 404
 
     session.status = "escalated"
+    session.current_step = "human_handoff"
+    session.last_message_at = datetime.now(timezone.utc)
 
     # Generate summary
     msgs = [{"sender": m.sender, "content": m.content} for m in session.messages]
@@ -4669,6 +4746,10 @@ with app.app_context():
                 conn.execute(sa_text("ALTER TABLE chat_messages ADD COLUMN seen_at TIMESTAMP"))
                 conn.commit()
                 print(">>> Added seen_at column to chat_messages")
+            if "content_json" not in existing_cols:
+                conn.execute(sa_text("ALTER TABLE chat_messages ADD COLUMN content_json JSON"))
+                conn.commit()
+                print(">>> Added content_json column to chat_messages")
     if insp.has_table("chat_sessions"):
         existing_cols = [c["name"] for c in insp.get_columns("chat_sessions")]
         with db.engine.connect() as conn:
@@ -4676,6 +4757,14 @@ with app.app_context():
                 conn.execute(sa_text("ALTER TABLE chat_sessions ADD COLUMN diagnosis_ran BOOLEAN NOT NULL DEFAULT FALSE"))
                 conn.commit()
                 print(">>> Added diagnosis_ran column to chat_sessions")
+            if "current_step" not in existing_cols:
+                conn.execute(sa_text("ALTER TABLE chat_sessions ADD COLUMN current_step VARCHAR(50) NOT NULL DEFAULT 'greeting'"))
+                conn.commit()
+                print(">>> Added current_step column to chat_sessions")
+            if "last_message_at" not in existing_cols:
+                conn.execute(sa_text("ALTER TABLE chat_sessions ADD COLUMN last_message_at TIMESTAMP DEFAULT NOW()"))
+                conn.commit()
+                print(">>> Added last_message_at column to chat_sessions")
 
     # Seed default admin if none exists
     if not User.query.filter_by(role="admin").first():

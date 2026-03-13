@@ -65,6 +65,75 @@ function getFollowupOptions(subprocessName) {
   return SUBPROCESS_FOLLOWUP_OPTIONS[key] || [];
 }
 
+// Message types that should be persisted to backend with payload for full replay
+const PERSIST_TYPES = new Set([
+  'sector-menu',
+  'subprocess-grid',
+  'network-subissue-grid',
+  'location-question',
+  'location-prompt',
+  'location-success',
+  'location-required',
+  'signal-offer',
+  'signal-codes',
+  'screenshot-upload',
+  'resolution',
+  'diagnosis-result',
+  'handoff',
+  'post-actions',
+  'unsat-options',
+  'email-action',
+  'email-sent',
+  'agent-resolved',
+]);
+
+function sanitizePayload(value) {
+  if (value === null || value === undefined) return value;
+  if (typeof value === 'function') return undefined;
+  if (typeof value !== 'object') return value;
+  if (Array.isArray(value)) return value.map(sanitizePayload);
+  const out = {};
+  Object.entries(value).forEach(([k, v]) => {
+    if (typeof v === 'function') return;
+    out[k] = sanitizePayload(v);
+  });
+  return out;
+}
+
+function stripHtml(html = '') {
+  if (!html) return '';
+  const tmp = document.createElement('div');
+  tmp.innerHTML = html;
+  return (tmp.textContent || tmp.innerText || '').trim();
+}
+
+const CACHE_PREFIX = 'chat_session_cache_';
+const cacheKey = (sessionId) => `${CACHE_PREFIX}${sessionId}`;
+
+function loadCachedSession(sessionId) {
+  if (!sessionId) return null;
+  try {
+    const raw = localStorage.getItem(cacheKey(sessionId));
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveCachedSession(sessionId, payload) {
+  if (!sessionId) return;
+  try {
+    localStorage.setItem(cacheKey(sessionId), JSON.stringify(payload));
+  } catch {}
+}
+
+function clearCachedSession(sessionId) {
+  if (!sessionId) return;
+  try {
+    localStorage.removeItem(cacheKey(sessionId));
+  } catch {}
+}
+
 export default function ChatSupport() {
   const { user } = useAuth();
   const navigate = useNavigate();
@@ -74,6 +143,7 @@ export default function ChatSupport() {
   const [wsConnected, setWsConnected] = useState(false);
 
   const [initPhase, setInitPhase] = useState('loading');
+  const [startChoice, setStartChoice] = useState(true);
 
   const [messages, setMessages] = useState([]);
   const [inputVisible, setInputVisible] = useState(false);
@@ -92,6 +162,7 @@ export default function ChatSupport() {
   const inputRef = useRef(null);
   const sessionIdRef = useRef(null);
   const socketRef = useRef(null);
+  const resumeNeededRef = useRef(false);
   const stateRef = useRef({
     step: 'welcome',
     sectorKey: null,
@@ -108,7 +179,6 @@ export default function ChatSupport() {
     diagnosisRan: false,
   });
   const msgIdCounter = useRef(0);
-
   const nextId = () => ++msgIdCounter.current;
 
   const scrollToBottom = useCallback(() => {
@@ -118,14 +188,6 @@ export default function ChatSupport() {
       }
     }, 100);
   }, []);
-
-  const addMessage = useCallback((msg) => {
-    const id = nextId();
-    const groupId = msg.groupId || id;
-    setMessages(prev => [...prev, { ...msg, id, groupId }]);
-    scrollToBottom();
-    return groupId;
-  }, [scrollToBottom]);
 
   const disableGroup = useCallback((groupId) => {
     setDisabledGroups(prev => new Set([...prev, groupId]));
@@ -139,15 +201,6 @@ export default function ChatSupport() {
 
   const hideInput = useCallback(() => {
     setInputVisible(false);
-  }, []);
-
-  const saveMessage = useCallback(async (sender, content, meta = {}) => {
-    if (!sessionIdRef.current) return;
-    try {
-      await chatApiCall(`/api/chat/session/${sessionIdRef.current}/message`, {
-        sender, content, ...meta,
-      });
-    } catch (e) {}
   }, []);
 
   const joinSocketSession = useCallback(() => {
@@ -173,15 +226,85 @@ export default function ChatSupport() {
     } catch (e) {}
   }, []);
 
-  const createSession = useCallback(async () => {
+  const ensureSession = useCallback(async ({ forceNew = false, step = null } = {}) => {
     try {
-      const data = await chatApiCall('/api/chat/session', {});
+      const payload = { force_new: forceNew };
+      if (step) payload.current_step = step;
+      const data = await chatApiCall('/api/chat/session', payload);
       if (data.session) {
         sessionIdRef.current = data.session.id;
+        localStorage.setItem('chat_session_id', String(data.session.id));
+        if (forceNew) clearCachedSession(sessionIdRef.current);
         joinSocketSession();
       }
-    } catch (e) {}
+      return sessionIdRef.current;
+    } catch (e) {
+      return null;
+    }
   }, [joinSocketSession]);
+
+  const saveMessage = useCallback(async (sender, content, meta = {}) => {
+    if (!sessionIdRef.current) {
+      await ensureSession({ step: stateRef.current.step });
+    }
+    if (!sessionIdRef.current) return;
+    try {
+      const contentPlain = sender === 'bot' ? stripHtml(meta.html || content || '') : content;
+      await chatApiCall(`/api/chat/session/${sessionIdRef.current}/message`, {
+        sender,
+        content: contentPlain || '',
+        current_step: stateRef.current.step,
+        ...meta,
+        payload: meta.payload || null,
+      });
+      const cached = loadCachedSession(sessionIdRef.current) || {};
+      const merged = Array.isArray(cached.messages) ? cached.messages : [];
+      // Append locally for instant cache even if setMessages not yet run
+      const type = sender === 'bot' ? 'bot' : sender === 'agent' ? 'live-agent-message' : 'user';
+      merged.push({ type, text: content, html: content, payload: meta.payload });
+      saveCachedSession(sessionIdRef.current, { messages: merged, state: stateRef.current });
+    } catch (e) {}
+  }, [ensureSession]);
+
+  const addMessage = useCallback((msg) => {
+    const id = nextId();
+    const groupId = msg.groupId || id;
+
+    // Persist bot messages to backend unless explicitly skipped
+    const maybePersistBot = async () => {
+      if (msg.type !== 'bot' && !PERSIST_TYPES.has(msg.type)) return;
+      if (msg.skipPersist) return;
+      if (msg.__hydrated) return; // avoid saving messages loaded from history/cache
+      if (!sessionIdRef.current) {
+        await ensureSession({ step: stateRef.current.step });
+      }
+      if (!sessionIdRef.current) return;
+      const content = msg.text || stripHtml(msg.html) || msg.type || '';
+      const payload = msg.payload || sanitizePayload({ type: msg.type, ...msg, id, groupId });
+      try {
+        await chatApiCall(`/api/chat/session/${sessionIdRef.current}/message`, {
+          sender: 'bot',
+          content,
+          current_step: stateRef.current.step,
+          payload,
+        });
+      } catch {}
+    };
+
+    const stamped = { ...msg, id, groupId };
+
+    setMessages(prev => {
+      const updated = [...prev, stamped];
+      if (sessionIdRef.current) {
+        saveCachedSession(sessionIdRef.current, { messages: updated, state: stateRef.current });
+      }
+      return updated;
+    });
+
+    maybePersistBot();
+    scrollToBottom();
+    return groupId;
+  }, [scrollToBottom, ensureSession]);
 
   // ══════════════════════════════════════════════════════════════════
   // LOCATION FUNCTIONS
@@ -266,6 +389,167 @@ export default function ChatSupport() {
     // ── END DEFAULT LOCATION ───────────────────────────────────────────────────
 
   }, [addMessage, saveLocationToBackend, disableGroup]);
+
+  const afterLocationCaptured = useCallback(() => {
+    setTimeout(() => {
+      addMessage({ type: 'bot', html: `Thank you! Your location has been recorded.` });
+      addMessage({ type: 'bot', html: `Please <strong>describe your specific issue</strong> so I can provide the best resolution.` });
+      showInput('Describe your issue in any language...');
+      stateRef.current.step = 'query';
+    }, 500);
+  }, [addMessage, showInput]);
+
+  const hydrateHistory = useCallback((history = []) => {
+    const restored = [];
+    let prevKey = null;
+
+    history.forEach((m) => {
+      if (m.type) {
+        const id = m.id || nextId();
+        const groupId = m.groupId || id;
+        restored.push({ ...m, id, groupId, __hydrated: true });
+        return;
+      }
+
+      const key = `${m.sender}|${m.content || ''}`.trim();
+      if (key && key === prevKey) return;
+      prevKey = key;
+
+      const id = nextId();
+      const groupId = m.groupId || id;
+      if (m.payload && m.payload.type) {
+        restored.push({ id, groupId, ...m.payload, __hydrated: true });
+        return;
+      }
+      if (m.content?.startsWith('__IMAGE__:')) {
+        restored.push({ id, groupId, type: 'user-image', imageSrc: m.content.replace('__IMAGE__:', ''), __hydrated: true });
+        return;
+      }
+      if (m.sender === 'agent') {
+        restored.push({ id, groupId, type: 'live-agent-message', text: m.content, timestamp: m.created_at, __hydrated: true });
+        return;
+      }
+      if (m.sender === 'bot') {
+        const html = formatResolution(m.content || '').replace(/\n/g, '<br>');
+        restored.push({ id, groupId, type: 'bot', html, __hydrated: true });
+        return;
+      }
+      restored.push({ id, groupId, type: 'user', text: m.content, __hydrated: true });
+    });
+
+    const wired = restored.map((msg) => {
+      if (msg.type === 'location-question') {
+        return {
+          ...msg,
+          onYes: () => {
+            disableGroup(msg.groupId);
+            addMessage({ type: 'user', text: "Yes, I'm at the issue location" });
+            const locPromptGroupId = nextId();
+            addMessage({
+              type: 'location-prompt',
+              groupId: locPromptGroupId,
+              onShare: () => {
+                disableGroup(locPromptGroupId);
+                requestLocation(() => { afterLocationCaptured(stateRef.current.subprocessName || ''); });
+              },
+            });
+            stateRef.current.step = 'location';
+          },
+          onNo: () => {
+            disableGroup(msg.groupId);
+            addMessage({ type: 'user', text: 'No, different location' });
+            addMessage({ type: 'system', text: 'Please describe the location of the issue.' });
+            showInput('Describe the location...');
+            stateRef.current.step = 'location-other';
+          },
+        };
+      }
+      if (msg.type === 'location-prompt') {
+        return {
+          ...msg,
+          onShare: () => {
+            disableGroup(msg.groupId);
+            requestLocation(() => { afterLocationCaptured(stateRef.current.subprocessName || ''); });
+          },
+        };
+      }
+      if (msg.type === 'location-required') {
+        return {
+          ...msg,
+          onRetry: () => {
+            disableGroup(msg.groupId);
+            requestLocation(() => { afterLocationCaptured(stateRef.current.subprocessName || ''); });
+          },
+        };
+      }
+      return msg;
+    });
+
+    setMessages(wired);
+    if (sessionIdRef.current) {
+      saveCachedSession(sessionIdRef.current, {
+        messages: wired,
+        state: stateRef.current,
+      });
+    }
+  }, [nextId, disableGroup, addMessage, requestLocation, afterLocationCaptured, showInput]);
+
+  const restoreSession = useCallback(async (opts = {}) => {
+    const { sessionId: forcedSessionId = null, allowResolved = false } = opts || {};
+    const token = getToken();
+    if (!token) return false;
+    try {
+      let data = null;
+      const storedId = forcedSessionId || localStorage.getItem('chat_session_id');
+      if (storedId) {
+        const resp = await fetch(`${API_BASE}/api/chat/session/${storedId}`, {
+          headers: { 'Authorization': `Bearer ${token}` },
+        });
+        if (resp.ok) data = await resp.json();
+      }
+      if (!data || data.error) {
+        const resp = await fetch(`${API_BASE}/api/chat/session/active`, { headers: { 'Authorization': `Bearer ${token}` } });
+        if (resp.ok) data = await resp.json();
+      }
+      if (data && data.session) {
+        sessionIdRef.current = data.session.id;
+        localStorage.setItem('chat_session_id', String(data.session.id));
+        const cache = loadCachedSession(sessionIdRef.current);
+        const history = (data.messages && data.messages.length ? data.messages : []) || [];
+        const merged = history.length ? history : cache?.messages || [];
+
+        // If session already resolved and redirect is allowed, jump to feedback
+        if (data.session.status === 'resolved' && !allowResolved) {
+          clearCachedSession(sessionIdRef.current);
+          localStorage.removeItem('chat_session_id');
+          navigate(`/customer/feedback?session=${sessionIdRef.current}`);
+          return true;
+        }
+
+        setDisabledGroups(new Set()); // re-enable interactive cards on restore
+        hydrateHistory(merged);
+        if (cache?.state) {
+          stateRef.current = { ...stateRef.current, ...cache.state };
+        }
+        const maxAgentId = Math.max(0, ...history.filter(m => m.sender === 'agent').map(m => m.id));
+        if (maxAgentId > 0) { lastSeenMsgIdRef.current = maxAgentId; }
+        stateRef.current.step = data.session.current_step || 'greeting';
+        stateRef.current.sectorName = data.session.sector_name || null;
+        stateRef.current.subprocessName = data.session.subprocess_name || null;
+        stateRef.current.queryText = data.session.query_text || '';
+        setHandoffActive(data.session.status === 'escalated');
+        setInitPhase('chat');
+        const placeholder = data.session.status === 'escalated'
+          ? 'Type your reply to the agent...'
+          : 'Describe your issue...';
+        showInput(placeholder);
+        joinSocketSession();
+        resumeNeededRef.current = true;
+        return true;
+      }
+    } catch (e) {}
+    return false;
+  }, [hydrateHistory, joinSocketSession, showInput]);
 
   // ── Poll for agent messages + resolution after handoff ──
   const lastSeenMsgIdRef = useRef(0);
@@ -373,7 +657,7 @@ export default function ChatSupport() {
     };
   }, [addMessage, joinSocketSession, markAgentMessagesSeen, showInput]);
 
-  const startChat = useCallback(async () => {
+  const startChat = useCallback(async (forceNew = false) => {
     setMessages([]);
     setDisabledGroups(new Set());
     setLocationStatus('idle');
@@ -384,14 +668,17 @@ export default function ChatSupport() {
     };
     sessionIdRef.current = null;
     agentResolvedShownRef.current = false;
+    resumeNeededRef.current = false;
     setHandoffActive(false);
     hideInput();
     setInitPhase('chat');
+    await ensureSession({ forceNew: forceNew, step: 'greeting' });
+    if (sessionIdRef.current) clearCachedSession(sessionIdRef.current);
     setTimeout(() => {
       addMessage({ type: 'bot', html: `<strong>Welcome to TeleBot Support!</strong><br>Say hello to get started!` });
       showInput('Type your greeting here...');
     }, 500);
-  }, [addMessage, hideInput, showInput]);
+  }, [addMessage, hideInput, showInput, ensureSession]);
 
   const loadSectorMenu = useCallback(async () => {
     const token = getToken();
@@ -414,6 +701,7 @@ export default function ChatSupport() {
     stateRef.current.sectorKey = key;
     stateRef.current.sectorName = name;
     addMessage({ type: 'user', text: name });
+    saveMessage('user', name, { sector_name: name, current_step: 'sector' });
     addMessage({ type: 'system', text: `Selected: ${name}` });
     setIsTyping(true);
     const data = await chatApiCall('/api/subprocesses', { sector_key: key, language: stateRef.current.language });
@@ -422,19 +710,10 @@ export default function ChatSupport() {
     const spGroupId = nextId();
     addMessage({ type: 'subprocess-grid', subprocesses: limitSubprocesses(data.subprocesses), groupId: spGroupId });
     stateRef.current.step = 'subprocess';
-  }, [addMessage, disableGroup]);
-
-  const afterLocationCaptured = useCallback(() => {
-    setTimeout(() => {
-      addMessage({ type: 'bot', html: `Thank you! Your location has been recorded.` });
-      addMessage({ type: 'bot', html: `Please <strong>describe your specific issue</strong> so I can provide the best resolution.` });
-      showInput('Describe your issue in any language...');
-      stateRef.current.step = 'query';
-    }, 500);
-  }, [addMessage, showInput]);
+  }, [addMessage, disableGroup, saveMessage]);
 
   const beginLocationFlow = useCallback(async (selectedIssueLabel) => {
-    if (!sessionIdRef.current) { await createSession(); }
+    if (!sessionIdRef.current) { await ensureSession({ step: 'location' }); }
     addMessage({
       type: 'bot',
       html: `You selected <strong>${selectedIssueLabel}</strong>.<br><br>To help us assist you better, we need to know about your location.`,
@@ -463,7 +742,22 @@ export default function ChatSupport() {
       },
     });
     stateRef.current.step = 'location-question';
-  }, [addMessage, disableGroup, showInput, createSession, requestLocation, afterLocationCaptured]);
+  }, [addMessage, disableGroup, showInput, ensureSession, requestLocation, afterLocationCaptured]);
+
+  useEffect(() => {
+    if (!resumeNeededRef.current) return;
+    const st = stateRef.current;
+    if (st.step === 'location' || st.step === 'location-question') {
+      resumeNeededRef.current = false;
+      beginLocationFlow(st.subprocessName || st.subprocessSubType || 'your issue');
+      return;
+    }
+    if (st.step === 'signal-diagnosis') {
+      resumeNeededRef.current = false;
+      const uploadGroupId = nextId();
+      addMessage({ type: 'screenshot-upload', groupId: uploadGroupId });
+    }
+  }, [beginLocationFlow, addMessage]);
 
   const autoRaiseTicket = useCallback(async (opts = {}) => {
     const { prefaceHtml } = opts;
@@ -508,7 +802,7 @@ export default function ChatSupport() {
   const fetchSolution = useCallback(async (userQuery) => {
     const st = stateRef.current;
     st.attempt += 1;
-    if (!sessionIdRef.current) { await createSession(); }
+    if (!sessionIdRef.current) { await ensureSession({ step: 'query' }); }
     if (st.attempt === 1) { st.queryText = userQuery; }
     saveMessage('user', userQuery, { query_text: userQuery, sector_name: st.sectorName, subprocess_name: st.subprocessName });
     const effectiveQuery = st.subprocessSubType
@@ -548,7 +842,7 @@ export default function ChatSupport() {
       showInput('Type your response...');
     }, 800);
     st.step = 'conversation';
-  }, [addMessage, saveMessage, showInput, createSession, autoRaiseTicket]);
+  }, [addMessage, saveMessage, showInput, ensureSession, autoRaiseTicket]);
 
   const selectSubprocess = useCallback(async (key, name, groupId) => {
     const followupOptions = getFollowupOptions(name);
@@ -560,6 +854,7 @@ export default function ChatSupport() {
       stateRef.current.attempt = 0;
       stateRef.current.previousSolutions = [];
       addMessage({ type: 'user', text: name });
+      saveMessage('user', name, { subprocess_name: name, sector_name: stateRef.current.sectorName, current_step: 'subprocess' });
       addMessage({
         type: 'bot',
         html: `You selected <strong>${name}</strong>. Please choose the <strong>specific issue type</strong>:`,
@@ -577,6 +872,7 @@ export default function ChatSupport() {
     stateRef.current.attempt = 0;
     stateRef.current.previousSolutions = [];
     addMessage({ type: 'user', text: name });
+    saveMessage('user', name, { subprocess_name: name, sector_name: stateRef.current.sectorName, current_step: 'subprocess' });
     if (isMobileNetworkIssue(stateRef.current.sectorName, name)) {
       await beginLocationFlow(name);
       return;
@@ -584,7 +880,7 @@ export default function ChatSupport() {
     addMessage({ type: 'bot', html: `Please <strong>describe your specific issue</strong> so I can provide the best resolution.` });
     showInput('Describe your issue in any language...');
     stateRef.current.step = 'query';
-  }, [addMessage, disableGroup, beginLocationFlow]);
+  }, [addMessage, disableGroup, beginLocationFlow, saveMessage, showInput]);
 
   const selectNetworkSubissue = useCallback(async (name, groupId) => {
     disableGroup(groupId);
@@ -595,6 +891,7 @@ export default function ChatSupport() {
     stateRef.current.attempt = 0;
     stateRef.current.previousSolutions = [];
     addMessage({ type: 'user', text: name });
+    saveMessage('user', name, { subprocess_name: finalSubprocessName, sector_name: stateRef.current.sectorName, current_step: 'subprocess' });
     if (isMobileNetworkIssue(stateRef.current.sectorName, finalSubprocessName)) {
       await beginLocationFlow(finalSubprocessName);
       return;
@@ -602,7 +899,7 @@ export default function ChatSupport() {
     addMessage({ type: 'bot', html: `Please <strong>describe your specific issue</strong> so I can provide the best resolution.` });
     showInput('Describe your issue in any language...');
     stateRef.current.step = 'query';
-  }, [addMessage, disableGroup, beginLocationFlow]);
+  }, [addMessage, disableGroup, beginLocationFlow, saveMessage, showInput]);
 
   const sendMessage = useCallback(async () => {
     const text = inputValue.trim();
@@ -610,6 +907,13 @@ export default function ChatSupport() {
     addMessage({ type: 'user', text });
     setInputValue('');
     hideInput();
+
+    let userSaved = false;
+    const saveUserOnce = (meta = {}) => {
+      if (userSaved) return;
+      saveMessage('user', text, meta);
+      userSaved = true;
+    };
 
     if (handoffActive || stateRef.current.step === 'human_handoff' || stateRef.current.step === 'escalated') {
       // Mark the message we just added as liveChat so ticks show
@@ -623,12 +927,13 @@ export default function ChatSupport() {
         }
         return updated;
       });
-      saveMessage('user', text);
+      saveUserOnce({ current_step: stateRef.current.step });
       showInput('Type your reply to the agent...');
       return;
     }
 
     if (stateRef.current.step === 'greeting') {
+      saveUserOnce({ current_step: 'greeting' });
       setIsTyping(true);
       let isGreeting = true;
       try {
@@ -657,6 +962,7 @@ export default function ChatSupport() {
       try { classification = await chatApiCall('/api/classify-response', { text }); } catch {}
       setIsTyping(false);
       if (classification.is_satisfied) {
+        saveUserOnce({ current_step: 'conversation' });
         addMessage({ type: 'thankyou' });
         if (sessionIdRef.current) {
           try {
@@ -697,6 +1003,7 @@ export default function ChatSupport() {
       let classification = { mentions_signal: false };
       try { classification = await chatApiCall('/api/classify-response', { text }); } catch {}
       if (classification.mentions_signal) {
+        saveUserOnce({ current_step: stateRef.current.step });
         addMessage({ type: 'bot', html: `It sounds like you're experiencing signal issues. Would you like to run a signal diagnosis?` });
         const diagGroupId = nextId();
         addMessage({ type: 'signal-offer', groupId: diagGroupId });
@@ -957,8 +1264,20 @@ export default function ChatSupport() {
   useEffect(() => {
     if (initialized.current) return;
     initialized.current = true;
-    startChat();
-  }, [startChat]);
+    (async () => {
+      const params = new URLSearchParams(window.location.search);
+      const resumeId = params.get('resume');
+      if (resumeId) {
+        const restored = await restoreSession({ sessionId: resumeId, allowResolved: true });
+        if (!restored) startChat(true);
+        else setTimeout(scrollToBottom, 200);
+        return;
+      }
+      // Show start choice UI; defer restore/new until user picks
+      setInitPhase('choice');
+      setStartChoice(true);
+    })();
+  }, [restoreSession, startChat, scrollToBottom]);
 
   // ══════════════════════════════════════════════════════════════════
   // RENDER MESSAGES
@@ -1394,13 +1713,33 @@ export default function ChatSupport() {
             <p>AI-powered multilingual support</p>
           </div>
           <div className="status-dot" />
-          {initPhase === 'chat' && <button className="restart-btn" onClick={startChat}>Restart</button>}
+          {initPhase === 'chat' && <button className="restart-btn" onClick={() => startChat(true)}>Restart</button>}
         </div>
 
         {initPhase === 'loading' && (
           <div className="chat-area" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
             <div className="typing-indicator visible">
               <div className="typing-dot" /><div className="typing-dot" /><div className="typing-dot" />
+            </div>
+          </div>
+        )}
+        {initPhase === 'choice' && (
+          <div className="chat-area" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+            <div style={{ background: '#fff', border: '1px solid #e2e8f0', borderRadius: 12, padding: '28px 32px', boxShadow: '0 6px 20px rgba(15,23,42,0.08)', maxWidth: 420, width: '100%', textAlign: 'center' }}>
+              <h3 style={{ margin: '0 0 12px', color: '#0f172a' }}>What would you like to do?</h3>
+              <p style={{ margin: '0 0 20px', color: '#475569', fontSize: 14 }}>Resume your last chat or start a new one.</p>
+              <div style={{ display: 'flex', gap: 12, justifyContent: 'center' }}>
+                <button className="btn btn-primary" onClick={async () => {
+                  setInitPhase('loading');
+                  const ok = await restoreSession(null);
+                  if (!ok) startChat(true); else setStartChoice(false);
+                }}>Resume Last Chat</button>
+                <button className="btn btn-secondary" onClick={async () => {
+                  setInitPhase('loading');
+                  setStartChoice(false);
+                  await startChat(true);
+                }}>Start New Chat</button>
+              </div>
             </div>
           </div>
         )}
