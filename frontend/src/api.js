@@ -1,4 +1,6 @@
-export const API_BASE = process.env.REACT_APP_API_URL || 'http://localhost:5500';
+// Dev: CRA proxy in package.json forwards /api/* → localhost:5500 automatically.
+// Production: set REACT_APP_API_URL=https://your-backend.com in your .env
+export const API_BASE = process.env.REACT_APP_API_URL || '';
 
 export function getToken() {
   return localStorage.getItem('token');

@@ -13,7 +13,7 @@ import random
 import string
 from datetime import datetime, timezone, timedelta
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from flask_jwt_extended import (
     JWTManager, create_access_token, jwt_required, get_jwt_identity
@@ -60,9 +60,16 @@ bcrypt.init_app(app)
 jwt = JWTManager(app)
 mail = Mail(app)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
+# CORS_ORIGINS: comma-separated allowed frontend origins.
+# Dev default: localhost:3000. Production: set CORS_ORIGINS=https://yourdomain.com
+_cors_origins = [
+    o.strip()
+    for o in os.environ.get("CORS_ORIGINS", "http://localhost:3000,http://localhost:3001").split(",")
+    if o.strip()
+]
 CORS(
     app,
-    resources={r"/api/*": {"origins": ["http://localhost:3000"]}},
+    resources={r"/api/*": {"origins": _cors_origins}},
     supports_credentials=True,
 )
 
@@ -4798,6 +4805,24 @@ with app.app_context():
             db.session.add(SystemSetting(key=key, value=info["value"], category="sla", description=info["description"]))
     db.session.commit()
 
+
+
+# ── Serve React build (production) ───────────────────────────────────────────
+# When Flask serves the built frontend, all non-API routes must return index.html
+# so that React Router can handle client-side navigation without 404s on refresh.
+BUILD_DIR = os.path.join(os.path.dirname(__file__), '..', 'frontend', 'build')
+
+@app.route('/', defaults={'path': ''})
+@app.route('/<path:path>')
+def serve_react(path):
+    # Never intercept API routes
+    if path.startswith('api/'):
+        from flask import abort
+        abort(404)
+    full_path = os.path.join(BUILD_DIR, path)
+    if path and os.path.exists(full_path):
+        return send_from_directory(BUILD_DIR, path)
+    return send_from_directory(BUILD_DIR, 'index.html')
 
 if __name__ == "__main__":
     run_sla_checks()
