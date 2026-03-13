@@ -250,24 +250,46 @@ class TelecomSite(db.Model):
     __tablename__ = "telecom_sites"
 
     id = db.Column(db.Integer, primary_key=True)
-    site_id = db.Column(db.String(50), unique=True, nullable=False)
+    site_id = db.Column(db.String(50), nullable=False, index=True)
+    site_name = db.Column(db.String(100), nullable=True)
+    cell_id = db.Column(db.String(100), nullable=True)
     latitude = db.Column(db.Float, nullable=False)
     longitude = db.Column(db.Float, nullable=False)
     zone = db.Column(db.String(100), default="")
     site_status = db.Column(db.String(20), default="on_air")   # 'on_air' or 'off_air'
     alarms = db.Column(db.Text, default="")
     solution = db.Column(db.Text, default="")
+    standard_solution_step = db.Column(db.Text, default="")
+    bandwidth_mhz = db.Column(db.Float, nullable=True)
+    antenna_gain_dbi = db.Column(db.Float, nullable=True)
+    rf_power_eirp_dbm = db.Column(db.Float, nullable=True)
+    antenna_height_agl_m = db.Column(db.Float, nullable=True)
+    e_tilt_degree = db.Column(db.Float, nullable=True)
+    crs_gain = db.Column(db.Float, nullable=True)
+
+    __table_args__ = (
+        db.UniqueConstraint("site_id", "cell_id", name="uq_telecom_sites_site_cell"),
+    )
 
     def to_dict(self):
         return {
             "id": self.id,
             "site_id": self.site_id,
+            "site_name": self.site_name or self.site_id,
+            "cell_id": self.cell_id,
             "latitude": self.latitude,
             "longitude": self.longitude,
             "zone": self.zone,
             "site_status": self.site_status or "on_air",
             "alarms": self.alarms or "",
             "solution": self.solution or "",
+            "standard_solution_step": self.standard_solution_step or "",
+            "bandwidth_mhz": self.bandwidth_mhz,
+            "antenna_gain_dbi": self.antenna_gain_dbi,
+            "rf_power_eirp_dbm": self.rf_power_eirp_dbm,
+            "antenna_height_agl_m": self.antenna_height_agl_m,
+            "e_tilt_degree": self.e_tilt_degree,
+            "crs_gain": self.crs_gain,
         }
 
 

@@ -11,7 +11,8 @@ import time
 import math
 import random
 import string
-from datetime import datetime, timezone, timedelta
+import hashlib
+from datetime import datetime, timezone, timedelta, date
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -34,6 +35,16 @@ from whatsapp_integration import send_whatsapp_message, format_chat_summary_for_
 load_dotenv()
 
 # ─── App Setup ────────────────────────────────────────────────────────────────
+def _get_jwt_secret():
+    raw = os.environ.get("JWT_SECRET")
+    if raw:
+        if len(raw) >= 32:
+            return raw
+        # Upgrade short secrets to a SHA-256 derived key to avoid insecure length warnings.
+        print("⚠️ JWT_SECRET is shorter than 32 bytes; deriving a stronger key.")
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return os.urandom(32).hex()
+
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", os.urandom(24).hex())
 app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get(
@@ -41,7 +52,7 @@ app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get(
     "postgresql://postgres:postgres@localhost:5432/telecom_complaints"
 )
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-app.config["JWT_SECRET_KEY"] = os.environ.get("JWT_SECRET", "super-secret-jwt-key-change-in-prod")
+app.config["JWT_SECRET_KEY"] = _get_jwt_secret()
 app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(hours=24)
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16MB max for image uploads
 
@@ -58,7 +69,7 @@ bcrypt.init_app(app)
 jwt = JWTManager(app)
 mail = Mail(app)
 
-
+from openai import OpenAI
 # ─── Google Gemini Configuration (OpenAI-compatible endpoint) ────────────────
 client = OpenAI(
     api_key=os.environ.get("GEMINI_API_KEY"),
@@ -201,18 +212,48 @@ def _haversine(lat1, lon1, lat2, lon2):
 
 NETWORK_PROBLEM_KPI_KEYWORDS = {
     "internet_signal": [
-        "internet", "speed", "bandwidth", "data", "throughput", "latency", "packet", "prb", "resource block",
-        "sinr", "rsrp", "rsrq", "cqi", "ul", "uplink", "dl", "downlink", "lte", "nr",
-        "4g", "5g", "availability", "session", "traffic", "interference", "coverage"
+        "throughput", "tput", "data rate", "pdcp", "user throughput",
+        "latency", "delay", "rtt", "packet loss",
+        "prb", "resource block", "utilization", "congestion",
+        "data volume", "traffic volume", "dl volume", "ul volume",
+        "active ue", "connected ue",
+        "sinr", "rsrp", "rsrq", "cqi",
+        "availability",
     ],
     "call_failure": [
-        "call setup", "cssr", "asr", "blocked", "failure", "accessibility", "sdcch",
-        "tch", "moc", "mtc", "paging", "attach", "volte", "voice", "srvcc"
+        "cssr", "call setup", "setup success", "accessibility",
+        "sdcch", "paging", "attach", "blocking", "asr", "volte",
+        "moc", "mtc",
     ],
     "call_drop": [
-        "drop", "cdr", "dcr", "tch drop", "rlf", "radio link failure", "handover",
-        "ho ", "ho_", "speech", "retainability", "voice", "call"
+        "drop", "call drop", "tch drop", "retainability",
+        "rlf", "radio link failure",
+        "handover", "ho success", "ho failure",
+        "speech", "voice",
     ],
+}
+
+# STRICT primary KPIs — these must match to be shown for the problem type
+NETWORK_PROBLEM_KPI_PRIMARY = {
+    "internet_signal": [
+        "throughput", "tput", "data rate", "pdcp", "user throughput",
+        "latency", "packet loss", "prb", "utilization",
+        "sinr", "rsrp", "rsrq", "cqi",
+    ],
+    "call_failure": [
+        "cssr", "call setup", "setup success", "accessibility",
+        "sdcch", "paging", "blocking", "asr", "volte", "attach",
+    ],
+    "call_drop": [
+        "drop", "call drop", "tch drop", "retainability",
+        "rlf", "radio link failure", "handover", "ho success", "ho failure",
+    ],
+}
+
+NETWORK_PROBLEM_KPI_STRONG = {
+    "internet_signal": ["throughput", "latency", "prb", "sinr", "rsrp", "rsrq", "cqi", "data volume"],
+    "call_failure": ["cssr", "call setup", "accessibility", "sdcch", "paging", "blocking"],
+    "call_drop": ["drop", "retainability", "rlf", "tch drop", "handover"],
 }
 
 
@@ -245,14 +286,37 @@ def _problem_type_label(problem_type: str) -> str:
 
 
 def _filter_kpi_names_for_problem(kpi_names, problem_type: str):
+    """
+    Return the KPIs most relevant to the problem type.
+    - Scores each KPI name against primary + secondary keyword lists.
+    - Returns up to 5 best-matched KPIs.
+    - If nothing matches at all, returns up to 5 KPIs sorted alphabetically
+      (so trend analysis always has something to show).
+    """
+    primary = NETWORK_PROBLEM_KPI_PRIMARY.get(problem_type, NETWORK_PROBLEM_KPI_PRIMARY["internet_signal"])
+    strong = NETWORK_PROBLEM_KPI_STRONG.get(problem_type, [])
     keys = NETWORK_PROBLEM_KPI_KEYWORDS.get(problem_type, NETWORK_PROBLEM_KPI_KEYWORDS["internet_signal"])
-    selected = [
-        name for name in sorted(kpi_names)
-        if any(k in (name or "").lower() for k in keys)
-    ]
-    if not selected:
-        selected = sorted(kpi_names)[:8]
-    return selected
+
+    scored = []
+    for name in kpi_names:
+        lname = (name or "").lower()
+        # Primary match carries most weight
+        primary_score = sum(2 for k in primary if k in lname)
+        # Strong keyword bonus
+        strong_bonus = 3 if any(k in lname for k in strong) else 0
+        # Secondary keyword match
+        secondary_score = sum(1 for k in keys if k in lname)
+
+        total_score = primary_score + strong_bonus + secondary_score
+        if total_score > 0:
+            scored.append((total_score, name))
+
+    if scored:
+        scored.sort(key=lambda x: (-x[0], x[1]))
+        return [n for _, n in scored[:5]]
+
+    # Nothing matched — return the first 5 KPIs alphabetically so the chart still renders
+    return sorted(kpi_names)[:5]
 
 
 def _period_key_for_row(row: KpiData, period: str) -> str:
@@ -363,23 +427,17 @@ def _force_numbered_points(raw_text: str, min_points: int, max_points: int, pref
     """
     lines = _normalize_ai_lines(raw_text)
 
-    # Score lines: prefer those with technical/diagnostic keywords and longer content
-    ranked = sorted(
-        lines,
-        key=lambda l: (
-            1 if re.search(r"\b(root cause|cause|kpi|trend|alarm|site|cell|impact|action|recommend)\b", l, re.IGNORECASE) else 0,
-            len(l),
-        ),
-        reverse=True,
-    )
+    # Keep lines in their ORIGINAL order — do not rerank.
+    # The AI already produces the output in priority order.
     picked = []
-    for line in ranked:
+    for line in lines:
         if len(line) < 12:
             continue
-        picked.append(line)  # No truncation — keep full sentence
+        picked.append(line)
         if len(picked) >= max_points:
             break
 
+    # Fill up to min_points from fallback if AI gave too few lines
     for line in (fallback_points or []):
         if len(picked) >= min_points:
             break
@@ -387,8 +445,17 @@ def _force_numbered_points(raw_text: str, min_points: int, max_points: int, pref
             picked.append(line)
 
     picked = picked[:max_points]
+
+    # Last resort: if truly nothing, generate from fallback directly
     if not picked:
-        picked = ["Analysis could not be generated from available data."]
+        for line in (fallback_points or []):
+            if line and len(line) >= 12:
+                picked.append(line)
+            if len(picked) >= max_points:
+                break
+
+    if not picked:
+        picked = ["Unable to generate recommendations — please ensure root cause analysis has been run first."]
 
     # prefix param ignored (was used for "**Crux:** " — removed)
     return "\n".join(f"{idx + 1}. {line}" for idx, line in enumerate(picked))
@@ -416,34 +483,249 @@ def _format_points_for_pdf(raw_text: str) -> str:
 
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _value_or_na(val, unit=""):
+    if val is None or val == "":
+        return "N/A"
+    return f"{val}{unit}"
+
+
+def _adjust_value(val, delta, min_val=None):
+    if val is None:
+        return None
+    try:
+        new_val = float(val) + float(delta)
+        if min_val is not None:
+            new_val = max(new_val, min_val)
+        return round(new_val, 2)
+    except Exception:
+        return None
+
+
+def _infer_issue_flags(text: str):
+    t = (text or "").lower()
+    flags = set()
+    if any(k in t for k in ["prb", "utilization", "congestion", "overload", "traffic spike"]):
+        flags.add("congestion")
+    if any(k in t for k in ["sinr", "rsrp", "rsrq", "weak signal", "coverage", "low signal"]):
+        flags.add("coverage")
+    if any(k in t for k in ["interference", "pilot pollution", "overshoot", "over-shoot"]):
+        flags.add("interference")
+    if any(k in t for k in ["latency", "packet loss", "delay", "jitter"]):
+        flags.add("latency")
+    if any(k in t for k in ["handover", "rlf", "drop", "call drop"]):
+        flags.add("handover")
+    if any(k in t for k in ["call setup", "cssr", "paging", "accessibility", "sdcch", "call failure"]):
+        flags.add("access")
+    if "off air" in t or "off_air" in t:
+        flags.add("off_air")
+    return flags
+
+
+def _build_parameter_recommendations(problem_type, root_cause, trend_summary, nearest):
+    text = f"{root_cause}\n{trend_summary}"
+    flags = _infer_issue_flags(text)
+
+    bw = nearest.get("bandwidth_mhz") if nearest else None
+    gain = nearest.get("antenna_gain_dbi") if nearest else None
+    eirp = nearest.get("rf_power_eirp_dbm") if nearest else None
+    height = nearest.get("antenna_height_agl_m") if nearest else None
+    tilt = nearest.get("e_tilt_degree") if nearest else None
+    crs = nearest.get("crs_gain") if nearest else None
+
+    recs = []
+
+    if "off_air" in flags:
+        recs.append(
+            f"**Restore Site to ON AIR**: Resolve active alarms first and validate recovery against KPI trends; "
+            f"then re-check RF parameters (EIRP {_value_or_na(eirp,' dBm')}, E-tilt {_value_or_na(tilt,'°')}) for post-recovery tuning."
+        )
+
+    if "congestion" in flags and bw is not None:
+        target_bw = bw + (10 if bw <= 10 else 5)
+        recs.append(
+            f"**Increase Bandwidth**: Bandwidth is {bw} MHz; expand to {target_bw} MHz (if spectrum/license allows) to reduce PRB congestion and improve throughput."
+        )
+    elif "congestion" in flags:
+        recs.append(
+            "**Increase Bandwidth**: Bandwidth value missing; increase carrier bandwidth (e.g., +5 to +10 MHz) to reduce PRB congestion and improve throughput."
+        )
+
+    if "interference" in flags and tilt is not None and eirp is not None:
+        target_tilt = _adjust_value(tilt, 1, min_val=0)
+        target_eirp = _adjust_value(eirp, -1)
+        recs.append(
+            f"**Reduce Overshoot/Interference**: E-tilt is {tilt}° and EIRP is {eirp} dBm; "
+            f"increase tilt to {target_tilt}° and lower EIRP to {target_eirp} dBm to reduce pilot pollution and stabilize SINR."
+        )
+    elif "coverage" in flags and tilt is not None and eirp is not None:
+        target_tilt = _adjust_value(tilt, -1, min_val=0)
+        target_eirp = _adjust_value(eirp, 1)
+        recs.append(
+            f"**Improve Coverage/RSS**: E-tilt is {tilt}° and EIRP is {eirp} dBm; "
+            f"reduce tilt to {target_tilt}° and raise EIRP to {target_eirp} dBm to lift RSRP and improve coverage."
+        )
+
+    if "handover" in flags and crs is not None:
+        target_crs = _adjust_value(crs, 3)
+        recs.append(
+            f"**Stabilize Handover**: CRS Gain is {crs}; raise to {target_crs} to improve reference signal quality and reduce RLF/call drops during mobility."
+        )
+    elif "access" in flags and gain is not None:
+        target_gain = _adjust_value(gain, 1)
+        recs.append(
+            f"**Improve Call Accessibility**: Antenna Gain is {gain} dBi; increase to {target_gain} dBi (or swap to higher-gain antenna) to improve call setup KPIs."
+        )
+
+    if "latency" in flags and height is not None:
+        target_height = _adjust_value(height, 2)
+        recs.append(
+            f"**Optimize Antenna Height**: Antenna height is {height} m AGL; adjust to {target_height} m to improve line-of-sight and reduce latency spikes."
+        )
+
+    # Ensure 4–5 points using unique parameter-based fill-up lines
+    padding_pool = []
+    if tilt is not None and eirp is not None:
+        padding_pool.append(
+            f"**RF Parameter Alignment**: Validate E-tilt ({tilt}°) and EIRP ({eirp} dBm) against the RCA-identified degradation window and confirm KPI recovery within 24 hours post-adjustment."
+        )
+    if bw is not None:
+        padding_pool.append(
+            f"**Capacity Confirmation**: Confirm bandwidth at {bw} MHz is adequate; if PRB utilization exceeds 70%, schedule a bandwidth expansion to {round(bw + 5, 1)} MHz."
+        )
+    if crs is not None:
+        padding_pool.append(
+            f"**CRS Gain Verification**: CRS Gain is currently {crs}; validate reference signal power across all sectors and adjust if RSRP drops below -105 dBm at cell edge."
+        )
+    if height is not None:
+        padding_pool.append(
+            f"**Antenna Height Review**: Antenna height is {height} m AGL; verify line-of-sight coverage and adjust mounting height if near-field obstruction is detected."
+        )
+    if gain is not None:
+        padding_pool.append(
+            f"**Antenna Gain Audit**: Antenna Gain is {gain} dBi; cross-check with drive test data and replace with higher-gain antenna if signal levels are below threshold."
+        )
+    # Generic always-available options
+    padding_pool += [
+        "**Drive Test Validation**: Conduct a drive test in the affected area post-parameter changes to confirm KPI recovery and customer experience improvement.",
+        "**Neighbor Cell Audit**: Review neighbor cell list for missing or unoptimized neighbors that may cause handover failures and increase call drops.",
+        "**Scheduler Tuning**: Adjust CQI-based scheduler parameters to prioritize users with degraded signal quality and improve cell-edge throughput by up to 15%.",
+    ]
+
+    for pad in padding_pool:
+        if len(recs) >= 5:
+            break
+        if pad not in recs:
+            recs.append(pad)
+
+    return recs[:5]
+
+
+def _recommendation_has_params(text: str):
+    t = (text or "").lower()
+    param_hits = 0
+    for p in ["bandwidth", "antenna gain", "eirp", "rf power", "antenna height", "e-tilt", "tilt", "crs gain"]:
+        if p in t:
+            param_hits += 1
+    has_numbers = bool(re.search(r"\d+(\.\d+)?", t))
+    return param_hits >= 2 and has_numbers
+
+
+def _filter_rca_lines(lines):
+    generic_patterns = [
+        r"\bsite status\b",
+        r"\bproblem classification\b",
+        r"\bproblem type\b",
+        r"\bprimary impact domain\b",
+        r"\bonly related kpi\b",
+        r"\btrend evidence\b",
+        r"\baction required\b",
+        r"\bfocus area\b",
+    ]
+    out = []
+    for line in lines:
+        l = line.lower()
+        if any(re.search(p, l) for p in generic_patterns):
+            continue
+        # Keep lines that mention KPI evidence or alarms/solutions
+        if re.search(r"\b(kpi|throughput|latency|prb|sinr|rsrp|rsrq|cqi|drop|handover|cssr|paging|rlf|alarm|off air|on air)\b", l):
+            out.append(line)
+            continue
+        # Keep lines with concrete numbers/percentages
+        if re.search(r"\d+(\.\d+)?", l):
+            out.append(line)
+    return out
+
+
+def _kpi_degradation_points(rows, selected_kpis, max_points=3):
+    from collections import defaultdict
+    grouped = defaultdict(list)
+    for r in rows:
+        if r.kpi_name in selected_kpis and r.value is not None:
+            grouped[r.kpi_name].append(r)
+    points = []
+    for kpi_name, kpi_rows in grouped.items():
+        kpi_rows.sort(key=lambda r: (r.date, r.hour))
+        vals = [float(r.value) for r in kpi_rows if r.value is not None]
+        if len(vals) < 2:
+            continue
+        overall = sum(vals) / len(vals)
+        latest_vals = [float(r.value) for r in kpi_rows[-min(8, len(kpi_rows)):] if r.value is not None]
+        latest = sum(latest_vals) / max(len(latest_vals), 1)
+        if overall == 0:
+            continue
+        delta_pct = (latest - overall) / overall * 100
+        if abs(delta_pct) < 20:
+            continue
+        direction = "drop" if delta_pct < 0 else "increase"
+        points.append((
+            abs(delta_pct),
+            f"**KPI Shift**: {kpi_name} shows a {direction} to {round(latest, 3)} vs baseline {round(overall, 3)} ({round(delta_pct, 1)}%)."
+        ))
+    points.sort(key=lambda x: -x[0])
+    return [p for _, p in points[:max_points]]
+
 
 def find_nearest_sites(lat, lon, n=3):
     """Return the n nearest telecom sites to the given coordinates from DB uploads."""
     if lat is None or lon is None:
         return []
 
-    sites = TelecomSite.query.all()
-    if not sites:
+    rows = TelecomSite.query.all()
+    if not rows:
         return []
 
-    scored = []
-    for site in sites:
+    best_by_site = {}
+    for site in rows:
         dist = _haversine(lat, lon, site.latitude, site.longitude)
-        scored.append((dist, site))
+        existing = best_by_site.get(site.site_id)
+        if existing is None or dist < existing[0]:
+            best_by_site[site.site_id] = (dist, site)
 
-    scored.sort(key=lambda x: x[0])
+    scored = sorted(best_by_site.values(), key=lambda x: x[0])
     results = []
     for dist, site in scored[:n]:
-        status = (site.site_status or "on_air").upper()
+        status = (site.site_status or "on_air").lower()
         results.append({
             "site_id": site.site_id,
+            "site_name": site.site_name or site.site_id,
+            "cell_id": site.cell_id or "",
             "zone": site.zone or "",
             "latitude": site.latitude,
             "longitude": site.longitude,
-            "status": status,
-            "alarm": site.alarms or "None",
-            "solution": site.solution or "No action required",
+            "site_status": status,
+            "alarms": site.alarms or "",
+            "solution": site.solution or site.standard_solution_step or "",
+            "standard_solution_step": site.standard_solution_step or "",
+            "bandwidth_mhz": site.bandwidth_mhz,
+            "antenna_gain_dbi": site.antenna_gain_dbi,
+            "rf_power_eirp_dbm": site.rf_power_eirp_dbm,
+            "antenna_height_agl_m": site.antenna_height_agl_m,
+            "e_tilt_degree": site.e_tilt_degree,
+            "crs_gain": site.crs_gain,
             "distance_km": round(dist, 2),
+            # Backward-compatible keys
+            "status": status,
+            "alarm": site.alarms or "",
         })
     return results
 
@@ -1080,7 +1362,7 @@ def login():
 @app.route("/api/auth/me", methods=["GET"])
 @jwt_required()
 def get_me():
-    user = User.query.get(int(get_jwt_identity()))
+    user = db.session.get(User, int(get_jwt_identity()))
     if not user:
         return jsonify({"error": "User not found"}), 404
     return jsonify({"user": user.to_dict()})
@@ -1233,7 +1515,7 @@ def create_chat_session():
 @jwt_required()
 def add_chat_message(session_id):
     user_id = int(get_jwt_identity())
-    session = ChatSession.query.get(session_id)
+    session = db.session.get(ChatSession, session_id)
     if not session:
         return jsonify({"error": "Session not found"}), 404
 
@@ -1269,7 +1551,7 @@ def add_chat_message(session_id):
 def save_session_location(session_id):
     """Save customer's GPS location for network signal complaints."""
     user_id = int(get_jwt_identity())
-    session = ChatSession.query.get(session_id)
+    session = db.session.get(ChatSession, session_id)
 
     if not session:
         return jsonify({"error": "Session not found"}), 404
@@ -1299,7 +1581,7 @@ def save_session_location(session_id):
 def analyze_signal(session_id):
     """Analyze a signal screenshot using Azure OpenAI Vision."""
     user_id = int(get_jwt_identity())
-    session = ChatSession.query.get(session_id)
+    session = db.session.get(ChatSession, session_id)
 
     if not session:
         return jsonify({"error": "Session not found"}), 404
@@ -1349,7 +1631,7 @@ def analyze_signal(session_id):
 @jwt_required()
 def resolve_session(session_id):
     user_id = int(get_jwt_identity())
-    session = ChatSession.query.get(session_id)
+    session = db.session.get(ChatSession, session_id)
     if not session:
         return jsonify({"error": "Session not found"}), 404
 
@@ -1367,7 +1649,7 @@ def resolve_session(session_id):
 
     # ← NEW: Send WhatsApp message
     try:
-        user = User.query.get(user_id)
+        user = db.session.get(User, user_id)
         if user and user.phone_number:
             whatsapp_msg = format_chat_summary_for_whatsapp(session, user.name)
             result = send_whatsapp_message(user.phone_number, whatsapp_msg)
@@ -1440,7 +1722,7 @@ def send_ticket_assignment_email(agent, ticket, session):
 @jwt_required()
 def escalate_session(session_id):
     user_id = int(get_jwt_identity())
-    session = ChatSession.query.get(session_id)
+    session = db.session.get(ChatSession, session_id)
     if not session:
         return jsonify({"error": "Session not found"}), 404
 
@@ -1498,7 +1780,7 @@ def escalate_session(session_id):
 
     # Send WhatsApp message for ticket
     try:
-        user = User.query.get(user_id)
+        user = db.session.get(User, user_id)
         if user and user.phone_number:
             whatsapp_msg = format_ticket_alert_for_whatsapp(ticket, user.name, session)
             result = send_whatsapp_message(user.phone_number, whatsapp_msg)
@@ -1533,11 +1815,11 @@ def escalate_session(session_id):
 def send_summary_email(session_id):
     """Send chat summary to the user's email saved in DB."""
     user_id = int(get_jwt_identity())
-    user = User.query.get(user_id)
+    user = db.session.get(User, user_id)
     if not user:
         return jsonify({"error": "User not found"}), 404
 
-    session = ChatSession.query.get(session_id)
+    session = db.session.get(ChatSession, session_id)
     if not session:
         return jsonify({"error": "Session not found"}), 404
 
@@ -1691,7 +1973,7 @@ def get_chat_session(session_id):
 @jwt_required()
 def get_session_status(session_id):
     """Lightweight poll endpoint: return session status + latest bot message."""
-    session = ChatSession.query.get(session_id)
+    session = db.session.get(ChatSession, session_id)
     if not session:
         return jsonify({"error": "Session not found"}), 404
     ticket = Ticket.query.filter_by(chat_session_id=session_id).order_by(Ticket.created_at.desc()).first()
@@ -1714,7 +1996,7 @@ def get_session_status(session_id):
 def session_presence(session_id):
     """Update customer presence for a chat session."""
     user_id = int(get_jwt_identity())
-    session = ChatSession.query.get(session_id)
+    session = db.session.get(ChatSession, session_id)
     if not session:
         return jsonify({"error": "Session not found"}), 404
     if session.user_id != user_id:
@@ -1867,7 +2149,7 @@ def submit_feedback():
 @jwt_required()
 def list_feedback():
     user_id = int(get_jwt_identity())
-    user = User.query.get(user_id)
+    user = db.session.get(User, user_id)
     if user.role == "customer":
         feedbacks = Feedback.query.filter_by(user_id=user_id).order_by(Feedback.created_at.desc()).all()
     else:
@@ -1883,7 +2165,7 @@ def list_feedback():
 @jwt_required()
 def manager_dashboard():
     user_id = int(get_jwt_identity())
-    user = User.query.get(user_id)
+    user = db.session.get(User, user_id)
     if user.role not in ("manager", "cto", "admin"):
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -1962,7 +2244,7 @@ def manager_dashboard():
 @jwt_required()
 def manager_tickets():
     user_id = int(get_jwt_identity())
-    user = User.query.get(user_id)
+    user = db.session.get(User, user_id)
     if user.role not in ("manager", "cto", "admin"):
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -1996,11 +2278,11 @@ def manager_tickets():
 @jwt_required()
 def update_ticket(ticket_id):
     user_id = int(get_jwt_identity())
-    user = User.query.get(user_id)
+    user = db.session.get(User, user_id)
     if user.role not in ("manager", "cto", "admin"):
         return jsonify({"error": "Unauthorized"}), 403
 
-    ticket = Ticket.query.get(ticket_id)
+    ticket = db.session.get(Ticket, ticket_id)
     if not ticket:
         return jsonify({"error": "Ticket not found"}), 404
 
@@ -2024,7 +2306,7 @@ def update_ticket(ticket_id):
 @jwt_required()
 def manager_chats():
     user_id = int(get_jwt_identity())
-    user = User.query.get(user_id)
+    user = db.session.get(User, user_id)
     if user.role not in ("manager", "cto", "admin"):
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -2041,7 +2323,7 @@ def manager_chats():
 @jwt_required()
 def manager_users():
     user_id = int(get_jwt_identity())
-    user = User.query.get(user_id)
+    user = db.session.get(User, user_id)
     if user.role not in ("manager", "cto", "admin"):
         return jsonify({"error": "Unauthorized"}), 403
     managers = User.query.filter(User.role.in_(["manager"])).all()
@@ -2056,7 +2338,7 @@ def manager_users():
 @jwt_required()
 def cto_overview():
     user_id = int(get_jwt_identity())
-    user = User.query.get(user_id)
+    user = db.session.get(User, user_id)
     if user.role != "cto":
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -2124,7 +2406,7 @@ def cto_duty_roster():
 @app.route("/api/manager/sla-alerts", methods=["GET"])
 @jwt_required()
 def manager_sla_alerts():
-    user = User.query.get(int(get_jwt_identity()))
+    user = db.session.get(User, int(get_jwt_identity()))
     if user.role not in ("manager", "admin"):
         return jsonify({"error": "Unauthorized"}), 403
     unread_only = request.args.get("unread_only", "false").lower() == "true"
@@ -2138,7 +2420,7 @@ def manager_sla_alerts():
 @app.route("/api/cto/sla-alerts", methods=["GET"])
 @jwt_required()
 def cto_sla_alerts():
-    user = User.query.get(int(get_jwt_identity()))
+    user = db.session.get(User, int(get_jwt_identity()))
     if user.role != "cto":
         return jsonify({"error": "Unauthorized"}), 403
     unread_only = request.args.get("unread_only", "false").lower() == "true"
@@ -2152,10 +2434,10 @@ def cto_sla_alerts():
 @app.route("/api/manager/sla-alerts/<int:alert_id>/read", methods=["PUT"])
 @jwt_required()
 def manager_mark_alert_read(alert_id):
-    user = User.query.get(int(get_jwt_identity()))
+    user = db.session.get(User, int(get_jwt_identity()))
     if user.role not in ("manager", "admin"):
         return jsonify({"error": "Unauthorized"}), 403
-    alert = SlaAlert.query.get(alert_id)
+    alert = db.session.get(SlaAlert, alert_id)
     if not alert or alert.recipient_role != "manager":
         return jsonify({"error": "Alert not found"}), 404
     alert.is_read = True
@@ -2166,10 +2448,10 @@ def manager_mark_alert_read(alert_id):
 @app.route("/api/cto/sla-alerts/<int:alert_id>/read", methods=["PUT"])
 @jwt_required()
 def cto_mark_alert_read(alert_id):
-    user = User.query.get(int(get_jwt_identity()))
+    user = db.session.get(User, int(get_jwt_identity()))
     if user.role != "cto":
         return jsonify({"error": "Unauthorized"}), 403
-    alert = SlaAlert.query.get(alert_id)
+    alert = db.session.get(SlaAlert, alert_id)
     if not alert or alert.recipient_role != "cto":
         return jsonify({"error": "Alert not found"}), 404
     alert.is_read = True
@@ -2180,7 +2462,7 @@ def cto_mark_alert_read(alert_id):
 @app.route("/api/manager/sla-alerts/read-all", methods=["PUT"])
 @jwt_required()
 def manager_mark_all_alerts_read():
-    user = User.query.get(int(get_jwt_identity()))
+    user = db.session.get(User, int(get_jwt_identity()))
     if user.role not in ("manager", "admin"):
         return jsonify({"error": "Unauthorized"}), 403
     SlaAlert.query.filter_by(recipient_role="manager", is_read=False).update({"is_read": True})
@@ -2191,7 +2473,7 @@ def manager_mark_all_alerts_read():
 @app.route("/api/cto/sla-alerts/read-all", methods=["PUT"])
 @jwt_required()
 def cto_mark_all_alerts_read():
-    user = User.query.get(int(get_jwt_identity()))
+    user = db.session.get(User, int(get_jwt_identity()))
     if user.role != "cto":
         return jsonify({"error": "Unauthorized"}), 403
     SlaAlert.query.filter_by(recipient_role="cto", is_read=False).update({"is_read": True})
@@ -2231,7 +2513,7 @@ def generate_employee_id(role):
 @jwt_required()
 def admin_dashboard():
     user_id = int(get_jwt_identity())
-    user = User.query.get(user_id)
+    user = db.session.get(User, user_id)
     if user.role != "admin":
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -2317,7 +2599,7 @@ def admin_dashboard():
 @jwt_required()
 def admin_list_users():
     user_id = int(get_jwt_identity())
-    user = User.query.get(user_id)
+    user = db.session.get(User, user_id)
     if user.role != "admin":
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -2343,7 +2625,7 @@ def admin_list_users():
 @jwt_required()
 def admin_create_user():
     user_id = int(get_jwt_identity())
-    user = User.query.get(user_id)
+    user = db.session.get(User, user_id)
     if user.role != "admin":
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -2378,7 +2660,7 @@ def admin_create_user():
 @jwt_required()
 def admin_upload_users():
     user_id = int(get_jwt_identity())
-    user = User.query.get(user_id)
+    user = db.session.get(User, user_id)
     if user.role != "admin":
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -2463,11 +2745,11 @@ def admin_upload_users():
 @jwt_required()
 def admin_update_user(uid):
     user_id = int(get_jwt_identity())
-    user = User.query.get(user_id)
+    user = db.session.get(User, user_id)
     if user.role != "admin":
         return jsonify({"error": "Unauthorized"}), 403
 
-    target = User.query.get(uid)
+    target = db.session.get(User, uid)
     if not target:
         return jsonify({"error": "User not found"}), 404
 
@@ -2505,14 +2787,14 @@ def admin_update_user(uid):
 @jwt_required()
 def admin_delete_user(uid):
     user_id = int(get_jwt_identity())
-    user = User.query.get(user_id)
+    user = db.session.get(User, user_id)
     if user.role != "admin":
         return jsonify({"error": "Unauthorized"}), 403
 
     if uid == user_id:
         return jsonify({"error": "Cannot delete your own account"}), 400
 
-    target = User.query.get(uid)
+    target = db.session.get(User, uid)
     if not target:
         return jsonify({"error": "User not found"}), 404
 
@@ -2534,7 +2816,7 @@ def admin_delete_user(uid):
 @jwt_required()
 def admin_agent_tickets():
     user_id = int(get_jwt_identity())
-    user = User.query.get(user_id)
+    user = db.session.get(User, user_id)
     if user.role != "admin":
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -2579,7 +2861,7 @@ def admin_agent_tickets():
 @jwt_required()
 def admin_agent_alerts():
     user_id = int(get_jwt_identity())
-    user = User.query.get(user_id)
+    user = db.session.get(User, user_id)
     if user.role != "admin":
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -2676,7 +2958,7 @@ def admin_agent_alerts():
 @jwt_required()
 def admin_feedback():
     user_id = int(get_jwt_identity())
-    user = User.query.get(user_id)
+    user = db.session.get(User, user_id)
     if user.role != "admin":
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -2695,15 +2977,42 @@ def admin_feedback():
 # SITE & KPI DATA UPLOAD (Admin)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def haversine(lat1, lon1, lat2, lon2):
-    """Calculate distance in km between two lat/lng points."""
-    R = 6371
-    dlat = math.radians(lat2 - lat1)
-    dlon = math.radians(lon2 - lon1)
-    a = (math.sin(dlat / 2) ** 2 +
-         math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) *
-         math.sin(dlon / 2) ** 2)
-    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+haversine = _haversine  # alias — keep backward compat
+
+# In-memory upload progress store: {job_id: {status, total, processed, created, updated, skipped, error}}
+import threading as _threading
+_upload_jobs = {}
+_upload_jobs_lock = _threading.Lock()
+
+
+def _new_upload_job():
+    import uuid
+    job_id = str(uuid.uuid4())
+    with _upload_jobs_lock:
+        _upload_jobs[job_id] = {
+            "status": "processing",
+            "total": 0,
+            "processed": 0,
+            "created": 0,
+            "updated": 0,
+            "skipped": [],
+            "error": None,
+        }
+    return job_id
+
+
+@app.route("/api/admin/upload-jobs/<job_id>", methods=["GET"])
+@jwt_required()
+def admin_upload_job_status(job_id):
+    """Poll progress of an async site upload job."""
+    user = db.session.get(User, int(get_jwt_identity()))
+    if not user or user.role != "admin":
+        return jsonify({"error": "Unauthorized"}), 403
+    with _upload_jobs_lock:
+        job = _upload_jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Job not found"}), 404
+    return jsonify(job)
 
 
 def _validate_ooxml_excel_upload(file_storage):
@@ -2733,8 +3042,9 @@ def _validate_ooxml_excel_upload(file_storage):
 @app.route("/api/admin/upload-sites", methods=["POST"])
 @jwt_required()
 def admin_upload_sites():
-    """Upload site data Excel (site_id, latitude, longitude, zone)."""
-    user = User.query.get(int(get_jwt_identity()))
+    """Upload site data Excel — processes in background chunks for large files.
+    Returns a job_id immediately. Poll /api/admin/upload-jobs/<job_id> for progress."""
+    user = db.session.get(User, int(get_jwt_identity()))
     if not user or user.role != "admin":
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -2748,52 +3058,238 @@ def admin_upload_sites():
     if not ok:
         return jsonify({"error": err}), 400
 
-    import openpyxl
-    wb = openpyxl.load_workbook(file, data_only=True)
-    ws = wb.active
+    import tempfile
+    fd, tmp_path = tempfile.mkstemp(suffix=".xlsx")
+    with os.fdopen(fd, "wb") as tmp:
+        file.save(tmp)
 
-    headers = [str(c.value).strip().lower() if c.value else "" for c in ws[1]]
-    col_map = {}
-    for i, h in enumerate(headers):
-        if "site" in h and "id" in h:
-            col_map["site_id"] = i
-        elif "lat" in h:
-            col_map["latitude"] = i
-        elif "lon" in h:
-            col_map["longitude"] = i
-        elif "zone" in h:
-            col_map["zone"] = i
+    job_id = _new_upload_job()
 
-    required = ["site_id", "latitude", "longitude"]
-    missing = [k for k in required if k not in col_map]
-    if missing:
-        return jsonify({"error": f"Missing columns: {', '.join(missing)}. Found headers: {headers}"}), 400
+    def _run_upload(path, jid):
+        import openpyxl as _openpyxl
 
-    created = 0
-    updated = 0
-    skipped = []
-    for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
+        def _norm_header(val):
+            return re.sub(r"[^a-z0-9]+", " ", (val or "").strip().lower()).strip()
+
+        def _parse_float(v):
+            if v is None:
+                return None
+            try:
+                s = str(v).strip()
+                return float(s) if s else None
+            except Exception:
+                return None
+
+        def _parse_str(v):
+            return "" if v is None else str(v).strip()
+
+        def _normalize_status(v):
+            s = _parse_str(v).lower()
+            if not s:
+                return "on_air"
+            if any(x in s for x in ["off", "down", "out", "inactive", "shutdown"]):
+                return "off_air"
+            return "on_air"
+
+        def _apply_batch(batch):
+            c_count = u_count = 0
+            deduped = {}
+            for b in batch:
+                key = (b.get("site_id"), b.get("cell_id"))
+                deduped[key] = b
+            site_ids = list({k[0] for k in deduped.keys()})
+            existing_rows = TelecomSite.query.filter(TelecomSite.site_id.in_(site_ids)).all()
+            existing_map = {(s.site_id, s.cell_id): s for s in existing_rows}
+            for b in deduped.values():
+                key = (b.get("site_id"), b.get("cell_id"))
+                site = existing_map.get(key)
+                if site:
+                    for field, val in b.items():
+                        if field != "site_id" and val is not None:
+                            setattr(site, field, val)
+                    u_count += 1
+                else:
+                    db.session.add(TelecomSite(**b))
+                    c_count += 1
+            db.session.commit()
+            return c_count, u_count
+
         try:
-            sid = str(row[col_map["site_id"]]).strip()
-            lat = float(row[col_map["latitude"]])
-            lon = float(row[col_map["longitude"]])
-            zone = str(row[col_map.get("zone", -1)]).strip() if col_map.get("zone") is not None and col_map.get("zone") < len(row) and row[col_map.get("zone")] else ""
+            wb = _openpyxl.load_workbook(path, data_only=True, read_only=True)
+            ws = wb.active
+
+            _fs = {
+                "site_id": ["site id", "site_id", "siteid", "site code"],
+                "site_name": ["site name", "sitename", "name"],
+                "cell_id": ["cell id", "cell_id", "cellid", "cell"],
+                "latitude": ["latitude", "lat"],
+                "longitude": ["longitude", "long", "lon", "lng"],
+                "zone": ["zone", "circle", "region", "area"],
+                "site_status": ["status", "site status", "site_status", "operational status"],
+                "alarms": ["alarm", "alarms", "alarm text", "active alarm"],
+                "standard_solution_step": ["standard solution step", "solution step", "standard solution", "standard_solution_step"],
+                "solution": ["solution", "resolution", "action", "recommended action"],
+                "bandwidth_mhz": ["bandwidth (mhz)", "bandwidth mhz", "bandwidth", "bw", "bandwidth(mhz)", "bw (mhz)"],
+                "antenna_gain_dbi": ["antenna gain (dbi)", "antenna gain", "gain dbi", "antenna gain(dbi)", "gain (dbi)"],
+                "rf_power_eirp_dbm": ["rf power (eirp) [dbm]", "rf power eirp", "eirp dbm", "eirp", "rf power", "rf power(eirp)[dbm]", "eirp [dbm]", "rf power eirp dbm"],
+                "antenna_height_agl_m": ["antenna height (above ground level) (m)", "antenna height (above ground level)(m)", "antenna height", "above ground", "agl", "antenna height agl", "height (m)", "height(m)", "antenna height (agl) (m)", "antenna height(above ground level)(m)"],
+                "e_tilt_degree": ["e-tilt (degree)", "e tilt", "e-tilt", "etilt", "electrical tilt", "tilt", "e tilt (degree)", "e-tilt(degree)"],
+                "crs_gain": ["crs gain", "crs", "crs_gain"],
+            }
+
+            headers = [str(c.value).strip() if c.value else "" for c in ws[1]]
+            norm_headers = [_norm_header(h) for h in headers]
+            col_map = {}
+            for i, nh in enumerate(norm_headers):
+                for field, synonyms in _fs.items():
+                    if field in col_map:
+                        continue
+                    if any(s in nh for s in synonyms):
+                        col_map[field] = i
+                        break
+            # Heuristic fallback
+            for i, nh in enumerate(norm_headers):
+                if "latitude" not in col_map and "lat" in nh:
+                    col_map["latitude"] = i
+                if "longitude" not in col_map and any(x in nh for x in ["lon", "lng", "long"]):
+                    col_map["longitude"] = i
+                if "site_id" not in col_map and "site" in nh and "id" in nh:
+                    col_map["site_id"] = i
+                if "site_name" not in col_map and "site" in nh and "name" in nh:
+                    col_map["site_name"] = i
+                if "cell_id" not in col_map and "cell" in nh and "id" in nh:
+                    col_map["cell_id"] = i
+                if "zone" not in col_map and "zone" in nh:
+                    col_map["zone"] = i
+                if "site_status" not in col_map and "status" in nh:
+                    col_map["site_status"] = i
+                if "alarms" not in col_map and "alarm" in nh:
+                    col_map["alarms"] = i
+                if "solution" not in col_map and "solution" in nh:
+                    col_map["solution"] = i
+                if "standard_solution_step" not in col_map and "standard" in nh and "solution" in nh:
+                    col_map["standard_solution_step"] = i
+                if "bandwidth_mhz" not in col_map and "bandwidth" in nh:
+                    col_map["bandwidth_mhz"] = i
+                if "antenna_gain_dbi" not in col_map and "antenna" in nh and "gain" in nh:
+                    col_map["antenna_gain_dbi"] = i
+                if "rf_power_eirp_dbm" not in col_map and ("eirp" in nh or ("rf" in nh and "power" in nh)):
+                    col_map["rf_power_eirp_dbm"] = i
+                if "antenna_height_agl_m" not in col_map and "antenna" in nh and "height" in nh:
+                    col_map["antenna_height_agl_m"] = i
+                if "e_tilt_degree" not in col_map and "tilt" in nh:
+                    col_map["e_tilt_degree"] = i
+                if "crs_gain" not in col_map and "crs" in nh:
+                    col_map["crs_gain"] = i
+
+            required = ["latitude", "longitude"]
+            if "site_id" not in col_map and "site_name" not in col_map:
+                required.append("site_id")
+            missing = [k for k in required if k not in col_map]
+            if missing:
+                with _upload_jobs_lock:
+                    _upload_jobs[jid]["status"] = "failed"
+                    _upload_jobs[jid]["error"] = f"Missing columns: {', '.join(missing)}. Found headers: {headers}"
+                return
+
+            all_rows = list(ws.iter_rows(min_row=2, values_only=True))
+            total_rows = len(all_rows)
+            with _upload_jobs_lock:
+                _upload_jobs[jid]["total"] = total_rows
+
+            created = updated = 0
+            skipped = []
+            batch = []
+            BATCH_SIZE = 500
+
+            with app.app_context():
+                for row_idx, row in enumerate(all_rows, start=2):
+                    try:
+                        raw_site_id = row[col_map["site_id"]] if "site_id" in col_map else None
+                        raw_site_name = row[col_map["site_name"]] if "site_name" in col_map else None
+                        sid = _parse_str(raw_site_id or raw_site_name)
+                        if not sid:
+                            raise ValueError("Missing site identifier")
+                        lat = _parse_float(row[col_map["latitude"]]) if "latitude" in col_map else None
+                        lon = _parse_float(row[col_map["longitude"]]) if "longitude" in col_map else None
+                        if lat is None or lon is None:
+                            raise ValueError("Missing latitude/longitude")
+                        zone = _parse_str(row[col_map["zone"]]) if "zone" in col_map else ""
+                        status = _normalize_status(row[col_map["site_status"]]) if "site_status" in col_map else "on_air"
+                        alarms = _parse_str(row[col_map["alarms"]]) if "alarms" in col_map else ""
+                        solution = _parse_str(row[col_map["solution"]]) if "solution" in col_map else ""
+                        std_solution = _parse_str(row[col_map["standard_solution_step"]]) if "standard_solution_step" in col_map else ""
+                        if not solution and std_solution:
+                            solution = std_solution
+                        cell_id_val = _parse_str(row[col_map["cell_id"]]) if "cell_id" in col_map else ""
+                        if not cell_id_val:
+                            cell_id_val = None
+                        entry = {
+                            "site_id": sid,
+                            "site_name": _parse_str(raw_site_name) if raw_site_name is not None else sid,
+                            "cell_id": cell_id_val,
+                            "latitude": lat,
+                            "longitude": lon,
+                            "zone": zone,
+                            "site_status": status,
+                            "alarms": alarms,
+                            "solution": solution,
+                            "standard_solution_step": std_solution,
+                            "bandwidth_mhz": _parse_float(row[col_map["bandwidth_mhz"]]) if "bandwidth_mhz" in col_map else None,
+                            "antenna_gain_dbi": _parse_float(row[col_map["antenna_gain_dbi"]]) if "antenna_gain_dbi" in col_map else None,
+                            "rf_power_eirp_dbm": _parse_float(row[col_map["rf_power_eirp_dbm"]]) if "rf_power_eirp_dbm" in col_map else None,
+                            "antenna_height_agl_m": _parse_float(row[col_map["antenna_height_agl_m"]]) if "antenna_height_agl_m" in col_map else None,
+                            "e_tilt_degree": _parse_float(row[col_map["e_tilt_degree"]]) if "e_tilt_degree" in col_map else None,
+                            "crs_gain": _parse_float(row[col_map["crs_gain"]]) if "crs_gain" in col_map else None,
+                        }
+                        batch.append(entry)
+                    except Exception as e:
+                        skipped.append(f"Row {row_idx}: {e}")
+                        continue
+
+                    if len(batch) >= BATCH_SIZE:
+                        c, u = _apply_batch(batch)
+                        created += c
+                        updated += u
+                        batch = []
+                        with _upload_jobs_lock:
+                            _upload_jobs[jid]["processed"] = row_idx - 1
+                            _upload_jobs[jid]["created"] = created
+                            _upload_jobs[jid]["updated"] = updated
+                            _upload_jobs[jid]["skipped"] = skipped[-20:]
+
+                if batch:
+                    c, u = _apply_batch(batch)
+                    created += c
+                    updated += u
+
+            with _upload_jobs_lock:
+                _upload_jobs[jid]["status"] = "done"
+                _upload_jobs[jid]["processed"] = total_rows
+                _upload_jobs[jid]["created"] = created
+                _upload_jobs[jid]["updated"] = updated
+                _upload_jobs[jid]["skipped"] = skipped
+                _upload_jobs[jid]["total"] = created + updated
+
+            wb.close()
+
         except Exception as e:
-            skipped.append(f"Row {row_idx}: {e}")
-            continue
+            with _upload_jobs_lock:
+                _upload_jobs[jid]["status"] = "failed"
+                _upload_jobs[jid]["error"] = str(e)
+        finally:
+            try:
+                os.remove(path)
+            except Exception:
+                pass
 
-        existing = TelecomSite.query.filter_by(site_id=sid).first()
-        if existing:
-            existing.latitude = lat
-            existing.longitude = lon
-            existing.zone = zone
-            updated += 1
-        else:
-            db.session.add(TelecomSite(site_id=sid, latitude=lat, longitude=lon, zone=zone))
-            created += 1
+    t = _threading.Thread(target=_run_upload, args=(tmp_path, job_id), daemon=True)
+    t.start()
 
-    db.session.commit()
-    return jsonify({"created": created, "updated": updated, "skipped": skipped, "total": created + updated})
+    return jsonify({
+        "job_id": job_id,
+        "message": "Upload started. Poll /api/admin/upload-jobs/<job_id> for progress.",
+    }), 202
 
 
 @app.route("/api/admin/upload-kpi-site-level", methods=["POST"])
@@ -2801,7 +3297,7 @@ def admin_upload_sites():
 def admin_upload_kpi_site_level():
     """Upload site-level KPI workbook (27 sheets, sheet name = KPI name).
     Each sheet: Site_ID column, then date columns with values."""
-    user = User.query.get(int(get_jwt_identity()))
+    user = db.session.get(User, int(get_jwt_identity()))
 
     user = db.session.get(User, int(get_jwt_identity()))
     if not user or user.role != "admin":
@@ -3131,7 +3627,7 @@ def admin_upload_kpi_cell_level():
 @jwt_required()
 def admin_delete_sites():
     """Delete all telecom site data."""
-    user = User.query.get(int(get_jwt_identity()))
+    user = db.session.get(User, int(get_jwt_identity()))
     if not user or user.role != "admin":
         return jsonify({"error": "Unauthorized"}), 403
     count = TelecomSite.query.count()
@@ -3144,7 +3640,7 @@ def admin_delete_sites():
 @jwt_required()
 def admin_delete_kpi_site_level():
     """Delete all site-level KPI data."""
-    user = User.query.get(int(get_jwt_identity()))
+    user = db.session.get(User, int(get_jwt_identity()))
     if not user or user.role != "admin":
         return jsonify({"error": "Unauthorized"}), 403
     count = KpiData.query.filter_by(data_level="site").count()
@@ -3157,7 +3653,7 @@ def admin_delete_kpi_site_level():
 @jwt_required()
 def admin_delete_kpi_cell_level():
     """Delete all cell-level KPI data."""
-    user = User.query.get(int(get_jwt_identity()))
+    user = db.session.get(User, int(get_jwt_identity()))
     if not user or user.role != "admin":
         return jsonify({"error": "Unauthorized"}), 403
     count = KpiData.query.filter_by(data_level="cell").count()
@@ -3170,7 +3666,7 @@ def admin_delete_kpi_cell_level():
 @jwt_required()
 def admin_uploaded_kpis():
     """Return list of uploaded KPI names with row counts, split by data level."""
-    user = User.query.get(int(get_jwt_identity()))
+    user = db.session.get(User, int(get_jwt_identity()))
     if not user or user.role != "admin":
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -3245,7 +3741,7 @@ def calc_trend(current, previous):
 @jwt_required()
 def reports_overview():
     user_id = int(get_jwt_identity())
-    user = User.query.get(user_id)
+    user = db.session.get(User, user_id)
     if user.role not in ("manager", "admin"):
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -3398,7 +3894,7 @@ def reports_overview():
 @jwt_required()
 def reports_agents():
     user_id = int(get_jwt_identity())
-    user = User.query.get(user_id)
+    user = db.session.get(User, user_id)
     if user.role not in ("manager", "admin"):
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -3473,7 +3969,7 @@ def reports_agents():
 @jwt_required()
 def reports_csat():
     user_id = int(get_jwt_identity())
-    user = User.query.get(user_id)
+    user = db.session.get(User, user_id)
     if user.role not in ("manager", "admin"):
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -3550,7 +4046,7 @@ def reports_csat():
 @jwt_required()
 def reports_sla():
     user_id = int(get_jwt_identity())
-    user = User.query.get(user_id)
+    user = db.session.get(User, user_id)
     if user.role not in ("manager", "admin"):
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -3686,7 +4182,7 @@ def reports_sla():
 @jwt_required()
 def reports_export():
     user_id = int(get_jwt_identity())
-    user = User.query.get(user_id)
+    user = db.session.get(User, user_id)
     if user.role not in ("manager", "admin"):
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -3760,7 +4256,7 @@ def reports_export():
 def agent_toggle_status():
     """Toggle human agent online/offline status."""
     user_id = int(get_jwt_identity())
-    user = User.query.get(user_id)
+    user = db.session.get(User, user_id)
     if not user or user.role != "human_agent":
         return jsonify({"error": "Unauthorized"}), 403
     data = request.json or {}
@@ -3793,7 +4289,7 @@ def manager_toggle_status():
 def agent_dashboard():
     """Return KPIs for the human agent."""
     user_id = int(get_jwt_identity())
-    user = User.query.get(user_id)
+    user = db.session.get(User, user_id)
     if not user or user.role != "human_agent":
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -3936,7 +4432,7 @@ def agent_dashboard():
 def agent_tickets():
     """Return tickets assigned to the current human agent."""
     user_id = int(get_jwt_identity())
-    user = User.query.get(user_id)
+    user = db.session.get(User, user_id)
     if not user or user.role != "human_agent":
         return jsonify({"error": "Unauthorized"}), 403
     tickets = Ticket.query.filter_by(assigned_to=user_id).order_by(Ticket.created_at.desc()).all()
@@ -3948,10 +4444,10 @@ def agent_tickets():
 def agent_resolve_ticket(ticket_id):
     """Mark a ticket as resolved by the agent."""
     user_id = int(get_jwt_identity())
-    user = User.query.get(user_id)
+    user = db.session.get(User, user_id)
     if not user or user.role != "human_agent":
         return jsonify({"error": "Unauthorized"}), 403
-    ticket = Ticket.query.get(ticket_id)
+    ticket = db.session.get(Ticket, ticket_id)
     if not ticket:
         return jsonify({"error": "Ticket not found"}), 404
     if ticket.assigned_to != user_id:
@@ -3973,7 +4469,7 @@ def agent_resolve_ticket(ticket_id):
     # ── Add a bot message to the chat session so the customer sees it ──
     chat_session = None
     if ticket.chat_session_id:
-        chat_session = ChatSession.query.get(ticket.chat_session_id)
+        chat_session = db.session.get(ChatSession, ticket.chat_session_id)
         if chat_session:
             resolve_text = (
                 f"Great news! Your support ticket ({ticket.reference_number}) has been resolved by "
@@ -3996,7 +4492,7 @@ def agent_resolve_ticket(ticket_id):
     db.session.commit()
 
     # ── Notify customer via Email ──
-    customer_user = User.query.get(ticket.user_id)
+    customer_user = db.session.get(User, ticket.user_id)
     if customer_user and customer_user.email:
         try:
             notes_row = f"<tr><td style='padding:8px 0;color:#64748b;width:140px;'>Resolution</td><td style='padding:8px 0;color:#1e293b;'>{resolution_notes}</td></tr>" if resolution_notes else ""
@@ -4071,15 +4567,15 @@ def agent_resolve_ticket(ticket_id):
 def agent_diagnose_ticket(ticket_id):
     """Use AI to generate a diagnosis/recommendation for resolving this ticket."""
     user_id = int(get_jwt_identity())
-    user = User.query.get(user_id)
+    user = db.session.get(User, user_id)
     if not user or user.role != "human_agent":
         return jsonify({"error": "Unauthorized"}), 403
 
-    ticket = Ticket.query.get(ticket_id)
+    ticket = db.session.get(Ticket, ticket_id)
     if not ticket:
         return jsonify({"error": "Ticket not found"}), 404
 
-    session = ChatSession.query.get(ticket.chat_session_id) if ticket.chat_session_id else None
+    session = db.session.get(ChatSession, ticket.chat_session_id) if ticket.chat_session_id else None
     chat_history = ""
     if session:
         msgs = session.messages[:20]  # Last 20 messages for context
@@ -4126,15 +4622,15 @@ Keep your response concise and actionable."""
 @jwt_required()
 def agent_nearest_sites(ticket_id):
     """Find 3 nearest telecom sites to customer's location."""
-    user = User.query.get(int(get_jwt_identity()))
+    user = db.session.get(User, int(get_jwt_identity()))
     if not user or user.role != "human_agent":
         return jsonify({"error": "Unauthorized"}), 403
 
-    ticket = Ticket.query.get(ticket_id)
+    ticket = db.session.get(Ticket, ticket_id)
     if not ticket:
         return jsonify({"error": "Ticket not found"}), 404
 
-    session = ChatSession.query.get(ticket.chat_session_id) if ticket.chat_session_id else None
+    session = db.session.get(ChatSession, ticket.chat_session_id) if ticket.chat_session_id else None
     if not session or not session.latitude or not session.longitude:
         return jsonify({"error": "Customer location not available"}), 400
 
@@ -4149,12 +4645,64 @@ def agent_nearest_sites(ticket_id):
     })
 
 
+def _detect_significant_drops(trend_data: list, drop_threshold_pct: float = 15.0):
+    """
+    Detect significant drops (or spikes) in a KPI trend list.
+    Returns a list of {label, value, drop_pct, type} for highlighted points.
+    A 'significant drop' is where the avg falls >=threshold% below the rolling baseline
+    (mean of all previous points). Also detects spikes (sharp increases) for metrics
+    like latency/packet_loss where a spike is bad.
+    """
+    if len(trend_data) < 3:
+        return []
+
+    drops = []
+    all_avgs = [p["avg"] for p in trend_data if p["avg"] is not None]
+    if not all_avgs:
+        return []
+
+    overall_mean = sum(all_avgs) / len(all_avgs)
+    if overall_mean == 0:
+        return []
+
+    for i, point in enumerate(trend_data):
+        val = point.get("avg")
+        if val is None:
+            continue
+        # Build baseline from preceding points (at least 2)
+        if i < 2:
+            continue
+        prev_vals = [trend_data[j]["avg"] for j in range(i) if trend_data[j]["avg"] is not None]
+        if not prev_vals:
+            continue
+        baseline = sum(prev_vals) / len(prev_vals)
+        if baseline == 0:
+            continue
+        pct_change = (val - baseline) / baseline * 100
+        if pct_change <= -drop_threshold_pct:
+            drops.append({
+                "label": point["label"],
+                "value": val,
+                "drop_pct": round(pct_change, 1),
+                "type": "drop",
+            })
+        elif pct_change >= drop_threshold_pct * 2:
+            # Spikes are reported for latency-like KPIs (positive = bad)
+            drops.append({
+                "label": point["label"],
+                "value": val,
+                "drop_pct": round(pct_change, 1),
+                "type": "spike",
+            })
+    return drops
+
+
 @app.route("/api/agent/sites/<site_id>/kpi-trends", methods=["GET"])
 @jwt_required()
 def agent_kpi_trends(site_id):
     """Get KPI trend data for a site, aggregated by period (month/week/day/hour).
     Supports data_level filter: 'site' or 'cell'."""
-    user = User.query.get(int(get_jwt_identity()))
+    user = db.session.get(User, int(get_jwt_identity()))
     if not user or user.role != "human_agent":
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -4187,6 +4735,7 @@ def agent_kpi_trends(site_id):
         if not rows:
             continue
         agg = defaultdict(list)
+        has_hour_variation = any((r.hour or 0) != 0 for r in rows)
         for r in rows:
             if r.value is None:
                 continue
@@ -4195,7 +4744,8 @@ def agent_kpi_trends(site_id):
             elif period == "week":
                 key = f"{r.date.isocalendar()[0]}-W{r.date.isocalendar()[1]:02d}"
             elif period == "hour":
-                key = f"{r.hour:02d}:00"
+                # If no true hourly data exists, fall back to daily key so chart still renders.
+                key = f"{r.hour:02d}:00" if has_hour_variation else r.date.strftime("%Y-%m-%d")
             else:  # day
                 key = r.date.strftime("%Y-%m-%d")
             agg[key].append(r.value)
@@ -4212,6 +4762,13 @@ def agent_kpi_trends(site_id):
         if trend:
             result[kpi_name] = trend
 
+    # Build significant_drops map separately — trends keeps flat array format for frontend compat
+    drops_map = {}
+    for kpi_name, trend_data in result.items():
+        drops = _detect_significant_drops(trend_data)
+        if drops:
+            drops_map[kpi_name] = drops
+
     return jsonify({
         "site_id": site_id,
         "period": period,
@@ -4219,6 +4776,7 @@ def agent_kpi_trends(site_id):
         "problem_type": _problem_type_label(problem_type),
         "selected_kpis": selected_kpis,
         "trends": result,
+        "significant_drops": drops_map,
     })
 
 
@@ -4226,15 +4784,15 @@ def agent_kpi_trends(site_id):
 @jwt_required()
 def agent_root_cause(ticket_id):
     """AI root cause analysis using both site-level and cell-level KPI trends of the nearest site."""
-    user = User.query.get(int(get_jwt_identity()))
+    user = db.session.get(User, int(get_jwt_identity()))
     if not user or user.role != "human_agent":
         return jsonify({"error": "Unauthorized"}), 403
 
-    ticket = Ticket.query.get(ticket_id)
+    ticket = db.session.get(Ticket, ticket_id)
     if not ticket:
         return jsonify({"error": "Ticket not found"}), 404
 
-    session = ChatSession.query.get(ticket.chat_session_id) if ticket.chat_session_id else None
+    session = db.session.get(ChatSession, ticket.chat_session_id) if ticket.chat_session_id else None
     if not session or not session.latitude or not session.longitude:
         return jsonify({"error": "Customer location not available"}), 400
 
@@ -4246,9 +4804,18 @@ def agent_root_cause(ticket_id):
     nearest_site_id = nearest["site_id"]
     nearest_zone = nearest.get("zone")
     dist_km = nearest["distance_km"]
-    site_status = nearest.get("status", "on_air")  # Get status from nearest site
-    alarms_text = nearest.get("alarm", "None")  # Get alarms from nearest site
-    solution_text = nearest.get("solution", "No action required")  # Get solution from nearest site
+    site_status = (nearest.get("site_status") or nearest.get("status") or "on_air").lower()
+    alarms_text = nearest.get("alarms") or nearest.get("alarm") or "None"
+    solution_text = nearest.get("solution") or "No action required"
+    std_solution_text = nearest.get("standard_solution_step") or ""
+    site_params_text = "\n".join([
+        f"- Bandwidth (MHz): {nearest.get('bandwidth_mhz')}",
+        f"- Antenna Gain (dBi): {nearest.get('antenna_gain_dbi')}",
+        f"- RF Power (EIRP) [dBm]: {nearest.get('rf_power_eirp_dbm')}",
+        f"- Antenna height (AGL) (M): {nearest.get('antenna_height_agl_m')}",
+        f"- E-tilt (Degree): {nearest.get('e_tilt_degree')}",
+        f"- CRS Gain: {nearest.get('crs_gain')}",
+    ])
 
     problem_type = _detect_network_problem_type(ticket)
     problem_type_label = _problem_type_label(problem_type)
@@ -4262,15 +4829,18 @@ def agent_root_cause(ticket_id):
     cell_kpi_text = _build_kpi_summary_text(cell_rows, selected_kpis, "cell-level")
 
     if site_status == "off_air":
-        prompt = f"""You are an expert telecom network engineer performing root cause analysis.
+        prompt = f"""You are a senior telecom network engineer performing root cause analysis.
 
-TICKET: {ticket.reference_number} - {ticket.category} / {ticket.subcategory}
-CUSTOMER ISSUE: {ticket.description}
+TICKET: {ticket.reference_number} — {ticket.category} / {ticket.subcategory}
+CUSTOMER REPORTED ISSUE: {ticket.description}
 PROBLEM TYPE: {problem_type_label}
 NEAREST SITE: {nearest_site_id} (Zone: {nearest_zone}, Distance: {dist_km} km from customer)
 
-SITE STATUS: OFF AIR. This site is currently down.
-Use only these KPI families relevant to {problem_type_label}: {", ".join(selected_kpis) if selected_kpis else "No matched KPI names"}.
+=== SITE STATUS: OFF AIR ===
+This site is currently down. Root cause analysis must integrate:
+(1) The active alarms that caused/indicate the outage.
+(2) The standard solution steps.
+(3) Trend evidence from the KPIs most directly related to {problem_type_label} — use actual values.
 
 ACTIVE ALARMS:
 {alarms_text if alarms_text else 'No alarm data available.'}
@@ -4278,43 +4848,62 @@ ACTIVE ALARMS:
 KNOWN SOLUTION:
 {solution_text if solution_text else 'No solution data available.'}
 
-SITE-LEVEL KPI TREND DATA:
-SITE-LEVEL KPI SUMMARY FOR SITE {nearest_site_id}:
+STANDARD SOLUTION STEP:
+{std_solution_text if std_solution_text else 'No standard solution steps available.'}
+
+SITE RF PARAMETERS (NEAREST SITE):
+{site_params_text}
+
+SITE-LEVEL KPI TREND DATA (only {problem_type_label}-related KPIs: {", ".join(selected_kpis) if selected_kpis else "none matched"}):
 {site_kpi_text if site_kpi_text else 'No site-level KPI data available.'}
 
-CELL-LEVEL KPI SUMMARY FOR SITE {nearest_site_id}:
+CELL-LEVEL KPI TREND DATA:
 {cell_kpi_text if cell_kpi_text else 'No cell-level KPI data available.'}
 
-Respond with exactly 4 to 5 numbered points.
-Format each point as: **Brief Title**: One or two sentences of precise explanation with KPI evidence.
-Each point must be self-contained, technically accurate, and directly relevant.
-Do not add headings, summaries, or extra sections."""
+INSTRUCTIONS:
+- Write exactly 4–5 numbered points.
+- Format: **Concise Title**: One or two sentences with specific technical evidence.
+- Each point must be about a DIFFERENT aspect of the root cause.
+- Point 1: State the primary root cause linking the alarm to the {problem_type_label} degradation with a specific KPI value.
+- Point 2: Describe what the KPI trend shows just before/during the outage and the magnitude of the drop.
+- Point 3: Explain the RF/parameter context (use actual values from site parameters) and how they contribute.
+- Point 4: Link the alarm's standard solution step to the expected KPI recovery.
+- Point 5 (if needed): Describe secondary impact on adjacent cells/sectors visible in cell-level KPI trends.
+- Use actual numbers from the KPI data. Do NOT use vague language.
+- Do not add headings, summaries, or extra sections."""
     else:
-        prompt = f"""You are an expert telecom network engineer performing root cause analysis.
+        prompt = f"""You are a senior telecom network engineer performing root cause analysis.
 
-TICKET: {ticket.reference_number} - {ticket.category} / {ticket.subcategory}
-CUSTOMER ISSUE: {ticket.description}
+TICKET: {ticket.reference_number} — {ticket.category} / {ticket.subcategory}
+CUSTOMER REPORTED ISSUE: {ticket.description}
 PROBLEM TYPE: {problem_type_label}
 NEAREST SITE: {nearest_site_id} (Zone: {nearest_zone}, Distance: {dist_km} km from customer)
 
-SITE STATUS: ON AIR. Analysis must be based on KPI trends only.
-Use only these KPI families relevant to {problem_type_label}: {", ".join(selected_kpis) if selected_kpis else "No matched KPI names"}.
+=== SITE STATUS: ON AIR ===
+Perform root cause analysis based entirely on KPI trend evidence.
+You MUST use the actual KPI values (avg, min, max, period) provided below to explain what is happening.
+Focus only on the KPI families directly relevant to {problem_type_label}: {", ".join(selected_kpis) if selected_kpis else "none matched"}.
 
-SITE-LEVEL KPI SUMMARY:
+SITE RF PARAMETERS (NEAREST SITE):
+{site_params_text}
+
+SITE-LEVEL KPI TREND DATA:
 {site_kpi_text if site_kpi_text else 'No site-level KPI data available.'}
 
-CELL-LEVEL KPI SUMMARY:
+CELL-LEVEL KPI TREND DATA:
 {cell_kpi_text if cell_kpi_text else 'No cell-level KPI data available.'}
 
-Analyze ALL the KPI data above (both site-level and cell-level) and provide:
-1. **Site-Level KPI Assessment** - Which site KPIs are performing well and which show degradation?
-2. **Cell-Level KPI Assessment** - Which cells show poor performance? Are specific cells causing issues?
-3. **Anomaly Detection** - Any unusual patterns or outliers at site or cell level?
-4. **Root Cause Identification** - What is the most likely root cause of the network/signal issue?
-5. **Impact Assessment** - How severe is the issue and what is the scope of impact?
-6. **Correlation Analysis** - Are there related KPI degradations across site and cell levels that point to a common cause?
-
-Be specific and reference actual KPI values in your analysis."""
+INSTRUCTIONS:
+- Write exactly 4–5 numbered points.
+- Format: **Concise Title**: One or two sentences with specific technical evidence.
+- Each point must be about a DIFFERENT degradation factor contributing to the {problem_type_label} problem.
+- Point 1: Identify the PRIMARY degraded KPI, state its recent value vs. baseline (use actual numbers), and explain what network condition this reflects.
+- Point 2: Identify the SECONDARY degraded KPI, state values, and explain the chain of impact to the customer's {problem_type_label} problem.
+- Point 3: Analyze the RF parameter context (bandwidth, E-tilt, EIRP, antenna height, CRS gain) and how the current values may be amplifying the KPI degradation.
+- Point 4: Describe the temporal pattern (when did the degradation start, is it continuous or intermittent, peak hours vs. off-peak) using the trend data.
+- Point 5 (if needed): Note any cell-level vs. site-level discrepancy that narrows the fault to a specific cell or sector.
+- Be precise: use actual KPI values from the data. Do NOT write generic statements.
+- Do not add headings, summaries, or extra sections."""
 
     try:
         response = client.chat.completions.create(
@@ -4324,33 +4913,41 @@ Be specific and reference actual KPI values in your analysis."""
             max_tokens=1500,
         )
         analysis_raw = response.choices[0].message.content.strip()
-        fallback_rca = [
-            f"**Site Status**: Nearest site {nearest_site_id} ({site_status.replace('_', ' ').upper()}) is the primary impact domain for this complaint.",
-            f"**Problem Classification**: Problem type is {problem_type_label}; only related KPI groups were considered for causality and trend correlation.",
-            "**Trend Evidence**: Daily/hourly trend shift confirms a recent degradation window; weekly/monthly baseline indicates this is not normal behavior.",
-            "**Cell-Site Correlation**: Cell-level variance aligns with site-level degradation, indicating a network-origin issue rather than isolated handset behavior.",
-            "**Action Required**: Immediate technical validation on the identified degraded KPI path is required to close the fault and stabilize service.",
-        ]
+        cleaned_lines = _filter_rca_lines(_normalize_ai_lines(analysis_raw))
+        fallback_rca = []
         if site_status == "off_air":
-            fallback_rca[0] = f"**Site Outage**: Nearest site {nearest_site_id} is OFF AIR and alarm state is the primary root trigger for outage impact."
-            fallback_rca[4] = "**Resolution Path**: Execute alarm-linked restoration steps first, then validate KPI recovery trend to confirm full service normalization."
+            fallback_rca.append(
+                f"**Site Outage**: Nearest site {nearest_site_id} is OFF AIR; alarms indicate outage as the primary cause."
+            )
+        fallback_rca += _kpi_degradation_points(site_rows + cell_rows, selected_kpis, max_points=3)
+        if not fallback_rca:
+            fallback_rca = [
+                f"**KPI Evidence**: KPI shifts around the degradation window indicate network-side impact on {problem_type_label}.",
+                "**Correlation**: Site and cell KPI movement align with the customer’s symptom window.",
+                "**Impact Scope**: The degradation is localized to the nearest site/cells based on trend evidence.",
+                "**Actionable Cause**: Prioritize the KPI paths with the largest deviation from baseline.",
+            ]
+        analysis_text = "\n".join(cleaned_lines) if cleaned_lines else ""
         analysis = _force_numbered_points(
-            analysis_raw,
+            analysis_text,
             min_points=4,
             max_points=5,
             fallback_points=fallback_rca,
         )
     except Exception as e:
+        fallback_rca = _kpi_degradation_points(site_rows + cell_rows, selected_kpis, max_points=4)
+        if not fallback_rca:
+            fallback_rca = [
+                f"**Model Error**: Root cause analysis could not be generated automatically: {str(e)}.",
+                f"**KPI Evidence**: Review KPI shifts for {problem_type_label} and isolate the largest deviations.",
+                "**Correlation**: Correlate degraded cell indicators with site KPIs to confirm the fault domain.",
+                "**Next Check**: Validate alarms and site status if KPI evidence is weak.",
+            ]
         analysis = _force_numbered_points(
-            "",
+            "\n".join(fallback_rca),
             min_points=4,
             max_points=5,
-            fallback_points=[
-                f"**Model Error**: Root cause analysis could not be generated automatically: {str(e)}.",
-                f"**Focus Area**: Nearest site {nearest_site_id} and problem type {problem_type_label} remain the active technical focus.",
-                "**Trend Review**: Review daily/hourly KPI movement against weekly/monthly baseline to isolate degradation start time.",
-                "**Fault Domain**: Correlate degraded cell-level indicators with site-level KPI shifts to validate fault domain.",
-            ],
+            fallback_points=fallback_rca,
         )
 
     # Generate PDF-friendly version (plain text, no markdown)
@@ -4372,35 +4969,66 @@ Be specific and reference actual KPI values in your analysis."""
 @jwt_required()
 def agent_recommendation(ticket_id):
     """AI recommendation based on root cause analysis and full trend analysis."""
-    user = User.query.get(int(get_jwt_identity()))
+    user = db.session.get(User, int(get_jwt_identity()))
     if not user or user.role != "human_agent":
         return jsonify({"error": "Unauthorized"}), 403
 
-    ticket = Ticket.query.get(ticket_id)
+    ticket = db.session.get(Ticket, ticket_id)
     if not ticket:
         return jsonify({"error": "Ticket not found"}), 404
+
+    session = db.session.get(ChatSession, ticket.chat_session_id) if ticket.chat_session_id else None
+    nearest = None
+    if session and session.latitude and session.longitude:
+        nearest_list = find_nearest_sites(session.latitude, session.longitude, n=1)
+        if nearest_list:
+            nearest = nearest_list[0]
 
     root_cause = request.json.get("root_cause", "") if request.json else ""
     trend_summary = request.json.get("trend_summary", "") if request.json else ""
     problem_type = _problem_type_label(_detect_network_problem_type(ticket))
 
-    prompt = f"""You are an expert telecom network engineer providing actionable recommendations.
+    site_context = "Nearest site data not available."
+    if nearest:
+        site_context = "\n".join([
+            f"NEAREST SITE: {nearest.get('site_id')} (Zone: {nearest.get('zone')}, Distance: {nearest.get('distance_km')} km)",
+            f"SITE STATUS: {(nearest.get('site_status') or 'on_air')}",
+            "SITE PARAMETERS:",
+            f"- Bandwidth (MHz): {nearest.get('bandwidth_mhz')}",
+            f"- Antenna Gain (dBi): {nearest.get('antenna_gain_dbi')}",
+            f"- RF Power (EIRP) [dBm]: {nearest.get('rf_power_eirp_dbm')}",
+            f"- Antenna height (AGL) (M): {nearest.get('antenna_height_agl_m')}",
+            f"- E-tilt (Degree): {nearest.get('e_tilt_degree')}",
+            f"- CRS Gain: {nearest.get('crs_gain')}",
+        ])
 
-TICKET: {ticket.reference_number} - {ticket.category} / {ticket.subcategory}
-CUSTOMER ISSUE: {ticket.description}
+    prompt = f"""You are a senior telecom network optimization engineer providing precise, actionable field recommendations.
+
+TICKET: {ticket.reference_number} — {ticket.category} / {ticket.subcategory}
+CUSTOMER REPORTED ISSUE: {ticket.description}
 PRIORITY: {ticket.priority.upper()}
 PROBLEM TYPE: {problem_type}
 
-TREND ANALYSIS SUMMARY:
+{site_context}
+
+=== TREND ANALYSIS EVIDENCE ===
 {trend_summary if trend_summary else 'No trend analysis summary available.'}
 
-ROOT CAUSE ANALYSIS:
+=== ROOT CAUSE ANALYSIS FINDINGS ===
 {root_cause if root_cause else 'No root cause analysis available.'}
 
-Respond with exactly 3 to 4 numbered points.
-Format each point as: **Brief Action Title**: One or two sentences describing the specific action, expected outcome, and timeline.
-Each recommendation must be directly actionable by a network engineer.
-Do not add headings, summaries, or extra sections."""
+=== INSTRUCTIONS ===
+Generate exactly 4–5 numbered recommendations. Format: **Action Title**: 2–3 sentences.
+
+Rules:
+1. Each recommendation must directly address a specific finding from the Root Cause Analysis.
+2. At least 3 recommendations MUST use the exact current site parameter values above and propose a CONCRETE target value (e.g., "Increase E-tilt from 3° to 5°", "Raise EIRP from 42 dBm to 44 dBm").
+3. One recommendation may leverage broader telecom best-practices or OpenAI knowledge (e.g., neighbor cell optimization, scheduler tuning, load balancing) beyond the listed parameters.
+4. State the EXPECTED OUTCOME for each recommendation (which KPI will improve, by how much approximately).
+5. Prioritize recommendations by impact — most impactful first.
+6. Be precise: do not say "consider adjusting" — say "adjust X from Y to Z to achieve W".
+7. Do not repeat the root cause. Focus only on the fix and its expected outcome.
+8. Do not add headings, summaries, preambles, or extra sections."""
 
     try:
         response = client.chat.completions.create(
@@ -4410,27 +5038,32 @@ Do not add headings, summaries, or extra sections."""
             max_tokens=1500,
         )
         recommendation_raw = response.choices[0].message.content.strip()
-        recommendation = _force_numbered_points(
-            recommendation_raw,
-            min_points=3,
-            max_points=4,
-            fallback_points=[
-                "**Immediate Action**: Apply corrective action on the top degraded KPI path and confirm hourly improvement at site and cell levels.",
-                "**Parameter Validation**: Run targeted parameter/hardware validation on affected cells and verify trend slope returns to weekly baseline.",
-                "**Escalation Criteria**: If recovery is partial, escalate to NOC/optimization with alarm evidence, KPI snapshots, and precise impact window.",
-                "**Customer Closure**: Communicate to customer with clear ETA after confirming stable daily trend and no recurring degradation.",
-            ],
-        )
+
+        # Always use the AI response directly if it contains meaningful content.
+        # Only fall back to parameter-based builder if AI returns empty/garbage.
+        if recommendation_raw and len(recommendation_raw) > 80:
+            recommendation = _force_numbered_points(
+                recommendation_raw,
+                min_points=4,
+                max_points=5,
+                fallback_points=_build_parameter_recommendations(problem_type, root_cause, trend_summary, nearest or {}),
+            )
+        else:
+            fallback_points = _build_parameter_recommendations(problem_type, root_cause, trend_summary, nearest or {})
+            recommendation = _force_numbered_points(
+                "\n".join(fallback_points),
+                min_points=4,
+                max_points=5,
+                fallback_points=fallback_points,
+            )
     except Exception as e:
+        fallback_points = _build_parameter_recommendations(problem_type, root_cause, trend_summary, nearest or {})
+        fallback_points.insert(0, f"**Model Error**: Recommendation generation failed: {str(e)}; proceeding with RCA-linked parameter actions.")
         recommendation = _force_numbered_points(
-            "",
-            min_points=3,
-            max_points=4,
-            fallback_points=[
-                f"**Model Error**: Recommendation generation failed: {str(e)}; proceed with technical triage on related KPI path.",
-                "**KPI Recovery**: Validate daily/hourly KPI recovery after corrective action before closure.",
-                "**Escalation**: Escalate with KPI and alarm evidence if stability is not achieved within the defined SLA window.",
-            ],
+            "\n".join(fallback_points),
+            min_points=4,
+            max_points=5,
+            fallback_points=fallback_points,
         )
 
     # Generate PDF-friendly version (plain text, no markdown)
@@ -4446,11 +5079,11 @@ Do not add headings, summaries, or extra sections."""
 def agent_customer360(customer_user_id):
     """Return 360-degree customer view: plan, billing history, past complaints, location, loyalty."""
     user_id = int(get_jwt_identity())
-    agent = User.query.get(user_id)
+    agent = db.session.get(User, user_id)
     if not agent or agent.role != "human_agent":
         return jsonify({"error": "Unauthorized"}), 403
 
-    customer = User.query.get(customer_user_id)
+    customer = db.session.get(User, customer_user_id)
     if not customer:
         return jsonify({"error": "Customer not found"}), 404
 
@@ -4527,10 +5160,10 @@ def agent_customer360(customer_user_id):
 def agent_view_chat(session_id):
     """Allow human agent to view full chat history of a session."""
     user_id = int(get_jwt_identity())
-    user = User.query.get(user_id)
+    user = db.session.get(User, user_id)
     if not user or user.role != "human_agent":
         return jsonify({"error": "Unauthorized"}), 403
-    session = ChatSession.query.get(session_id)
+    session = db.session.get(ChatSession, session_id)
     if not session:
         return jsonify({"error": "Session not found"}), 404
     return jsonify({
@@ -4549,10 +5182,10 @@ def agent_view_chat(session_id):
 def agent_send_message(session_id):
     """Human agent sends a message into a customer chat session."""
     user_id = int(get_jwt_identity())
-    user = User.query.get(user_id)
+    user = db.session.get(User, user_id)
     if not user or user.role != "human_agent":
         return jsonify({"error": "Unauthorized"}), 403
-    session = ChatSession.query.get(session_id)
+    session = db.session.get(ChatSession, session_id)
     if not session:
         return jsonify({"error": "Session not found"}), 404
 
@@ -4756,6 +5389,70 @@ with app.app_context():
     # Migrate: add new columns to kpi_data if they don't exist
     from sqlalchemy import inspect as sa_inspect, text as sa_text
     insp = sa_inspect(db.engine)
+    if insp.has_table("chat_sessions"):
+        existing_cols = [c["name"] for c in insp.get_columns("chat_sessions")]
+        with db.engine.connect() as conn:
+            if "customer_present" not in existing_cols:
+                conn.execute(sa_text("ALTER TABLE chat_sessions ADD COLUMN customer_present BOOLEAN NOT NULL DEFAULT FALSE"))
+                conn.commit()
+                print(">>> Added customer_present column to chat_sessions")
+    if insp.has_table("telecom_sites"):
+        existing_cols = [c["name"] for c in insp.get_columns("telecom_sites")]
+        with db.engine.connect() as conn:
+            # Drop legacy unique constraint on site_id if present
+            try:
+                conn.execute(sa_text("ALTER TABLE telecom_sites DROP CONSTRAINT IF EXISTS telecom_sites_site_id_key"))
+                conn.commit()
+            except Exception:
+                pass
+            # Add composite unique constraint (site_id, cell_id)
+            try:
+                conn.execute(sa_text(
+                    "DO $$ BEGIN "
+                    "IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'uq_telecom_sites_site_cell') THEN "
+                    "ALTER TABLE telecom_sites ADD CONSTRAINT uq_telecom_sites_site_cell UNIQUE (site_id, cell_id); "
+                    "END IF; "
+                    "END $$;"
+                ))
+                conn.commit()
+            except Exception:
+                pass
+            if "site_name" not in existing_cols:
+                conn.execute(sa_text("ALTER TABLE telecom_sites ADD COLUMN site_name VARCHAR(100)"))
+                conn.commit()
+                print(">>> Added site_name column to telecom_sites")
+            if "cell_id" not in existing_cols:
+                conn.execute(sa_text("ALTER TABLE telecom_sites ADD COLUMN cell_id VARCHAR(100)"))
+                conn.commit()
+                print(">>> Added cell_id column to telecom_sites")
+            if "standard_solution_step" not in existing_cols:
+                conn.execute(sa_text("ALTER TABLE telecom_sites ADD COLUMN standard_solution_step TEXT"))
+                conn.commit()
+                print(">>> Added standard_solution_step column to telecom_sites")
+            if "bandwidth_mhz" not in existing_cols:
+                conn.execute(sa_text("ALTER TABLE telecom_sites ADD COLUMN bandwidth_mhz DOUBLE PRECISION"))
+                conn.commit()
+                print(">>> Added bandwidth_mhz column to telecom_sites")
+            if "antenna_gain_dbi" not in existing_cols:
+                conn.execute(sa_text("ALTER TABLE telecom_sites ADD COLUMN antenna_gain_dbi DOUBLE PRECISION"))
+                conn.commit()
+                print(">>> Added antenna_gain_dbi column to telecom_sites")
+            if "rf_power_eirp_dbm" not in existing_cols:
+                conn.execute(sa_text("ALTER TABLE telecom_sites ADD COLUMN rf_power_eirp_dbm DOUBLE PRECISION"))
+                conn.commit()
+                print(">>> Added rf_power_eirp_dbm column to telecom_sites")
+            if "antenna_height_agl_m" not in existing_cols:
+                conn.execute(sa_text("ALTER TABLE telecom_sites ADD COLUMN antenna_height_agl_m DOUBLE PRECISION"))
+                conn.commit()
+                print(">>> Added antenna_height_agl_m column to telecom_sites")
+            if "e_tilt_degree" not in existing_cols:
+                conn.execute(sa_text("ALTER TABLE telecom_sites ADD COLUMN e_tilt_degree DOUBLE PRECISION"))
+                conn.commit()
+                print(">>> Added e_tilt_degree column to telecom_sites")
+            if "crs_gain" not in existing_cols:
+                conn.execute(sa_text("ALTER TABLE telecom_sites ADD COLUMN crs_gain DOUBLE PRECISION"))
+                conn.commit()
+                print(">>> Added crs_gain column to telecom_sites")
     if insp.has_table("kpi_data"):
         existing_cols = [c["name"] for c in insp.get_columns("kpi_data")]
         with db.engine.connect() as conn:

@@ -1070,6 +1070,29 @@ function TrendMiniChart({ kpiName, data, color = '#00338D' }) {
   );
 
   const { ResponsiveContainer, LineChart, Line, XAxis, YAxis, Tooltip } = RC;
+  const vals = data.map(d => Number(d?.avg)).filter(v => Number.isFinite(v));
+  const min = vals.length ? Math.min(...vals) : 0;
+  const max = vals.length ? Math.max(...vals) : 0;
+  const range = Math.max(max - min, 1e-6);
+  const sorted = [...vals].sort((a, b) => a - b);
+  const p05 = sorted.length ? sorted[Math.floor(sorted.length * 0.05)] : min;
+
+  const dropIdx = new Set();
+  for (let i = 1; i < data.length; i++) {
+    const prev = Number(data[i - 1]?.avg);
+    const curr = Number(data[i]?.avg);
+    if (!Number.isFinite(prev) || !Number.isFinite(curr)) continue;
+    const delta = prev - curr;
+    const threshold = Math.max(Math.abs(prev) * 0.5, range * 0.5);
+    const isVeryLow = curr <= p05;
+    if (delta > threshold && isVeryLow) dropIdx.add(i);
+  }
+
+  const DropDot = (props) => {
+    if (!dropIdx.has(props.index)) return null;
+    return <circle cx={props.cx} cy={props.cy} r={3} fill="#dc2626" stroke="#991b1b" strokeWidth={0.6} />;
+  };
+
   return (
     <div style={{ background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 8, padding: 12, height: 180 }}>
       <div style={{ fontSize: 11, fontWeight: 700, color: '#475569', marginBottom: 4 }}>{kpiName}</div>
@@ -1078,7 +1101,7 @@ function TrendMiniChart({ kpiName, data, color = '#00338D' }) {
           <XAxis dataKey="label" tick={{ fontSize: 8 }} interval="preserveStartEnd" />
           <YAxis tick={{ fontSize: 8 }} width={35} />
           <Tooltip contentStyle={{ fontSize: 11 }} />
-          <Line type="monotone" dataKey="avg" stroke={color} strokeWidth={1.5} dot={false} />
+          <Line type="monotone" dataKey="avg" stroke={color} strokeWidth={1.5} dot={DropDot} />
         </LineChart>
       </ResponsiveContainer>
     </div>
