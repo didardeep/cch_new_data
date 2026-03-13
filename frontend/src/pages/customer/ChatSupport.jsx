@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
-import { useNavigate } from 'react-router-dom';
-import { getToken, apiGet, API_BASE } from '../../api';
+import { useNavigate, useSearchParams } from 'react-router-dom';
+import { getToken, apiGet, apiPost, API_BASE } from '../../api';
 import { useAuth } from '../../AuthContext';
 import '../../styles/chatbot.css';
 import { io } from 'socket.io-client';
@@ -134,6 +134,12 @@ function clearCachedSession(sessionId) {
   } catch {}
 }
 
+function clearStoredSession() {
+  const sid = localStorage.getItem('chat_session_id');
+  if (sid) clearCachedSession(sid);
+  localStorage.removeItem('chat_session_id');
+}
+
 export default function ChatSupport() {
   const { user } = useAuth();
   const navigate = useNavigate();
@@ -151,6 +157,12 @@ export default function ChatSupport() {
   const [inputValue, setInputValue] = useState('');
   const [isTyping, setIsTyping] = useState(false);
   const [disabledGroups, setDisabledGroups] = useState(new Set());
+  const [pendingFeedback, setPendingFeedback] = useState([]);
+  const [fbRating, setFbRating] = useState(0);
+  const [fbComment, setFbComment] = useState('');
+  const [fbSubmitting, setFbSubmitting] = useState(false);
+  const [currentFbIdx, setCurrentFbIdx] = useState(0);
+  const [searchParams] = useSearchParams();
 
   const [locationStatus, setLocationStatus] = useState('idle');
   const locationRetryRef = useRef(null);
@@ -161,6 +173,8 @@ export default function ChatSupport() {
   const chatAreaRef = useRef(null);
   const inputRef = useRef(null);
   const sessionIdRef = useRef(null);
+  const socketRef = useRef(null);
+  const resumeNeededRef = useRef(false);
   const agentJoinedRef = useRef(false);
   const stateRef = useRef({
     step: 'welcome',
@@ -257,18 +271,21 @@ export default function ChatSupport() {
     if (!sessionIdRef.current) return;
     try {
       const contentPlain = sender === 'bot' ? stripHtml(meta.html || content || '') : content;
+      const payloadForSave = meta.payload || (sender === 'bot'
+        ? { type: meta.type || 'bot', html: meta.html || content, text: content }
+        : null);
       await chatApiCall(`/api/chat/session/${sessionIdRef.current}/message`, {
         sender,
         content: contentPlain || '',
         current_step: stateRef.current.step,
         ...meta,
-        payload: meta.payload || null,
+        payload: payloadForSave,
       });
       const cached = loadCachedSession(sessionIdRef.current) || {};
       const merged = Array.isArray(cached.messages) ? cached.messages : [];
       // Append locally for instant cache even if setMessages not yet run
       const type = sender === 'bot' ? 'bot' : sender === 'agent' ? 'live-agent-message' : 'user';
-      merged.push({ type, text: content, html: content, payload: meta.payload });
+      merged.push({ type, text: content, html: meta.html || content, payload: payloadForSave });
       saveCachedSession(sessionIdRef.current, { messages: merged, state: stateRef.current });
     } catch (e) {}
   }, [ensureSession]);
@@ -287,7 +304,7 @@ export default function ChatSupport() {
       }
       if (!sessionIdRef.current) return;
       const content = msg.text || stripHtml(msg.html) || msg.type || '';
-      const payload = msg.payload || sanitizePayload({ type: msg.type, ...msg, id, groupId });
+      const payload = msg.payload || sanitizePayload({ type: msg.type, html: msg.html, text: msg.text, ...msg, id, groupId });
       try {
         await chatApiCall(`/api/chat/session/${sessionIdRef.current}/message`, {
           sender: 'bot',
@@ -298,7 +315,10 @@ export default function ChatSupport() {
       } catch {}
     };
 
-    const stamped = { ...msg, id, groupId };
+    const stampedPayload = msg.payload || (msg.type === 'bot'
+      ? { type: msg.type, html: msg.html, text: msg.text }
+      : undefined);
+    const stamped = { ...msg, id, groupId, payload: stampedPayload };
 
     setMessages(prev => {
       const updated = [...prev, stamped];
@@ -525,12 +545,20 @@ export default function ChatSupport() {
         const history = (data.messages && data.messages.length ? data.messages : []) || [];
         const merged = history.length ? history : cache?.messages || [];
 
-        // If session already resolved and redirect is allowed, jump to feedback
-        if (data.session.status === 'resolved' && !allowResolved) {
-          clearCachedSession(sessionIdRef.current);
-          localStorage.removeItem('chat_session_id');
-          navigate(`/customer/feedback?session=${sessionIdRef.current}`);
-          return true;
+        // Seed welcome/menu if session is empty
+        if (merged.length === 0) {
+          try {
+            const menuResp = await apiGet('/api/menu');
+            const menu = menuResp?.menu || {};
+            addMessage({ type: 'bot', html: `<strong>Welcome to TeleBot Support!</strong><br>Say hello to get started!` });
+            const spGroupId = nextId();
+            addMessage({ type: 'sector-menu', menu, groupId: spGroupId });
+            stateRef.current.step = 'greeting';
+            setInitPhase('chat');
+            showInput('Type your greeting here...');
+            joinSocketSession();
+            return true;
+          } catch {}
         }
 
         setDisabledGroups(new Set()); // re-enable interactive cards on restore
@@ -580,8 +608,8 @@ export default function ChatSupport() {
         const newAgentMsgs = allMsgs.filter(
           m => m.sender === 'agent' && m.id > lastSeenMsgIdRef.current
         );
-        const s = data.session || {};
-        if (!handoffActive && (newAgentMsgs.length > 0 || s.status === 'escalated')) {
+        const sessionInfo = data.session || {};
+        if (!handoffActive && (newAgentMsgs.length > 0 || sessionInfo.status === 'escalated')) {
           setHandoffActive(true);
         }
         newAgentMsgs.forEach(m => {
@@ -605,8 +633,7 @@ export default function ChatSupport() {
           showInput('Type your message for the agent...');
           stateRef.current.step = 'live-agent';
         }
-        const s = data.session || {};
-        if (s.status === 'resolved' && !agentResolvedShownRef.current) {
+        if (sessionInfo.status === 'resolved' && !agentResolvedShownRef.current) {
           agentResolvedShownRef.current = true;
           setHandoffActive(false);
           hideInput();
@@ -690,6 +717,14 @@ export default function ChatSupport() {
     setHandoffActive(false);
     hideInput();
     setInitPhase('chat');
+    if (forceNew) {
+      clearStoredSession();
+      try {
+        const url = new URL(window.location.href);
+        url.searchParams.delete('resume');
+        window.history.replaceState(null, '', url.toString());
+      } catch {}
+    }
     await ensureSession({ forceNew: forceNew, step: 'greeting' });
     if (sessionIdRef.current) clearCachedSession(sessionIdRef.current);
     setTimeout(() => {
@@ -699,16 +734,8 @@ export default function ChatSupport() {
   }, [addMessage, hideInput, showInput, ensureSession]);
 
   const beginNewChat = useCallback(async () => {
-    try {
-      const pending = await apiGet('/api/customer/pending-feedback');
-      const sessions = pending?.sessions || [];
-      if (sessions.length > 0) {
-        navigate(`/customer/feedback?session=${sessions[0].id}&return=1`);
-        return;
-      }
-    } catch {}
-    startChat();
-  }, [navigate, startChat]);
+    await startChat(true);
+  }, [startChat]);
 
   const loadSectorMenu = useCallback(async () => {
     const token = getToken();
@@ -1188,8 +1215,11 @@ export default function ChatSupport() {
     stateRef.current.step = 'exited';
     setTimeout(() => {
       addMessage({ type: 'exit-box' });
+      if (currentSessionId) {
+        navigate(`/customer/feedback?session=${currentSessionId}`);
+      }
     }, 800);
-  }, [addMessage, disableGroup, hideInput, handoffActive, showInput]);
+  }, [addMessage, disableGroup, hideInput, handoffActive, showInput, navigate]);
 
   const handleScreenshotUpload = useCallback(async (file) => {
     if (!file || !file.type.startsWith('image/')) {
@@ -1473,6 +1503,14 @@ export default function ChatSupport() {
           }
         } catch {}
       }
+      // Try to resume last active session; if none, show start gate
+      try {
+        const active = await apiGet('/api/chat/session/active');
+        if (active?.session && active.session.status !== 'resolved') {
+          resumeChat(active.session, active.messages || []);
+          return;
+        }
+      } catch {}
       setInitPhase('start-gate');
     })();
   }, [searchParams, resumeChat]);
