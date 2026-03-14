@@ -150,6 +150,8 @@ export default function ChatSupport() {
 
   const [initPhase, setInitPhase] = useState('loading');
   const [startChoice, setStartChoice] = useState(true);
+  const [resumeCandidate, setResumeCandidate] = useState(null);
+  const [resumeMessages, setResumeMessages] = useState([]);
 
   const [messages, setMessages] = useState([]);
   const [inputVisible, setInputVisible] = useState(false);
@@ -706,6 +708,8 @@ export default function ChatSupport() {
     setMessages([]);
     setDisabledGroups(new Set());
     setLocationStatus('idle');
+    setResumeCandidate(null);
+    setResumeMessages([]);
     stateRef.current = {
       step: 'greeting', sectorKey: null, sectorName: null,
       subprocessKey: null, subprocessName: null, language: 'English',
@@ -1354,6 +1358,8 @@ export default function ChatSupport() {
   }, []);
 
   const resumeChat = useCallback(async (session, msgs) => {
+    setResumeCandidate(null);
+    setResumeMessages([]);
     setInitPhase('chat');
     setMessages([]);
     setDisabledGroups(new Set());
@@ -1503,11 +1509,13 @@ export default function ChatSupport() {
           }
         } catch {}
       }
-      // Try to resume last active session; if none, show start gate
+      // If an active session exists, offer a choice to continue or start fresh
       try {
         const active = await apiGet('/api/chat/session/active');
         if (active?.session && active.session.status !== 'resolved') {
-          resumeChat(active.session, active.messages || []);
+          setResumeCandidate(active.session);
+          setResumeMessages(active.messages || []);
+          setInitPhase('resume-prompt');
           return;
         }
       } catch {}
@@ -1939,9 +1947,9 @@ export default function ChatSupport() {
   };
 
   const renderResumePrompt = () => {
-    const session = activeSessionData;
+    const session = resumeCandidate;
     if (!session) return null;
-    const lastMsg = activeSessionMsgs.length > 0 ? activeSessionMsgs[activeSessionMsgs.length - 1] : null;
+    const lastMsg = resumeMessages.length > 0 ? resumeMessages[resumeMessages.length - 1] : null;
     const isActiveSession = session.status === 'active';
     return (
       <div className="gate-overlay">
@@ -1961,7 +1969,7 @@ export default function ChatSupport() {
             {lastMsg && <div className="gate-summary"><span className="gate-label">Last message</span><p>{lastMsg.content.length > 120 ? lastMsg.content.slice(0, 120) + '...' : lastMsg.content}</p></div>}
           </div>
           <div className="gate-actions">
-            <button className="gate-btn gate-btn-primary" onClick={() => resumeChat(activeSessionData, activeSessionMsgs)}>
+            <button className="gate-btn gate-btn-primary" onClick={() => resumeChat(resumeCandidate, resumeMessages)}>
               {isActiveSession ? 'Continue Chat' : 'Open Chat'}
             </button>
             <button className="gate-btn gate-btn-secondary" onClick={() => beginNewChat()}>Start New Chat</button>

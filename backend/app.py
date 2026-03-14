@@ -84,14 +84,13 @@ CORS(
     supports_credentials=True,
 )
 
-from openai import OpenAI
-# ─── Google Gemini Configuration (OpenAI-compatible endpoint) ────────────────
-client = OpenAI(
-    api_key=os.environ.get("GEMINI_API_KEY"),
-    base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
+# ─── Azure OpenAI Configuration (pulled from .env) ───────────────────────────
+client = AzureOpenAI(
+    api_key=os.environ.get("AZURE_OPENAI_API_KEY"),
+    azure_endpoint=os.environ.get("AZURE_OPENAI_ENDPOINT"),
+    api_version=os.environ.get("AZURE_OPENAI_API_VERSION", "2023-07-01-preview"),
 )
-
-DEPLOYMENT_NAME =  "gemini-3-flash-preview"
+DEPLOYMENT_NAME = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini")
 
 def _user_brief(u, off_days=None):
     return {
@@ -5762,70 +5761,53 @@ with app.app_context():
     # Migrate: add new columns to kpi_data if they don't exist
     from sqlalchemy import inspect as sa_inspect, text as sa_text
     insp = sa_inspect(db.engine)
+
+    def _safe_exec(conn, sql, label):
+        """Execute DDL safely: rollback on error so later statements still run."""
+        try:
+            conn.execute(sa_text(sql))
+            conn.commit()
+            print(f">>> {label}")
+        except Exception as e:
+            conn.rollback()
+            print(f"⚠️ Skipped {label}: {e}")
+
     if insp.has_table("chat_sessions"):
         existing_cols = [c["name"] for c in insp.get_columns("chat_sessions")]
         with db.engine.connect() as conn:
             if "customer_present" not in existing_cols:
-                conn.execute(sa_text("ALTER TABLE chat_sessions ADD COLUMN customer_present BOOLEAN NOT NULL DEFAULT FALSE"))
-                conn.commit()
-                print(">>> Added customer_present column to chat_sessions")
+                _safe_exec(conn, "ALTER TABLE chat_sessions ADD COLUMN customer_present BOOLEAN NOT NULL DEFAULT FALSE", "Added customer_present column to chat_sessions")
     if insp.has_table("telecom_sites"):
         existing_cols = [c["name"] for c in insp.get_columns("telecom_sites")]
         with db.engine.connect() as conn:
             # Drop legacy unique constraint on site_id if present
-            try:
-                conn.execute(sa_text("ALTER TABLE telecom_sites DROP CONSTRAINT IF EXISTS telecom_sites_site_id_key"))
-                conn.commit()
-            except Exception:
-                pass
+            _safe_exec(conn, "ALTER TABLE telecom_sites DROP CONSTRAINT IF EXISTS telecom_sites_site_id_key", "Dropped legacy telecom_sites_site_id_key constraint")
             # Add composite unique constraint (site_id, cell_id)
-            try:
-                conn.execute(sa_text(
-                    "DO $$ BEGIN "
-                    "IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'uq_telecom_sites_site_cell') THEN "
-                    "ALTER TABLE telecom_sites ADD CONSTRAINT uq_telecom_sites_site_cell UNIQUE (site_id, cell_id); "
-                    "END IF; "
-                    "END $$;"
-                ))
-                conn.commit()
-            except Exception:
-                pass
+            _safe_exec(conn,
+                "DO $$ BEGIN "
+                "IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'uq_telecom_sites_site_cell') THEN "
+                "ALTER TABLE telecom_sites ADD CONSTRAINT uq_telecom_sites_site_cell UNIQUE (site_id, cell_id); "
+                "END IF; "
+                "END $$;",
+                "Ensured uq_telecom_sites_site_cell unique constraint")
             if "site_name" not in existing_cols:
-                conn.execute(sa_text("ALTER TABLE telecom_sites ADD COLUMN site_name VARCHAR(100)"))
-                conn.commit()
-                print(">>> Added site_name column to telecom_sites")
+                _safe_exec(conn, "ALTER TABLE telecom_sites ADD COLUMN site_name VARCHAR(100)", "Added site_name column to telecom_sites")
             if "cell_id" not in existing_cols:
-                conn.execute(sa_text("ALTER TABLE telecom_sites ADD COLUMN cell_id VARCHAR(100)"))
-                conn.commit()
-                print(">>> Added cell_id column to telecom_sites")
+                _safe_exec(conn, "ALTER TABLE telecom_sites ADD COLUMN cell_id VARCHAR(100)", "Added cell_id column to telecom_sites")
             if "standard_solution_step" not in existing_cols:
-                conn.execute(sa_text("ALTER TABLE telecom_sites ADD COLUMN standard_solution_step TEXT"))
-                conn.commit()
-                print(">>> Added standard_solution_step column to telecom_sites")
+                _safe_exec(conn, "ALTER TABLE telecom_sites ADD COLUMN standard_solution_step TEXT", "Added standard_solution_step column to telecom_sites")
             if "bandwidth_mhz" not in existing_cols:
-                conn.execute(sa_text("ALTER TABLE telecom_sites ADD COLUMN bandwidth_mhz DOUBLE PRECISION"))
-                conn.commit()
-                print(">>> Added bandwidth_mhz column to telecom_sites")
+                _safe_exec(conn, "ALTER TABLE telecom_sites ADD COLUMN bandwidth_mhz DOUBLE PRECISION", "Added bandwidth_mhz column to telecom_sites")
             if "antenna_gain_dbi" not in existing_cols:
-                conn.execute(sa_text("ALTER TABLE telecom_sites ADD COLUMN antenna_gain_dbi DOUBLE PRECISION"))
-                conn.commit()
-                print(">>> Added antenna_gain_dbi column to telecom_sites")
+                _safe_exec(conn, "ALTER TABLE telecom_sites ADD COLUMN antenna_gain_dbi DOUBLE PRECISION", "Added antenna_gain_dbi column to telecom_sites")
             if "rf_power_eirp_dbm" not in existing_cols:
-                conn.execute(sa_text("ALTER TABLE telecom_sites ADD COLUMN rf_power_eirp_dbm DOUBLE PRECISION"))
-                conn.commit()
-                print(">>> Added rf_power_eirp_dbm column to telecom_sites")
+                _safe_exec(conn, "ALTER TABLE telecom_sites ADD COLUMN rf_power_eirp_dbm DOUBLE PRECISION", "Added rf_power_eirp_dbm column to telecom_sites")
             if "antenna_height_agl_m" not in existing_cols:
-                conn.execute(sa_text("ALTER TABLE telecom_sites ADD COLUMN antenna_height_agl_m DOUBLE PRECISION"))
-                conn.commit()
-                print(">>> Added antenna_height_agl_m column to telecom_sites")
+                _safe_exec(conn, "ALTER TABLE telecom_sites ADD COLUMN antenna_height_agl_m DOUBLE PRECISION", "Added antenna_height_agl_m column to telecom_sites")
             if "e_tilt_degree" not in existing_cols:
-                conn.execute(sa_text("ALTER TABLE telecom_sites ADD COLUMN e_tilt_degree DOUBLE PRECISION"))
-                conn.commit()
-                print(">>> Added e_tilt_degree column to telecom_sites")
+                _safe_exec(conn, "ALTER TABLE telecom_sites ADD COLUMN e_tilt_degree DOUBLE PRECISION", "Added e_tilt_degree column to telecom_sites")
             if "crs_gain" not in existing_cols:
-                conn.execute(sa_text("ALTER TABLE telecom_sites ADD COLUMN crs_gain DOUBLE PRECISION"))
-                conn.commit()
-                print(">>> Added crs_gain column to telecom_sites")
+                _safe_exec(conn, "ALTER TABLE telecom_sites ADD COLUMN crs_gain DOUBLE PRECISION", "Added crs_gain column to telecom_sites")
     if insp.has_table("kpi_data"):
         existing_cols = [c["name"] for c in insp.get_columns("kpi_data")]
         with db.engine.connect() as conn:
