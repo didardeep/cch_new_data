@@ -241,7 +241,7 @@ function parseRcaPoints(text) {
       const content = numMatch[2].trim();
       current = { index: parseInt(numMatch[1], 10), raw: content, title: '', body: content };
 
-      // Try "**Title**: Body"
+      // Try "*Title*: Body" or "**Title**: Body"
       const boldMatch = content.match(/^\*\*([^*]+)\*\*\s*[:\-–]\s*(.+)/s);
       if (boldMatch) {
         current.title = boldMatch[1].trim();

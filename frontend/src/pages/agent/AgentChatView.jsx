@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { useParams, useNavigate, useSearchParams } from 'react-router-dom';
-import { apiGet, apiPost, apiPut } from '../../api';
+import { apiGet, apiPost, apiPut, getToken } from '../../api';
+import { io } from 'socket.io-client';
 
 /* ── SVG icon set ─────────────────────────────────────────────────────── */
 const IC = {
@@ -121,12 +122,14 @@ export default function AgentChatView() {
   const [customer, setCustomer] = useState(null);
   const [newMessage, setNewMessage] = useState('');
   const [sending, setSending] = useState(false);
+  const [ending, setEnding] = useState(false);
   const [resolving, setResolving] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [activePanel, setActivePanel] = useState(null);
   const [diagnosisRequesting, setDiagnosisRequesting] = useState(false);
   const [diagnosisRequestSent, setDiagnosisRequestSent] = useState(false);
+  const [wsConnected, setWsConnected] = useState(false);
   const bottomRef = useRef(null);
   const pollingRef = useRef(null);
   const socketRef = useRef(null);
