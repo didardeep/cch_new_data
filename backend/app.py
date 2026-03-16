@@ -2595,6 +2595,48 @@ def _validate_ooxml_excel_upload(file_storage):
     return True, None
 
 
+def _normalize_excel_header(value):
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
+
+
+def _find_site_id_column(headers):
+    """Find a site identifier column across multiple workbook formats."""
+    for i, header in enumerate(headers):
+        normalized = _normalize_excel_header(header)
+        if normalized in {"siteid", "homesitecode", "cellsiteid"}:
+            return i
+        if "site" in normalized and "id" in normalized:
+            return i
+    return None
+
+
+def _extract_excel_date_columns(headers, skip_indices=None):
+    """Return (column_index, date) for headers that can be parsed as dates."""
+    skip_indices = set(skip_indices or [])
+    date_columns = []
+    for col_idx, header in enumerate(headers):
+        if col_idx in skip_indices or header is None:
+            continue
+        try:
+            if isinstance(header, datetime):
+                date_columns.append((col_idx, header.date()))
+            elif isinstance(header, str):
+                for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d", "%d-%b-%y", "%d-%b-%Y"):
+                    try:
+                        date_columns.append((col_idx, datetime.strptime(header.strip(), fmt).date()))
+                        break
+                    except ValueError:
+                        continue
+            elif hasattr(header, "date"):
+                date_columns.append((col_idx, header.date()))
+        except Exception:
+            continue
+    return date_columns
+
+
+SHARED_WORKBOOK_KPI_NAMES = ("Site Users", "Site Revenue")
+
+
 @app.route("/api/admin/upload-sites", methods=["POST"])
 @jwt_required()
 def admin_upload_sites():
@@ -2674,8 +2716,11 @@ def admin_upload_kpi_site_level():
         return jsonify({"error": "No file provided"}), 400
 
     file = request.files["file"]
-    if not file.filename.endswith((".xlsx", ".xls")):
-        return jsonify({"error": "Only .xlsx or .xls files accepted"}), 400
+    if not file.filename.lower().endswith((".xlsx", ".xlsm")):
+        return jsonify({"error": "Only .xlsx or .xlsm files are supported (.xls is not supported)."}), 400
+    ok, err = _validate_ooxml_excel_upload(file)
+    if not ok:
+        return jsonify({"error": err}), 400
 
     import openpyxl
     wb = openpyxl.load_workbook(file, data_only=True)
@@ -2708,7 +2753,6 @@ def admin_upload_kpi_site_level():
                 if isinstance(h, datetime):
                     date_columns.append((col_idx, h.date()))
                 elif isinstance(h, str):
-                    # Try multiple date formats
                     for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d"):
                         try:
                             date_columns.append((col_idx, datetime.strptime(h.strip(), fmt).date()))
@@ -2762,6 +2806,140 @@ def admin_upload_kpi_site_level():
     })
 
 
+@app.route("/api/admin/upload-shared-site-workbook", methods=["POST"])
+@jwt_required()
+def admin_upload_shared_site_workbook():
+    """Upload the shared telecom_site_dataset workbook format as site-level KPI data."""
+    user = User.query.get(int(get_jwt_identity()))
+    if not user or user.role != "admin":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    if "file" not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+
+    file = request.files["file"]
+    if not file.filename.lower().endswith((".xlsx", ".xlsm")):
+        return jsonify({"error": "Only .xlsx or .xlsm files are supported (.xls is not supported)."}), 400
+    ok, err = _validate_ooxml_excel_upload(file)
+    if not ok:
+        return jsonify({"error": err}), 400
+
+    import openpyxl
+    wb = openpyxl.load_workbook(file, data_only=True)
+
+    KpiData.query.filter(
+        KpiData.data_level == "site",
+        KpiData.kpi_name.in_(SHARED_WORKBOOK_KPI_NAMES)
+    ).delete(synchronize_session=False)
+    db.session.flush()
+
+    total_inserted = 0
+    kpi_summary = []
+    errors = []
+
+    for ws in wb.worksheets:
+        kpi_name = ws.title.strip()
+        if not kpi_name:
+            continue
+
+        headers = [c.value for c in ws[1]]
+        if not headers:
+            errors.append(f"Sheet '{kpi_name}': missing header row")
+            continue
+
+        site_id_col = _find_site_id_column(headers)
+        if site_id_col is None:
+            errors.append(f"Sheet '{kpi_name}': no HomeSitecode/site ID column found")
+            continue
+
+        date_columns = _extract_excel_date_columns(headers, skip_indices={site_id_col})
+        if not date_columns:
+            errors.append(f"Sheet '{kpi_name}': no valid date columns found")
+            continue
+
+        sheet_inserted = 0
+        batch = []
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            site_id = str(row[site_id_col]).strip() if site_id_col < len(row) and row[site_id_col] else None
+            if not site_id or site_id == "None":
+                continue
+
+            for col_idx, date_val in date_columns:
+                if col_idx < len(row) and row[col_idx] is not None:
+                    try:
+                        val = float(row[col_idx])
+                    except (ValueError, TypeError):
+                        continue
+                    batch.append(KpiData(
+                        site_id=site_id, kpi_name=kpi_name, date=date_val,
+                        hour=0, value=val, data_level="site"
+                    ))
+                    sheet_inserted += 1
+
+                    if len(batch) >= 2000:
+                        db.session.bulk_save_objects(batch)
+                        batch = []
+
+        if batch:
+            db.session.bulk_save_objects(batch)
+
+        total_inserted += sheet_inserted
+        kpi_summary.append({"name": kpi_name, "rows": sheet_inserted})
+
+    db.session.commit()
+    return jsonify({
+        "message": f"Shared workbook data added to database: {total_inserted} records inserted across {len(kpi_summary)} sheets.",
+        "inserted": total_inserted,
+        "kpis_processed": len(kpi_summary),
+        "kpi_summary": kpi_summary,
+        "errors": errors,
+    })
+
+
+@app.route("/api/admin/shared-site-workbook-summary", methods=["GET"])
+@jwt_required()
+def admin_shared_site_workbook_summary():
+    """Return summary for shared workbook KPI data only."""
+    user = User.query.get(int(get_jwt_identity()))
+    if not user or user.role != "admin":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    total_records = db.session.query(db.func.count(KpiData.id)).filter(
+        KpiData.data_level == "site",
+        KpiData.kpi_name.in_(SHARED_WORKBOOK_KPI_NAMES)
+    ).scalar() or 0
+
+    total_sites = db.session.query(db.func.count(db.distinct(KpiData.site_id))).filter(
+        KpiData.data_level == "site",
+        KpiData.kpi_name.in_(SHARED_WORKBOOK_KPI_NAMES)
+    ).scalar() or 0
+
+    return jsonify({
+        "total_sites": total_sites,
+        "total_records": total_records,
+    })
+
+
+@app.route("/api/admin/delete-shared-site-workbook", methods=["DELETE"])
+@jwt_required()
+def admin_delete_shared_site_workbook():
+    """Delete all shared workbook KPI data only."""
+    user = User.query.get(int(get_jwt_identity()))
+    if not user or user.role != "admin":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    count = KpiData.query.filter(
+        KpiData.data_level == "site",
+        KpiData.kpi_name.in_(SHARED_WORKBOOK_KPI_NAMES)
+    ).count()
+    KpiData.query.filter(
+        KpiData.data_level == "site",
+        KpiData.kpi_name.in_(SHARED_WORKBOOK_KPI_NAMES)
+    ).delete(synchronize_session=False)
+    db.session.commit()
+    return jsonify({"deleted": count})
+
+
 @app.route("/api/admin/upload-kpi-cell-level", methods=["POST"])
 @jwt_required()
 def admin_upload_kpi_cell_level():
@@ -2775,8 +2953,11 @@ def admin_upload_kpi_cell_level():
         return jsonify({"error": "No file provided"}), 400
 
     file = request.files["file"]
-    if not file.filename.endswith((".xlsx", ".xls")):
-        return jsonify({"error": "Only .xlsx or .xls files accepted"}), 400
+    if not file.filename.lower().endswith((".xlsx", ".xlsm")):
+        return jsonify({"error": "Only .xlsx or .xlsm files are supported (.xls is not supported)."}), 400
+    ok, err = _validate_ooxml_excel_upload(file)
+    if not ok:
+        return jsonify({"error": err}), 400
 
     import openpyxl
     wb = openpyxl.load_workbook(file, data_only=True)
