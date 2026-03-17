@@ -1,10 +1,11 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
-import { useSearchParams, useNavigate } from 'react-router-dom';
-import { getToken, apiGet, apiPost } from '../../api';
+import { useNavigate, useSearchParams } from 'react-router-dom';
+import { getToken, apiGet, apiPost, API_BASE } from '../../api';
 import { useAuth } from '../../AuthContext';
 import '../../styles/chatbot.css';
+import { io } from 'socket.io-client';
 
-const API_BASE = '';
+const SOCKET_URL = process.env.REACT_APP_API_URL || 'http://localhost:5500';
 
 // ── DEFAULT LOCATION (used instead of real GPS) ──────────────────────────────
 // TODO: Remove this and uncomment the real geolocation logic when ready
@@ -64,22 +65,93 @@ function getFollowupOptions(subprocessName) {
   return SUBPROCESS_FOLLOWUP_OPTIONS[key] || [];
 }
 
+// Message types that should be persisted to backend with payload for full replay
+const PERSIST_TYPES = new Set([
+  'sector-menu',
+  'subprocess-grid',
+  'network-subissue-grid',
+  'location-question',
+  'location-prompt',
+  'location-success',
+  'location-required',
+  'signal-offer',
+  'signal-codes',
+  'screenshot-upload',
+  'resolution',
+  'diagnosis-result',
+  'handoff',
+  'post-actions',
+  'unsat-options',
+  'email-action',
+  'email-sent',
+  'agent-resolved',
+]);
+
+function sanitizePayload(value) {
+  if (value === null || value === undefined) return value;
+  if (typeof value === 'function') return undefined;
+  if (typeof value !== 'object') return value;
+  if (Array.isArray(value)) return value.map(sanitizePayload);
+  const out = {};
+  Object.entries(value).forEach(([k, v]) => {
+    if (typeof v === 'function') return;
+    out[k] = sanitizePayload(v);
+  });
+  return out;
+}
+
+function stripHtml(html = '') {
+  if (!html) return '';
+  const tmp = document.createElement('div');
+  tmp.innerHTML = html;
+  return (tmp.textContent || tmp.innerText || '').trim();
+}
+
+const CACHE_PREFIX = 'chat_session_cache_';
+const cacheKey = (sessionId) => `${CACHE_PREFIX}${sessionId}`;
+
+function loadCachedSession(sessionId) {
+  if (!sessionId) return null;
+  try {
+    const raw = localStorage.getItem(cacheKey(sessionId));
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveCachedSession(sessionId, payload) {
+  if (!sessionId) return;
+  try {
+    localStorage.setItem(cacheKey(sessionId), JSON.stringify(payload));
+  } catch {}
+}
+
+function clearCachedSession(sessionId) {
+  if (!sessionId) return;
+  try {
+    localStorage.removeItem(cacheKey(sessionId));
+  } catch {}
+}
+
+function clearStoredSession() {
+  const sid = localStorage.getItem('chat_session_id');
+  if (sid) clearCachedSession(sid);
+  localStorage.removeItem('chat_session_id');
+}
+
 export default function ChatSupport() {
   const { user } = useAuth();
   const navigate = useNavigate();
-  const [searchParams] = useSearchParams();
 
   const [handoffActive, setHandoffActive] = useState(false);
   const agentResolvedShownRef = useRef(false);
+  const [wsConnected, setWsConnected] = useState(false);
 
   const [initPhase, setInitPhase] = useState('loading');
-  const [pendingFeedback, setPendingFeedback] = useState([]);
-  const [currentFbIdx, setCurrentFbIdx] = useState(0);
-  const [activeSessionData, setActiveSessionData] = useState(null);
-  const [activeSessionMsgs, setActiveSessionMsgs] = useState([]);
-  const [fbRating, setFbRating] = useState(0);
-  const [fbComment, setFbComment] = useState('');
-  const [fbSubmitting, setFbSubmitting] = useState(false);
+  const [startChoice, setStartChoice] = useState(true);
+  const [resumeCandidate, setResumeCandidate] = useState(null);
+  const [resumeMessages, setResumeMessages] = useState([]);
 
   const [messages, setMessages] = useState([]);
   const [inputVisible, setInputVisible] = useState(false);
@@ -87,6 +159,12 @@ export default function ChatSupport() {
   const [inputValue, setInputValue] = useState('');
   const [isTyping, setIsTyping] = useState(false);
   const [disabledGroups, setDisabledGroups] = useState(new Set());
+  const [pendingFeedback, setPendingFeedback] = useState([]);
+  const [fbRating, setFbRating] = useState(0);
+  const [fbComment, setFbComment] = useState('');
+  const [fbSubmitting, setFbSubmitting] = useState(false);
+  const [currentFbIdx, setCurrentFbIdx] = useState(0);
+  const [searchParams] = useSearchParams();
 
   const [locationStatus, setLocationStatus] = useState('idle');
   const locationRetryRef = useRef(null);
@@ -97,6 +175,8 @@ export default function ChatSupport() {
   const chatAreaRef = useRef(null);
   const inputRef = useRef(null);
   const sessionIdRef = useRef(null);
+  const socketRef = useRef(null);
+  const resumeNeededRef = useRef(false);
   const agentJoinedRef = useRef(false);
   const stateRef = useRef({
     step: 'welcome',
@@ -114,7 +194,6 @@ export default function ChatSupport() {
     diagnosisRan: false,
   });
   const msgIdCounter = useRef(0);
-
   const nextId = () => ++msgIdCounter.current;
 
   const isRecentSession = useCallback((session) => {
@@ -133,14 +212,6 @@ export default function ChatSupport() {
     }, 100);
   }, []);
 
-  const addMessage = useCallback((msg) => {
-    const id = nextId();
-    const groupId = msg.groupId || id;
-    setMessages(prev => [...prev, { ...msg, id, groupId }]);
-    scrollToBottom();
-    return groupId;
-  }, [scrollToBottom]);
-
   const disableGroup = useCallback((groupId) => {
     setDisabledGroups(prev => new Set([...prev, groupId]));
   }, []);
@@ -155,23 +226,114 @@ export default function ChatSupport() {
     setInputVisible(false);
   }, []);
 
-  const saveMessage = useCallback(async (sender, content, meta = {}) => {
+  const joinSocketSession = useCallback(() => {
+    if (!socketRef.current || !sessionIdRef.current) return;
+    const token = getToken();
+    if (!token) return;
+    socketRef.current.emit('join_session', { session_id: sessionIdRef.current, token });
+  }, []);
+
+  const markAgentMessagesSeen = useCallback(async (messageIds) => {
     if (!sessionIdRef.current) return;
+    if (!Array.isArray(messageIds) || messageIds.length === 0) return;
     try {
-      await chatApiCall(`/api/chat/session/${sessionIdRef.current}/message`, {
-        sender, content, ...meta,
+      const token = getToken();
+      await fetch(`${API_BASE}/api/chat/session/${sessionIdRef.current}/seen`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+        },
+        body: JSON.stringify({ message_ids: messageIds }),
       });
     } catch (e) {}
   }, []);
 
-  const createSession = useCallback(async () => {
+  const ensureSession = useCallback(async ({ forceNew = false, step = null } = {}) => {
     try {
-      const data = await chatApiCall('/api/chat/session', {});
+      const payload = { force_new: forceNew };
+      if (step) payload.current_step = step;
+      const data = await chatApiCall('/api/chat/session', payload);
       if (data.session) {
         sessionIdRef.current = data.session.id;
+        localStorage.setItem('chat_session_id', String(data.session.id));
+        if (forceNew) clearCachedSession(sessionIdRef.current);
+        joinSocketSession();
       }
+      return sessionIdRef.current;
+    } catch (e) {
+      return null;
+    }
+  }, [joinSocketSession]);
+
+  const saveMessage = useCallback(async (sender, content, meta = {}) => {
+    if (!sessionIdRef.current) {
+      await ensureSession({ step: stateRef.current.step });
+    }
+    if (!sessionIdRef.current) return;
+    try {
+      const contentPlain = sender === 'bot' ? stripHtml(meta.html || content || '') : content;
+      const payloadForSave = meta.payload || (sender === 'bot'
+        ? { type: meta.type || 'bot', html: meta.html || content, text: content }
+        : null);
+      await chatApiCall(`/api/chat/session/${sessionIdRef.current}/message`, {
+        sender,
+        content: contentPlain || '',
+        current_step: stateRef.current.step,
+        ...meta,
+        payload: payloadForSave,
+      });
+      const cached = loadCachedSession(sessionIdRef.current) || {};
+      const merged = Array.isArray(cached.messages) ? cached.messages : [];
+      // Append locally for instant cache even if setMessages not yet run
+      const type = sender === 'bot' ? 'bot' : sender === 'agent' ? 'live-agent-message' : 'user';
+      merged.push({ type, text: content, html: meta.html || content, payload: payloadForSave });
+      saveCachedSession(sessionIdRef.current, { messages: merged, state: stateRef.current });
     } catch (e) {}
-  }, []);
+  }, [ensureSession]);
+
+  const addMessage = useCallback((msg) => {
+    const id = nextId();
+    const groupId = msg.groupId || id;
+
+    // Persist bot messages to backend unless explicitly skipped
+    const maybePersistBot = async () => {
+      if (msg.type !== 'bot' && !PERSIST_TYPES.has(msg.type)) return;
+      if (msg.skipPersist) return;
+      if (msg.__hydrated) return; // avoid saving messages loaded from history/cache
+      if (!sessionIdRef.current) {
+        await ensureSession({ step: stateRef.current.step });
+      }
+      if (!sessionIdRef.current) return;
+      const content = msg.text || stripHtml(msg.html) || msg.type || '';
+      const payload = msg.payload || sanitizePayload({ type: msg.type, html: msg.html, text: msg.text, ...msg, id, groupId });
+      try {
+        await chatApiCall(`/api/chat/session/${sessionIdRef.current}/message`, {
+          sender: 'bot',
+          content,
+          current_step: stateRef.current.step,
+          payload,
+        });
+      } catch {}
+    };
+
+    const stampedPayload = msg.payload || (msg.type === 'bot'
+      ? { type: msg.type, html: msg.html, text: msg.text }
+      : undefined);
+    const stamped = { ...msg, id, groupId, payload: stampedPayload };
+
+    setMessages(prev => {
+      const updated = [...prev, stamped];
+      if (sessionIdRef.current) {
+        saveCachedSession(sessionIdRef.current, { messages: updated, state: stateRef.current });
+      }
+      return updated;
+    });
+
+    maybePersistBot();
+    scrollToBottom();
+    return groupId;
+  }, [scrollToBottom, ensureSession]);
 
   // ══════════════════════════════════════════════════════════════════
   // LOCATION FUNCTIONS
@@ -257,6 +419,175 @@ export default function ChatSupport() {
 
   }, [addMessage, saveLocationToBackend, disableGroup]);
 
+  const afterLocationCaptured = useCallback(() => {
+    setTimeout(() => {
+      addMessage({ type: 'bot', html: `Thank you! Your location has been recorded.` });
+      addMessage({ type: 'bot', html: `Please <strong>describe your specific issue</strong> so I can provide the best resolution.` });
+      showInput('Describe your issue in any language...');
+      stateRef.current.step = 'query';
+    }, 500);
+  }, [addMessage, showInput]);
+
+  const hydrateHistory = useCallback((history = []) => {
+    const restored = [];
+    let prevKey = null;
+
+    history.forEach((m) => {
+      if (m.type) {
+        const id = m.id || nextId();
+        const groupId = m.groupId || id;
+        restored.push({ ...m, id, groupId, __hydrated: true });
+        return;
+      }
+
+      const key = `${m.sender}|${m.content || ''}`.trim();
+      if (key && key === prevKey) return;
+      prevKey = key;
+
+      const id = nextId();
+      const groupId = m.groupId || id;
+      if (m.payload && m.payload.type) {
+        restored.push({ id, groupId, ...m.payload, __hydrated: true });
+        return;
+      }
+      if (m.content?.startsWith('__IMAGE__:')) {
+        restored.push({ id, groupId, type: 'user-image', imageSrc: m.content.replace('__IMAGE__:', ''), __hydrated: true });
+        return;
+      }
+      if (m.sender === 'agent') {
+        restored.push({ id, groupId, type: 'live-agent-message', text: m.content, timestamp: m.created_at, __hydrated: true });
+        return;
+      }
+      if (m.sender === 'bot') {
+        const html = formatResolution(m.content || '').replace(/\n/g, '<br>');
+        restored.push({ id, groupId, type: 'bot', html, __hydrated: true });
+        return;
+      }
+      restored.push({ id, groupId, type: 'user', text: m.content, __hydrated: true });
+    });
+
+    const wired = restored.map((msg) => {
+      if (msg.type === 'location-question') {
+        return {
+          ...msg,
+          onYes: () => {
+            disableGroup(msg.groupId);
+            addMessage({ type: 'user', text: "Yes, I'm at the issue location" });
+            const locPromptGroupId = nextId();
+            addMessage({
+              type: 'location-prompt',
+              groupId: locPromptGroupId,
+              onShare: () => {
+                disableGroup(locPromptGroupId);
+                requestLocation(() => { afterLocationCaptured(stateRef.current.subprocessName || ''); });
+              },
+            });
+            stateRef.current.step = 'location';
+          },
+          onNo: () => {
+            disableGroup(msg.groupId);
+            addMessage({ type: 'user', text: 'No, different location' });
+            addMessage({ type: 'system', text: 'Please describe the location of the issue.' });
+            showInput('Describe the location...');
+            stateRef.current.step = 'location-other';
+          },
+        };
+      }
+      if (msg.type === 'location-prompt') {
+        return {
+          ...msg,
+          onShare: () => {
+            disableGroup(msg.groupId);
+            requestLocation(() => { afterLocationCaptured(stateRef.current.subprocessName || ''); });
+          },
+        };
+      }
+      if (msg.type === 'location-required') {
+        return {
+          ...msg,
+          onRetry: () => {
+            disableGroup(msg.groupId);
+            requestLocation(() => { afterLocationCaptured(stateRef.current.subprocessName || ''); });
+          },
+        };
+      }
+      return msg;
+    });
+
+    setMessages(wired);
+    if (sessionIdRef.current) {
+      saveCachedSession(sessionIdRef.current, {
+        messages: wired,
+        state: stateRef.current,
+      });
+    }
+  }, [nextId, disableGroup, addMessage, requestLocation, afterLocationCaptured, showInput]);
+
+  const restoreSession = useCallback(async (opts = {}) => {
+    const { sessionId: forcedSessionId = null, allowResolved = false } = opts || {};
+    const token = getToken();
+    if (!token) return false;
+    try {
+      let data = null;
+      const storedId = forcedSessionId || localStorage.getItem('chat_session_id');
+      if (storedId) {
+        const resp = await fetch(`${API_BASE}/api/chat/session/${storedId}`, {
+          headers: { 'Authorization': `Bearer ${token}` },
+        });
+        if (resp.ok) data = await resp.json();
+      }
+      if (!data || data.error) {
+        const resp = await fetch(`${API_BASE}/api/chat/session/active`, { headers: { 'Authorization': `Bearer ${token}` } });
+        if (resp.ok) data = await resp.json();
+      }
+      if (data && data.session) {
+        sessionIdRef.current = data.session.id;
+        localStorage.setItem('chat_session_id', String(data.session.id));
+        const cache = loadCachedSession(sessionIdRef.current);
+        const history = (data.messages && data.messages.length ? data.messages : []) || [];
+        const merged = history.length ? history : cache?.messages || [];
+
+        // Seed welcome/menu if session is empty
+        if (merged.length === 0) {
+          try {
+            const menuResp = await apiGet('/api/menu');
+            const menu = menuResp?.menu || {};
+            addMessage({ type: 'bot', html: `<strong>Welcome to TeleBot Support!</strong><br>Say hello to get started!` });
+            const spGroupId = nextId();
+            addMessage({ type: 'sector-menu', menu, groupId: spGroupId });
+            stateRef.current.step = 'greeting';
+            setInitPhase('chat');
+            showInput('Type your greeting here...');
+            joinSocketSession();
+            return true;
+          } catch {}
+        }
+
+        setDisabledGroups(new Set()); // re-enable interactive cards on restore
+        hydrateHistory(merged);
+        if (cache?.state) {
+          stateRef.current = { ...stateRef.current, ...cache.state };
+        }
+        const maxAgentId = Math.max(0, ...history.filter(m => m.sender === 'agent').map(m => m.id));
+        if (maxAgentId > 0) { lastSeenMsgIdRef.current = maxAgentId; }
+        stateRef.current.step = data.session.current_step || 'greeting';
+        stateRef.current.sectorName = data.session.sector_name || null;
+        stateRef.current.subprocessName = data.session.subprocess_name || null;
+        stateRef.current.queryText = data.session.query_text || '';
+        setHandoffActive(data.session.status === 'escalated');
+        setInitPhase('chat');
+        const placeholder = data.session.status === 'escalated'
+          ? 'Type your reply to the agent...'
+          : 'Describe your issue...';
+        showInput(placeholder);
+        joinSocketSession();
+        resumeNeededRef.current = true;
+        return true;
+      }
+    } catch (e) {}
+    return false;
+  }, [hydrateHistory, joinSocketSession, showInput]);
+
   // ── Poll for agent messages + resolution after handoff ──
   const lastSeenMsgIdRef = useRef(0);
 
@@ -279,8 +610,23 @@ export default function ChatSupport() {
         const newAgentMsgs = allMsgs.filter(
           m => m.sender === 'agent' && m.id > lastSeenMsgIdRef.current
         );
+        const sessionInfo = data.session || {};
+        if (!handoffActive && (newAgentMsgs.length > 0 || sessionInfo.status === 'escalated')) {
+          setHandoffActive(true);
+        }
         newAgentMsgs.forEach(m => {
           lastSeenMsgIdRef.current = Math.max(lastSeenMsgIdRef.current, m.id);
+
+          // Intercept agent-triggered diagnosis request — don't show as a chat bubble
+          if (m.content === '__AGENT_REQUEST_DIAGNOSIS__') {
+            addMessage({
+              type: 'bot',
+              html: 'Your support agent has requested a <strong>signal diagnosis</strong> to better assist you. Please run it now:',
+            });
+            addMessage({ type: 'signal-offer', groupId: m.id });
+            return;
+          }
+
           addMessage({ type: 'live-agent-message', text: m.content, timestamp: m.created_at });
         });
         if (newAgentMsgs.length > 0 && !agentJoinedRef.current) {
@@ -289,8 +635,7 @@ export default function ChatSupport() {
           showInput('Type your message for the agent...');
           stateRef.current.step = 'live-agent';
         }
-        const s = data.session || {};
-        if (s.status === 'resolved' && !agentResolvedShownRef.current) {
+        if (sessionInfo.status === 'resolved' && !agentResolvedShownRef.current) {
           agentResolvedShownRef.current = true;
           setHandoffActive(false);
           hideInput();
@@ -312,10 +657,59 @@ export default function ChatSupport() {
     };
   }, [handoffActive, addMessage, hideInput, showInput]);
 
-  const startChat = useCallback(async () => {
+  useEffect(() => {
+    const token = getToken();
+    if (!token) return;
+    const s = io(SOCKET_URL, { transports: ['websocket', 'polling'] });
+    socketRef.current = s;
+    s.on('connect', () => {
+      setWsConnected(true);
+      joinSocketSession();
+    });
+    s.on('disconnect', () => setWsConnected(false));
+    s.on('new_message', (m) => {
+      if (!m || !sessionIdRef.current || m.session_id !== sessionIdRef.current) return;
+      if (m.sender !== 'agent') return;
+      if (m.id <= lastSeenMsgIdRef.current) return;
+      lastSeenMsgIdRef.current = Math.max(lastSeenMsgIdRef.current, m.id);
+      if (m.content === '__AGENT_REQUEST_DIAGNOSIS__') {
+        addMessage({
+          type: 'bot',
+          html: 'Your support agent has requested a <strong>signal diagnosis</strong> to better assist you. Please run it now:',
+        });
+        addMessage({ type: 'signal-offer', groupId: m.id });
+        setHandoffActive(true);
+        showInput('Type your reply to the agent...');
+        return;
+      }
+      addMessage({ type: 'live-agent-message', text: m.content, timestamp: m.created_at });
+      markAgentMessagesSeen([m.id]);
+      setHandoffActive(true);
+      showInput('Type your reply to the agent...');
+    });
+    s.on('session_updated', (payload) => {
+      if (!payload || payload.session_id !== sessionIdRef.current) return;
+      if (payload.status === 'resolved' && !agentResolvedShownRef.current) {
+        agentResolvedShownRef.current = true;
+        setHandoffActive(false);
+        addMessage({
+          type: 'agent-resolved',
+          botMessage: 'Your support ticket has been resolved.',
+        });
+      }
+    });
+    return () => {
+      s.disconnect();
+      socketRef.current = null;
+    };
+  }, [addMessage, joinSocketSession, markAgentMessagesSeen, showInput]);
+
+  const startChat = useCallback(async (forceNew = false) => {
     setMessages([]);
     setDisabledGroups(new Set());
     setLocationStatus('idle');
+    setResumeCandidate(null);
+    setResumeMessages([]);
     stateRef.current = {
       step: 'greeting', sectorKey: null, sectorName: null,
       subprocessKey: null, subprocessName: null, language: 'English',
@@ -327,33 +721,40 @@ export default function ChatSupport() {
     setHandoffActive(false);
     hideInput();
     setInitPhase('chat');
+    if (forceNew) {
+      clearStoredSession();
+      try {
+        const url = new URL(window.location.href);
+        url.searchParams.delete('resume');
+        window.history.replaceState(null, '', url.toString());
+      } catch {}
+    }
+    await ensureSession({ forceNew: forceNew, step: 'greeting' });
+    if (sessionIdRef.current) clearCachedSession(sessionIdRef.current);
     setTimeout(() => {
       addMessage({ type: 'bot', html: `<strong>Welcome to TeleBot Support!</strong><br>Say hello to get started!` });
       showInput('Type your greeting here...');
     }, 500);
-  }, [addMessage, hideInput, showInput]);
+  }, [addMessage, hideInput, showInput, ensureSession]);
 
   const beginNewChat = useCallback(async () => {
-    try {
-      const pending = await apiGet('/api/customer/pending-feedback');
-      const sessions = pending?.sessions || [];
-      if (sessions.length > 0) {
-        navigate(`/customer/feedback?session=${sessions[0].id}&return=1`);
-        return;
-      }
-    } catch {}
-    startChat();
-  }, [navigate, startChat]);
+    await startChat(true);
+  }, [startChat]);
 
   const loadSectorMenu = useCallback(async () => {
     const token = getToken();
     const headers = {};
     if (token) headers['Authorization'] = `Bearer ${token}`;
-    const resp = await fetch(`${API_BASE}/api/menu`, { headers });
-    const data = await resp.json();
-    const groupId = nextId();
-    addMessage({ type: 'sector-menu', menu: data.menu, groupId });
-    stateRef.current.step = 'sector';
+    setIsTyping(true);
+    try {
+      const resp = await fetch(`${API_BASE}/api/menu`, { headers });
+      const data = await resp.json();
+      const groupId = nextId();
+      addMessage({ type: 'sector-menu', menu: data.menu, groupId });
+      stateRef.current.step = 'sector';
+    } finally {
+      setIsTyping(false);
+    }
   }, [addMessage]);
 
   const selectSector = useCallback(async (key, name, groupId) => {
@@ -361,6 +762,7 @@ export default function ChatSupport() {
     stateRef.current.sectorKey = key;
     stateRef.current.sectorName = name;
     addMessage({ type: 'user', text: name });
+    saveMessage('user', name, { sector_name: name, current_step: 'sector' });
     addMessage({ type: 'system', text: `Selected: ${name}` });
     setIsTyping(true);
     const data = await chatApiCall('/api/subprocesses', { sector_key: key, language: stateRef.current.language });
@@ -369,19 +771,10 @@ export default function ChatSupport() {
     const spGroupId = nextId();
     addMessage({ type: 'subprocess-grid', subprocesses: limitSubprocesses(data.subprocesses), groupId: spGroupId });
     stateRef.current.step = 'subprocess';
-  }, [addMessage, disableGroup]);
-
-  const afterLocationCaptured = useCallback(() => {
-    setTimeout(() => {
-      addMessage({ type: 'bot', html: `Thank you! Your location has been recorded.` });
-      addMessage({ type: 'bot', html: `Please <strong>describe your specific issue</strong> so I can provide the best resolution.` });
-      showInput('Describe your issue in any language...');
-      stateRef.current.step = 'query';
-    }, 500);
-  }, [addMessage, showInput]);
+  }, [addMessage, disableGroup, saveMessage]);
 
   const beginLocationFlow = useCallback(async (selectedIssueLabel) => {
-    if (!sessionIdRef.current) { await createSession(); }
+    if (!sessionIdRef.current) { await ensureSession({ step: 'location' }); }
     addMessage({
       type: 'bot',
       html: `You selected <strong>${selectedIssueLabel}</strong>.<br><br>To help us assist you better, we need to know about your location.`,
@@ -406,15 +799,26 @@ export default function ChatSupport() {
         stateRef.current.step = 'location';
       },
       onNo: () => {
-        disableGroup(locQGroupId);
-        addMessage({ type: 'user', text: "No, I'm at a different location" });
-        addMessage({ type: 'bot', html: `Please describe the location where you're experiencing this issue (e.g., area, address, landmark):` });
-        showInput('Describe your issue location...');
-        stateRef.current.step = 'location-describe';
+        // No alternate location flow for now
       },
     });
     stateRef.current.step = 'location-question';
-  }, [addMessage, disableGroup, showInput, createSession, requestLocation, afterLocationCaptured]);
+  }, [addMessage, disableGroup, showInput, ensureSession, requestLocation, afterLocationCaptured]);
+
+  useEffect(() => {
+    if (!resumeNeededRef.current) return;
+    const st = stateRef.current;
+    if (st.step === 'location' || st.step === 'location-question') {
+      resumeNeededRef.current = false;
+      beginLocationFlow(st.subprocessName || st.subprocessSubType || 'your issue');
+      return;
+    }
+    if (st.step === 'signal-diagnosis') {
+      resumeNeededRef.current = false;
+      const uploadGroupId = nextId();
+      addMessage({ type: 'screenshot-upload', groupId: uploadGroupId });
+    }
+  }, [beginLocationFlow, addMessage]);
 
   const autoRaiseTicket = useCallback(async (opts = {}) => {
     const { prefaceHtml } = opts;
@@ -423,6 +827,7 @@ export default function ChatSupport() {
     let slaHours = null;
     if (sessionIdRef.current) {
       try {
+        setIsTyping(true);
         const token = getToken();
         const resp = await fetch(`${API_BASE}/api/chat/session/${sessionIdRef.current}/escalate`, {
           method: 'PUT',
@@ -431,7 +836,7 @@ export default function ChatSupport() {
         const data = await resp.json();
         if (data.ticket) { refNum = data.ticket.reference_number; slaHours = data.ticket.sla_hours || null; }
         if (data.assigned_agent) { assignedAgent = data.assigned_agent; }
-      } catch {}
+      } catch {} finally { setIsTyping(false); }
     }
     const header = prefaceHtml || `Your ticket is being raised now.`;
     addMessage({
@@ -447,9 +852,9 @@ export default function ChatSupport() {
                ${assignedAgent.employee_id ? `<div style="font-size:11px;color:#64748b;margin-top:2px;">ID: ${assignedAgent.employee_id}</div>` : ''}
                ${slaHours ? `<div style="font-size:12px;color:#16a34a;margin-top:6px;font-weight:600;">Your issue will be resolved within ${slaHours} hour${slaHours !== 1 ? 's' : ''}</div>` : ''}
              </div>`
-          : `<br><br>Our support team will reach out to you shortly.` +
+          : `<br><br>We are connecting you to a human agent. Our support team will reach out to you shortly.` +
             (slaHours ? `<br><span style="color:#16a34a;font-weight:600;">Your issue will be resolved within ${slaHours} hour${slaHours !== 1 ? 's' : ''}</span>` : '')) +
-        `<br>You can track your ticket from the dashboard.`,
+        `<br><br>The agent may send you messages below - please stay in this chat.<br>You can track your ticket from the dashboard.`,
     });
     addMessage({ type: 'system', text: 'Please wait — we are connecting you to a human agent.' });
     stateRef.current.step = 'live-agent';
@@ -462,7 +867,7 @@ export default function ChatSupport() {
   const fetchSolution = useCallback(async (userQuery) => {
     const st = stateRef.current;
     st.attempt += 1;
-    if (!sessionIdRef.current) { await createSession(); }
+    if (!sessionIdRef.current) { await ensureSession({ step: 'query' }); }
     if (st.attempt === 1) { st.queryText = userQuery; }
     saveMessage('user', userQuery, { query_text: userQuery, sector_name: st.sectorName, subprocess_name: st.subprocessName });
     const effectiveQuery = st.subprocessSubType
@@ -502,7 +907,7 @@ export default function ChatSupport() {
       showInput('Type your response...');
     }, 800);
     st.step = 'conversation';
-  }, [addMessage, saveMessage, showInput, createSession, autoRaiseTicket]);
+  }, [addMessage, saveMessage, showInput, ensureSession, autoRaiseTicket]);
 
   const selectSubprocess = useCallback(async (key, name, groupId) => {
     const followupOptions = getFollowupOptions(name);
@@ -514,6 +919,7 @@ export default function ChatSupport() {
       stateRef.current.attempt = 0;
       stateRef.current.previousSolutions = [];
       addMessage({ type: 'user', text: name });
+      saveMessage('user', name, { subprocess_name: name, sector_name: stateRef.current.sectorName, current_step: 'subprocess' });
       addMessage({
         type: 'bot',
         html: `You selected <strong>${name}</strong>. Please choose the <strong>specific issue type</strong>:`,
@@ -531,6 +937,7 @@ export default function ChatSupport() {
     stateRef.current.attempt = 0;
     stateRef.current.previousSolutions = [];
     addMessage({ type: 'user', text: name });
+    saveMessage('user', name, { subprocess_name: name, sector_name: stateRef.current.sectorName, current_step: 'subprocess' });
     if (isMobileNetworkIssue(stateRef.current.sectorName, name)) {
       await beginLocationFlow(name);
       return;
@@ -538,7 +945,7 @@ export default function ChatSupport() {
     addMessage({ type: 'bot', html: `Please <strong>describe your specific issue</strong> so I can provide the best resolution.` });
     showInput('Describe your issue in any language...');
     stateRef.current.step = 'query';
-  }, [addMessage, disableGroup, beginLocationFlow]);
+  }, [addMessage, disableGroup, beginLocationFlow, saveMessage, showInput]);
 
   const selectNetworkSubissue = useCallback(async (name, groupId) => {
     disableGroup(groupId);
@@ -549,6 +956,7 @@ export default function ChatSupport() {
     stateRef.current.attempt = 0;
     stateRef.current.previousSolutions = [];
     addMessage({ type: 'user', text: name });
+    saveMessage('user', name, { subprocess_name: finalSubprocessName, sector_name: stateRef.current.sectorName, current_step: 'subprocess' });
     if (isMobileNetworkIssue(stateRef.current.sectorName, finalSubprocessName)) {
       await beginLocationFlow(finalSubprocessName);
       return;
@@ -556,7 +964,7 @@ export default function ChatSupport() {
     addMessage({ type: 'bot', html: `Please <strong>describe your specific issue</strong> so I can provide the best resolution.` });
     showInput('Describe your issue in any language...');
     stateRef.current.step = 'query';
-  }, [addMessage, disableGroup, beginLocationFlow]);
+  }, [addMessage, disableGroup, beginLocationFlow, saveMessage, showInput]);
 
   const sendMessage = useCallback(async () => {
     const text = inputValue.trim();
@@ -569,7 +977,32 @@ export default function ChatSupport() {
     }
     hideInput();
 
+    let userSaved = false;
+    const saveUserOnce = (meta = {}) => {
+      if (userSaved) return;
+      saveMessage('user', text, meta);
+      userSaved = true;
+    };
+
+    if (handoffActive || stateRef.current.step === 'human_handoff' || stateRef.current.step === 'escalated') {
+      // Mark the message we just added as liveChat so ticks show
+      setMessages(prev => {
+        const updated = [...prev];
+        for (let i = updated.length - 1; i >= 0; i--) {
+          if (updated[i].type === 'user' && updated[i].text === text) {
+            updated[i] = { ...updated[i], liveChat: true };
+            break;
+          }
+        }
+        return updated;
+      });
+      saveUserOnce({ current_step: stateRef.current.step });
+      showInput('Type your reply to the agent...');
+      return;
+    }
+
     if (stateRef.current.step === 'greeting') {
+      saveUserOnce({ current_step: 'greeting' });
       setIsTyping(true);
       let isGreeting = true;
       try {
@@ -592,28 +1025,13 @@ export default function ChatSupport() {
       return;
     }
 
-    if (stateRef.current.step === 'location-describe') {
-      if (sessionIdRef.current) {
-        try {
-          const token = getToken();
-          await fetch(`${API_BASE}/api/chat/session/${sessionIdRef.current}/location`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-            body: JSON.stringify({ location_description: text }),
-          });
-        } catch (e) {}
-      }
-      addMessage({ type: 'bot', html: `Thank you! Location noted: <strong>${text}</strong>` });
-      afterLocationCaptured(stateRef.current.subprocessName);
-      return;
-    }
-
     if (stateRef.current.step === 'conversation') {
       setIsTyping(true);
       let classification = { is_satisfied: false, mentions_signal: false };
       try { classification = await chatApiCall('/api/classify-response', { text }); } catch {}
       setIsTyping(false);
       if (classification.is_satisfied) {
+        saveUserOnce({ current_step: 'conversation' });
         addMessage({ type: 'thankyou' });
         if (sessionIdRef.current) {
           try {
@@ -654,6 +1072,7 @@ export default function ChatSupport() {
       let classification = { mentions_signal: false };
       try { classification = await chatApiCall('/api/classify-response', { text }); } catch {}
       if (classification.mentions_signal) {
+        saveUserOnce({ current_step: stateRef.current.step });
         addMessage({ type: 'bot', html: `It sounds like you're experiencing signal issues. Would you like to run a signal diagnosis?` });
         const diagGroupId = nextId();
         addMessage({ type: 'signal-offer', groupId: diagGroupId });
@@ -670,6 +1089,7 @@ export default function ChatSupport() {
     if (!sessionIdRef.current) return;
     addMessage({ type: 'system', text: 'Sending summary to your email...' });
     try {
+      setIsTyping(true);
       const token = getToken();
       const resp = await fetch(`${API_BASE}/api/chat/session/${sessionIdRef.current}/send-summary-email`, {
         method: 'POST',
@@ -679,6 +1099,7 @@ export default function ChatSupport() {
       if (resp.ok) { addMessage({ type: 'email-sent', message: data.message }); }
       else { addMessage({ type: 'system', text: data.error || 'Failed to send email.' }); }
     } catch { addMessage({ type: 'system', text: 'Failed to send email. Please try again later.' }); }
+    finally { setIsTyping(false); }
   }, [addMessage, disableGroup]);
 
   const handleSignalDiagnosis = useCallback((groupId) => {
@@ -704,6 +1125,7 @@ export default function ChatSupport() {
     let slaHours = null;
     if (sessionIdRef.current) {
       try {
+        setIsTyping(true);
         const token = getToken();
         const resp = await fetch(`${API_BASE}/api/chat/session/${sessionIdRef.current}/escalate`, {
           method: 'PUT',
@@ -712,7 +1134,7 @@ export default function ChatSupport() {
         const data = await resp.json();
         if (data.ticket) { refNum = data.ticket.reference_number; slaHours = data.ticket.sla_hours || null; }
         if (data.assigned_agent) { assignedAgent = data.assigned_agent; }
-      } catch {}
+      } catch {} finally { setIsTyping(false); }
     }
     addMessage({
       type: 'bot',
@@ -732,7 +1154,6 @@ export default function ChatSupport() {
             (slaHours ? `<br><span style="color:#16a34a;font-weight:600;">SLA: Your issue will be resolved within ${slaHours} hour${slaHours !== 1 ? 's' : ''}</span>` : '')) +
         `<br>You can track your ticket from the dashboard.`,
     });
-    setTimeout(() => { const ag = nextId(); addMessage({ type: 'post-actions', groupId: ag }); }, 1000);
     stateRef.current.step = 'escalated';
     agentResolvedShownRef.current = false;
     setHandoffActive(true);
@@ -785,12 +1206,24 @@ export default function ChatSupport() {
         const data = await resp.json();
         if (resp.ok) { addMessage({ type: 'email-sent', message: data.message }); }
       } catch {}
+      if (!handoffActive) {
+        try {
+          const token = getToken();
+          await fetch(`${API_BASE}/api/chat/session/${currentSessionId}/resolve`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+          });
+        } catch {}
+      }
     }
     stateRef.current.step = 'exited';
     setTimeout(() => {
       addMessage({ type: 'exit-box' });
+      if (currentSessionId) {
+        navigate(`/customer/feedback?session=${currentSessionId}`);
+      }
     }, 800);
-  }, [addMessage, disableGroup, hideInput, handoffActive, showInput]);
+  }, [addMessage, disableGroup, hideInput, handoffActive, showInput, navigate]);
 
   const handleScreenshotUpload = useCallback(async (file) => {
     if (!file || !file.type.startsWith('image/')) {
@@ -814,10 +1247,10 @@ export default function ChatSupport() {
       setIsTyping(true);
       try {
         const token = getToken();
-        const resp = await fetch(`${API_BASE}/api/chat/session/${sessionIdRef.current}/analyze-signal`, {
+      const resp = await fetch(`${API_BASE}/api/chat/session/${sessionIdRef.current}/analyze-signal`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-          body: JSON.stringify({ image: base64String }),
+          body: JSON.stringify({ image: base64String, image_data_url: reader.result }),
         });
         const data = await resp.json();
         setIsTyping(false);
@@ -868,6 +1301,7 @@ export default function ChatSupport() {
     let slaHours = null;
     if (sessionIdRef.current) {
       try {
+        setIsTyping(true);
         const token = getToken();
         const resp = await fetch(`${API_BASE}/api/chat/session/${sessionIdRef.current}/escalate`, {
           method: 'PUT',
@@ -876,7 +1310,7 @@ export default function ChatSupport() {
         const data = await resp.json();
         if (data.ticket) { refNum = data.ticket.reference_number; slaHours = data.ticket.sla_hours || null; }
         if (data.assigned_agent) { assignedAgent = data.assigned_agent; }
-      } catch {}
+      } catch {} finally { setIsTyping(false); }
     }
     addMessage({
       type: 'handoff',
@@ -902,10 +1336,8 @@ export default function ChatSupport() {
         type: 'bot',
         html: `Your ticket is being raised now.` +
           `<br><br>Your request has been submitted and a support ticket has been raised.` + agentCard +
-          `<br>Reference: <strong>${refNum}</strong><br><br>The agent may send you messages below — please stay in this chat.<br><br>What would you like to do next?`,
+          `<br>Reference: <strong>${refNum}</strong><br><br>The agent may send you messages below - please stay in this chat.<br><br>What would you like to do next?`,
       });
-      const actionGroupId = nextId();
-      addMessage({ type: 'post-actions', groupId: actionGroupId });
     }, 1500);
     addMessage({ type: 'system', text: 'Please wait — we are connecting you to a human agent.' });
     stateRef.current.step = 'live-agent';
@@ -926,6 +1358,8 @@ export default function ChatSupport() {
   }, []);
 
   const resumeChat = useCallback(async (session, msgs) => {
+    setResumeCandidate(null);
+    setResumeMessages([]);
     setInitPhase('chat');
     setMessages([]);
     setDisabledGroups(new Set());
@@ -1064,7 +1498,8 @@ export default function ChatSupport() {
     if (initialized.current) return;
     initialized.current = true;
     (async () => {
-      const resumeId = searchParams.get('resume');
+      const params = new URLSearchParams(window.location.search);
+      const resumeId = params.get('resume');
       if (resumeId) {
         try {
           const data = await apiGet(`/api/chat/session/${resumeId}`);
@@ -1074,6 +1509,16 @@ export default function ChatSupport() {
           }
         } catch {}
       }
+      // If an active session exists, offer a choice to continue or start fresh
+      try {
+        const active = await apiGet('/api/chat/session/active');
+        if (active?.session && active.session.status !== 'resolved') {
+          setResumeCandidate(active.session);
+          setResumeMessages(active.messages || []);
+          setInitPhase('resume-prompt');
+          return;
+        }
+      } catch {}
       setInitPhase('start-gate');
     })();
   }, [searchParams, resumeChat]);
@@ -1087,7 +1532,18 @@ export default function ChatSupport() {
       case 'bot':
         return <div key={msg.id} className="message bot" dangerouslySetInnerHTML={{ __html: msg.html }} />;
       case 'user':
-        return <div key={msg.id} className="message user">{msg.text}</div>;
+        return (
+          <div key={msg.id} className="message user">
+            <span>{msg.text}</span>
+            {msg.liveChat && (
+              <span className={`msg-tick ${msg.seen ? 'msg-tick--seen' : 'msg-tick--sent'}`} title={msg.seen ? 'Seen' : 'Sent'}>
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                  <polyline points="20 6 9 17 4 12" />
+                </svg>
+              </span>
+            )}
+          </div>
+        );
       case 'system':
         return <div key={msg.id} className="message system">{msg.text}</div>;
       case 'sector-menu':
@@ -1263,20 +1719,29 @@ export default function ChatSupport() {
         );
 
       // ── LOCATION SUCCESS ──
-      case 'location-success':
+      case 'location-success': {
+        const hasCoords = typeof msg.latitude === 'number' && typeof msg.longitude === 'number';
         return (
           <div key={msg.id} style={{ background: '#ffffff', border: '1px solid #d8e0ec', borderLeft: '3px solid #00875a', borderRadius: '10px', padding: '14px 18px', margin: '6px 0', display: 'flex', alignItems: 'center', gap: '14px', boxShadow: '0 1px 2px rgba(0, 20, 60, 0.04)' }}>
             <div style={{ fontSize: '18px', color: '#00875a', fontWeight: 700 }}>&#10003;</div>
             <div>
               <div style={{ fontWeight: '700', fontSize: '13px', color: '#00875a' }}>Location Captured Successfully</div>
-              <div style={{ fontSize: '12px', color: '#3d5068', marginTop: '4px' }}>
-                Lat: <strong style={{ color: '#0f1d33' }}>{msg.latitude?.toFixed(6)}</strong> &nbsp;|&nbsp;
-                Long: <strong style={{ color: '#0f1d33' }}>{msg.longitude?.toFixed(6)}</strong>
-              </div>
+              {hasCoords && (
+                <div style={{ fontSize: '12px', color: '#3d5068', marginTop: '4px' }}>
+                  Lat: <strong style={{ color: '#0f1d33' }}>{msg.latitude?.toFixed(6)}</strong> &nbsp;|&nbsp;
+                  Long: <strong style={{ color: '#0f1d33' }}>{msg.longitude?.toFixed(6)}</strong>
+                </div>
+              )}
+              {msg.description && (
+                <div style={{ fontSize: '12px', color: '#3d5068', marginTop: '4px' }}>
+                  Location: <strong style={{ color: '#0f1d33' }}>{msg.description}</strong>
+                </div>
+              )}
               <div style={{ fontSize: '11px', color: '#8596ab', marginTop: '2px' }}>Stored securely for network diagnostics</div>
             </div>
           </div>
         );
+      }
 
       case 'signal-codes':
         return (
@@ -1482,9 +1947,9 @@ export default function ChatSupport() {
   };
 
   const renderResumePrompt = () => {
-    const session = activeSessionData;
+    const session = resumeCandidate;
     if (!session) return null;
-    const lastMsg = activeSessionMsgs.length > 0 ? activeSessionMsgs[activeSessionMsgs.length - 1] : null;
+    const lastMsg = resumeMessages.length > 0 ? resumeMessages[resumeMessages.length - 1] : null;
     const isActiveSession = session.status === 'active';
     return (
       <div className="gate-overlay">
@@ -1504,7 +1969,7 @@ export default function ChatSupport() {
             {lastMsg && <div className="gate-summary"><span className="gate-label">Last message</span><p>{lastMsg.content.length > 120 ? lastMsg.content.slice(0, 120) + '...' : lastMsg.content}</p></div>}
           </div>
           <div className="gate-actions">
-            <button className="gate-btn gate-btn-primary" onClick={() => resumeChat(activeSessionData, activeSessionMsgs)}>
+            <button className="gate-btn gate-btn-primary" onClick={() => resumeChat(resumeCandidate, resumeMessages)}>
               {isActiveSession ? 'Continue Chat' : 'Open Chat'}
             </button>
             <button className="gate-btn gate-btn-secondary" onClick={() => beginNewChat()}>Start New Chat</button>
@@ -1593,6 +2058,9 @@ export default function ChatSupport() {
     </div>
   );
 }
+
+
+
 
 
 

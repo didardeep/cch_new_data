@@ -20,6 +20,7 @@ import CTOAlertBox from './pages/cto/CTOAlertBox';
 import TechnicalKPI from './pages/cto/TechnicalKPI';
 import BusinessKPI from './pages/cto/BusinessKPI';
 import OperationalKPI from './pages/cto/OperationalKPI';
+import CTODutyRoster from './pages/cto/CTODutyRoster';
 import AdminLayout from './pages/admin/AdminLayout';
 import AdminDashboard from './pages/admin/AdminDashboard';
 import UserManagement from './pages/admin/UserManagement';
@@ -87,6 +88,7 @@ export default function App() {
         <Route path="tracking" element={<IssueTracking />} />
         <Route path="chat-detail/:id" element={<ChatDetail />} />
         <Route path="alerts" element={<CTOAlertBox />} />
+        <Route path="roster" element={<CTODutyRoster />} />
       </Route>
 
       {/* Admin Routes */}

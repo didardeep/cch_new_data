@@ -65,6 +65,9 @@ class ChatSession(db.Model):
     longitude = db.Column(db.Float, nullable=True)
     location_description = db.Column(db.Text, nullable=True)
     customer_present = db.Column(db.Boolean, default=False)
+    diagnosis_ran = db.Column(db.Boolean, default=False, nullable=False)
+    current_step = db.Column(db.String(50), default="greeting")
+    last_message_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
 
     messages = db.relationship("ChatMessage", backref="session", lazy=True, order_by="ChatMessage.created_at")
     ticket = db.relationship("Ticket", backref="chat_session", uselist=False, lazy=True)
@@ -89,6 +92,9 @@ class ChatSession(db.Model):
             "longitude": self.longitude,
             "location_description": self.location_description,
             "customer_present": self.customer_present,
+            "diagnosis_ran": bool(self.diagnosis_ran),
+            "current_step": self.current_step or "greeting",
+            "last_message_at": self.last_message_at.isoformat() if self.last_message_at else None,
         }
 
 
@@ -99,7 +105,10 @@ class ChatMessage(db.Model):
     session_id = db.Column(db.Integer, db.ForeignKey("chat_sessions.id"), nullable=False)
     sender = db.Column(db.String(20), nullable=False)
     content = db.Column(db.Text, nullable=False)
+    content_json = db.Column(db.JSON, nullable=True)
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+    delivered_at = db.Column(db.DateTime, nullable=True)
+    seen_at = db.Column(db.DateTime, nullable=True)
 
     def to_dict(self):
         return {
@@ -107,7 +116,10 @@ class ChatMessage(db.Model):
             "session_id": self.session_id,
             "sender": self.sender,
             "content": self.content,
+            "payload": self.content_json,
             "created_at": self.created_at.isoformat() if self.created_at else None,
+            "delivered_at": self.delivered_at.isoformat() if self.delivered_at else None,
+            "seen_at": self.seen_at.isoformat() if self.seen_at else None,
         }
 
 
@@ -250,24 +262,46 @@ class TelecomSite(db.Model):
     __tablename__ = "telecom_sites"
 
     id = db.Column(db.Integer, primary_key=True)
-    site_id = db.Column(db.String(50), unique=True, nullable=False)
+    site_id = db.Column(db.String(50), nullable=False, index=True)
+    site_name = db.Column(db.String(100), nullable=True)
+    cell_id = db.Column(db.String(100), nullable=True)
     latitude = db.Column(db.Float, nullable=False)
     longitude = db.Column(db.Float, nullable=False)
     zone = db.Column(db.String(100), default="")
     site_status = db.Column(db.String(20), default="on_air")   # 'on_air' or 'off_air'
     alarms = db.Column(db.Text, default="")
     solution = db.Column(db.Text, default="")
+    standard_solution_step = db.Column(db.Text, default="")
+    bandwidth_mhz = db.Column(db.Float, nullable=True)
+    antenna_gain_dbi = db.Column(db.Float, nullable=True)
+    rf_power_eirp_dbm = db.Column(db.Float, nullable=True)
+    antenna_height_agl_m = db.Column(db.Float, nullable=True)
+    e_tilt_degree = db.Column(db.Float, nullable=True)
+    crs_gain = db.Column(db.Float, nullable=True)
+
+    __table_args__ = (
+        db.UniqueConstraint("site_id", "cell_id", name="uq_telecom_sites_site_cell"),
+    )
 
     def to_dict(self):
         return {
             "id": self.id,
             "site_id": self.site_id,
+            "site_name": self.site_name or self.site_id,
+            "cell_id": self.cell_id,
             "latitude": self.latitude,
             "longitude": self.longitude,
             "zone": self.zone,
             "site_status": self.site_status or "on_air",
             "alarms": self.alarms or "",
             "solution": self.solution or "",
+            "standard_solution_step": self.standard_solution_step or "",
+            "bandwidth_mhz": self.bandwidth_mhz,
+            "antenna_gain_dbi": self.antenna_gain_dbi,
+            "rf_power_eirp_dbm": self.rf_power_eirp_dbm,
+            "antenna_height_agl_m": self.antenna_height_agl_m,
+            "e_tilt_degree": self.e_tilt_degree,
+            "crs_gain": self.crs_gain,
         }
 
 

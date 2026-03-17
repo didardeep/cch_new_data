@@ -280,7 +280,7 @@ export default function DataUpload() {
         </div>
         <div className="section-card-body">
           <p style={{ fontSize: 13, color: '#64748b', marginBottom: 16 }}>
-            Upload an Excel file (.xlsx) with columns: <strong>Site_ID, Latitude, Longitude, Zone, Status, Alarm, Solution</strong>
+            Upload an Excel file (.xlsx) with columns (names can vary): <strong>Site name/Site_ID, Cell ID, Zone, Longitude, Latitude, Status, Alarm, Bandwidth (MHz), Antenna Gain (dBi), RF Power (EIRP) [dBm], Antenna height (AGL) (M), E-tilt (Degree), Standard Solution Step, CRS Gain</strong>
           </p>
           <div style={{ display: 'flex', gap: 16, alignItems: 'center', marginBottom: 16 }}>
             <div style={{ background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 8, padding: '10px 16px' }}>
