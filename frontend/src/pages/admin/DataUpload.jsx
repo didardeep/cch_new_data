@@ -3,6 +3,30 @@ import { getToken } from '../../api';
 
 const API_BASE = process.env.REACT_APP_API_URL || '';
 
+async function parseApiResponse(resp) {
+  const contentType = resp.headers.get('content-type') || '';
+  const rawText = await resp.text();
+
+  if (contentType.includes('application/json')) {
+    try {
+      return { data: rawText ? JSON.parse(rawText) : {} };
+    } catch {
+      return { data: {}, error: `Invalid JSON response (HTTP ${resp.status})` };
+    }
+  }
+
+  const cleaned = rawText
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 180);
+
+  return {
+    data: {},
+    error: cleaned || `Server returned HTTP ${resp.status} instead of JSON`,
+  };
+}
+
 export default function DataUpload() {
   const [siteFile, setSiteFile] = useState(null);
   const [siteLevelFile, setSiteLevelFile] = useState(null);
@@ -26,7 +50,7 @@ export default function DataUpload() {
       const resp = await fetch(`${API_BASE}/api/admin/uploaded-kpis`, {
         headers: { Authorization: `Bearer ${getToken()}` },
       });
-      const d = await resp.json();
+      const { data: d } = await parseApiResponse(resp);
       if (d.site_kpis) setSiteKpiList(d.site_kpis);
       if (d.cell_kpis) setCellKpiList(d.cell_kpis);
       if (d.site_count !== undefined) setSiteCount(d.site_count);
@@ -38,7 +62,7 @@ export default function DataUpload() {
       const resp = await fetch(`${API_BASE}/api/admin/shared-site-workbook-summary`, {
         headers: { Authorization: `Bearer ${getToken()}` },
       });
-      const d = await resp.json();
+      const { data: d } = await parseApiResponse(resp);
       if (resp.ok) {
         setSharedWorkbookStats({
           total_sites: d.total_sites ?? 0,
@@ -65,13 +89,13 @@ export default function DataUpload() {
         headers: { Authorization: `Bearer ${getToken()}` },
         body: form,
       });
-      const d = await resp.json();
+      const { data: d, error: parseError } = await parseApiResponse(resp);
       if (resp.ok) {
         setSiteResult(d);
         setSiteFile(null);
         fetchKpiList();
       } else {
-        setError(d.error || 'Upload failed');
+        setError(d.error || parseError || `Upload failed (HTTP ${resp.status})`);
       }
     } catch (e) { setError('Upload failed: ' + e.message); }
     setUploading(p => ({ ...p, sites: false }));
@@ -86,12 +110,12 @@ export default function DataUpload() {
         method: 'DELETE',
         headers: { Authorization: `Bearer ${getToken()}` },
       });
-      const d = await resp.json();
+      const { data: d, error: parseError } = await parseApiResponse(resp);
       if (resp.ok) {
         setSuccess(`Deleted ${d.deleted} sites from database.`);
         setSiteResult(null);
         fetchKpiList();
-      } else { setError(d.error || 'Delete failed'); }
+      } else { setError(d.error || parseError || `Delete failed (HTTP ${resp.status})`); }
     } catch (e) { setError('Delete failed: ' + e.message); }
     setDeleting(p => ({ ...p, sites: false }));
   };
@@ -108,12 +132,12 @@ export default function DataUpload() {
         headers: { Authorization: `Bearer ${getToken()}` },
         body: form,
       });
-      const d = await resp.json();
+      const { data: d, error: parseError } = await parseApiResponse(resp);
       if (resp.ok) {
         setSiteLevelResult(d);
         setSiteLevelFile(null);
         fetchKpiList();
-      } else { setError(d.error || 'Upload failed'); }
+      } else { setError(d.error || parseError || `Upload failed (HTTP ${resp.status})`); }
     } catch (e) { setError('Upload failed: ' + e.message); }
     setUploading(p => ({ ...p, siteLevel: false }));
   };
@@ -127,12 +151,12 @@ export default function DataUpload() {
         method: 'DELETE',
         headers: { Authorization: `Bearer ${getToken()}` },
       });
-      const d = await resp.json();
+      const { data: d, error: parseError } = await parseApiResponse(resp);
       if (resp.ok) {
         setSuccess(`Deleted ${d.deleted} site-level KPI records.`);
         setSiteLevelResult(null);
         fetchKpiList();
-      } else { setError(d.error || 'Delete failed'); }
+      } else { setError(d.error || parseError || `Delete failed (HTTP ${resp.status})`); }
     } catch (e) { setError('Delete failed: ' + e.message); }
     setDeleting(p => ({ ...p, siteLevel: false }));
   };
@@ -149,12 +173,12 @@ export default function DataUpload() {
         headers: { Authorization: `Bearer ${getToken()}` },
         body: form,
       });
-      const d = await resp.json();
+      const { data: d, error: parseError } = await parseApiResponse(resp);
       if (resp.ok) {
         setCellLevelResult(d);
         setCellLevelFile(null);
         fetchKpiList();
-      } else { setError(d.error || 'Upload failed'); }
+      } else { setError(d.error || parseError || `Upload failed (HTTP ${resp.status})`); }
     } catch (e) { setError('Upload failed: ' + e.message); }
     setUploading(p => ({ ...p, cellLevel: false }));
   };
@@ -171,14 +195,14 @@ export default function DataUpload() {
         headers: { Authorization: `Bearer ${getToken()}` },
         body: form,
       });
-      const d = await resp.json();
+      const { data: d, error: parseError } = await parseApiResponse(resp);
       if (resp.ok) {
         setSharedWorkbookResult(d);
         setSharedWorkbookFile(null);
         fetchKpiList();
         fetchSharedWorkbookStats();
       } else {
-        setError(d.error || 'Upload failed');
+        setError(d.error || parseError || `Upload failed (HTTP ${resp.status})`);
       }
     } catch (e) {
       setError('Upload failed: ' + e.message);
@@ -195,13 +219,13 @@ export default function DataUpload() {
         method: 'DELETE',
         headers: { Authorization: `Bearer ${getToken()}` },
       });
-      const d = await resp.json();
+      const { data: d, error: parseError } = await parseApiResponse(resp);
       if (resp.ok) {
         setSuccess(`Deleted ${d.deleted} shared workbook records.`);
         fetchKpiList();
         fetchSharedWorkbookStats();
       } else {
-        setError(d.error || 'Delete failed');
+        setError(d.error || parseError || `Delete failed (HTTP ${resp.status})`);
       }
     } catch (e) {
       setError('Delete failed: ' + e.message);
@@ -218,12 +242,12 @@ export default function DataUpload() {
         method: 'DELETE',
         headers: { Authorization: `Bearer ${getToken()}` },
       });
-      const d = await resp.json();
+      const { data: d, error: parseError } = await parseApiResponse(resp);
       if (resp.ok) {
         setSuccess(`Deleted ${d.deleted} cell-level KPI records.`);
         setCellLevelResult(null);
         fetchKpiList();
-      } else { setError(d.error || 'Delete failed'); }
+      } else { setError(d.error || parseError || `Delete failed (HTTP ${resp.status})`); }
     } catch (e) { setError('Delete failed: ' + e.message); }
     setDeleting(p => ({ ...p, cellLevel: false }));
   };
