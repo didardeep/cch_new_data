@@ -19,14 +19,14 @@ from flask_jwt_extended import (
     JWTManager, create_access_token, jwt_required, get_jwt_identity
 )
 from flask_mail import Mail, Message
-from openai import AzureOpenAI
+from openai import AzureOpenAI, OpenAI
 from dotenv import load_dotenv
 from types import SimpleNamespace
 import urllib.request
 import urllib.parse
 import urllib.error
 
-from sqlalchemy import case as sql_case
+from sqlalchemy import case as sql_case, text
 from sqlalchemy.orm import joinedload
 from models import db, bcrypt, User, ChatSession, ChatMessage, Ticket, Feedback, SystemSetting, SlaAlert, TelecomSite, KpiData
 # Add this import after other imports
@@ -59,16 +59,53 @@ jwt = JWTManager(app)
 mail = Mail(app)
 
 
-# ─── Azure OpenAI Configuration ──────────────────────────────────────────────
-client = AzureOpenAI(
-    api_key=os.environ.get("AZURE_OPENAI_API_KEY"),
-    api_version=os.environ.get("AZURE_OPENAI_API_VERSION"),
-    azure_endpoint=os.environ.get("AZURE_OPENAI_ENDPOINT"),
+# # ─── Azure OpenAI Configuration ──────────────────────────────────────────────
+# client = AzureOpenAI(
+#     api_key=os.environ.get("AZURE_OPENAI_API_KEY"),
+#     api_version=os.environ.get("AZURE_OPENAI_API_VERSION"),
+#     azure_endpoint=os.environ.get("AZURE_OPENAI_ENDPOINT"),
+# )
+# DEPLOYMENT_NAME = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini")
+
+
+# ─── AI Provider Configuration ────────────────────────────────────────────────
+AZURE_OPENAI_API_KEY = os.environ.get("AZURE_OPENAI_API_KEY")
+AZURE_OPENAI_ENDPOINT = os.environ.get("AZURE_OPENAI_ENDPOINT")
+AZURE_OPENAI_API_VERSION = os.environ.get("AZURE_OPENAI_API_VERSION", "2023-07-01-preview")
+AZURE_DEPLOYMENT_NAME = (
+    os.environ.get("AZURE_OPENAI_DEPLOYMENT")
+    or os.environ.get("AZURE_DEPLOYMENT_NAME")
+    or "gpt-4o-mini"
 )
-DEPLOYMENT_NAME = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini")
 
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("OPENAI_API_KEY")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")
 
+AI_PROVIDER = None
 
+if GEMINI_API_KEY:
+    client = OpenAI(
+        api_key=GEMINI_API_KEY,
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
+    )
+    DEPLOYMENT_NAME = GEMINI_MODEL
+    AI_PROVIDER = "gemini"
+elif AZURE_OPENAI_API_KEY and AZURE_OPENAI_ENDPOINT:
+    client = AzureOpenAI(
+        api_key=AZURE_OPENAI_API_KEY,
+        api_version=AZURE_OPENAI_API_VERSION,
+        azure_endpoint=AZURE_OPENAI_ENDPOINT,
+    )
+    DEPLOYMENT_NAME = AZURE_DEPLOYMENT_NAME
+    AI_PROVIDER = "azure"
+else:
+    raise RuntimeError(
+        "Missing AI provider credentials. Configure Azure "
+        "(AZURE_OPENAI_API_KEY and AZURE_OPENAI_ENDPOINT) or Gemini "
+        "(GEMINI_API_KEY or OPENAI_API_KEY)."
+    )
+
+print(f">>> AI provider: {AI_PROVIDER}, model: {DEPLOYMENT_NAME}")
 # ─── Nearest-Tower Lookup (DB-backed from admin uploads) ────────────────────────────
 
 
@@ -619,6 +656,7 @@ def detect_language(text: str) -> str:
 
 def _friendly_ai_error(err: Exception) -> str:
     """Return a user-friendly message when the AI provider is unavailable."""
+    print(f"AI provider error: {type(err).__name__}: {err}")
     return (
         "I'm having trouble reaching the AI service right now. "
         "Please try again in a few moments."
@@ -1983,6 +2021,306 @@ def cto_overview():
     })
 
 
+def _require_cto_user():
+    user = User.query.get(int(get_jwt_identity()))
+    if not user or user.role != "cto":
+        return None
+    return user
+
+
+def _latest_site_values_for_kpi(kpi_name):
+    rows = KpiData.query.filter_by(data_level="site", kpi_name=kpi_name).order_by(KpiData.site_id, KpiData.date.desc()).all()
+    latest = {}
+    for row in rows:
+        if row.site_id not in latest and row.value is not None:
+            latest[row.site_id] = {"date": row.date, "value": float(row.value)}
+    return latest
+
+
+def _series_for_kpi_patterns(patterns):
+    rows = KpiData.query.filter(
+        KpiData.data_level == "site",
+        db.or_(*[KpiData.kpi_name.ilike(pattern) for pattern in patterns])
+    ).all()
+
+    grouped = {}
+    for row in rows:
+        if row.value is None:
+            continue
+        key = row.date.isoformat()
+        bucket = grouped.setdefault(key, {"date": key, "total": 0.0, "count": 0})
+        bucket["total"] += float(row.value)
+        bucket["count"] += 1
+
+    series = []
+    for day in sorted(grouped.keys()):
+        bucket = grouped[day]
+        avg = bucket["total"] / bucket["count"] if bucket["count"] else 0
+        series.append({"date": day, "value": round(avg, 2)})
+    return series
+
+
+def _latest_average_for_patterns(patterns):
+    series = _series_for_kpi_patterns(patterns)
+    return round(series[-1]["value"], 2) if series else 0
+
+
+@app.route("/api/cto/map-data", methods=["GET"])
+@jwt_required()
+def cto_map_data():
+    user = _require_cto_user()
+    if not user:
+        return jsonify({"error": "Unauthorized"}), 403
+
+    sites = TelecomSite.query.with_entities(
+        TelecomSite.site_id,
+        TelecomSite.latitude,
+        TelecomSite.longitude,
+        TelecomSite.zone,
+        TelecomSite.site_status,
+        TelecomSite.alarms,
+        TelecomSite.solution,
+    ).all()
+
+    return jsonify({
+        "sites": [
+            {
+                "site_id": site.site_id,
+                "lat": site.latitude,
+                "lng": site.longitude,
+                "zone": site.zone or "",
+                "status": (site.site_status or "active").lower(),
+                "alarm": site.alarms or "",
+                "solution": site.solution or "",
+            }
+            for site in sites
+            if (
+                site.latitude is not None and
+                site.longitude is not None and
+                float(site.latitude) != 0 and
+                float(site.longitude) != 0
+            )
+        ]
+    })
+
+
+@app.route("/api/cto/technical-kpi", methods=["GET"])
+@jwt_required()
+def cto_technical_kpi():
+    user = _require_cto_user()
+    if not user:
+        return jsonify({"error": "Unauthorized"}), 403
+
+    kpi_defs = [
+        {
+            "key": "accessibility",
+            "label": "Accessibility",
+            "patterns": [
+                "%availability%",
+                "%rrc setup success rate%",
+                "%call setup success rate%",
+                "%e-rab setup success rate%",
+                "%access success rate%",
+            ],
+        },
+        {
+            "key": "retainability",
+            "label": "Retainability",
+            "patterns": [
+                "%call drop rate%",
+                "%ho success rate%",
+                "%handover success rate%",
+            ],
+        },
+        {
+            "key": "downlink_throughput",
+            "label": "Downlink Throughput",
+            "patterns": [
+                "%dl - cell ave throughput%",
+                "%dl - usr ave throughput%",
+                "%downlink throughput%",
+                "%dl throughput%",
+            ],
+        },
+        {
+            "key": "prb_utilization",
+            "label": "PRB Utilization",
+            "patterns": [
+                "%prb utilization%",
+                "%prb util%",
+            ],
+        },
+        {
+            "key": "downlink_volume",
+            "label": "Downlink Volume",
+            "patterns": [
+                "%dl data total volume%",
+                "%downlink volume%",
+                "%dl volume%",
+            ],
+        },
+        {
+            "key": "uplink_volume",
+            "label": "Uplink Volume",
+            "patterns": [
+                "%ul data total volume%",
+                "%uplink volume%",
+                "%ul volume%",
+            ],
+        },
+    ]
+
+    cards = []
+    chart_series = {}
+    for item in kpi_defs:
+        series = _series_for_kpi_patterns(item["patterns"])
+        cards.append({
+            "key": item["key"],
+            "label": item["label"],
+            "value": round(series[-1]["value"], 2) if series else 0,
+        })
+        chart_series[item["key"]] = series[-30:]
+
+    return jsonify({
+        "cards": cards,
+        "series": chart_series,
+    })
+
+
+@app.route("/api/cto/business-kpi", methods=["GET"])
+@jwt_required()
+def cto_business_kpi():
+    user = _require_cto_user()
+    if not user:
+        return jsonify({"error": "Unauthorized"}), 403
+
+    users_latest = _latest_site_values_for_kpi("Site Users")
+    revenue_latest = _latest_site_values_for_kpi("Site Revenue")
+    prb_latest = _latest_site_values_for_kpi("PRB Utilization")
+
+    users_series = _series_for_kpi_patterns(["Site Users"])
+    revenue_series = _series_for_kpi_patterns(["Site Revenue"])
+
+    all_site_ids = sorted(set(users_latest.keys()) | set(revenue_latest.keys()))
+    site_rows = []
+    for site_id in all_site_ids:
+        user_val = users_latest.get(site_id, {}).get("value", 0.0)
+        revenue_val = revenue_latest.get(site_id, {}).get("value", 0.0)
+        util_val = prb_latest.get(site_id, {}).get("value", 0.0)
+        arpu = (revenue_val / user_val) if user_val else 0.0
+        site_rows.append({
+            "site_id": site_id,
+            "users": round(user_val, 2),
+            "revenue": round(revenue_val, 2),
+            "utilization": round(util_val, 2),
+            "arpu": round(arpu, 2),
+        })
+
+    total_users = round(sum(row["users"] for row in site_rows), 2)
+    avg_users = round(total_users / len(site_rows), 2) if site_rows else 0
+    total_revenue = round(sum(row["revenue"] for row in site_rows), 2)
+    arpu = round(total_revenue / total_users, 2) if total_users else 0
+
+    if len(users_series) >= 2 and users_series[-2]["value"]:
+        growth = round(((users_series[-1]["value"] - users_series[-2]["value"]) / users_series[-2]["value"]) * 100, 2)
+    else:
+        growth = 0
+
+    declining_sites = []
+    overloaded_sites = []
+    revenue_at_risk = 0.0
+
+    for row in site_rows:
+        growth_pct = 0.0
+        if row["users"] and avg_users:
+            growth_pct = round(((row["users"] - avg_users) / avg_users) * 100, 2)
+        item = {**row, "growth": growth_pct}
+        if growth_pct < 0:
+            declining_sites.append(item)
+        if row["utilization"] > 80:
+            overloaded_sites.append(item)
+        if growth_pct < 0 or row["utilization"] > 80:
+            revenue_at_risk += row["users"] * arpu
+
+    top_sites = sorted(site_rows, key=lambda row: (row["revenue"], row["users"]), reverse=True)[:10]
+    declining_sites = sorted(declining_sites, key=lambda row: row["growth"])[:10]
+    overloaded_sites = sorted(overloaded_sites, key=lambda row: row["utilization"], reverse=True)[:10]
+
+    trend = []
+    revenue_by_day = {row["date"]: row["value"] for row in revenue_series}
+    for row in users_series[-30:]:
+        trend.append({
+            "date": row["date"],
+            "users": row["value"],
+            "revenue": revenue_by_day.get(row["date"], 0),
+        })
+
+    return jsonify({
+        "summary": {
+            "total_users": total_users,
+            "avg_users": avg_users,
+            "growth": growth,
+            "arpu": arpu,
+            "revenue_at_risk": round(revenue_at_risk, 2),
+        },
+        "top_sites": top_sites,
+        "declining_sites": declining_sites,
+        "overloaded_sites": overloaded_sites,
+        "trend": trend,
+    })
+
+
+@app.route("/api/cto/operational-kpi", methods=["GET"])
+@jwt_required()
+def cto_operational_kpi():
+    user = _require_cto_user()
+    if not user:
+        return jsonify({"error": "Unauthorized"}), 403
+
+    tickets = Ticket.query.all()
+    total_tickets = len(tickets)
+    resolved_tickets = [t for t in tickets if t.status == "resolved"]
+    sla_breaches = len([t for t in tickets if t.sla_breached])
+    sla_compliance = round(((total_tickets - sla_breaches) / total_tickets) * 100, 1) if total_tickets else 0
+
+    resolution_hours = []
+    for ticket in resolved_tickets:
+        if ticket.created_at and ticket.resolved_at:
+            resolution_hours.append((ticket.resolved_at - ticket.created_at).total_seconds() / 3600)
+    avg_resolution_time = round(sum(resolution_hours) / len(resolution_hours), 2) if resolution_hours else 0
+
+    csat_raw = db.session.query(db.func.avg(Feedback.rating)).filter(Feedback.rating > 0).scalar() or 0
+    csat = round(float(csat_raw), 2)
+
+    status_breakdown = db.session.query(Ticket.status, db.func.count(Ticket.id)).group_by(Ticket.status).all()
+    status_data = [{"name": status or "unknown", "value": count} for status, count in status_breakdown]
+
+    agent_workload = db.session.query(
+        User.name,
+        db.func.count(Ticket.id)
+    ).outerjoin(Ticket, Ticket.assigned_to == User.id).filter(User.role == "human_agent").group_by(User.name).all()
+    workload_data = [{"agent": name or "Unassigned", "tickets": count} for name, count in agent_workload]
+
+    escalated_count = len([t for t in tickets if t.status == "escalated"])
+    escalation_rate = round((escalated_count / total_tickets) * 100, 1) if total_tickets else 0
+
+    breach_alerts = SlaAlert.query.filter_by(recipient_role="cto").count()
+
+    return jsonify({
+        "summary": {
+            "total_tickets": total_tickets,
+            "sla_compliance": sla_compliance,
+            "sla_breaches": sla_breaches,
+            "avg_resolution_time": avg_resolution_time,
+            "csat": csat,
+            "escalation_rate": escalation_rate,
+            "breach_alerts": breach_alerts,
+        },
+        "status_breakdown": status_data,
+        "agent_workload": workload_data,
+    })
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # SLA ALERT DASHBOARD ENDPOINTS
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2662,7 +3000,7 @@ def admin_upload_sites():
     headers = [str(c.value).strip().lower() if c.value else "" for c in ws[1]]
     col_map = {}
     for i, h in enumerate(headers):
-        if "site" in h and "id" in h:
+        if ("site" in h and "id" in h) or h in ("site name", "sitename", "site"):
             col_map["site_id"] = i
         elif "lat" in h:
             col_map["latitude"] = i
@@ -2670,6 +3008,12 @@ def admin_upload_sites():
             col_map["longitude"] = i
         elif "zone" in h:
             col_map["zone"] = i
+        elif h == "status" or "site status" in h:
+            col_map["site_status"] = i
+        elif "alarm" in h:
+            col_map["alarms"] = i
+        elif h in ("solution", "standard solution step", "standard solution"):
+            col_map["solution"] = i
 
     required = ["site_id", "latitude", "longitude"]
     missing = [k for k in required if k not in col_map]
@@ -2685,18 +3029,43 @@ def admin_upload_sites():
             lat = float(row[col_map["latitude"]])
             lon = float(row[col_map["longitude"]])
             zone = str(row[col_map.get("zone", -1)]).strip() if col_map.get("zone") is not None and col_map.get("zone") < len(row) and row[col_map.get("zone")] else ""
+            raw_status = str(row[col_map.get("site_status", -1)]).strip().lower() if col_map.get("site_status") is not None and col_map.get("site_status") < len(row) and row[col_map.get("site_status")] else "on_air"
+            alarms = str(row[col_map.get("alarms", -1)]).strip() if col_map.get("alarms") is not None and col_map.get("alarms") < len(row) and row[col_map.get("alarms")] else ""
+            solution = str(row[col_map.get("solution", -1)]).strip() if col_map.get("solution") is not None and col_map.get("solution") < len(row) and row[col_map.get("solution")] else ""
         except Exception as e:
             skipped.append(f"Row {row_idx}: {e}")
             continue
+
+        status_map = {
+            "active": "on_air",
+            "on_air": "on_air",
+            "on air": "on_air",
+            "down": "off_air",
+            "off_air": "off_air",
+            "off air": "off_air",
+            "alarm": "off_air",
+        }
+        site_status = status_map.get(raw_status, raw_status or "on_air")
 
         existing = TelecomSite.query.filter_by(site_id=sid).first()
         if existing:
             existing.latitude = lat
             existing.longitude = lon
             existing.zone = zone
+            existing.site_status = site_status
+            existing.alarms = alarms
+            existing.solution = solution
             updated += 1
         else:
-            db.session.add(TelecomSite(site_id=sid, latitude=lat, longitude=lon, zone=zone))
+            db.session.add(TelecomSite(
+                site_id=sid,
+                latitude=lat,
+                longitude=lon,
+                zone=zone,
+                site_status=site_status,
+                alarms=alarms,
+                solution=solution,
+            ))
             created += 1
 
     db.session.commit()
@@ -2753,7 +3122,7 @@ def admin_upload_kpi_site_level():
                 if isinstance(h, datetime):
                     date_columns.append((col_idx, h.date()))
                 elif isinstance(h, str):
-                    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d"):
+                    for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%d-%m-%Y", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d"):
                         try:
                             date_columns.append((col_idx, datetime.strptime(h.strip(), fmt).date()))
                             break
@@ -3095,7 +3464,10 @@ def admin_uploaded_kpis():
 
     site_kpis = db.session.query(
         KpiData.kpi_name, db.func.count(KpiData.id)
-    ).filter_by(data_level="site").group_by(KpiData.kpi_name).order_by(KpiData.kpi_name).all()
+    ).filter(
+        KpiData.data_level == "site",
+        ~KpiData.kpi_name.in_(SHARED_WORKBOOK_KPI_NAMES)
+    ).group_by(KpiData.kpi_name).order_by(KpiData.kpi_name).all()
 
     cell_kpis = db.session.query(
         KpiData.kpi_name, db.func.count(KpiData.id)
@@ -4674,6 +5046,22 @@ with app.app_context():
                 conn.execute(sa_text("ALTER TABLE kpi_data ADD COLUMN cell_site_id VARCHAR(100)"))
                 conn.commit()
                 print(">>> Added cell_site_id column to kpi_data")
+
+    if insp.has_table("telecom_sites"):
+        existing_cols = [c["name"] for c in insp.get_columns("telecom_sites")]
+        with db.engine.connect() as conn:
+            if "site_status" not in existing_cols:
+                conn.execute(text("ALTER TABLE telecom_sites ADD COLUMN site_status VARCHAR(20) DEFAULT 'on_air'"))
+                conn.commit()
+                print(">>> Added site_status column to telecom_sites")
+            if "alarms" not in existing_cols:
+                conn.execute(text("ALTER TABLE telecom_sites ADD COLUMN alarms TEXT DEFAULT ''"))
+                conn.commit()
+                print(">>> Added alarms column to telecom_sites")
+            if "solution" not in existing_cols:
+                conn.execute(text("ALTER TABLE telecom_sites ADD COLUMN solution TEXT DEFAULT ''"))
+                conn.commit()
+                print(">>> Added solution column to telecom_sites")
 
     # Seed default admin if none exists
     if not User.query.filter_by(role="admin").first():
