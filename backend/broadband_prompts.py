@@ -24,7 +24,7 @@ Those queries are routed directly to ticket escalation.
 """
 
 from datetime import datetime, timezone
-from flask import request, jsonify
+from flask import request, jsonify, Response
 from flask_jwt_extended import jwt_required, get_jwt_identity
 
 
@@ -197,6 +197,10 @@ def build_broadband_prompt(subprocess_name, language, attempt,
 def register_routes(app):
     """Register all /api/broadband/* routes on the Flask app."""
 
+    # Pre-generate a 2MB payload for the speed test endpoint to avoid repeated
+    # allocations on every request.
+    speedtest_bytes = b"0" * (2 * 1024 * 1024)
+
     @app.route("/api/broadband/billing-check", methods=["GET"])
     @jwt_required()
     def broadband_billing_check():
@@ -268,3 +272,28 @@ def register_routes(app):
         # ── END MOCK DATA ──────────────────────────────────────────────────────
 
         return jsonify(connection_data), 200
+
+    @app.route("/api/broadband/speedtest-file", methods=["GET"])
+    @jwt_required()
+    def broadband_speedtest_file():
+        """
+        Returns a 2MB dummy payload to measure download speed from the browser.
+        Caching is disabled so each request hits the network.
+        """
+        resp = Response(speedtest_bytes, mimetype="application/octet-stream")
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+        resp.headers["Pragma"] = "no-cache"
+        resp.headers["Expires"] = "0"
+        resp.headers["Content-Length"] = str(len(speedtest_bytes))
+        # Add a content-disposition so browsers don't try to display it.
+        resp.headers["Content-Disposition"] = 'attachment; filename="speedtest.bin"'
+        return resp
+
+    @app.route("/api/broadband/ping", methods=["GET"])
+    @jwt_required()
+    def broadband_ping():
+        """
+        Lightweight latency check endpoint. Returns current timestamp in ms.
+        """
+        ts_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        return jsonify({"ok": True, "timestamp": ts_ms}), 200

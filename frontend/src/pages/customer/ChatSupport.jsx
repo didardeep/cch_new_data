@@ -44,6 +44,12 @@ function isMobileNetworkIssue(sectorName, subprocessName) {
   return sector.includes('mobile services') && sub.includes('network / signal problems');
 }
 
+function isBroadbandSector(sectorKey, sectorName) {
+  if (!sectorKey && !sectorName) return false;
+  if (String(sectorKey) === '2') return true;
+  return sectorName?.toLowerCase().includes('broadband / internet services');
+}
+
 function limitSubprocesses(subprocesses) {
   const entries = Object.entries(subprocesses);
   const others = entries.filter(([, v]) => v === 'Others' || v.toLowerCase().includes('other'));
@@ -85,6 +91,7 @@ const PERSIST_TYPES = new Set([
   'email-action',
   'email-sent',
   'agent-resolved',
+  'broadband-diagnostic',
 ]);
 
 function sanitizePayload(value) {
@@ -192,9 +199,15 @@ export default function ChatSupport() {
     previousSolutions: [],
     diagnosisSummary: '',
     diagnosisRan: false,
+    billingContext: null,
+    connectionContext: null,
+    planSpeedMbps: null,
   });
   const msgIdCounter = useRef(0);
   const nextId = () => ++msgIdCounter.current;
+
+  const broadbandDiagStatusRef = useRef('idle');
+  const broadbandDiagResultRef = useRef(null);
 
   const isRecentSession = useCallback((session) => {
     if (!session?.created_at) return false;
@@ -427,6 +440,178 @@ export default function ChatSupport() {
       stateRef.current.step = 'query';
     }, 500);
   }, [addMessage, showInput]);
+
+  // ─── Broadband diagnostics (billing, line, browser-side checks) ────────────
+  const classifySpeed = (speedMbps, planSpeedMbps) => {
+    if (typeof speedMbps !== 'number' || speedMbps <= 0 || !planSpeedMbps) {
+      return { label: 'Unknown', percent: null };
+    }
+    const percent = Math.round((speedMbps / planSpeedMbps) * 100);
+    if (percent >= 80) return { label: 'Good', percent };
+    if (percent >= 40) return { label: 'Degraded', percent };
+    return { label: 'Poor', percent };
+  };
+
+  const classifyLatency = (latencyMs) => {
+    if (typeof latencyMs !== 'number' || Number.isNaN(latencyMs) || latencyMs <= 0) return 'Unknown';
+    if (latencyMs < 50) return 'Good';
+    if (latencyMs <= 150) return 'Moderate';
+    return 'High';
+  };
+
+  const measurePing = useCallback(async () => {
+    const token = getToken();
+    const start = performance.now();
+    const resp = await fetch(`${API_BASE}/api/broadband/ping?ts=${Date.now()}`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      cache: 'no-store',
+    });
+    if (!resp.ok) throw new Error('Ping request failed');
+    await resp.json();
+    return performance.now() - start;
+  }, []);
+
+  const measureDownloadSpeed = useCallback(async () => {
+    const token = getToken();
+    const start = performance.now();
+    const resp = await fetch(`${API_BASE}/api/broadband/speedtest-file?ts=${Date.now()}`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      cache: 'no-store',
+    });
+    if (!resp.ok) throw new Error('Speed test file request failed');
+    let bytes = 0;
+    if (resp.body?.getReader) {
+      const reader = resp.body.getReader();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        bytes += (value && value.length) || 0;
+      }
+    } else {
+      const buf = await resp.arrayBuffer();
+      bytes = buf.byteLength;
+    }
+    const durationSec = (performance.now() - start) / 1000;
+    const mbps = durationSec > 0 ? (bytes * 8) / (durationSec * 1e6) : 0;
+    return { mbps: Number(mbps.toFixed(1)), bytes, durationSec };
+  }, []);
+
+  const runBrowserQualityChecks = useCallback(async (planSpeedMbps) => {
+    const connectionType = navigator.connection?.effectiveType || 'unknown';
+    let latencyMs = null;
+    let latencyError = null;
+    let speedMbps = null;
+    let speedError = null;
+
+    try { latencyMs = Math.round(await measurePing()); }
+    catch (e) { latencyError = e?.message || 'Latency check failed'; }
+
+    try { const speed = await measureDownloadSpeed(); speedMbps = speed.mbps; }
+    catch (e) { speedError = e?.message || 'Speed test failed'; }
+
+    const speedMeta = classifySpeed(speedMbps, planSpeedMbps);
+    const latencyLabel = classifyLatency(latencyMs);
+
+    return {
+      speedMbps,
+      speedPercent: speedMeta.percent,
+      speedLabel: speedMeta.label,
+      latencyMs,
+      latencyLabel,
+      connectionType,
+      latencyError,
+      speedError,
+    };
+  }, [measurePing, measureDownloadSpeed]);
+
+  const buildConnectionContext = useCallback((billing, connection, quality) => {
+    const parts = [];
+    if (billing?.plan_speed_mbps) {
+      parts.push(`Plan speed: ${billing.plan_speed_mbps} Mbps`);
+    }
+    if (quality?.speedMbps) {
+      const pct = quality.speedPercent != null ? ` (${quality.speedPercent}% of plan, ${quality.speedLabel})` : '';
+      parts.push(`Measured speed: ${quality.speedMbps} Mbps${pct}`);
+    } else if (quality?.speedError) {
+      parts.push(`Measured speed unavailable (${quality.speedError})`);
+    }
+    if (quality?.latencyMs) {
+      parts.push(`Latency: ${quality.latencyMs} ms (${quality.latencyLabel})`);
+    } else if (quality?.latencyError) {
+      parts.push(`Latency unavailable (${quality.latencyError})`);
+    }
+    if (quality?.connectionType) {
+      parts.push(`Connection type: ${quality.connectionType}`);
+    }
+    if (connection?.line_quality) {
+      parts.push(`Line quality (NOC): ${connection.line_quality}`);
+    }
+    if (connection?.router_status) {
+      parts.push(`Router status: ${connection.router_status}`);
+    }
+    if (connection?.area_outage) {
+      parts.push('Area outage detected');
+    }
+    return parts.join('. ');
+  }, []);
+
+  const runBroadbandDiagnostics = useCallback(async () => {
+    if (!isBroadbandSector(stateRef.current.sectorKey, stateRef.current.sectorName)) return null;
+    if (broadbandDiagStatusRef.current === 'running') return broadbandDiagResultRef.current;
+    if (broadbandDiagStatusRef.current === 'done') return broadbandDiagResultRef.current;
+
+    broadbandDiagStatusRef.current = 'running';
+    addMessage({ type: 'bot', html: 'Running broadband diagnostics (billing, connection, and browser checks)...', skipPersist: true });
+    setIsTyping(true);
+    const diag = { billing: null, connection: null, quality: null, errors: {} };
+    let planSpeed = null;
+
+    try {
+      try {
+        diag.billing = await apiGet('/api/broadband/billing-check');
+        planSpeed = diag.billing?.plan_speed_mbps || null;
+        const billSummary = [];
+        if (diag.billing?.plan_name) billSummary.push(`Plan: ${diag.billing.plan_name}`);
+        if (diag.billing?.plan_speed_mbps) billSummary.push(`Speed: ${diag.billing.plan_speed_mbps} Mbps`);
+        if (diag.billing?.bill_paid !== undefined) billSummary.push(`Bill paid: ${diag.billing.bill_paid ? 'Yes' : 'No'}`);
+        if (diag.billing?.fup_hit !== undefined) billSummary.push(`FUP hit: ${diag.billing.fup_hit ? 'Yes' : 'No'}`);
+        stateRef.current.billingContext = billSummary.join('; ');
+      } catch (e) {
+        diag.errors.billing = 'Billing check failed';
+        stateRef.current.billingContext = null;
+      }
+
+      try {
+        diag.connection = await apiGet('/api/broadband/connection-check');
+      } catch (e) {
+        diag.errors.connection = 'Connection check failed';
+      }
+
+      try {
+        diag.quality = await runBrowserQualityChecks(planSpeed);
+      } catch (e) {
+        diag.errors.quality = 'Browser checks failed';
+      }
+
+      const connectionContext = buildConnectionContext(diag.billing, diag.connection, diag.quality);
+      stateRef.current.connectionContext = connectionContext || null;
+      stateRef.current.planSpeedMbps = planSpeed;
+
+      broadbandDiagResultRef.current = diag;
+      addMessage({
+        type: 'broadband-diagnostic',
+        billing: diag.billing,
+        connection: diag.connection,
+        quality: diag.quality,
+        errors: diag.errors,
+        planSpeed,
+      });
+      return diag;
+    } finally {
+      setIsTyping(false);
+      broadbandDiagStatusRef.current = 'done';
+    }
+  }, [addMessage, buildConnectionContext, runBrowserQualityChecks]);
 
   const hydrateHistory = useCallback((history = []) => {
     const restored = [];
@@ -714,7 +899,11 @@ export default function ChatSupport() {
       step: 'greeting', sectorKey: null, sectorName: null,
       subprocessKey: null, subprocessName: null, language: 'English',
       queryText: '', resolution: '', attempt: 0, previousSolutions: [],
+      diagnosisSummary: '', diagnosisRan: false,
+      billingContext: null, connectionContext: null, planSpeedMbps: null,
     };
+    broadbandDiagStatusRef.current = 'idle';
+    broadbandDiagResultRef.current = null;
     sessionIdRef.current = null;
     agentResolvedShownRef.current = false;
     agentJoinedRef.current = false;
@@ -761,6 +950,11 @@ export default function ChatSupport() {
     disableGroup(groupId);
     stateRef.current.sectorKey = key;
     stateRef.current.sectorName = name;
+    stateRef.current.billingContext = null;
+    stateRef.current.connectionContext = null;
+    stateRef.current.planSpeedMbps = null;
+    broadbandDiagStatusRef.current = 'idle';
+    broadbandDiagResultRef.current = null;
     addMessage({ type: 'user', text: name });
     saveMessage('user', name, { sector_name: name, current_step: 'sector' });
     addMessage({ type: 'system', text: `Selected: ${name}` });
@@ -884,6 +1078,8 @@ export default function ChatSupport() {
       attempt: st.attempt,
       original_query: st.attempt > 1 ? st.queryText : undefined,
       diagnosis_summary: st.diagnosisSummary || undefined,
+      billing_context: st.billingContext || undefined,
+      connection_context: st.connectionContext || undefined,
     });
     setIsTyping(false);
     if (resolveData.is_telecom === false) {
@@ -1081,8 +1277,12 @@ export default function ChatSupport() {
       }
     }
 
+    if (isBroadbandSector(stateRef.current.sectorKey, stateRef.current.sectorName)) {
+      await runBroadbandDiagnostics();
+    }
+
     await fetchSolution(text);
-  }, [inputValue, addMessage, hideInput, fetchSolution, loadSectorMenu, user, afterLocationCaptured, handoffActive, saveMessage]);
+  }, [inputValue, addMessage, hideInput, fetchSolution, loadSectorMenu, user, afterLocationCaptured, handoffActive, saveMessage, runBroadbandDiagnostics]);
 
   const handleSendEmail = useCallback(async (groupId) => {
     disableGroup(groupId);
@@ -1168,6 +1368,11 @@ export default function ChatSupport() {
     }
     stateRef.current.attempt = 0;
     stateRef.current.previousSolutions = [];
+    stateRef.current.billingContext = null;
+    stateRef.current.connectionContext = null;
+    stateRef.current.planSpeedMbps = null;
+    broadbandDiagStatusRef.current = 'idle';
+    broadbandDiagResultRef.current = null;
     addMessage({ type: 'user', text: 'Main Menu' });
     addMessage({ type: 'bot', html: `Sure! Please select your <strong>telecom service category</strong>:` });
     setTimeout(() => loadSectorMenu(), 400);
@@ -1782,6 +1987,93 @@ export default function ChatSupport() {
             <div style={{ fontSize: '11px', color: '#8596ab', marginTop: '8px' }}>PNG, JPG, JPEG (max 5MB)</div>
           </div>
         );
+
+      case 'broadband-diagnostic': {
+        const billing = msg.billing || {};
+        const connection = msg.connection || {};
+        const quality = msg.quality || {};
+        const errors = msg.errors || {};
+        const planSpeed = msg.planSpeed || billing.plan_speed_mbps || null;
+
+        const speedLabel = quality.speedLabel || 'Unknown';
+        const speedColor = speedLabel === 'Good' ? '#00875a' : speedLabel === 'Degraded' ? '#c87d0a' : '#c42b1c';
+        const latencyLabel = quality.latencyLabel || 'Unknown';
+        const latencyColor = latencyLabel === 'Good' ? '#00875a' : latencyLabel === 'Moderate' ? '#c87d0a' : '#c42b1c';
+
+        const sectionStyle = { background: '#fff', border: '1px solid #d8e0ec', borderRadius: '10px', padding: '12px 14px', marginTop: '10px' };
+        const labelStyle = { fontSize: '11px', letterSpacing: '0.04em', color: '#00338d', fontWeight: 700, textTransform: 'uppercase', marginBottom: '6px' };
+
+        return (
+          <div key={msg.id} style={{ background: '#f7f9fc', border: '1px solid #d8e0ec', borderLeft: '4px solid #00338d', borderRadius: '12px', padding: '16px 18px', margin: '8px 0', boxShadow: '0 1px 2px rgba(0, 20, 60, 0.05)' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '6px' }}>
+              <div style={{ width: 10, height: 10, borderRadius: '50%', background: '#00338d' }}></div>
+              <div style={{ fontWeight: 700, fontSize: 14, color: '#0f1d33' }}>Broadband Diagnostic</div>
+            </div>
+            <div style={{ fontSize: 12, color: '#3d5068', marginBottom: '10px' }}>Billing check → line check → browser quality check</div>
+
+            <div style={sectionStyle}>
+              <div style={labelStyle}>Billing Check</div>
+              {errors.billing ? (
+                <div style={{ color: '#c42b1c', fontSize: 12 }}>{errors.billing}</div>
+              ) : (
+                <div style={{ fontSize: 12, color: '#1a2b42', lineHeight: 1.6 }}>
+                  <div><strong style={{ color: '#0f1d33' }}>{billing.plan_name || 'Plan'}</strong>{planSpeed ? ` · ${planSpeed} Mbps` : ''}</div>
+                  <div style={{ marginTop: 4 }}>Account: <strong style={{ color: billing.account_active === false ? '#c42b1c' : '#0f1d33' }}>{billing.account_active === false ? 'Inactive' : 'Active'}</strong></div>
+                  <div>Bill Paid: <strong style={{ color: billing.bill_paid === false ? '#c42b1c' : '#0f1d33' }}>{billing.bill_paid === false ? 'No' : 'Yes'}</strong></div>
+                  <div>FUP Hit: <strong style={{ color: billing.fup_hit ? '#c87d0a' : '#0f1d33' }}>{billing.fup_hit ? 'Yes' : 'No'}</strong></div>
+                </div>
+              )}
+            </div>
+
+            <div style={sectionStyle}>
+              <div style={labelStyle}>Connection Check (NOC)</div>
+              {errors.connection ? (
+                <div style={{ color: '#c42b1c', fontSize: 12 }}>{errors.connection}</div>
+              ) : (
+                <div style={{ fontSize: 12, color: '#1a2b42', lineHeight: 1.6, display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: '6px 10px' }}>
+                  <div>Line Quality: <strong style={{ color: '#0f1d33' }}>{connection.line_quality || 'n/a'}</strong></div>
+                  <div>Router: <strong style={{ color: connection.router_status === 'offline' ? '#c42b1c' : '#0f1d33' }}>{connection.router_status || 'n/a'}</strong></div>
+                  <div>Sync Speed: <strong style={{ color: '#0f1d33' }}>{connection.sync_speed_mbps != null ? `${connection.sync_speed_mbps} Mbps` : 'n/a'}</strong></div>
+                  <div>Outage: <strong style={{ color: connection.area_outage ? '#c42b1c' : '#0f1d33' }}>{connection.area_outage ? 'Yes' : 'No'}</strong></div>
+                </div>
+              )}
+            </div>
+
+            <div style={sectionStyle}>
+              <div style={labelStyle}>Browser Quality Check</div>
+              {errors.quality ? (
+                <div style={{ color: '#c42b1c', fontSize: 12 }}>{errors.quality}</div>
+              ) : (
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: '10px 12px', alignItems: 'center' }}>
+                  <div style={{ fontSize: 12, color: '#1a2b42' }}>
+                    <div style={{ color: '#8596ab', fontSize: 11 }}>Speed</div>
+                    <div style={{ fontSize: 16, fontWeight: 700, color: '#0f1d33' }}>
+                      {quality.speedMbps != null ? `${quality.speedMbps} Mbps` : 'n/a'}
+                      {quality.speedPercent != null ? <span style={{ fontSize: 11, color: '#64748b', marginLeft: 6 }}>({quality.speedPercent}% of plan)</span> : null}
+                    </div>
+                    <div style={{ marginTop: 4, display: 'inline-block', padding: '3px 10px', borderRadius: 12, background: `${speedColor}15`, color: speedColor, fontWeight: 700, fontSize: 11 }}>{speedLabel}</div>
+                  </div>
+                  <div style={{ fontSize: 12, color: '#1a2b42' }}>
+                    <div style={{ color: '#8596ab', fontSize: 11 }}>Latency</div>
+                    <div style={{ fontSize: 16, fontWeight: 700, color: '#0f1d33' }}>{quality.latencyMs != null ? `${quality.latencyMs} ms` : 'n/a'}</div>
+                    <div style={{ marginTop: 4, display: 'inline-block', padding: '3px 10px', borderRadius: 12, background: `${latencyColor}15`, color: latencyColor, fontWeight: 700, fontSize: 11 }}>{latencyLabel}</div>
+                  </div>
+                  <div style={{ fontSize: 12, color: '#1a2b42' }}>
+                    <div style={{ color: '#8596ab', fontSize: 11 }}>Connection Type</div>
+                    <div style={{ fontSize: 14, fontWeight: 700, color: '#0f1d33' }}>{quality.connectionType || 'Unknown'}</div>
+                  </div>
+                </div>
+              )}
+              {(quality.speedError || quality.latencyError) && (
+                <div style={{ marginTop: 8, fontSize: 11, color: '#c42b1c' }}>
+                  {quality.speedError && <div>Speed: {quality.speedError}</div>}
+                  {quality.latencyError && <div>Latency: {quality.latencyError}</div>}
+                </div>
+              )}
+            </div>
+          </div>
+        );
+      }
 
       case 'user-image':
         return (
