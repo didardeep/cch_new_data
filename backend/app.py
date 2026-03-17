@@ -34,6 +34,9 @@ from sqlalchemy.orm import joinedload
 from models import db, bcrypt, User, ChatSession, ChatMessage, Ticket, Feedback, SystemSetting, SlaAlert, TelecomSite, KpiData, ParameterChange
 # Add this import after other imports
 from whatsapp_integration import send_whatsapp_message, format_chat_summary_for_whatsapp, format_ticket_alert_for_whatsapp
+import network_prompts
+import broadband_prompts
+import network_diagnosis
 load_dotenv()
 
 # ─── App Setup ────────────────────────────────────────────────────────────────
@@ -91,6 +94,20 @@ client = AzureOpenAI(
     api_version=os.environ.get("AZURE_OPENAI_API_VERSION", "2023-07-01-preview"),
 )
 DEPLOYMENT_NAME = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini")
+
+# ─── Init AI prompt modules ───────────────────────────────────────────────────
+# Initialise both modules with the shared Azure OpenAI client so they can
+# make API calls without importing app-level globals themselves.
+# TELECOM_MENU is defined further below — modules are re-inited after it.
+network_prompts.init(client, DEPLOYMENT_NAME, {})
+broadband_prompts.init(client, DEPLOYMENT_NAME, db, User)
+network_diagnosis.init(client, DEPLOYMENT_NAME, db, {
+    "User": User, "Ticket": Ticket, "ChatSession": ChatSession,
+    "KpiData": KpiData, "TelecomSite": TelecomSite,
+})
+
+broadband_prompts.register_routes(app)
+network_diagnosis.register_routes(app)
 
 def _user_brief(u, off_days=None):
     return {
@@ -224,480 +241,22 @@ def _haversine(lat1, lon1, lat2, lon2):
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
-NETWORK_PROBLEM_KPI_KEYWORDS = {
-    "internet_signal": [
-        "throughput", "tput", "data rate", "pdcp", "user throughput",
-        "latency", "delay", "rtt", "packet loss",
-        "prb", "resource block", "utilization", "congestion",
-        "data volume", "traffic volume", "dl volume", "ul volume",
-        "active ue", "connected ue",
-        "sinr", "rsrp", "rsrq", "cqi",
-        "availability",
-    ],
-    "call_failure": [
-        "cssr", "call setup", "setup success", "accessibility",
-        "sdcch", "paging", "attach", "blocking", "asr", "volte",
-        "moc", "mtc",
-    ],
-    "call_drop": [
-        "drop", "call drop", "tch drop", "retainability",
-        "rlf", "radio link failure",
-        "handover", "ho success", "ho failure",
-        "speech", "voice",
-    ],
-}
-
-# STRICT primary KPIs — these must match to be shown for the problem type
-NETWORK_PROBLEM_KPI_PRIMARY = {
-    "internet_signal": [
-        "throughput", "tput", "data rate", "pdcp", "user throughput",
-        "latency", "packet loss", "prb", "utilization",
-        "sinr", "rsrp", "rsrq", "cqi",
-    ],
-    "call_failure": [
-        "cssr", "call setup", "setup success", "accessibility",
-        "sdcch", "paging", "blocking", "asr", "volte", "attach",
-    ],
-    "call_drop": [
-        "drop", "call drop", "tch drop", "retainability",
-        "rlf", "radio link failure", "handover", "ho success", "ho failure",
-    ],
-}
-
-NETWORK_PROBLEM_KPI_STRONG = {
-    "internet_signal": ["throughput", "latency", "prb", "sinr", "rsrp", "rsrq", "cqi", "data volume"],
-    "call_failure": ["cssr", "call setup", "accessibility", "sdcch", "paging", "blocking"],
-    "call_drop": ["drop", "retainability", "rlf", "tch drop", "handover"],
-}
-
-
-def _normalize_problem_text(ticket: Ticket) -> str:
-    return " ".join([
-        (ticket.category or "").strip().lower(),
-        (ticket.subcategory or "").strip().lower(),
-        (ticket.description or "").strip().lower(),
-    ])
-
-
-def _detect_network_problem_type(ticket: Ticket) -> str:
-    text = _normalize_problem_text(ticket)
-    if any(x in text for x in ["call drop", "calls drop", "dropped call", "call disconnect", "drop rate"]):
-        return "call_drop"
-    if any(x in text for x in ["call failure", "calls fail", "unable to make call", "call not connecting", "call setup"]):
-        return "call_failure"
-    if "call / sms failures" in text:
-        return "call_failure"
-    return "internet_signal"
-
-
-def _problem_type_label(problem_type: str) -> str:
-    labels = {
-        "internet_signal": "Internet Speed",
-        "call_failure": "Call Failure",
-        "call_drop": "Call Drop",
-    }
-    return labels.get(problem_type, "Internet Speed")
-
-
-def _filter_kpi_names_for_problem(kpi_names, problem_type: str):
-    """
-    Return the KPIs most relevant to the problem type.
-    - Scores each KPI name against primary + secondary keyword lists.
-    - Returns up to 5 best-matched KPIs.
-    - If nothing matches at all, returns up to 5 KPIs sorted alphabetically
-      (so trend analysis always has something to show).
-    """
-    primary = NETWORK_PROBLEM_KPI_PRIMARY.get(problem_type, NETWORK_PROBLEM_KPI_PRIMARY["internet_signal"])
-    strong = NETWORK_PROBLEM_KPI_STRONG.get(problem_type, [])
-    keys = NETWORK_PROBLEM_KPI_KEYWORDS.get(problem_type, NETWORK_PROBLEM_KPI_KEYWORDS["internet_signal"])
-
-    scored = []
-    for name in kpi_names:
-        lname = (name or "").lower()
-        # Primary match carries most weight
-        primary_score = sum(2 for k in primary if k in lname)
-        # Strong keyword bonus
-        strong_bonus = 3 if any(k in lname for k in strong) else 0
-        # Secondary keyword match
-        secondary_score = sum(1 for k in keys if k in lname)
-
-        total_score = primary_score + strong_bonus + secondary_score
-        if total_score > 0:
-            scored.append((total_score, name))
-
-    if scored:
-        scored.sort(key=lambda x: (-x[0], x[1]))
-        return [n for _, n in scored[:5]]
-
-    # Nothing matched — return the first 5 KPIs alphabetically so the chart still renders
-    return sorted(kpi_names)[:5]
-
-
-def _period_key_for_row(row: KpiData, period: str) -> str:
-    if period == "month":
-        return row.date.strftime("%Y-%m")
-    if period == "week":
-        iso = row.date.isocalendar()
-        return f"{iso[0]}-W{iso[1]:02d}"
-    if period == "hour":
-        return f"{row.date.strftime('%Y-%m-%d')} {row.hour:02d}:00"
-    return row.date.strftime("%Y-%m-%d")
-
-
-def _build_period_stats(rows, period: str):
-    agg = {}
-    for r in rows:
-        if r.value is None:
-            continue
-        key = _period_key_for_row(r, period)
-        agg.setdefault(key, []).append(float(r.value))
-    if not agg:
-        return "no data"
-    ordered = sorted(agg.items(), key=lambda kv: kv[0])
-    latest_key, latest_vals = ordered[-1]
-    flat_vals = [v for _, vals in ordered for v in vals]
-    avg_all = round(sum(flat_vals) / len(flat_vals), 4)
-    return f"{latest_key}: avg={round(sum(latest_vals)/len(latest_vals), 4)}, overall_avg={avg_all}, min={round(min(flat_vals), 4)}, max={round(max(flat_vals), 4)}"
-
-
-def _build_kpi_summary_text(rows, selected_kpis, data_level_label: str) -> str:
-    from collections import defaultdict
-    grouped = defaultdict(list)
-    for r in rows:
-        if r.kpi_name in selected_kpis and r.value is not None:
-            grouped[r.kpi_name].append(r)
-    if not grouped:
-        return f"No {data_level_label} KPI data available."
-
-    parts = []
-    for kpi_name in sorted(grouped.keys()):
-        kpi_rows = grouped[kpi_name]
-        monthly = _build_period_stats(kpi_rows, "month")
-        weekly = _build_period_stats(kpi_rows, "week")
-        daily = _build_period_stats(kpi_rows, "day")
-        hourly = _build_period_stats(kpi_rows, "hour")
-        parts.append(
-            f"- {kpi_name}\n"
-            f"  Monthly: {monthly}\n"
-            f"  Weekly: {weekly}\n"
-            f"  Daily: {daily}\n"
-            f"  Hourly: {hourly}"
-        )
-    return "\n".join(parts)
-
-
-# ─── UPDATED: RCA text formatting helpers ────────────────────────────────────
-
-def _normalize_ai_lines(text: str):
-    """
-    Split raw AI text into clean, complete lines.
-    - Strips leading bullet / number markers only
-    - Removes stray 'Crux:' prefix labels (all variants)
-    - Deduplicates while preserving order
-    - Does NOT strip **bold** from mid-line content (titles like **Title**: body are kept)
-    - Does NOT truncate content — full sentences are preserved
-    """
-    lines = []
-    for raw in (text or "").splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        # Remove leading list markers: "1.", "2)", "-", "*", "•"
-        line = re.sub(r"^\s*(?:[-*•]|\d+[.)]\s*)\s*", "", line).strip()
-        # Remove "**Crux:**", "Crux:", "**Crux**:", etc. from the front only
-        line = re.sub(r"^\*{0,2}[Cc]rux\*{0,2}\s*:?\s*", "", line).strip()
-        # Only strip ** if they wrap the ENTIRE line AND there's no colon separator
-        # i.e. "**Some Title**" alone → "Some Title"
-        # but "**Title**: body text" is kept as-is (bold title with body)
-        if re.match(r"^\*\*[^*]+\*\*$", line):
-            line = re.sub(r"^\*\*(.*?)\*\*$", r"\1", line).strip()
-        if not line:
-            continue
-        lines.append(line)
-
-    # Deduplicate while preserving order
-    unique, seen = [], set()
-    for line in lines:
-        key = line.lower()
-        if key not in seen:
-            seen.add(key)
-            unique.append(line)
-
-    # Drop the last line if it looks truncated (no closing punctuation).
-    # This happens when the AI response is cut by max_tokens mid-sentence.
-    if unique and not re.search(r'[.!?)>]$', unique[-1].rstrip()):
-        unique = unique[:-1]
-
-    return unique
-
-
-def _force_numbered_points(raw_text: str, min_points: int, max_points: int, prefix: str = "", fallback_points=None):
-    """
-    Parse AI output into clean numbered points.
-    - Full sentences preserved — no character truncation
-    - No 'Crux:' prefix injected (prefix param kept for API compat but defaults to "")
-    - Bold markdown (**Title**: body) preserved as-is for frontend rendering
-    - Picks most technically relevant lines first
-    """
-    lines = _normalize_ai_lines(raw_text)
-
-    # Keep lines in their ORIGINAL order — do not rerank.
-    # The AI already produces the output in priority order.
-    picked = []
-    for line in lines:
-        if len(line) < 12:
-            continue
-        picked.append(line)
-        if len(picked) >= max_points:
-            break
-
-    # Fill up to min_points from fallback if AI gave too few lines
-    for line in (fallback_points or []):
-        if len(picked) >= min_points:
-            break
-        if line and line not in picked:
-            picked.append(line)
-
-    picked = picked[:max_points]
-
-    # Last resort: if truly nothing, generate from fallback directly
-    if not picked:
-        for line in (fallback_points or []):
-            if line and len(line) >= 12:
-                picked.append(line)
-            if len(picked) >= max_points:
-                break
-
-    if not picked:
-        picked = ["Unable to generate recommendations — please ensure root cause analysis has been run first."]
-
-    # prefix param ignored (was used for "**Crux:** " — removed)
-    return "\n".join(f"{idx + 1}. {line}" for idx, line in enumerate(picked))
-
-
-def _strip_markdown_for_pdf(text: str) -> str:
-    """Remove **bold** and *italic* markdown markers for plain-text PDF output."""
-    text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
-    text = re.sub(r"\*(.*?)\*", r"\1", text)
-    return text
-
-
-def _format_points_for_pdf(raw_text: str) -> str:
-    """
-    Convert numbered markdown points to clean plain-text for PDF sections.
-    Input:  "1. **Site Offline**: The site is off air due to power failure.\n2. ..."
-    Output: "1. Site Offline: The site is off air due to power failure.\n\n2. ..."
-    """
-    lines = _normalize_ai_lines(raw_text)
-    plain_lines = []
-    for i, line in enumerate(lines[:5], 1):
-        plain = _strip_markdown_for_pdf(line)
-        plain_lines.append(f"{i}. {plain}")
-    return "\n\n".join(plain_lines)
-
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _value_or_na(val, unit=""):
-    if val is None or val == "":
-        return "N/A"
-    return f"{val}{unit}"
-
-
-def _adjust_value(val, delta, min_val=None):
-    if val is None:
-        return None
-    try:
-        new_val = float(val) + float(delta)
-        if min_val is not None:
-            new_val = max(new_val, min_val)
-        return round(new_val, 2)
-    except Exception:
-        return None
-
-
-def _infer_issue_flags(text: str):
-    t = (text or "").lower()
-    flags = set()
-    if any(k in t for k in ["prb", "utilization", "congestion", "overload", "traffic spike"]):
-        flags.add("congestion")
-    if any(k in t for k in ["sinr", "rsrp", "rsrq", "weak signal", "coverage", "low signal"]):
-        flags.add("coverage")
-    if any(k in t for k in ["interference", "pilot pollution", "overshoot", "over-shoot"]):
-        flags.add("interference")
-    if any(k in t for k in ["latency", "packet loss", "delay", "jitter"]):
-        flags.add("latency")
-    if any(k in t for k in ["handover", "rlf", "drop", "call drop"]):
-        flags.add("handover")
-    if any(k in t for k in ["call setup", "cssr", "paging", "accessibility", "sdcch", "call failure"]):
-        flags.add("access")
-    if "off air" in t or "off_air" in t:
-        flags.add("off_air")
-    return flags
-
-
-def _build_parameter_recommendations(problem_type, root_cause, trend_summary, nearest):
-    text = f"{root_cause}\n{trend_summary}"
-    flags = _infer_issue_flags(text)
-
-    bw = nearest.get("bandwidth_mhz") if nearest else None
-    gain = nearest.get("antenna_gain_dbi") if nearest else None
-    eirp = nearest.get("rf_power_eirp_dbm") if nearest else None
-    height = nearest.get("antenna_height_agl_m") if nearest else None
-    tilt = nearest.get("e_tilt_degree") if nearest else None
-    crs = nearest.get("crs_gain") if nearest else None
-
-    recs = []
-
-    if "off_air" in flags:
-        recs.append(
-            f"**Restore Site to ON AIR**: Resolve active alarms first and validate recovery against KPI trends; "
-            f"then re-check RF parameters (EIRP {_value_or_na(eirp,' dBm')}, E-tilt {_value_or_na(tilt,'°')}) for post-recovery tuning."
-        )
-
-    if "congestion" in flags and bw is not None:
-        target_bw = bw + (10 if bw <= 10 else 5)
-        recs.append(
-            f"**Increase Bandwidth**: Bandwidth is {bw} MHz; expand to {target_bw} MHz (if spectrum/license allows) to reduce PRB congestion and improve throughput."
-        )
-    elif "congestion" in flags:
-        recs.append(
-            "**Increase Bandwidth**: Bandwidth value missing; increase carrier bandwidth (e.g., +5 to +10 MHz) to reduce PRB congestion and improve throughput."
-        )
-
-    if "interference" in flags and tilt is not None and eirp is not None:
-        target_tilt = _adjust_value(tilt, 1, min_val=0)
-        target_eirp = _adjust_value(eirp, -1)
-        recs.append(
-            f"**Reduce Overshoot/Interference**: E-tilt is {tilt}° and EIRP is {eirp} dBm; "
-            f"increase tilt to {target_tilt}° and lower EIRP to {target_eirp} dBm to reduce pilot pollution and stabilize SINR."
-        )
-    elif "coverage" in flags and tilt is not None and eirp is not None:
-        target_tilt = _adjust_value(tilt, -1, min_val=0)
-        target_eirp = _adjust_value(eirp, 1)
-        recs.append(
-            f"**Improve Coverage/RSS**: E-tilt is {tilt}° and EIRP is {eirp} dBm; "
-            f"reduce tilt to {target_tilt}° and raise EIRP to {target_eirp} dBm to lift RSRP and improve coverage."
-        )
-
-    if "handover" in flags and crs is not None:
-        target_crs = _adjust_value(crs, 3)
-        recs.append(
-            f"**Stabilize Handover**: CRS Gain is {crs}; raise to {target_crs} to improve reference signal quality and reduce RLF/call drops during mobility."
-        )
-    elif "access" in flags and gain is not None:
-        target_gain = _adjust_value(gain, 1)
-        recs.append(
-            f"**Improve Call Accessibility**: Antenna Gain is {gain} dBi; increase to {target_gain} dBi (or swap to higher-gain antenna) to improve call setup KPIs."
-        )
-
-    if "latency" in flags and height is not None:
-        target_height = _adjust_value(height, 2)
-        recs.append(
-            f"**Optimize Antenna Height**: Antenna height is {height} m AGL; adjust to {target_height} m to improve line-of-sight and reduce latency spikes."
-        )
-
-    # Ensure 4–5 points using unique parameter-based fill-up lines
-    padding_pool = []
-    if tilt is not None and eirp is not None:
-        padding_pool.append(
-            f"**RF Parameter Alignment**: Validate E-tilt ({tilt}°) and EIRP ({eirp} dBm) against the RCA-identified degradation window and confirm KPI recovery within 24 hours post-adjustment."
-        )
-    if bw is not None:
-        padding_pool.append(
-            f"**Capacity Confirmation**: Confirm bandwidth at {bw} MHz is adequate; if PRB utilization exceeds 70%, schedule a bandwidth expansion to {round(bw + 5, 1)} MHz."
-        )
-    if crs is not None:
-        padding_pool.append(
-            f"**CRS Gain Verification**: CRS Gain is currently {crs}; validate reference signal power across all sectors and adjust if RSRP drops below -105 dBm at cell edge."
-        )
-    if height is not None:
-        padding_pool.append(
-            f"**Antenna Height Review**: Antenna height is {height} m AGL; verify line-of-sight coverage and adjust mounting height if near-field obstruction is detected."
-        )
-    if gain is not None:
-        padding_pool.append(
-            f"**Antenna Gain Audit**: Antenna Gain is {gain} dBi; cross-check with drive test data and replace with higher-gain antenna if signal levels are below threshold."
-        )
-    # Generic always-available options
-    padding_pool += [
-        "**Drive Test Validation**: Conduct a drive test in the affected area post-parameter changes to confirm KPI recovery and customer experience improvement.",
-        "**Neighbor Cell Audit**: Review neighbor cell list for missing or unoptimized neighbors that may cause handover failures and increase call drops.",
-        "**Scheduler Tuning**: Adjust CQI-based scheduler parameters to prioritize users with degraded signal quality and improve cell-edge throughput by up to 15%.",
-    ]
-
-    for pad in padding_pool:
-        if len(recs) >= 5:
-            break
-        if pad not in recs:
-            recs.append(pad)
-
-    return recs[:5]
-
-
-def _recommendation_has_params(text: str):
-    t = (text or "").lower()
-    param_hits = 0
-    for p in ["bandwidth", "antenna gain", "eirp", "rf power", "antenna height", "e-tilt", "tilt", "crs gain"]:
-        if p in t:
-            param_hits += 1
-    has_numbers = bool(re.search(r"\d+(\.\d+)?", t))
-    return param_hits >= 2 and has_numbers
-
-
-def _filter_rca_lines(lines):
-    generic_patterns = [
-        r"\bsite status\b",
-        r"\bproblem classification\b",
-        r"\bproblem type\b",
-        r"\bprimary impact domain\b",
-        r"\bonly related kpi\b",
-        r"\btrend evidence\b",
-        r"\baction required\b",
-        r"\bfocus area\b",
-    ]
-    out = []
-    for line in lines:
-        l = line.lower()
-        if any(re.search(p, l) for p in generic_patterns):
-            continue
-        # Keep lines that mention KPI evidence or alarms/solutions
-        if re.search(r"\b(kpi|throughput|latency|prb|sinr|rsrp|rsrq|cqi|drop|handover|cssr|paging|rlf|alarm|off air|on air)\b", l):
-            out.append(line)
-            continue
-        # Keep lines with concrete numbers/percentages
-        if re.search(r"\d+(\.\d+)?", l):
-            out.append(line)
-    return out
-
-
-def _kpi_degradation_points(rows, selected_kpis, max_points=3):
-    from collections import defaultdict
-    grouped = defaultdict(list)
-    for r in rows:
-        if r.kpi_name in selected_kpis and r.value is not None:
-            grouped[r.kpi_name].append(r)
-    points = []
-    for kpi_name, kpi_rows in grouped.items():
-        kpi_rows.sort(key=lambda r: (r.date, r.hour))
-        vals = [float(r.value) for r in kpi_rows if r.value is not None]
-        if len(vals) < 2:
-            continue
-        overall = sum(vals) / len(vals)
-        latest_vals = [float(r.value) for r in kpi_rows[-min(8, len(kpi_rows)):] if r.value is not None]
-        latest = sum(latest_vals) / max(len(latest_vals), 1)
-        if overall == 0:
-            continue
-        delta_pct = (latest - overall) / overall * 100
-        if abs(delta_pct) < 20:
-            continue
-        direction = "drop" if delta_pct < 0 else "increase"
-        points.append((
-            abs(delta_pct),
-            f"**KPI Shift**: {kpi_name} shows a {direction} to {round(latest, 3)} vs baseline {round(overall, 3)} ({round(delta_pct, 1)}%)."
-        ))
-    points.sort(key=lambda x: -x[0])
-    return [p for _, p in points[:max_points]]
-
+# ─── Network diagnosis helpers (delegated to network_diagnosis.py) ───────────
+# All KPI constants, tower lookup, RCA helpers, and text formatting functions
+# now live in network_diagnosis.py. These aliases keep any remaining
+# in-file references working without changes.
+find_nearest_sites          = network_diagnosis.find_nearest_sites
+_detect_network_problem_type = network_diagnosis._detect_network_problem_type
+_problem_type_label          = network_diagnosis._problem_type_label
+_filter_kpi_names_for_problem = network_diagnosis._filter_kpi_names_for_problem
+_build_kpi_summary_text      = network_diagnosis._build_kpi_summary_text
+_build_parameter_recommendations = network_diagnosis._build_parameter_recommendations
+_normalize_ai_lines          = network_diagnosis._normalize_ai_lines
+_force_numbered_points       = network_diagnosis._force_numbered_points
+_format_points_for_pdf       = network_diagnosis._format_points_for_pdf
+_filter_rca_lines            = network_diagnosis._filter_rca_lines
+_kpi_degradation_points      = network_diagnosis._kpi_degradation_points
+_detect_significant_drops    = network_diagnosis._detect_significant_drops
 
 # ─── Socket.IO Helpers ───────────────────────────────────────────────────────
 
@@ -866,6 +425,14 @@ TELECOM_MENU = {
     },
 }
 
+# Re-init network_prompts now that TELECOM_MENU is available
+network_prompts.init(client, DEPLOYMENT_NAME, TELECOM_MENU)
+# Re-init network_diagnosis with full model references after all imports are resolved
+network_diagnosis.init(client, DEPLOYMENT_NAME, db, {
+    "User": User, "Ticket": Ticket, "ChatSession": ChatSession,
+    "KpiData": KpiData, "TelecomSite": TelecomSite,
+})
+
 
 def get_subprocess_details(sector_key: str) -> str:
     sector = TELECOM_MENU[sector_key]
@@ -884,241 +451,36 @@ def get_subprocess_name(sector_key: str, subprocess_key: str) -> str:
     return sp if isinstance(sp, str) else "Others"
 
 
-def is_telecom_related(query: str, sector_name=None, subprocess_name=None) -> bool:
-    context_block = ""
-    if sector_name:
-        context_block = (
-            f'\n\n── USER\'S MENU NAVIGATION ──\n'
-            f'The user already selected telecom sector: "{sector_name}"'
-        )
-        if subprocess_name:
-            context_block += f'\nThey also selected subprocess: "{subprocess_name}"'
-        context_block += (
-            "\n\nBecause the user navigated a TELECOM complaint menu to reach this point, "
-            "their query is almost certainly telecom-related. Generic complaints like "
-            " 'money deducted', 'service not working', 'bad experience', 'want refund', "
-            " 'not getting what I paid for' etc. should be interpreted in the telecom context.\n"
-            "Only classify as NOT telecom if the query is EXPLICITLY about a completely "
-            "different industry."
-        )
-    try:
-        response = client.chat.completions.create(
-            model=DEPLOYMENT_NAME,
-            messages=[
-                {"role": "system", "content": (
-                    "You are a semantic intent classifier for a TELECOM complaint chatbot.\n\n"
-                    "Your job is to determine whether the user's query is related to telecommunications.\n\n"
-                    "TELECOM includes (but is not limited to):\n"
-                    "- Mobile phone services (calls, SMS, data, prepaid, postpaid)\n"
-                    "- Internet/broadband/WiFi/fiber services\n"
-                    "- DTH/cable TV/satellite TV\n"
-                    "- Landline/fixed-line telephone\n"
-                    "- Enterprise telecom (leased lines, VPN, MPLS, SLA)\n"
-                    "- ANY billing, payment, refund, service quality, or customer care issue "
-                    "related to any of the above\n\n"
-                    "SEMANTIC REASONING RULES:\n"
-                    "1. Focus on the USER'S INTENT, not just the words they used.\n"
-                    "2. 'Money deducted' in a telecom context = telecom billing issue.\n"
-                    "3. 'Service not working' in a telecom context = telecom service disruption.\n"
-                    "4. Vague complaints ARE telecom if the user came through the telecom menu.\n"
-                    "5. Only reject if the query is CLEARLY about a non-telecom industry.\n"
-                    + context_block +
-                    '\n\nRespond with ONLY this JSON (no extra text):\n'
-                    '{"reasoning": "<one sentence about why>", "is_telecom": true/false}'
-                )},
-                {"role": "user", "content": query},
-            ],
-            temperature=0,
-            max_tokens=120,
-        )
-        raw = response.choices[0].message.content.strip()
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-            raw = raw.strip()
-        result = json.loads(raw)
-        return result.get("is_telecom", False)
-    except Exception:
-        return True if sector_name else False
+def is_telecom_related(query, sector_name=None, subprocess_name=None):
+    return network_prompts.is_telecom_related(query, sector_name, subprocess_name)
+
+def identify_subprocess(query, sector_key):
+    return network_prompts.identify_subprocess(query, sector_key)
+
+def detect_greeting(text):
+    return network_prompts.detect_greeting(text)
+
+def classify_user_response(text):
+    return network_prompts.classify_user_response(text)
+
+def detect_language(text):
+    return network_prompts.detect_language(text)
+
+def _friendly_ai_error(err):
+    return network_prompts._friendly_ai_error(err)
 
 
-def identify_subprocess(query: str, sector_key: str) -> str:
-    sector = TELECOM_MENU[sector_key]
-    subprocess_details = get_subprocess_details(sector_key)
-    try:
-        response = client.chat.completions.create(
-            model=DEPLOYMENT_NAME,
-            messages=[
-                {"role": "system", "content": (
-                    f"You are a semantic complaint classifier for: {sector['name']}.\n"
-                    f"Sector description: {sector.get('description', '')}\n\n"
-                    "Below are the available subprocesses:\n\n"
-                    f"{subprocess_details}\n\n"
-                    "Analyze the user's complaint and determine which subprocess it belongs to.\n\n"
-                    "Respond with ONLY this JSON:\n"
-                    '{"reasoning": "<brief explanation>", "matched_subprocess": "<exact name>", "confidence": <0.0 to 1.0>}'
-                )},
-                {"role": "user", "content": query},
-            ],
-            temperature=0,
-            max_tokens=200,
-        )
-        raw = response.choices[0].message.content.strip()
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-            raw = raw.strip()
-        result = json.loads(raw)
-        return result.get("matched_subprocess", "General Inquiry")
-    except Exception:
-        return "General Inquiry"
-
-
-def detect_greeting(text: str) -> bool:
-    """Semantically determine whether a message is a greeting in any language."""
-    try:
-        response = client.chat.completions.create(
-            model=DEPLOYMENT_NAME,
-            messages=[
-                {"role": "system", "content": (
-                    "Determine if the user's message is a greeting or salutation in ANY language or mixed language. "
-                    "A greeting includes (but is not limited to): hello, hi, hey, hiya, howdy, good morning, "
-                    "good afternoon, good evening, namaste, namaskar, salaam, assalamu alaikum, "
-                    "bonjour, hola, ciao, salam, sat sri akal, vanakkam, adab, greetings, what's up, "
-                    "yo, sup, hii, helo, hai, or informal/phonetic variants in any script. "
-                    "Mixed-language greetings (e.g. 'hello aur kaise ho', 'hi there bhai') also count. "
-                    'Respond with ONLY valid JSON: {"is_greeting": true} or {"is_greeting": false}'
-                )},
-                {"role": "user", "content": text},
-            ],
-            temperature=0,
-            max_tokens=20,
-        )
-        raw = response.choices[0].message.content.strip()
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-            raw = raw.strip()
-        result = json.loads(raw)
-        return bool(result.get("is_greeting", True))
-    except Exception:
-        return True   # fail-open: treat ambiguous input as a greeting
-
-
-def classify_user_response(text: str) -> dict:
-    """Classify user's response after a solution: is satisfied, mentions signal/network issues, or needs more help."""
-    try:
-        response = client.chat.completions.create(
-            model=DEPLOYMENT_NAME,
-            messages=[
-                {"role": "system", "content": (
-                    "You are classifying a customer's response in a telecom support chat. "
-                    "The customer was just given a solution and asked 'Did this help?'\n\n"
-                    "Determine:\n"
-                    "1. is_satisfied: Is the user saying the issue is resolved / they are happy / it worked / thank you / yes it helped? (true/false)\n"
-                    "2. mentions_signal: Does the user's message semantically relate to network signal, coverage, "
-                    "poor reception, no signal, weak signal, call drops, slow internet speed, network not available, "
-                    "data not working, or similar signal/network connectivity issues? (true/false)\n\n"
-                    'Respond with ONLY valid JSON: {"is_satisfied": true/false, "mentions_signal": true/false}'
-                )},
-                {"role": "user", "content": text},
-            ],
-            temperature=0,
-            max_tokens=30,
-        )
-        raw = response.choices[0].message.content.strip()
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-            raw = raw.strip()
-        return json.loads(raw)
-    except Exception:
-        return {"is_satisfied": False, "mentions_signal": False}
-
-
-def detect_language(text: str) -> str:
-    try:
-        response = client.chat.completions.create(
-            model=DEPLOYMENT_NAME,
-            messages=[
-                {"role": "system", "content": (
-                    "Detect the language of the following text. "
-                    'Respond with ONLY: {"language": "<language_name>", "code": "<iso_code>"}'
-                )},
-                {"role": "user", "content": text},
-            ],
-            temperature=0,
-            max_tokens=50,
-        )
-        raw = response.choices[0].message.content.strip()
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-            raw = raw.strip()
-        result = json.loads(raw)
-        return result.get("language", "English")
-    except Exception:
-        return "English"
-
-def _friendly_ai_error(err: Exception) -> str:
-    """Return a user-friendly message when the AI provider is unavailable."""
-    return (
-        "I'm having trouble reaching the AI service right now. "
-        "Please try again in a few moments."
-    )
 
 
 def generate_resolution(query, sector_name, subprocess_name, language):
-    try:
-        response = client.chat.completions.create(
-            model=DEPLOYMENT_NAME,
-            messages=[
-                {"role": "system", "content": (
-                    f"You are a senior telecom network support specialist. The customer has reported an issue "
-                    f"under: '{sector_name}' > '{subprocess_name}'.\n"
-                    "You must scope all solutions strictly to this subprocess. Do NOT mix solutions from sibling subprocesses. "
-                    "For example, if subprocess is 'Network / Signal Problems – Internet / Mobile Data', do NOT mention call drop or call failure steps.\n\n"
-                    "RESPONSE FORMAT:\n"
-                    "1. One-line empathetic acknowledgment of the specific issue.\n"
-                    "2. ONE precise, field-proven solution with 3-5 numbered steps.\n\n"
-                    "STEP QUALITY RULES — every step must be:\n"
-                    "• Specific: include exact menu paths, setting names, dial codes, or field values (e.g. 'Settings → Mobile Network → Preferred Network Type → 4G/LTE only').\n"
-                    "• Actionable: tell the user exactly what to tap, toggle, enter, or dial — never vague instructions like 'check your settings'.\n"
-                    "• Technically grounded: use industry-standard methods (APN reconfiguration, VoLTE/VoWiFi toggle, network band selection, USSD codes, eSIM re-provisioning, ONT/ONU LED diagnosis, transponder re-scan, UPC regeneration, etc.).\n\n"
-                    "BANNED SUGGESTIONS (never include):\n"
-                    "- Restart phone / toggle airplane mode\n"
-                    "- Restart router or modem\n"
-                    "- Move to open area or near a window\n"
-                    "- Wait for network congestion\n"
-                    "- Contact customer support / call care / raise ticket / visit service center\n\n"
-                    "ISSUE-SPECIFIC TECHNICAL GUIDANCE (apply the relevant section):\n"
-                    "Mobile data not working: Manually configure APN via Settings → SIM & Network → Access Point Names → Add New APN (enter operator APN name/type: default,supl; MCC/MNC per operator). Check Preferred Network Type (Settings → Mobile Network → set to LTE/4G), SIM slot assignment, and Data Roaming flag.\n"
-                    "Call drops / poor voice: Enable VoLTE at Settings → Mobile Network → VoLTE Calls → ON. Enable VoWiFi at Settings → Mobile Network → Wi-Fi Calling → ON. To check/lock band: dial *#2263# (Samsung) and select preferred band (Band 3 1800MHz / Band 40 2300MHz TDD-LTE per operator).\n"
-                    "Billing / wrong deduction: Dial *121# or *199# for itemised balance; *121*1# for data pack status; *123# for talktime ledger. To dispute: open carrier app → My Account → Bill Details → Dispute Transaction. Request CDR from Usage History in self-care app.\n"
-                    "Plan/pack not activated: Check provisioning via *199*2# or *121*2#. For eSIM: Settings → Cellular → Add eSIM → rescan operator QR; if error, generate new QR from operator self-care app. For prepaid: dial *444# to verify active pack; retry activation via USSD after top-up.\n"
-                    "Broadband / fiber slow: Diagnose via ONT LEDs — LOS red = fiber break (ISP fault); PON off = ODN issue; INTERNET amber = PPPoE auth failure. Fix PPPoE: router admin (192.168.1.1) → WAN → re-enter PPPoE credentials. Set DNS to 1.1.1.1 / 8.8.8.8 and MTU to 1492 (PPPoE) in router LAN settings.\n"
-                    "DTH signal loss: Check signal strength in TV menu (target >60%). Re-scan transponders: Dish TV → Setup → Edit TP → 11090 V 30000; Tata Play → 12515 H 22000. Reactivate smart card: carrier app → Manage Device → Reactivate Smart Card (provisioning takes ~15 min).\n"
-                    "MNP / Port-in stuck: Regenerate UPC by sending SMS 'PORT <10-digit number>' to 1900 (valid 4 days). Check port status: SMS 'PORTSTATUS' to 1900. If HLR not updated after 7 working days, the operator must trigger HLR refresh via NOC — initiate via self-care portal under 'Port Request Status'.\n\n"
-                    "Do NOT include any URLs or hyperlinks.\n"
-                    f"Respond entirely in {language}. Be concise, precise, and technically accurate."
-                )},
-                {"role": "user", "content": query},
-            ],
-            temperature=0.4,
-            max_tokens=1000,
-        )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        return _friendly_ai_error(e)
+    return network_prompts.generate_resolution(query, sector_name, subprocess_name, language)
 
 
-def generate_single_solution(sector_name, subprocess_name, language, user_query="", previous_solutions=None, attempt=1, original_query="", diagnosis_summary=""):
-    """Generate a single focused solution."""
+def generate_single_solution(sector_name, subprocess_name, language, user_query="",
+                              previous_solutions=None, attempt=1, original_query="",
+                              diagnosis_summary="", sector_key=None,
+                              billing_context=None, connection_context=None):
+    """Routes to broadband or mobile prompt based on sector_key."""
     prev_block = ""
     if previous_solutions:
         prev_block = (
@@ -1126,59 +488,50 @@ def generate_single_solution(sector_name, subprocess_name, language, user_query=
             "Do NOT repeat them. Provide a DIFFERENT approach:\n"
             + "\n---\n".join(previous_solutions[-10:])
         )
-
-    query_block = ""
-    if user_query:
-        query_block = f"\n\nThe user described their specific issue as: \"{user_query}\""
-
+    query_block = f'\n\nThe user described their specific issue as: "{user_query}"' if user_query else ""
     context_block = ""
     if original_query and original_query != user_query:
         context_block = f"\n\nOriginal issue description: \"{original_query}\"\nThe user's follow-up message is: \"{user_query}\""
-
     diagnosis_block = ""
     if diagnosis_summary:
         diagnosis_block = (
             f"\n\nSIGNAL DIAGNOSIS RESULTS: {diagnosis_summary}\n"
             "Use this diagnosis data to tailor your solution precisely. "
-            "If RSRP < -100 dBm or SINR < 0 dB: the issue is cell-edge coverage — suggest network band change (*#2263# to lock a stronger band), VoLTE/VoWiFi enablement, or SIM re-provisioning to trigger HLR re-attachment. "
-            "If RSRP -100 to -85 dBm: moderate signal — focus on device-side fixes (APN reconfiguration, preferred network type, VoLTE toggle). "
-            "If RSRP > -85 dBm and SINR > 5 dB: signal is adequate — focus on account/provisioning issues (pack activation via USSD, APN type mismatch, IPv6 toggle, MTU adjustment)."
+            "If RSRP < -100 dBm or SINR < 0 dB: cell-edge coverage — suggest band change, VoLTE/VoWiFi, SIM re-provisioning. "
+            "If RSRP -100 to -85 dBm: moderate signal — APN reconfiguration, preferred network type, VoLTE toggle. "
+            "If RSRP > -85 dBm and SINR > 5 dB: signal adequate — account/provisioning issues."
+        )
+
+    # Route to broadband prompt
+    if broadband_prompts.is_broadband_sector(sector_key) or (sector_name and "broadband" in sector_name.lower()):
+        system_prompt = broadband_prompts.build_broadband_prompt(
+            subprocess_name=subprocess_name,
+            language=language,
+            attempt=attempt,
+            billing_context=billing_context,
+            connection_context=connection_context,
+            query_block=query_block,
+            context_block=context_block,
+            prev_block=prev_block,
+        )
+    else:
+        # Mobile / generic prompt
+        system_prompt = network_prompts.build_mobile_system_prompt(
+            sector_name=sector_name,
+            subprocess_name=subprocess_name,
+            language=language,
+            attempt=attempt,
+            query_block=query_block,
+            context_block=context_block,
+            diagnosis_block=diagnosis_block,
+            prev_block=prev_block,
         )
 
     try:
         response = client.chat.completions.create(
             model=DEPLOYMENT_NAME,
             messages=[
-                {"role": "system", "content": (
-                    f"You are a senior telecom network support specialist. The customer has an issue "
-                    f"under: '{sector_name}' > '{subprocess_name}'. This is solution attempt #{attempt}.\n"
-                    "Stay strictly within this subprocess. Do NOT mix steps from sibling subprocesses "
-                    "(e.g., if subprocess is 'Network / Signal Problems – Internet / Mobile Data', do not mention call-drop or call-failure steps).\n\n"
-                    "Provide exactly ONE precise, field-proven solution with 3-5 numbered steps. Each step must:\n"
-                    "• Include exact menu paths, setting names, dial codes, or field values.\n"
-                    "• Tell the user exactly what to tap, toggle, enter, or dial — no vague instructions.\n"
-                    "• Use industry-standard troubleshooting methods (APN config, VoLTE/VoWiFi toggle, band locking, USSD codes, PPPoE re-auth, ONT LED diagnosis, eSIM re-provisioning, etc.).\n\n"
-                    "BANNED SUGGESTIONS (never include):\n"
-                    "- Restart phone / toggle airplane mode\n"
-                    "- Restart router or modem\n"
-                    "- Move to open area or near a window\n"
-                    "- Wait for network congestion\n"
-                    "- Contact support / call care / raise ticket / visit service center\n\n"
-                    "ISSUE-SPECIFIC TECHNICAL GUIDANCE (apply relevant section):\n"
-                    "Mobile data: Configure APN (Settings → SIM & Network → Access Point Names → New APN → enter name/type/MCC/MNC). Set Preferred Network Type to LTE/4G. Check SIM slot assignment and Data Roaming flag.\n"
-                    "Call drops/voice: VoLTE: Settings → Mobile Network → VoLTE Calls → ON. VoWiFi: Settings → Mobile Network → Wi-Fi Calling → ON. Band lock: *#2263# (Samsung) → select Band 3/40 per operator.\n"
-                    "Billing: Balance: *121# or *199#. Data pack: *121*1#. Talktime: *123#. Dispute via carrier app → My Account → Bill Details → Dispute Transaction. CDR from app → Usage History.\n"
-                    "Plan activation: Provisioning: *199*2#. eSIM: Settings → Cellular → Add eSIM → rescan QR or generate new QR via self-care app. Prepaid pack: *444# to verify; retry via USSD post top-up.\n"
-                    "Broadband/fiber: ONT LEDs: LOS red = fiber break; INTERNET amber = PPPoE failure → re-enter credentials at 192.168.1.1 → WAN. DNS: 1.1.1.1/8.8.8.8, MTU: 1492.\n"
-                    "DTH: Signal check via TV menu (>60%). Dish TV transponder: 11090 V 30000. Tata Play: 12515 H 22000. Smart card: carrier app → Manage Device → Reactivate.\n"
-                    "MNP/port-in: UPC: SMS 'PORT <number>' to 1900. Status: SMS 'PORTSTATUS' to 1900. HLR refresh after 7 days via self-care → Port Request Status.\n\n"
-                    "Do NOT include any URLs or hyperlinks.\n"
-                    + query_block
-                    + context_block
-                    + diagnosis_block
-                    + prev_block +
-                    f"\n\nRespond entirely in {language}. Be concise, precise, and technically accurate."
-                )},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_query if user_query else f"I have an issue with {subprocess_name} in {sector_name}"},
             ],
             temperature=0.5,
@@ -1189,177 +542,17 @@ def generate_single_solution(sector_name, subprocess_name, language, user_query=
         return _friendly_ai_error(e)
 
 
-def translate_text(text: str, target_language: str) -> str:
-    if target_language.lower() in ("english", "en"):
-        return text
-    try:
-        response = client.chat.completions.create(
-            model=DEPLOYMENT_NAME,
-            messages=[
-                {"role": "system", "content": f"Translate the following text to {target_language}. Keep formatting intact. Return ONLY the translation."},
-                {"role": "user", "content": text},
-            ],
-            temperature=0,
-            max_tokens=500,
-        )
-        return response.choices[0].message.content.strip()
-    except Exception:
-        return text
+def translate_text(text, target_language):
+    return network_prompts.translate_text(text, target_language)
 
 
 def generate_chat_summary(messages_list, sector_name, subprocess_name):
-    """Generate a summary of the chat conversation."""
-    try:
-        conversation = "\n".join([f"{m['sender']}: {m['content']}" for m in messages_list])
-        response = client.chat.completions.create(
-            model=DEPLOYMENT_NAME,
-            messages=[
-                {"role": "system", "content": (
-                    "Summarize this telecom support chat in 3-4 sentences. "
-                    f"Category: {sector_name} > {subprocess_name}. "
-                    "Include: what the issue was, what resolution was provided, and the outcome."
-                )},
-                {"role": "user", "content": conversation},
-            ],
-            temperature=0.3,
-            max_tokens=200,
-        )
-        return response.choices[0].message.content.strip()
-    except Exception:
-        return f"Chat about {sector_name} - {subprocess_name}. Customer query handled."
+    return network_prompts.generate_chat_summary(messages_list, sector_name, subprocess_name)
 
 
 def analyze_signal_screenshot(image_base64):
-    """Use Azure OpenAI Vision to extract signal metrics from a screenshot."""
-    # Strip data URL prefix if present
-    clean_b64 = re.sub(r"^data:image/[^;]+;base64,", "", image_base64)
+    return network_prompts.analyze_signal_screenshot(image_base64)
 
-    response = client.chat.completions.create(
-        model=DEPLOYMENT_NAME,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are a telecom signal analysis expert. Extract signal metrics from "
-                    "the provided screenshot of a phone's service mode or signal information screen.\n\n"
-                    "Extract these values:\n"
-                    "- RSRP (Reference Signal Received Power) in dBm\n"
-                    "- SINR (Signal to Interference plus Noise Ratio) in dB\n"
-                    "- Cell ID (the cell identifier)\n\n"
-                    "Return ONLY valid JSON in this exact format:\n"
-                    '{"rsrp": <number or null>, "sinr": <number or null>, "cell_id": <string or null>}\n\n'
-                    "If a value is not visible or cannot be determined, use null.\n"
-                    "For RSRP, return just the number (e.g., -95, not '-95 dBm').\n"
-                    "For SINR, return just the number (e.g., 12, not '12 dB').\n"
-                    "For Cell ID, return the string value as shown."
-                ),
-            },
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": "Extract RSRP, SINR, and Cell ID values from this signal information screenshot.",
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/png;base64,{clean_b64}",
-                            "detail": "high",
-                        },
-                    },
-                ],
-            },
-        ],
-        temperature=0,
-        max_tokens=200,
-    )
-
-    raw = response.choices[0].message.content.strip()
-    # Extract JSON from possible markdown code block
-    json_match = re.search(r"\{.*\}", raw, re.DOTALL)
-    if not json_match:
-        raise ValueError("Could not parse AI response")
-    extracted = json.loads(json_match.group())
-
-    rsrp = extracted.get("rsrp")
-    sinr = extracted.get("sinr")
-    cell_id = extracted.get("cell_id")
-
-    # Classify RSRP
-    if rsrp is not None:
-        rsrp = float(rsrp)
-        if -105 <= rsrp <= -40:
-            rsrp_status, rsrp_label = "green", "Good"
-        elif -115 <= rsrp < -105:
-            rsrp_status, rsrp_label = "amber", "Moderate"
-        else:
-            rsrp_status, rsrp_label = "red", "Weak"
-    else:
-        rsrp_status, rsrp_label = "unknown", "Not detected"
-
-    # Classify SINR
-    if sinr is not None:
-        sinr = float(sinr)
-        if sinr > 5:
-            sinr_status, sinr_label = "green", "Good"
-        elif sinr >= 0:
-            sinr_status, sinr_label = "amber", "Moderate"
-        else:
-            sinr_status, sinr_label = "red", "Weak"
-    else:
-        sinr_status, sinr_label = "unknown", "Not detected"
-
-    # Determine busy hours (9-11 AM or 6-9 PM local time)
-    from datetime import datetime as dt
-    now = dt.now()
-    current_hour = now.hour
-    is_busy_hour = (9 <= current_hour < 11) or (18 <= current_hour < 21)
-
-    # Overall signal judgment
-    statuses = [s for s in [rsrp_status, sinr_status] if s != "unknown"]
-    if not statuses:
-        overall = "unknown"
-        overall_label = "Unable to determine signal quality"
-    elif any(s == "red" for s in statuses):
-        overall = "red"
-        overall_label = "Poor"
-    elif any(s == "amber" for s in statuses):
-        overall = "amber"
-        overall_label = "Moderate"
-    else:
-        overall = "green"
-        overall_label = "Good"
-
-    # Build summary message
-    if overall == "green":
-        summary = "Your signal strength is good. You should have stable connectivity in your area."
-    elif overall == "amber":
-        summary = "Your signal strength is moderate. You may experience occasional slowdowns or drops."
-    elif overall == "red":
-        summary = "Your signal strength is poor. This is likely causing the connectivity issues you're experiencing."
-    else:
-        summary = "We could not fully determine your signal quality from the screenshot."
-
-    if is_busy_hour:
-        summary += (
-            f" Note: You are currently in peak network hours ({now.strftime('%I:%M %p')}). "
-            "Network congestion during 9-11 AM and 6-9 PM can further degrade signal quality and speeds."
-        )
-
-    return {
-        "rsrp": rsrp,
-        "rsrp_status": rsrp_status,
-        "rsrp_label": rsrp_label,
-        "sinr": sinr,
-        "sinr_status": sinr_status,
-        "sinr_label": sinr_label,
-        "cell_id": str(cell_id) if cell_id is not None else None,
-        "overall_status": overall,
-        "overall_label": overall_label,
-        "is_busy_hour": is_busy_hour,
-        "summary": summary,
-    }
 
 
 def generate_ref_number():
@@ -1391,6 +584,11 @@ def auto_assign_priority(query_text, subprocess_name):
         return "medium"
     return "low"
 
+
+
+
+# Broadband routes (/api/broadband/*) are registered via broadband_prompts.register_routes(app)
+# See broadband_prompts.py
 
 
 
@@ -1526,6 +724,11 @@ def resolve_step():
     original_query = data.get("original_query", "")
     diagnosis_summary = data.get("diagnosis_summary", "")
 
+    # Broadband diagnostic context — passed from frontend when billing/connection
+    # check results are available (stored in bb_* columns on chat_sessions)
+    billing_context = data.get("billing_context", None)
+    connection_context = data.get("connection_context", None)
+
     sector = TELECOM_MENU.get(sector_key, {})
     sector_name = sector.get("name", "Telecom")
     subprocess_name = selected_subprocess or get_subprocess_name(sector_key, subprocess_key)
@@ -1547,6 +750,9 @@ def resolve_step():
         attempt=attempt,
         original_query=original_query,
         diagnosis_summary=diagnosis_summary,
+        sector_key=sector_key,
+        billing_context=billing_context,
+        connection_context=connection_context,
     )
     return jsonify({
         "resolution": solution,
@@ -4898,526 +4104,13 @@ def agent_create_parameter_change(ticket_id):
     return jsonify(change.to_dict()), 201
 
 
-@app.route("/api/agent/tickets/<int:ticket_id>/diagnose", methods=["POST"])
-@jwt_required()
-def agent_diagnose_ticket(ticket_id):
-    """Use AI to generate a diagnosis/recommendation for resolving this ticket."""
-    user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
-    if not user or user.role != "human_agent":
-        return jsonify({"error": "Unauthorized"}), 403
-
-    ticket = db.session.get(Ticket, ticket_id)
-    if not ticket:
-        return jsonify({"error": "Ticket not found"}), 404
-
-    session = db.session.get(ChatSession, ticket.chat_session_id) if ticket.chat_session_id else None
-    chat_history = ""
-    if session:
-        msgs = session.messages[:20]  # Last 20 messages for context
-        chat_history = "\n".join(f"{m.sender.upper()}: {m.content}" for m in msgs)
-
-    prompt = f"""You are an expert telecom support engineer. A human agent needs your help diagnosing and resolving a customer complaint.
-
-TICKET DETAILS:
-- Reference: {ticket.reference_number}
-- Category: {ticket.category}
-- Sub-category: {ticket.subcategory}
-- Priority: {ticket.priority.upper()}
-- Customer Issue: {ticket.description}
-
-CHAT HISTORY (between customer and AI chatbot):
-{chat_history if chat_history else 'No chat history available.'}
-
-Please provide:
-1. **Root Cause Analysis** - What is likely causing this issue?
-2. **Recommended Steps** - Specific step-by-step resolution actions for the agent
-3. **Escalation Criteria** - When should this be escalated further?
-4. **Resolution Time Estimate** - Expected time to resolve
-5. **Customer Communication** - What to tell the customer
-
-Keep your response concise and actionable."""
-
-    try:
-        response = client.chat.completions.create(
-            model=DEPLOYMENT_NAME,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.3,
-            max_tokens=800,
-        )
-        diagnosis = response.choices[0].message.content.strip()
-    except Exception as e:
-        diagnosis = _friendly_ai_error(e)
-
-    return jsonify({"diagnosis": diagnosis, "ticket_id": ticket_id})
-
-
-# ── Network Diagnosis: Nearest Sites ─────────────────────────────────────────
-
-@app.route("/api/agent/tickets/<int:ticket_id>/nearest-sites", methods=["GET"])
-@jwt_required()
-def agent_nearest_sites(ticket_id):
-    """Find 3 nearest telecom sites to customer's location."""
-    user = db.session.get(User, int(get_jwt_identity()))
-    if not user or user.role != "human_agent":
-        return jsonify({"error": "Unauthorized"}), 403
-
-    ticket = db.session.get(Ticket, ticket_id)
-    if not ticket:
-        return jsonify({"error": "Ticket not found"}), 404
-
-    session = db.session.get(ChatSession, ticket.chat_session_id) if ticket.chat_session_id else None
-    if not session or not session.latitude or not session.longitude:
-        return jsonify({"error": "Customer location not available"}), 400
-
-    cust_lat, cust_lng = session.latitude, session.longitude
-    ranked = find_nearest_sites(cust_lat, cust_lng, n=3)
-    if not ranked:
-        return jsonify({"error": "No Excel site data available for nearest-site lookup."}), 400
-
-    return jsonify({
-        "customer": {"latitude": cust_lat, "longitude": cust_lng},
-        "nearest_sites": ranked,
-    })
-
-
-def _detect_significant_drops(trend_data: list, drop_threshold_pct: float = 15.0):
-    """
-    Detect significant drops (or spikes) in a KPI trend list.
-    Returns a list of {label, value, drop_pct, type} for highlighted points.
-    A 'significant drop' is where the avg falls >=threshold% below the rolling baseline
-    (mean of all previous points). Also detects spikes (sharp increases) for metrics
-    like latency/packet_loss where a spike is bad.
-    """
-    if len(trend_data) < 3:
-        return []
-
-    drops = []
-    all_avgs = [p["avg"] for p in trend_data if p["avg"] is not None]
-    if not all_avgs:
-        return []
-
-    overall_mean = sum(all_avgs) / len(all_avgs)
-    if overall_mean == 0:
-        return []
-
-    for i, point in enumerate(trend_data):
-        val = point.get("avg")
-        if val is None:
-            continue
-        # Build baseline from preceding points (at least 2)
-        if i < 2:
-            continue
-        prev_vals = [trend_data[j]["avg"] for j in range(i) if trend_data[j]["avg"] is not None]
-        if not prev_vals:
-            continue
-        baseline = sum(prev_vals) / len(prev_vals)
-        if baseline == 0:
-            continue
-        pct_change = (val - baseline) / baseline * 100
-        if pct_change <= -drop_threshold_pct:
-            drops.append({
-                "label": point["label"],
-                "value": val,
-                "drop_pct": round(pct_change, 1),
-                "type": "drop",
-            })
-        elif pct_change >= drop_threshold_pct * 2:
-            # Spikes are reported for latency-like KPIs (positive = bad)
-            drops.append({
-                "label": point["label"],
-                "value": val,
-                "drop_pct": round(pct_change, 1),
-                "type": "spike",
-            })
-    return drops
-
-
-@app.route("/api/agent/sites/<site_id>/kpi-trends", methods=["GET"])
-@jwt_required()
-def agent_kpi_trends(site_id):
-    """Get KPI trend data for a site, aggregated by period (month/week/day/hour).
-    Supports data_level filter: 'site' or 'cell'."""
-    user = db.session.get(User, int(get_jwt_identity()))
-    if not user or user.role != "human_agent":
-        return jsonify({"error": "Unauthorized"}), 403
-
-    period = request.args.get("period", "day")
-    data_level = request.args.get("data_level", "site")
-    ticket_id = request.args.get("ticket_id", type=int)
-
-    problem_type = "internet_signal"
-    if ticket_id:
-        ticket = db.session.get(Ticket, ticket_id)
-        if ticket:
-            problem_type = _detect_network_problem_type(ticket)
-
-    query = KpiData.query.filter_by(site_id=site_id, data_level=data_level)
-    kpi_rows = query.all()
-
-    if not kpi_rows:
-        return jsonify({"error": f"No {data_level}-level KPI data found for site {site_id}"}), 404
-
-    from collections import defaultdict
-    kpi_groups = defaultdict(list)
-    for r in kpi_rows:
-        kpi_groups[r.kpi_name].append(r)
-
-    selected_kpis = _filter_kpi_names_for_problem(kpi_groups.keys(), problem_type)
-
-    result = {}
-    for kpi_name in selected_kpis:
-        rows = kpi_groups.get(kpi_name, [])
-        if not rows:
-            continue
-        agg = defaultdict(list)
-        has_hour_variation = any((r.hour or 0) != 0 for r in rows)
-        for r in rows:
-            if r.value is None:
-                continue
-            if period == "month":
-                key = r.date.strftime("%Y-%m")
-            elif period == "week":
-                key = f"{r.date.isocalendar()[0]}-W{r.date.isocalendar()[1]:02d}"
-            elif period == "hour":
-                # If no true hourly data exists, fall back to daily key so chart still renders.
-                key = f"{r.hour:02d}:00" if has_hour_variation else r.date.strftime("%Y-%m-%d")
-            else:  # day
-                key = r.date.strftime("%Y-%m-%d")
-            agg[key].append(r.value)
-
-        trend = []
-        for key in sorted(agg.keys()):
-            vals = agg[key]
-            trend.append({
-                "label": key,
-                "avg": round(sum(vals) / len(vals), 4),
-                "min": round(min(vals), 4),
-                "max": round(max(vals), 4),
-            })
-        if trend:
-            result[kpi_name] = trend
-
-    # Build significant_drops map separately — trends keeps flat array format for frontend compat
-    drops_map = {}
-    for kpi_name, trend_data in result.items():
-        drops = _detect_significant_drops(trend_data)
-        if drops:
-            drops_map[kpi_name] = drops
-
-    return jsonify({
-        "site_id": site_id,
-        "period": period,
-        "data_level": data_level,
-        "problem_type": _problem_type_label(problem_type),
-        "selected_kpis": selected_kpis,
-        "trends": result,
-        "significant_drops": drops_map,
-    })
-
-
-@app.route("/api/agent/tickets/<int:ticket_id>/root-cause", methods=["POST"])
-@jwt_required()
-def agent_root_cause(ticket_id):
-    """AI root cause analysis using both site-level and cell-level KPI trends of the nearest site."""
-    user = db.session.get(User, int(get_jwt_identity()))
-    if not user or user.role != "human_agent":
-        return jsonify({"error": "Unauthorized"}), 403
-
-    ticket = db.session.get(Ticket, ticket_id)
-    if not ticket:
-        return jsonify({"error": "Ticket not found"}), 404
-
-    session = db.session.get(ChatSession, ticket.chat_session_id) if ticket.chat_session_id else None
-    if not session or not session.latitude or not session.longitude:
-        return jsonify({"error": "Customer location not available"}), 400
-
-    # Find nearest site from Excel-backed site data
-    nearest_list = find_nearest_sites(session.latitude, session.longitude, n=1)
-    if not nearest_list:
-        return jsonify({"error": "No Excel site data available for nearest-site lookup."}), 400
-    nearest = nearest_list[0]
-    nearest_site_id = nearest["site_id"]
-    nearest_zone = nearest.get("zone")
-    dist_km = nearest["distance_km"]
-    site_status = (nearest.get("site_status") or nearest.get("status") or "on_air").lower()
-    alarms_text = nearest.get("alarms") or nearest.get("alarm") or "None"
-    solution_text = nearest.get("solution") or "No action required"
-    std_solution_text = nearest.get("standard_solution_step") or ""
-    site_params_text = "\n".join([
-        f"- Bandwidth (MHz): {nearest.get('bandwidth_mhz')}",
-        f"- Antenna Gain (dBi): {nearest.get('antenna_gain_dbi')}",
-        f"- RF Power (EIRP) [dBm]: {nearest.get('rf_power_eirp_dbm')}",
-        f"- Antenna height (AGL) (M): {nearest.get('antenna_height_agl_m')}",
-        f"- E-tilt (Degree): {nearest.get('e_tilt_degree')}",
-        f"- CRS Gain: {nearest.get('crs_gain')}",
-    ])
-
-    problem_type = _detect_network_problem_type(ticket)
-    problem_type_label = _problem_type_label(problem_type)
-
-    site_rows = KpiData.query.filter_by(site_id=nearest_site_id, data_level="site").all()
-    cell_rows = KpiData.query.filter_by(site_id=nearest_site_id, data_level="cell").all()
-    all_kpis = {r.kpi_name for r in site_rows + cell_rows}
-    selected_kpis = _filter_kpi_names_for_problem(all_kpis, problem_type)
-
-    site_kpi_text = _build_kpi_summary_text(site_rows, selected_kpis, "site-level")
-    cell_kpi_text = _build_kpi_summary_text(cell_rows, selected_kpis, "cell-level")
-
-    if site_status == "off_air":
-        prompt = f"""You are a senior telecom network engineer performing root cause analysis.
-
-TICKET: {ticket.reference_number} — {ticket.category} / {ticket.subcategory}
-CUSTOMER REPORTED ISSUE: {ticket.description}
-PROBLEM TYPE: {problem_type_label}
-NEAREST SITE: {nearest_site_id} (Zone: {nearest_zone}, Distance: {dist_km} km from customer)
-
-=== SITE STATUS: OFF AIR ===
-This site is currently down. Root cause analysis must integrate:
-(1) The active alarms that caused/indicate the outage.
-(2) The standard solution steps.
-(3) Trend evidence from the KPIs most directly related to {problem_type_label} — use actual values.
-
-ACTIVE ALARMS:
-{alarms_text if alarms_text else 'No alarm data available.'}
-
-KNOWN SOLUTION:
-{solution_text if solution_text else 'No solution data available.'}
-
-STANDARD SOLUTION STEP:
-{std_solution_text if std_solution_text else 'No standard solution steps available.'}
-
-SITE RF PARAMETERS (NEAREST SITE):
-{site_params_text}
-
-SITE-LEVEL KPI TREND DATA (only {problem_type_label}-related KPIs: {", ".join(selected_kpis) if selected_kpis else "none matched"}):
-{site_kpi_text if site_kpi_text else 'No site-level KPI data available.'}
-
-CELL-LEVEL KPI TREND DATA:
-{cell_kpi_text if cell_kpi_text else 'No cell-level KPI data available.'}
-
-INSTRUCTIONS:
-- Write exactly 4–5 numbered points.
-- Format: **Concise Title**: One or two sentences with specific technical evidence.
-- Each point must be about a DIFFERENT aspect of the root cause.
-- Point 1: State the primary root cause linking the alarm to the {problem_type_label} degradation with a specific KPI value.
-- Point 2: Describe what the KPI trend shows just before/during the outage and the magnitude of the drop.
-- Point 3: Explain the RF/parameter context (use actual values from site parameters) and how they contribute.
-- Point 4: Link the alarm's standard solution step to the expected KPI recovery.
-- Point 5 (if needed): Describe secondary impact on adjacent cells/sectors visible in cell-level KPI trends.
-- Use actual numbers from the KPI data. Do NOT use vague language.
-- Do not add headings, summaries, or extra sections."""
-    else:
-        prompt = f"""You are a senior telecom network engineer performing root cause analysis.
-
-TICKET: {ticket.reference_number} — {ticket.category} / {ticket.subcategory}
-CUSTOMER REPORTED ISSUE: {ticket.description}
-PROBLEM TYPE: {problem_type_label}
-NEAREST SITE: {nearest_site_id} (Zone: {nearest_zone}, Distance: {dist_km} km from customer)
-
-=== SITE STATUS: ON AIR ===
-Perform root cause analysis based entirely on KPI trend evidence.
-You MUST use the actual KPI values (avg, min, max, period) provided below to explain what is happening.
-Focus only on the KPI families directly relevant to {problem_type_label}: {", ".join(selected_kpis) if selected_kpis else "none matched"}.
-
-SITE RF PARAMETERS (NEAREST SITE):
-{site_params_text}
-
-SITE-LEVEL KPI TREND DATA:
-{site_kpi_text if site_kpi_text else 'No site-level KPI data available.'}
-
-CELL-LEVEL KPI TREND DATA:
-{cell_kpi_text if cell_kpi_text else 'No cell-level KPI data available.'}
-
-INSTRUCTIONS:
-- Write exactly 4–5 numbered points.
-- Format: **Concise Title**: One or two sentences with specific technical evidence.
-- Each point must be about a DIFFERENT degradation factor contributing to the {problem_type_label} problem.
-- Point 1: Identify the PRIMARY degraded KPI, state its recent value vs. baseline (use actual numbers), and explain what network condition this reflects.
-- Point 2: Identify the SECONDARY degraded KPI, state values, and explain the chain of impact to the customer's {problem_type_label} problem.
-- Point 3: Analyze the RF parameter context (bandwidth, E-tilt, EIRP, antenna height, CRS gain) and how the current values may be amplifying the KPI degradation.
-- Point 4: Describe the temporal pattern (when did the degradation start, is it continuous or intermittent, peak hours vs. off-peak) using the trend data.
-- Point 5 (if needed): Note any cell-level vs. site-level discrepancy that narrows the fault to a specific cell or sector.
-- Be precise: use actual KPI values from the data. Do NOT write generic statements.
-- Do not add headings, summaries, or extra sections."""
-
-    try:
-        response = client.chat.completions.create(
-            model=DEPLOYMENT_NAME,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-            max_tokens=1500,
-        )
-        analysis_raw = response.choices[0].message.content.strip()
-        cleaned_lines = _filter_rca_lines(_normalize_ai_lines(analysis_raw))
-        fallback_rca = []
-        if site_status == "off_air":
-            fallback_rca.append(
-                f"**Site Outage**: Nearest site {nearest_site_id} is OFF AIR; alarms indicate outage as the primary cause."
-            )
-        fallback_rca += _kpi_degradation_points(site_rows + cell_rows, selected_kpis, max_points=3)
-        # Ensure at least 4 fallback points so UI always shows full analysis
-        if len(fallback_rca) < 4:
-            fallback_rca += [
-                f"**KPI Evidence**: Trend shifts across {problem_type_label}-related KPIs indicate measurable degradation during the reported window.",
-                "**Correlation**: Site-level and cell-level KPI movement aligns with the customer's symptom timeline.",
-                "**Impact Scope**: Degradation appears localized to the nearest site/cells based on trend evidence.",
-                "**Next Check**: Validate alarms and RF parameters for contributing factors if KPI evidence is weak.",
-            ]
-            fallback_rca = fallback_rca[:4]
-        if not fallback_rca:
-            fallback_rca = [
-                f"**KPI Evidence**: KPI shifts around the degradation window indicate network-side impact on {problem_type_label}.",
-                "**Correlation**: Site and cell KPI movement align with the customer’s symptom window.",
-                "**Impact Scope**: The degradation is localized to the nearest site/cells based on trend evidence.",
-                "**Actionable Cause**: Prioritize the KPI paths with the largest deviation from baseline.",
-            ]
-        analysis_text = "\n".join(cleaned_lines) if cleaned_lines else ""
-        analysis = _force_numbered_points(
-            analysis_text,
-            min_points=4,
-            max_points=5,
-            fallback_points=fallback_rca,
-        )
-    except Exception as e:
-        fallback_rca = _kpi_degradation_points(site_rows + cell_rows, selected_kpis, max_points=4)
-        if not fallback_rca:
-            fallback_rca = [
-                f"**Model Error**: Root cause analysis could not be generated automatically: {str(e)}.",
-                f"**KPI Evidence**: Review KPI shifts for {problem_type_label} and isolate the largest deviations.",
-                "**Correlation**: Correlate degraded cell indicators with site KPIs to confirm the fault domain.",
-                "**Next Check**: Validate alarms and site status if KPI evidence is weak.",
-            ]
-        analysis = _force_numbered_points(
-            "\n".join(fallback_rca),
-            min_points=4,
-            max_points=5,
-            fallback_points=fallback_rca,
-        )
-
-    # Generate PDF-friendly version (plain text, no markdown)
-    analysis_pdf = _format_points_for_pdf(analysis)
-
-    return jsonify({
-        "analysis": analysis,
-        "analysis_pdf": analysis_pdf,
-        "site_id": nearest_site_id,
-        "site_zone": nearest_zone,
-        "site_status": site_status,
-        "distance_km": dist_km,
-        "problem_type": problem_type_label,
-        "selected_kpis": selected_kpis,
-    })
-
-
-@app.route("/api/agent/tickets/<int:ticket_id>/recommendation", methods=["POST"])
-@jwt_required()
-def agent_recommendation(ticket_id):
-    """AI recommendation based on root cause analysis and full trend analysis."""
-    user = db.session.get(User, int(get_jwt_identity()))
-    if not user or user.role != "human_agent":
-        return jsonify({"error": "Unauthorized"}), 403
-
-    ticket = db.session.get(Ticket, ticket_id)
-    if not ticket:
-        return jsonify({"error": "Ticket not found"}), 404
-
-    session = db.session.get(ChatSession, ticket.chat_session_id) if ticket.chat_session_id else None
-    nearest = None
-    if session and session.latitude and session.longitude:
-        nearest_list = find_nearest_sites(session.latitude, session.longitude, n=1)
-        if nearest_list:
-            nearest = nearest_list[0]
-
-    root_cause = request.json.get("root_cause", "") if request.json else ""
-    trend_summary = request.json.get("trend_summary", "") if request.json else ""
-    problem_type = _problem_type_label(_detect_network_problem_type(ticket))
-
-    site_context = "Nearest site data not available."
-    if nearest:
-        site_context = "\n".join([
-            f"NEAREST SITE: {nearest.get('site_id')} (Zone: {nearest.get('zone')}, Distance: {nearest.get('distance_km')} km)",
-            f"SITE STATUS: {(nearest.get('site_status') or 'on_air')}",
-            "SITE PARAMETERS:",
-            f"- Bandwidth (MHz): {nearest.get('bandwidth_mhz')}",
-            f"- Antenna Gain (dBi): {nearest.get('antenna_gain_dbi')}",
-            f"- RF Power (EIRP) [dBm]: {nearest.get('rf_power_eirp_dbm')}",
-            f"- Antenna height (AGL) (M): {nearest.get('antenna_height_agl_m')}",
-            f"- E-tilt (Degree): {nearest.get('e_tilt_degree')}",
-            f"- CRS Gain: {nearest.get('crs_gain')}",
-        ])
-
-    prompt = f"""You are a senior telecom network optimization engineer providing precise, actionable field recommendations.
-
-TICKET: {ticket.reference_number} — {ticket.category} / {ticket.subcategory}
-CUSTOMER REPORTED ISSUE: {ticket.description}
-PRIORITY: {ticket.priority.upper()}
-PROBLEM TYPE: {problem_type}
-
-{site_context}
-
-=== TREND ANALYSIS EVIDENCE ===
-{trend_summary if trend_summary else 'No trend analysis summary available.'}
-
-=== ROOT CAUSE ANALYSIS FINDINGS ===
-{root_cause if root_cause else 'No root cause analysis available.'}
-
-=== INSTRUCTIONS ===
-Generate exactly 4–5 numbered recommendations. Format: **Action Title**: 2–3 sentences.
-
-Rules:
-1. Each recommendation must directly address a specific finding from the Root Cause Analysis.
-2. At least 3 recommendations MUST use the exact current site parameter values above and propose a CONCRETE target value (e.g., "Increase E-tilt from 3° to 5°", "Raise EIRP from 42 dBm to 44 dBm").
-3. One recommendation may leverage broader telecom best-practices or OpenAI knowledge (e.g., neighbor cell optimization, scheduler tuning, load balancing) beyond the listed parameters.
-4. State the EXPECTED OUTCOME for each recommendation (which KPI will improve, by how much approximately).
-5. Prioritize recommendations by impact — most impactful first.
-6. Be precise: do not say "consider adjusting" — say "adjust X from Y to Z to achieve W".
-7. Do not repeat the root cause. Focus only on the fix and its expected outcome.
-8. Do not add headings, summaries, preambles, or extra sections."""
-
-    try:
-        response = client.chat.completions.create(
-            model=DEPLOYMENT_NAME,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-            max_tokens=1500,
-        )
-        recommendation_raw = response.choices[0].message.content.strip()
-
-        # Always use the AI response directly if it contains meaningful content.
-        # Only fall back to parameter-based builder if AI returns empty/garbage.
-        if recommendation_raw and len(recommendation_raw) > 80:
-            recommendation = _force_numbered_points(
-                recommendation_raw,
-                min_points=4,
-                max_points=5,
-                fallback_points=_build_parameter_recommendations(problem_type, root_cause, trend_summary, nearest or {}),
-            )
-        else:
-            fallback_points = _build_parameter_recommendations(problem_type, root_cause, trend_summary, nearest or {})
-            recommendation = _force_numbered_points(
-                "\n".join(fallback_points),
-                min_points=4,
-                max_points=5,
-                fallback_points=fallback_points,
-            )
-    except Exception as e:
-        fallback_points = _build_parameter_recommendations(problem_type, root_cause, trend_summary, nearest or {})
-        fallback_points.insert(0, f"**Model Error**: Recommendation generation failed: {str(e)}; proceeding with RCA-linked parameter actions.")
-        recommendation = _force_numbered_points(
-            "\n".join(fallback_points),
-            min_points=4,
-            max_points=5,
-            fallback_points=fallback_points,
-        )
-
-    # Generate PDF-friendly version (plain text, no markdown)
-    recommendation_pdf = _format_points_for_pdf(recommendation)
-
-    return jsonify({
-        "recommendation": recommendation,
-        "recommendation_pdf": recommendation_pdf,
-    })
+# ── Network diagnosis routes (delegated to network_diagnosis.py) ──────────────
+# /api/agent/tickets/:id/diagnose
+# /api/agent/tickets/:id/nearest-sites
+# /api/agent/sites/:site_id/kpi-trends
+# /api/agent/tickets/:id/root-cause
+# /api/agent/tickets/:id/recommendation
+# All registered via network_diagnosis.register_routes(app) at startup.
 
 @app.route("/api/agent/customer360/<int:customer_user_id>", methods=["GET"])
 @jwt_required()
