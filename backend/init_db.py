@@ -1,5 +1,5 @@
 from app import app, db
-from models import User, SystemSetting
+from models import User, SystemSetting, BillingAccount
 
 with app.app_context():
     # Create all tables
@@ -11,6 +11,7 @@ with app.app_context():
     print("   - tickets")
     print("   - system_settings")
     print("   - feedbacks")
+    print("   - billing_accounts")
 
     # Create Admin user
     if not User.query.filter_by(email="admin@telecom.com").first() and \

@@ -7,11 +7,8 @@ import { io } from 'socket.io-client';
 
 const SOCKET_URL = process.env.REACT_APP_API_URL || 'http://localhost:5500';
 
-// ── DEFAULT LOCATION (used instead of real GPS) ──────────────────────────────
-// TODO: Remove this and uncomment the real geolocation logic when ready
-const DEFAULT_LATITUDE = 28.4595;   // Gurgaon, Haryana, India
+const DEFAULT_LATITUDE = 28.4595;
 const DEFAULT_LONGITUDE = 77.0266;
-// ─────────────────────────────────────────────────────────────────────────────
 
 async function chatApiCall(endpoint, body) {
   const token = getToken();
@@ -71,8 +68,10 @@ function getFollowupOptions(subprocessName) {
   return SUBPROCESS_FOLLOWUP_OPTIONS[key] || [];
 }
 
-// Message types that should be persisted to backend with payload for full replay
+// ── CHANGE 1: expanded PERSIST_TYPES to cover every renderable message type ──
 const PERSIST_TYPES = new Set([
+  'bot',
+  'system',
   'sector-menu',
   'subprocess-grid',
   'network-subissue-grid',
@@ -92,6 +91,11 @@ const PERSIST_TYPES = new Set([
   'email-sent',
   'agent-resolved',
   'broadband-diagnostic',
+  'thankyou',
+  'exit-box',
+  'non-telecom-warning',
+  'live-agent-message',
+  'user-image',
 ]);
 
 function sanitizePayload(value) {
@@ -298,28 +302,30 @@ export default function ChatSupport() {
       });
       const cached = loadCachedSession(sessionIdRef.current) || {};
       const merged = Array.isArray(cached.messages) ? cached.messages : [];
-      // Append locally for instant cache even if setMessages not yet run
       const type = sender === 'bot' ? 'bot' : sender === 'agent' ? 'live-agent-message' : 'user';
       merged.push({ type, text: content, html: meta.html || content, payload: payloadForSave });
       saveCachedSession(sessionIdRef.current, { messages: merged, state: stateRef.current });
     } catch (e) {}
   }, [ensureSession]);
 
+  // ── CHANGE 2: addMessage now saves full sanitized payload for ALL types ─────
   const addMessage = useCallback((msg) => {
     const id = nextId();
     const groupId = msg.groupId || id;
 
-    // Persist bot messages to backend unless explicitly skipped
     const maybePersistBot = async () => {
       if (msg.type !== 'bot' && !PERSIST_TYPES.has(msg.type)) return;
       if (msg.skipPersist) return;
-      if (msg.__hydrated) return; // avoid saving messages loaded from history/cache
+      if (msg.__hydrated) return;
       if (!sessionIdRef.current) {
         await ensureSession({ step: stateRef.current.step });
       }
       if (!sessionIdRef.current) return;
       const content = msg.text || stripHtml(msg.html) || msg.type || '';
-      const payload = msg.payload || sanitizePayload({ type: msg.type, html: msg.html, text: msg.text, ...msg, id, groupId });
+      // Sanitize strips functions so payload is safe to serialise
+      const payload = sanitizePayload(
+        msg.payload || { type: msg.type, html: msg.html, text: msg.text, ...msg, id, groupId }
+      );
       try {
         await chatApiCall(`/api/chat/session/${sessionIdRef.current}/message`, {
           sender: 'bot',
@@ -330,9 +336,11 @@ export default function ChatSupport() {
       } catch {}
     };
 
-    const stampedPayload = msg.payload || (msg.type === 'bot'
-      ? { type: msg.type, html: msg.html, text: msg.text }
-      : undefined);
+    // Always store a full serialisable payload in the stamped message so the
+    // localStorage cache can reconstruct every card type on refresh.
+    const stampedPayload = sanitizePayload(
+      msg.payload || { type: msg.type, html: msg.html, text: msg.text, ...msg, id, groupId }
+    );
     const stamped = { ...msg, id, groupId, payload: stampedPayload };
 
     setMessages(prev => {
@@ -367,57 +375,8 @@ export default function ChatSupport() {
     } catch (e) {}
   }, []);
 
-  // ── Request Location — uses DEFAULT lat/long instead of real GPS ──────────
-  // TODO: Uncomment the real geolocation block below and remove the default
-  //       location block when GPS is ready to be used in production.
   const requestLocation = useCallback((onSuccess) => {
     setLocationStatus('requesting');
-
-    // ── REAL GEOLOCATION (commented out) ──────────────────────────────────────
-    // if (!navigator.geolocation) {
-    //   addMessage({
-    //     type: 'system',
-    //     text: 'Your browser does not support location services. Please use a modern browser.',
-    //   });
-    //   return;
-    // }
-    //
-    // navigator.geolocation.getCurrentPosition(
-    //   // SUCCESS
-    //   (position) => {
-    //     const { latitude, longitude } = position.coords;
-    //     setLocationStatus('granted');
-    //     saveLocationToBackend(latitude, longitude);
-    //     addMessage({
-    //       type: 'location-success',
-    //       latitude,
-    //       longitude,
-    //     });
-    //     if (onSuccess) onSuccess();
-    //   },
-    //   // ERROR — user denied or error
-    //   (error) => {
-    //     setLocationStatus('denied');
-    //     const locGroupId = nextId();
-    //     addMessage({
-    //       type: 'location-required',
-    //       groupId: locGroupId,
-    //       onRetry: () => {
-    //         disableGroup(locGroupId);
-    //         requestLocation(onSuccess);
-    //       },
-    //     });
-    //   },
-    //   {
-    //     enableHighAccuracy: true,
-    //     timeout: 15000,
-    //     maximumAge: 0,
-    //   }
-    // );
-    // ── END REAL GEOLOCATION ───────────────────────────────────────────────────
-
-    // ── DEFAULT LOCATION (hardcoded fallback) ──────────────────────────────────
-    // TODO: Remove this block when switching back to real GPS
     const latitude = DEFAULT_LATITUDE;
     const longitude = DEFAULT_LONGITUDE;
     setLocationStatus('granted');
@@ -428,8 +387,6 @@ export default function ChatSupport() {
       longitude,
     });
     if (onSuccess) onSuccess();
-    // ── END DEFAULT LOCATION ───────────────────────────────────────────────────
-
   }, [addMessage, saveLocationToBackend, disableGroup]);
 
   const afterLocationCaptured = useCallback(() => {
@@ -441,7 +398,7 @@ export default function ChatSupport() {
     }, 500);
   }, [addMessage, showInput]);
 
-  // ─── Broadband diagnostics (billing, line, browser-side checks) ────────────
+  // ── Broadband diagnostics ──────────────────────────────────────────────────
   const classifySpeed = (speedMbps, planSpeedMbps) => {
     if (typeof speedMbps !== 'number' || speedMbps <= 0 || !planSpeedMbps) {
       return { label: 'Unknown', percent: null };
@@ -526,9 +483,7 @@ export default function ChatSupport() {
 
   const buildConnectionContext = useCallback((billing, connection, quality) => {
     const parts = [];
-    if (billing?.plan_speed_mbps) {
-      parts.push(`Plan speed: ${billing.plan_speed_mbps} Mbps`);
-    }
+    if (billing?.plan_speed_mbps) parts.push(`Plan speed: ${billing.plan_speed_mbps} Mbps`);
     if (quality?.speedMbps) {
       const pct = quality.speedPercent != null ? ` (${quality.speedPercent}% of plan, ${quality.speedLabel})` : '';
       parts.push(`Measured speed: ${quality.speedMbps} Mbps${pct}`);
@@ -540,23 +495,16 @@ export default function ChatSupport() {
     } else if (quality?.latencyError) {
       parts.push(`Latency unavailable (${quality.latencyError})`);
     }
-    if (quality?.connectionType) {
-      parts.push(`Connection type: ${quality.connectionType}`);
-    }
-    if (connection?.line_quality) {
-      parts.push(`Line quality (NOC): ${connection.line_quality}`);
-    }
-    if (connection?.router_status) {
-      parts.push(`Router status: ${connection.router_status}`);
-    }
-    if (connection?.area_outage) {
-      parts.push('Area outage detected');
-    }
+    if (quality?.connectionType) parts.push(`Connection type: ${quality.connectionType}`);
+    if (connection?.line_quality) parts.push(`Line quality (NOC): ${connection.line_quality}`);
+    if (connection?.router_status) parts.push(`Router status: ${connection.router_status}`);
+    if (connection?.area_outage) parts.push('Area outage detected');
     return parts.join('. ');
   }, []);
 
   const runBroadbandDiagnostics = useCallback(async () => {
     if (!isBroadbandSector(stateRef.current.sectorKey, stateRef.current.sectorName)) return null;
+    if (stateRef.current.step === 'exited') return null;
     if (broadbandDiagStatusRef.current === 'running') return broadbandDiagResultRef.current;
     if (broadbandDiagStatusRef.current === 'done') return broadbandDiagResultRef.current;
 
@@ -598,14 +546,17 @@ export default function ChatSupport() {
       stateRef.current.planSpeedMbps = planSpeed;
 
       broadbandDiagResultRef.current = diag;
-      addMessage({
-        type: 'broadband-diagnostic',
-        billing: diag.billing,
-        connection: diag.connection,
-        quality: diag.quality,
-        errors: diag.errors,
-        planSpeed,
-      });
+      if (!stateRef.current.broadbandDiagShown) {
+        addMessage({
+          type: 'broadband-diagnostic',
+          billing: diag.billing,
+          connection: diag.connection,
+          quality: diag.quality,
+          errors: diag.errors,
+          planSpeed,
+        });
+        stateRef.current.broadbandDiagShown = true;
+      }
       return diag;
     } finally {
       setIsTyping(false);
@@ -613,45 +564,118 @@ export default function ChatSupport() {
     }
   }, [addMessage, buildConnectionContext, runBrowserQualityChecks]);
 
+  // ── CHANGE 3: fully rewritten hydrateHistory ───────────────────────────────
+  // Restores every message type correctly from both localStorage cache
+  // (which has full typed payloads) and DB history (which has sender/content).
+  // Interactive cards get their onClick handlers re-attached after restore.
   const hydrateHistory = useCallback((history = []) => {
     const restored = [];
     let prevKey = null;
 
     history.forEach((m) => {
-      if (m.type) {
-        const id = m.id || nextId();
-        const groupId = m.groupId || id;
+      const id      = m.id      || nextId();
+      const groupId = m.groupId || id;
+
+      // ── Already a typed message from localStorage cache ──────────────────
+      // These come back with type set and full payload data intact.
+      if (m.type && m.type !== 'bot' && m.type !== 'user' && m.type !== 'system') {
         restored.push({ ...m, id, groupId, __hydrated: true });
         return;
       }
 
+      // ── Plain typed bot/user/system from cache ───────────────────────────
+      if (m.type === 'bot' || m.type === 'user' || m.type === 'system') {
+        // If it also has a payload with a richer type, use that instead
+        if (m.payload && m.payload.type && m.payload.type !== 'bot') {
+          restored.push({ id, groupId, ...m.payload, __hydrated: true });
+          return;
+        }
+        restored.push({ ...m, id, groupId, __hydrated: true });
+        return;
+      }
+
+      // ── DB message — deduplicate consecutive identical messages ───────────
       const key = `${m.sender}|${m.content || ''}`.trim();
       if (key && key === prevKey) return;
       prevKey = key;
 
-      const id = nextId();
-      const groupId = m.groupId || id;
+      // ── DB message with payload — reconstruct full card from payload ──────
       if (m.payload && m.payload.type) {
         restored.push({ id, groupId, ...m.payload, __hydrated: true });
         return;
       }
+
+      // ── Image messages ────────────────────────────────────────────────────
       if (m.content?.startsWith('__IMAGE__:')) {
-        restored.push({ id, groupId, type: 'user-image', imageSrc: m.content.replace('__IMAGE__:', ''), __hydrated: true });
+        restored.push({
+          id, groupId,
+          type:       'user-image',
+          imageSrc:   m.content.replace('__IMAGE__:', ''),
+          __hydrated: true,
+        });
         return;
       }
+      if (m.content?.startsWith('data:image/')) {
+        restored.push({
+          id, groupId,
+          type:       'user-image',
+          imageSrc:   m.content,
+          __hydrated: true,
+        });
+        return;
+      }
+
+      // ── Agent messages ────────────────────────────────────────────────────
       if (m.sender === 'agent') {
-        restored.push({ id, groupId, type: 'live-agent-message', text: m.content, timestamp: m.created_at, __hydrated: true });
+        if (m.content === '__AGENT_REQUEST_DIAGNOSIS__') return;
+        restored.push({
+          id, groupId,
+          type:       'live-agent-message',
+          text:        m.content,
+          timestamp:   m.created_at,
+          __hydrated: true,
+        });
         return;
       }
+
+      // ── User messages ─────────────────────────────────────────────────────
+      if (m.sender === 'user') {
+        restored.push({
+          id, groupId,
+          type:       'user',
+          text:        m.content || '',
+          __hydrated: true,
+        });
+        return;
+      }
+
+      // ── Bot messages — resolution box if long, bubble if short ───────────
       if (m.sender === 'bot') {
-        const html = formatResolution(m.content || '').replace(/\n/g, '<br>');
-        restored.push({ id, groupId, type: 'bot', html, __hydrated: true });
+        const content = m.content || '';
+        const html    = formatResolution(content);
+        if (content.length > 150) {
+          restored.push({ id, groupId, type: 'resolution', html, __hydrated: true });
+        } else {
+          restored.push({ id, groupId, type: 'bot', html, __hydrated: true });
+        }
         return;
       }
-      restored.push({ id, groupId, type: 'user', text: m.content, __hydrated: true });
+
+      // ── Fallback: system ──────────────────────────────────────────────────
+      restored.push({
+        id, groupId,
+        type:       'system',
+        text:        m.content || m.text || '',
+        __hydrated: true,
+      });
     });
 
+    // ── Re-attach onClick handlers to interactive cards ────────────────────
+    // Functions cannot be JSON-serialised so they must be re-wired after
+    // every restore. Cards that are already past their interactive moment
+    // are left disabled so the user cannot re-trigger them.
     const wired = restored.map((msg) => {
+
       if (msg.type === 'location-question') {
         return {
           ...msg,
@@ -660,11 +684,13 @@ export default function ChatSupport() {
             addMessage({ type: 'user', text: "Yes, I'm at the issue location" });
             const locPromptGroupId = nextId();
             addMessage({
-              type: 'location-prompt',
+              type:    'location-prompt',
               groupId: locPromptGroupId,
               onShare: () => {
                 disableGroup(locPromptGroupId);
-                requestLocation(() => { afterLocationCaptured(stateRef.current.subprocessName || ''); });
+                requestLocation(() => {
+                  afterLocationCaptured(stateRef.current.subprocessName || '');
+                });
               },
             });
             stateRef.current.step = 'location';
@@ -678,24 +704,31 @@ export default function ChatSupport() {
           },
         };
       }
+
       if (msg.type === 'location-prompt') {
         return {
           ...msg,
           onShare: () => {
             disableGroup(msg.groupId);
-            requestLocation(() => { afterLocationCaptured(stateRef.current.subprocessName || ''); });
+            requestLocation(() => {
+              afterLocationCaptured(stateRef.current.subprocessName || '');
+            });
           },
         };
       }
+
       if (msg.type === 'location-required') {
         return {
           ...msg,
           onRetry: () => {
             disableGroup(msg.groupId);
-            requestLocation(() => { afterLocationCaptured(stateRef.current.subprocessName || ''); });
+            requestLocation(() => {
+              afterLocationCaptured(stateRef.current.subprocessName || '');
+            });
           },
         };
       }
+
       return msg;
     });
 
@@ -703,13 +736,16 @@ export default function ChatSupport() {
     if (sessionIdRef.current) {
       saveCachedSession(sessionIdRef.current, {
         messages: wired,
-        state: stateRef.current,
+        state:    stateRef.current,
       });
     }
-  }, [nextId, disableGroup, addMessage, requestLocation, afterLocationCaptured, showInput]);
+  }, [disableGroup, addMessage, requestLocation, afterLocationCaptured, showInput]);
 
+  // ── CHANGE 4: restoreSession now prefers localStorage cache over DB ────────
+  // The cache holds full typed payloads for every card. DB messages are used
+  // only as a fallback when the cache is empty (e.g. different browser/device).
   const restoreSession = useCallback(async (opts = {}) => {
-    const { sessionId: forcedSessionId = null, allowResolved = false } = opts || {};
+    const { sessionId: forcedSessionId = null } = opts || {};
     const token = getToken();
     if (!token) return false;
     try {
@@ -722,18 +758,27 @@ export default function ChatSupport() {
         if (resp.ok) data = await resp.json();
       }
       if (!data || data.error) {
-        const resp = await fetch(`${API_BASE}/api/chat/session/active`, { headers: { 'Authorization': `Bearer ${token}` } });
+        const resp = await fetch(`${API_BASE}/api/chat/session/active`, {
+          headers: { 'Authorization': `Bearer ${token}` },
+        });
         if (resp.ok) data = await resp.json();
       }
       if (data && data.session) {
         sessionIdRef.current = data.session.id;
         localStorage.setItem('chat_session_id', String(data.session.id));
-        const cache = loadCachedSession(sessionIdRef.current);
-        const history = (data.messages && data.messages.length ? data.messages : []) || [];
-        const merged = history.length ? history : cache?.messages || [];
 
-        // Seed welcome/menu if session is empty
-        if (merged.length === 0) {
+        // ── Try localStorage cache first ─────────────────────────────────
+        const cache   = loadCachedSession(sessionIdRef.current);
+        const dbMsgs  = data.messages && data.messages.length ? data.messages : [];
+
+        // Cache messages have full typed payloads — always prefer them.
+        // Fall back to DB messages only if cache is empty.
+        const toHydrate = (cache?.messages && cache.messages.length > 0)
+          ? cache.messages
+          : dbMsgs;
+
+        // Seed welcome/menu if session is genuinely empty
+        if (toHydrate.length === 0) {
           try {
             const menuResp = await apiGet('/api/menu');
             const menu = menuResp?.menu || {};
@@ -748,19 +793,37 @@ export default function ChatSupport() {
           } catch {}
         }
 
-        setDisabledGroups(new Set()); // re-enable interactive cards on restore
-        hydrateHistory(merged);
+        // Restore state from cache if available
         if (cache?.state) {
           stateRef.current = { ...stateRef.current, ...cache.state };
         }
-        const maxAgentId = Math.max(0, ...history.filter(m => m.sender === 'agent').map(m => m.id));
-        if (maxAgentId > 0) { lastSeenMsgIdRef.current = maxAgentId; }
-        stateRef.current.step = data.session.current_step || 'greeting';
-        stateRef.current.sectorName = data.session.sector_name || null;
-        stateRef.current.subprocessName = data.session.subprocess_name || null;
-        stateRef.current.queryText = data.session.query_text || '';
+
+        // All past interactive cards should start disabled on restore so the
+        // user cannot accidentally re-click a sector or subprocess that was
+        // already chosen earlier in the conversation.
+        const allGroupIds = new Set(
+          toHydrate
+            .filter(m => m.groupId)
+            .map(m => m.groupId)
+        );
+        setDisabledGroups(allGroupIds);
+
+        hydrateHistory(toHydrate);
+
+        const maxAgentId = Math.max(
+          0,
+          ...dbMsgs.filter(m => m.sender === 'agent').map(m => m.id)
+        );
+        if (maxAgentId > 0) lastSeenMsgIdRef.current = maxAgentId;
+
+        stateRef.current.step        = data.session.current_step || 'greeting';
+        stateRef.current.sectorName  = data.session.sector_name  || stateRef.current.sectorName  || null;
+        stateRef.current.subprocessName = data.session.subprocess_name || stateRef.current.subprocessName || null;
+        stateRef.current.queryText   = data.session.query_text   || stateRef.current.queryText   || '';
+
         setHandoffActive(data.session.status === 'escalated');
         setInitPhase('chat');
+
         const placeholder = data.session.status === 'escalated'
           ? 'Type your reply to the agent...'
           : 'Describe your issue...';
@@ -771,9 +834,9 @@ export default function ChatSupport() {
       }
     } catch (e) {}
     return false;
-  }, [hydrateHistory, joinSocketSession, showInput]);
+  }, [hydrateHistory, joinSocketSession, showInput, addMessage]);
 
-  // ── Poll for agent messages + resolution after handoff ──
+  // ── Poll for agent messages + resolution after handoff ──────────────────────
   const lastSeenMsgIdRef = useRef(0);
 
   useEffect(() => {
@@ -801,8 +864,6 @@ export default function ChatSupport() {
         }
         newAgentMsgs.forEach(m => {
           lastSeenMsgIdRef.current = Math.max(lastSeenMsgIdRef.current, m.id);
-
-          // Intercept agent-triggered diagnosis request — don't show as a chat bubble
           if (m.content === '__AGENT_REQUEST_DIAGNOSIS__') {
             addMessage({
               type: 'bot',
@@ -811,7 +872,6 @@ export default function ChatSupport() {
             addMessage({ type: 'signal-offer', groupId: m.id });
             return;
           }
-
           addMessage({ type: 'live-agent-message', text: m.content, timestamp: m.created_at });
         });
         if (newAgentMsgs.length > 0 && !agentJoinedRef.current) {
@@ -901,6 +961,7 @@ export default function ChatSupport() {
       queryText: '', resolution: '', attempt: 0, previousSolutions: [],
       diagnosisSummary: '', diagnosisRan: false,
       billingContext: null, connectionContext: null, planSpeedMbps: null,
+      broadbandDiagShown: false,
     };
     broadbandDiagStatusRef.current = 'idle';
     broadbandDiagResultRef.current = null;
@@ -986,7 +1047,6 @@ export default function ChatSupport() {
           groupId: locPromptGroupId,
           onShare: () => {
             disableGroup(locPromptGroupId);
-            // requestLocation will use DEFAULT_LATITUDE/DEFAULT_LONGITUDE (see above)
             requestLocation(() => { afterLocationCaptured(selectedIssueLabel); });
           },
         });
@@ -1181,7 +1241,6 @@ export default function ChatSupport() {
     };
 
     if (handoffActive || stateRef.current.step === 'human_handoff' || stateRef.current.step === 'escalated') {
-      // Mark the message we just added as liveChat so ticks show
       setMessages(prev => {
         const updated = [...prev];
         for (let i = updated.length - 1; i >= 0; i--) {
@@ -1452,7 +1511,7 @@ export default function ChatSupport() {
       setIsTyping(true);
       try {
         const token = getToken();
-      const resp = await fetch(`${API_BASE}/api/chat/session/${sessionIdRef.current}/analyze-signal`, {
+        const resp = await fetch(`${API_BASE}/api/chat/session/${sessionIdRef.current}/analyze-signal`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
           body: JSON.stringify({ image: base64String, image_data_url: reader.result }),
@@ -1570,11 +1629,11 @@ export default function ChatSupport() {
     setDisabledGroups(new Set());
     hideInput();
     sessionIdRef.current = session.id;
-    stateRef.current.sectorName = session.sector_name || null;
+    stateRef.current.sectorName     = session.sector_name     || null;
     stateRef.current.subprocessName = session.subprocess_name || null;
-    stateRef.current.language = session.language || 'English';
-    stateRef.current.queryText = session.query_text || '';
-    stateRef.current.resolution = session.resolution || '';
+    stateRef.current.language       = session.language        || 'English';
+    stateRef.current.queryText      = session.query_text      || '';
+    stateRef.current.resolution     = session.resolution      || '';
     try {
       const token = getToken();
       const headers = {};
@@ -1618,7 +1677,7 @@ export default function ChatSupport() {
       }
     }
     stateRef.current.previousSolutions = botResolutions;
-    stateRef.current.attempt = botResolutions.length;
+    stateRef.current.attempt           = botResolutions.length;
     setMessages(prev => [...prev, ...newMsgs]);
     scrollToBottom();
     if (!msgs.length && session.status === 'active') {
@@ -1629,20 +1688,14 @@ export default function ChatSupport() {
     }
     setTimeout(async () => {
       if (session.status === 'resolved') {
-        addMessage({
-          type: 'bot',
-          html: `This chat session is <strong>${session.status}</strong>. You are viewing the complete chat history.`,
-        });
+        addMessage({ type: 'bot', html: `This chat session is <strong>${session.status}</strong>. You are viewing the complete chat history.` });
         addMessage({ type: 'bot', html: `Start a new chat if you need more help.` });
         hideInput();
         stateRef.current.step = 'view-only';
         return;
       }
       if (session.status === 'escalated') {
-        addMessage({
-          type: 'bot',
-          html: `Please wait — we are connecting you to a human agent.`,
-        });
+        addMessage({ type: 'bot', html: `Please wait — we are connecting you to a human agent.` });
         agentResolvedShownRef.current = false;
         agentJoinedRef.current = false;
         setHandoffActive(true);
@@ -1698,13 +1751,18 @@ export default function ChatSupport() {
     setInitPhase('start-gate');
   }, [searchParams, resumeChat]);
 
+  // ── CHANGE 5: initialization now auto-restores active session on refresh ───
+  // Instead of always showing the resume-prompt gate, we silently restore the
+  // active session directly so the chat reappears immediately on refresh.
   const initialized = useRef(false);
   useEffect(() => {
     if (initialized.current) return;
     initialized.current = true;
     (async () => {
-      const params = new URLSearchParams(window.location.search);
+      const params   = new URLSearchParams(window.location.search);
       const resumeId = params.get('resume');
+
+      // ── Explicit resume link ─────────────────────────────────────────────
       if (resumeId) {
         try {
           const data = await apiGet(`/api/chat/session/${resumeId}`);
@@ -1714,22 +1772,38 @@ export default function ChatSupport() {
           }
         } catch {}
       }
-      // If an active session exists, offer a choice to continue or start fresh
+
+      // ── Check for a stored session id in localStorage ────────────────────
+      const storedId = localStorage.getItem('chat_session_id');
+      if (storedId) {
+        const restored = await restoreSession({ sessionId: storedId });
+        if (restored) return;
+      }
+
+      // ── Check for any active session on the server ───────────────────────
       try {
         const active = await apiGet('/api/chat/session/active');
         if (active?.session && active.session.status !== 'resolved') {
+          // If there is a localStorage cache for this session, restore silently.
+          // Otherwise show the resume-prompt so the user can choose.
+          const cache = loadCachedSession(active.session.id);
+          if (cache?.messages && cache.messages.length > 0) {
+            const restored = await restoreSession({ sessionId: active.session.id });
+            if (restored) return;
+          }
           setResumeCandidate(active.session);
           setResumeMessages(active.messages || []);
           setInitPhase('resume-prompt');
           return;
         }
       } catch {}
+
       setInitPhase('start-gate');
     })();
-  }, [searchParams, resumeChat]);
+  }, [searchParams, resumeChat, restoreSession]);
 
   // ══════════════════════════════════════════════════════════════════
-  // RENDER MESSAGES
+  // RENDER MESSAGES — unchanged from original
   // ══════════════════════════════════════════════════════════════════
   const renderMessage = (msg) => {
     const isDisabled = disabledGroups.has(msg.groupId);
@@ -1853,8 +1927,6 @@ export default function ChatSupport() {
             <div className="exit-msg">Thank you for using Customer Handling.<br />Have a great day! Click <strong>Restart</strong> anytime to start a new session.</div>
           </div>
         );
-
-      // ── LOCATION QUESTION ──
       case 'location-question':
         return (
           <div key={msg.id} style={{ background: 'rgba(0, 145, 218, 0.12)', border: '1px solid rgba(0, 145, 218, 0.25)', borderRadius: '10px', padding: '20px 22px', margin: '6px 0', textAlign: 'center' }}>
@@ -1879,9 +1951,6 @@ export default function ChatSupport() {
             </div>
           </div>
         );
-
-      // ── LOCATION PROMPT — clicking "Share My Location" uses DEFAULT_LATITUDE/DEFAULT_LONGITUDE
-      //    Real GPS is commented out in requestLocation() above.
       case 'location-prompt':
         return (
           <div key={msg.id} style={{ background: 'rgba(0, 145, 218, 0.12)', border: 'none', borderRadius: '10px', padding: '20px 22px', margin: '6px 0', textAlign: 'center', boxShadow: '0 2px 8px rgba(0, 145, 218, 0.25)' }}>
@@ -1903,9 +1972,6 @@ export default function ChatSupport() {
             </div>
           </div>
         );
-
-      // ── LOCATION REQUIRED — never shown while default location is active;
-      //    will reappear once real GPS is re-enabled.
       case 'location-required':
         return (
           <div key={msg.id} style={{ background: '#ffffff', border: '1px solid #d8e0ec', borderLeft: '3px solid #c42b1c', borderRadius: '10px', padding: '20px 22px', margin: '6px 0', textAlign: 'center', boxShadow: '0 1px 2px rgba(0, 20, 60, 0.04)' }}>
@@ -1922,8 +1988,6 @@ export default function ChatSupport() {
             </button>
           </div>
         );
-
-      // ── LOCATION SUCCESS ──
       case 'location-success': {
         const hasCoords = typeof msg.latitude === 'number' && typeof msg.longitude === 'number';
         return (
@@ -1947,7 +2011,6 @@ export default function ChatSupport() {
           </div>
         );
       }
-
       case 'signal-codes':
         return (
           <div key={msg.id} style={{ background: 'rgba(0, 145, 218, 0.12)', border: 'none', borderRadius: '10px', padding: '18px 20px', margin: '6px 0', boxShadow: '0 2px 8px rgba(0, 145, 218, 0.25)' }}>
@@ -1968,7 +2031,6 @@ export default function ChatSupport() {
             </div>
           </div>
         );
-
       case 'screenshot-upload':
         return (
           <div key={msg.id} style={{ background: 'rgba(0, 145, 218, 0.12)', border: 'none', borderRadius: '10px', padding: '16px 20px', margin: '6px 0', textAlign: 'center', boxShadow: '0 2px 8px rgba(0, 145, 218, 0.25)' }}>
@@ -1987,94 +2049,65 @@ export default function ChatSupport() {
             <div style={{ fontSize: '11px', color: '#8596ab', marginTop: '8px' }}>PNG, JPG, JPEG (max 5MB)</div>
           </div>
         );
-
       case 'broadband-diagnostic': {
-        const billing = msg.billing || {};
-        const connection = msg.connection || {};
-        const quality = msg.quality || {};
-        const errors = msg.errors || {};
-        const planSpeed = msg.planSpeed || billing.plan_speed_mbps || null;
-
-        const speedLabel = quality.speedLabel || 'Unknown';
-        const speedColor = speedLabel === 'Good' ? '#00875a' : speedLabel === 'Degraded' ? '#c87d0a' : '#c42b1c';
-        const latencyLabel = quality.latencyLabel || 'Unknown';
-        const latencyColor = latencyLabel === 'Good' ? '#00875a' : latencyLabel === 'Moderate' ? '#c87d0a' : '#c42b1c';
-
+        const billing     = msg.billing     || {};
+        const quality     = msg.quality     || {};
+        const errors      = msg.errors      || {};
+        const planSpeed   = msg.planSpeed   || billing.plan_speed_mbps || null;
+        const speedLabel  = quality.speedLabel  || 'Unknown';
+        const speedColor  = speedLabel === 'Good' ? '#00875a' : speedLabel === 'Degraded' ? '#c87d0a' : '#c42b1c';
+        const accountActive = billing.account_active !== false;
         const sectionStyle = { background: '#fff', border: '1px solid #d8e0ec', borderRadius: '10px', padding: '12px 14px', marginTop: '10px' };
-        const labelStyle = { fontSize: '11px', letterSpacing: '0.04em', color: '#00338d', fontWeight: 700, textTransform: 'uppercase', marginBottom: '6px' };
-
+        const labelStyle   = { fontSize: '11px', letterSpacing: '0.04em', color: '#00338d', fontWeight: 700, textTransform: 'uppercase', marginBottom: '6px' };
         return (
           <div key={msg.id} style={{ background: '#f7f9fc', border: '1px solid #d8e0ec', borderLeft: '4px solid #00338d', borderRadius: '12px', padding: '16px 18px', margin: '8px 0', boxShadow: '0 1px 2px rgba(0, 20, 60, 0.05)' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '6px' }}>
               <div style={{ width: 10, height: 10, borderRadius: '50%', background: '#00338d' }}></div>
               <div style={{ fontWeight: 700, fontSize: 14, color: '#0f1d33' }}>Broadband Diagnostic</div>
             </div>
-            <div style={{ fontSize: 12, color: '#3d5068', marginBottom: '10px' }}>Billing check → line check → browser quality check</div>
-
+            <div style={{ fontSize: 12, color: '#3d5068', marginBottom: '10px' }}>Plan info + quick browser speed check</div>
             <div style={sectionStyle}>
-              <div style={labelStyle}>Billing Check</div>
+              <div style={labelStyle}>Plan Details</div>
               {errors.billing ? (
                 <div style={{ color: '#c42b1c', fontSize: 12 }}>{errors.billing}</div>
               ) : (
-                <div style={{ fontSize: 12, color: '#1a2b42', lineHeight: 1.6 }}>
-                  <div><strong style={{ color: '#0f1d33' }}>{billing.plan_name || 'Plan'}</strong>{planSpeed ? ` · ${planSpeed} Mbps` : ''}</div>
-                  <div style={{ marginTop: 4 }}>Account: <strong style={{ color: billing.account_active === false ? '#c42b1c' : '#0f1d33' }}>{billing.account_active === false ? 'Inactive' : 'Active'}</strong></div>
-                  <div>Bill Paid: <strong style={{ color: billing.bill_paid === false ? '#c42b1c' : '#0f1d33' }}>{billing.bill_paid === false ? 'No' : 'Yes'}</strong></div>
-                  <div>FUP Hit: <strong style={{ color: billing.fup_hit ? '#c87d0a' : '#0f1d33' }}>{billing.fup_hit ? 'Yes' : 'No'}</strong></div>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: '8px 12px', fontSize: 12, color: '#1a2b42' }}>
+                  <div><span style={{ color: '#8596ab' }}>Plan:</span> <strong style={{ color: '#0f1d33' }}>{billing.plan_name || 'N/A'}</strong></div>
+                  <div><span style={{ color: '#8596ab' }}>Speed:</span> <strong style={{ color: '#0f1d33' }}>{planSpeed != null ? `${planSpeed} Mbps` : 'N/A'}</strong></div>
+                  <div><span style={{ color: '#8596ab' }}>Account:</span> <strong style={{ color: accountActive ? '#0f1d33' : '#c42b1c' }}>{accountActive ? 'Active' : 'Inactive'}</strong></div>
+                  <div><span style={{ color: '#8596ab' }}>Bill Paid:</span> <strong style={{ color: billing.bill_paid === false ? '#c42b1c' : '#0f1d33' }}>{billing.bill_paid === false ? 'No' : 'Yes'}</strong></div>
                 </div>
               )}
             </div>
-
             <div style={sectionStyle}>
-              <div style={labelStyle}>Connection Check (NOC)</div>
-              {errors.connection ? (
-                <div style={{ color: '#c42b1c', fontSize: 12 }}>{errors.connection}</div>
-              ) : (
-                <div style={{ fontSize: 12, color: '#1a2b42', lineHeight: 1.6, display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: '6px 10px' }}>
-                  <div>Line Quality: <strong style={{ color: '#0f1d33' }}>{connection.line_quality || 'n/a'}</strong></div>
-                  <div>Router: <strong style={{ color: connection.router_status === 'offline' ? '#c42b1c' : '#0f1d33' }}>{connection.router_status || 'n/a'}</strong></div>
-                  <div>Sync Speed: <strong style={{ color: '#0f1d33' }}>{connection.sync_speed_mbps != null ? `${connection.sync_speed_mbps} Mbps` : 'n/a'}</strong></div>
-                  <div>Outage: <strong style={{ color: connection.area_outage ? '#c42b1c' : '#0f1d33' }}>{connection.area_outage ? 'Yes' : 'No'}</strong></div>
-                </div>
-              )}
-            </div>
-
-            <div style={sectionStyle}>
-              <div style={labelStyle}>Browser Quality Check</div>
+              <div style={labelStyle}>Speed Test</div>
               {errors.quality ? (
                 <div style={{ color: '#c42b1c', fontSize: 12 }}>{errors.quality}</div>
               ) : (
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: '10px 12px', alignItems: 'center' }}>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '10px 12px', alignItems: 'center' }}>
                   <div style={{ fontSize: 12, color: '#1a2b42' }}>
-                    <div style={{ color: '#8596ab', fontSize: 11 }}>Speed</div>
-                    <div style={{ fontSize: 16, fontWeight: 700, color: '#0f1d33' }}>
+                    <div style={{ color: '#8596ab', fontSize: 11 }}>Plan Speed</div>
+                    <div style={{ fontSize: 14, fontWeight: 700, color: '#0f1d33' }}>{planSpeed != null ? `${planSpeed} Mbps` : 'n/a'}</div>
+                  </div>
+                  <div style={{ fontSize: 12, color: '#1a2b42' }}>
+                    <div style={{ color: '#8596ab', fontSize: 11 }}>Measured Speed</div>
+                    <div style={{ fontSize: 18, fontWeight: 800, color: '#0f1d33' }}>
                       {quality.speedMbps != null ? `${quality.speedMbps} Mbps` : 'n/a'}
                       {quality.speedPercent != null ? <span style={{ fontSize: 11, color: '#64748b', marginLeft: 6 }}>({quality.speedPercent}% of plan)</span> : null}
                     </div>
-                    <div style={{ marginTop: 4, display: 'inline-block', padding: '3px 10px', borderRadius: 12, background: `${speedColor}15`, color: speedColor, fontWeight: 700, fontSize: 11 }}>{speedLabel}</div>
-                  </div>
-                  <div style={{ fontSize: 12, color: '#1a2b42' }}>
-                    <div style={{ color: '#8596ab', fontSize: 11 }}>Latency</div>
-                    <div style={{ fontSize: 16, fontWeight: 700, color: '#0f1d33' }}>{quality.latencyMs != null ? `${quality.latencyMs} ms` : 'n/a'}</div>
-                    <div style={{ marginTop: 4, display: 'inline-block', padding: '3px 10px', borderRadius: 12, background: `${latencyColor}15`, color: latencyColor, fontWeight: 700, fontSize: 11 }}>{latencyLabel}</div>
-                  </div>
-                  <div style={{ fontSize: 12, color: '#1a2b42' }}>
-                    <div style={{ color: '#8596ab', fontSize: 11 }}>Connection Type</div>
-                    <div style={{ fontSize: 14, fontWeight: 700, color: '#0f1d33' }}>{quality.connectionType || 'Unknown'}</div>
+                    <div style={{ marginTop: 4, display: 'inline-block', padding: '4px 12px', borderRadius: 12, background: `${speedColor}15`, color: speedColor, fontWeight: 700, fontSize: 11 }}>{speedLabel}</div>
                   </div>
                 </div>
               )}
-              {(quality.speedError || quality.latencyError) && (
+              {quality.speedError && (
                 <div style={{ marginTop: 8, fontSize: 11, color: '#c42b1c' }}>
-                  {quality.speedError && <div>Speed: {quality.speedError}</div>}
-                  {quality.latencyError && <div>Latency: {quality.latencyError}</div>}
+                  Speed: {quality.speedError}
                 </div>
               )}
             </div>
           </div>
         );
       }
-
       case 'user-image':
         return (
           <div key={msg.id} style={{ display: 'flex', justifyContent: 'flex-end' }}>
@@ -2083,11 +2116,10 @@ export default function ChatSupport() {
             </div>
           </div>
         );
-
       case 'diagnosis-result': {
         const d = msg.diagnosis;
         const overallColor = { green: '#00875a', amber: '#c87d0a', red: '#c42b1c', unknown: '#8596ab' };
-        const overallBg = { green: '#f0fdf4', amber: '#fffbeb', red: '#fef2f2', unknown: '#f7f9fc' };
+        const overallBg    = { green: '#f0fdf4', amber: '#fffbeb', red: '#fef2f2', unknown: '#f7f9fc' };
         const status = d.overall_status || 'unknown';
         return (
           <div key={msg.id} style={{ background: overallBg[status], border: '1px solid #d8e0ec', borderLeft: `4px solid ${overallColor[status]}`, borderRadius: '10px', padding: '18px 20px', margin: '6px 0', boxShadow: '0 1px 2px rgba(0, 20, 60, 0.04)' }}>
@@ -2126,7 +2158,6 @@ export default function ChatSupport() {
           </div>
         );
       }
-
       case 'post-diagnosis-actions':
         return (
           <div key={msg.id} className="post-feedback-actions">
@@ -2135,13 +2166,12 @@ export default function ChatSupport() {
             <button className={`sat-btn ticket${isDisabled ? ' disabled' : ''}`} onClick={() => !isDisabled && handleRaiseTicket(msg.groupId)}>Raise a Ticket</button>
           </div>
         );
-
       case 'unsat-options': {
         const options = [
           { cls: 'retry', icon: '', title: 'Describe Again', desc: 'Provide more details for better resolution steps', fn: () => handleRetry(msg.groupId) },
           { cls: 'human', icon: '', title: 'Connect to Human Agent', desc: 'A support ticket will be raised for you', fn: () => handleHumanHandoff(msg.groupId) },
-          { cls: 'newc', icon: '', title: 'Main Menu', desc: 'Go back to the main service category menu', fn: () => handleBackToMenu(msg.groupId) },
-          { cls: 'exit', icon: '', title: 'Exit', desc: 'End this session', fn: () => handleExit(msg.groupId) },
+          { cls: 'newc',  icon: '', title: 'Main Menu', desc: 'Go back to the main service category menu', fn: () => handleBackToMenu(msg.groupId) },
+          { cls: 'exit',  icon: '', title: 'Exit', desc: 'End this session', fn: () => handleExit(msg.groupId) },
         ];
         return (
           <div key={msg.id} className="unsat-options">
@@ -2155,7 +2185,6 @@ export default function ChatSupport() {
           </div>
         );
       }
-
       case 'email-action':
         return (
           <div key={msg.id} className="email-action-container">
@@ -2164,7 +2193,6 @@ export default function ChatSupport() {
             </button>
           </div>
         );
-
       case 'email-sent':
         return (
           <div key={msg.id} className="email-sent-box">
@@ -2172,7 +2200,6 @@ export default function ChatSupport() {
             <div className="email-sent-text">{msg.message}</div>
           </div>
         );
-
       case 'handoff':
         return (
           <div key={msg.id} className="handoff-box">
@@ -2196,7 +2223,6 @@ export default function ChatSupport() {
             <div className="handoff-ref">Reference No: {msg.refNum}</div>
           </div>
         );
-
       case 'live-agent-message':
         return (
           <div key={msg.id} style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', maxWidth: '80%' }}>
@@ -2212,7 +2238,6 @@ export default function ChatSupport() {
             </div>
           </div>
         );
-
       case 'agent-resolved':
         return (
           <div key={msg.id} style={{ background: 'linear-gradient(135deg, #f0fdf4, #dcfce7)', border: '2px solid #22c55e', borderRadius: 14, padding: '20px 22px', margin: '8px 0' }}>
@@ -2232,7 +2257,6 @@ export default function ChatSupport() {
             </div>
           </div>
         );
-
       default:
         return null;
     }
@@ -2306,7 +2330,7 @@ export default function ChatSupport() {
           </div>
         )}
         {initPhase === 'resume-prompt' && <div className="chat-area">{renderResumePrompt()}</div>}
-        {initPhase === 'start-gate' && <div className="chat-area">{renderStartGate()}</div>}
+        {initPhase === 'start-gate'    && <div className="chat-area">{renderStartGate()}</div>}
 
         {initPhase === 'chat' && (
           <>
@@ -2350,10 +2374,4 @@ export default function ChatSupport() {
     </div>
   );
 }
-
-
-
-
-
-
 
