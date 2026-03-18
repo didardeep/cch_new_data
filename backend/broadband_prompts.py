@@ -68,8 +68,9 @@ def build_broadband_prompt(subprocess_name, language, attempt,
 def register_routes(app):
     """Register all /api/broadband/* routes on the Flask app."""
 
-    # Pre-generate a 2MB payload for the speed test endpoint to avoid repeated allocations.
-    speedtest_bytes = b"0" * (2 * 1024 * 1024)
+    # Pre-generate a 10MB payload for the speed test endpoint — larger payload
+    # gives more accurate download speed readings especially on fast connections.
+    speedtest_bytes = b"0" * (10 * 1024 * 1024)
 
     @app.route("/api/broadband/billing-check", methods=["GET"])
     @jwt_required()
@@ -139,6 +140,50 @@ def register_routes(app):
     @app.route("/api/broadband/ping", methods=["GET"])
     @jwt_required()
     def broadband_ping():
-        """Lightweight latency check endpoint."""
+        """Lightweight latency check endpoint — measures round-trip time."""
         ts_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
         return jsonify({"ok": True, "timestamp": ts_ms}), 200
+
+    @app.route("/api/broadband/speedtest-upload", methods=["POST"])
+    @jwt_required()
+    def broadband_speedtest_upload():
+        """Accepts a binary payload and echoes bytes received — used to measure upload speed."""
+        from flask import request as _req
+        body = _req.get_data()
+        return jsonify({"ok": True, "received_bytes": len(body)}), 200
+
+    @app.route("/api/broadband/classify-connection-issue", methods=["POST"])
+    @jwt_required()
+    def broadband_classify_connection_issue():
+        """Broadband-only classifier: detects if the user's query is about a connection/speed problem."""
+        from flask import request as _req
+        import json as _json
+        text = (_req.json or {}).get("text", "")
+        if not text:
+            return jsonify({"mentions_connection_issue": False}), 200
+        try:
+            response = _client.chat.completions.create(
+                model=_deployment,
+                messages=[
+                    {"role": "system", "content": (
+                        "You are classifying a broadband customer's support query.\n\n"
+                        "Determine: does the message semantically describe a broadband or internet "
+                        "connectivity problem? This includes: slow speed, no internet, buffering, "
+                        "connection dropping, high ping, latency, Wi-Fi not working, speed lower than "
+                        "expected, internet cutting out, or any complaint about internet/broadband performance.\n\n"
+                        'Respond with ONLY valid JSON: {"mentions_connection_issue": true/false}'
+                    )},
+                    {"role": "user", "content": text},
+                ],
+                temperature=0,
+                max_tokens=20,
+            )
+            raw = response.choices[0].message.content.strip()
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+                raw = raw.strip()
+            return jsonify(_json.loads(raw)), 200
+        except Exception:
+            return jsonify({"mentions_connection_issue": False}), 200
