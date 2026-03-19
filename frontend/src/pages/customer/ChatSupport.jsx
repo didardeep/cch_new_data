@@ -139,11 +139,18 @@ const isConnectionSummary = (msg) => {
 // All parent-scope callbacks are received as props.
 // ══════════════════════════════════════════════════════════════════
 
-function SpeedTestCard({ groupId, disabled, disableGroup, addMessage, fetchSolution, saveMessage, stateRef }) {
-  const [phase, setPhase]       = useState('idle');   // idle | running | done | error
-  const [results, setResults]   = useState(null);
-  const [reported, setReported] = useState(false);
+function SpeedTestCard({ msgId, groupId, disabled, disableGroup, addMessage, fetchSolution, saveMessage, stateRef, updateMessage, initialPhase, initialResults, initialReported }) {
+  const [phase, setPhase]       = useState(initialPhase   || 'idle');
+  const [results, setResults]   = useState(initialResults || null);
+  const [reported, setReported] = useState(initialReported || false);
   const iframeRef               = useRef(null);
+  const isFirstRender           = useRef(true);
+
+  // Persist phase/results/reported into the cache whenever they change.
+  useEffect(() => {
+    if (isFirstRender.current) { isFirstRender.current = false; return; }
+    if (updateMessage && msgId) updateMessage(msgId, { phase, results, reported });
+  }, [phase, results, reported, msgId, updateMessage]);
 
   // Listen for postMessage from our self-hosted speed test iframe
   useEffect(() => {
@@ -207,16 +214,18 @@ function SpeedTestCard({ groupId, disabled, disableGroup, addMessage, fetchSolut
         )}
       </div>
 
-      {/* Compact iframe — 220px tall */}
-      <div style={{ borderRadius: 10, overflow: 'hidden', border: '1px solid #1e3a5f', marginBottom: 8, height: 220 }}>
-        <iframe
-          ref={iframeRef}
-          src={`${API_BASE}/api/speedtest-widget?Run`}
-          title="Speed Test"
-          onLoad={handleIframeLoad}
-          style={{ width: '100%', height: '100%', border: 'none', display: 'block' }}
-        />
-      </div>
+      {/* Compact iframe — hidden when results already exist (restored from cache) */}
+      {phase !== 'done' && (
+        <div style={{ borderRadius: 10, overflow: 'hidden', border: '1px solid #1e3a5f', marginBottom: 8, height: 220 }}>
+          <iframe
+            ref={iframeRef}
+            src={`${API_BASE}/api/speedtest-widget?Run`}
+            title="Speed Test"
+            onLoad={handleIframeLoad}
+            style={{ width: '100%', height: '100%', border: 'none', display: 'block' }}
+          />
+        </div>
+      )}
 
       {/* Results row — shown after test completes */}
       {phase === 'done' && results && !reported && (
@@ -355,8 +364,15 @@ function LiveConnectionCard({ groupId, disabled, autoStart, saveMessage, stateRe
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-function ConnectionCheckOffer({ groupId, disabled, queryText, disableGroup, addMessage, fetchSolution, stateRef }) {
-  const [showWidget, setShowWidget] = useState(false);
+function ConnectionCheckOffer({ msgId, groupId, disabled, queryText, disableGroup, addMessage, fetchSolution, stateRef, updateMessage, initialShowWidget }) {
+  const [showWidget, setShowWidget] = useState(initialShowWidget || false);
+  const isFirstRender = useRef(true);
+
+  // Persist showWidget state into the cache whenever it changes (skip initial render).
+  useEffect(() => {
+    if (isFirstRender.current) { isFirstRender.current = false; return; }
+    if (updateMessage && msgId) updateMessage(msgId, { showWidget });
+  }, [showWidget, msgId, updateMessage]);
 
   return (
     <div style={{ background: 'rgba(0,94,184,0.07)', border: '1px solid rgba(0,94,184,0.2)', borderRadius: 12, padding: '16px 18px', margin: '6px 0' }}>
@@ -521,11 +537,9 @@ export default function ChatSupport() {
       await chatApiCall(`/api/chat/session/${sessionIdRef.current}/message`, {
         sender, content: contentPlain || '', current_step: stateRef.current.step, ...meta, payload: payloadForSave,
       });
-      const cached = loadCachedSession(sessionIdRef.current) || {};
-      const merged = Array.isArray(cached.messages) ? cached.messages.filter(m => !isConnectionSummary(m)) : [];
-      const type = sender === 'bot' ? 'bot' : sender === 'agent' ? 'live-agent-message' : 'user';
-      merged.push({ type, text: content, html: meta.html || content, payload: payloadForSave });
-      saveCachedSession(sessionIdRef.current, { messages: merged, state: stateRef.current });
+      // Local cache is managed by addMessage (via setMessages callback) to preserve
+      // correct message order. Updating it here after an async backend call would
+      // append duplicates out-of-order after subsequent bot messages.
     } catch {}
   }, [ensureSession]);
 
@@ -561,6 +575,16 @@ export default function ChatSupport() {
     scrollToBottom();
     return groupId;
   }, [scrollToBottom, ensureSession]);
+
+  // Lets interactive cards (SpeedTestCard, ConnectionCheckOffer) persist their
+  // internal state back into the message cache so it survives a page refresh.
+  const updateMessage = useCallback((msgId, updates) => {
+    setMessages(prev => {
+      const updated = prev.map(m => m.id === msgId ? { ...m, ...updates } : m);
+      if (sessionIdRef.current) saveCachedSession(sessionIdRef.current, { messages: updated, state: stateRef.current });
+      return updated;
+    });
+  }, []);
 
   const saveLocationToBackend = useCallback(async (latitude, longitude) => {
     if (!sessionIdRef.current) return;
@@ -712,7 +736,7 @@ export default function ChatSupport() {
   }, [disableGroup, addMessage, requestLocation, afterLocationCaptured, showInput]);
 
   const restoreSession = useCallback(async (opts = {}) => {
-    const { sessionId: forcedSessionId = null } = opts || {};
+    const { sessionId: forcedSessionId = null, maxAgeMs = null } = opts || {};
     const token = getToken();
     if (!token) return false;
     try {
@@ -727,6 +751,13 @@ export default function ChatSupport() {
         if (resp.ok) data = await resp.json();
       }
       if (data && data.session) {
+        // Age check — reject sessions older than maxAgeMs (used for direct chat navigation).
+        // Dashboard restores (resume param) pass no maxAgeMs so they always succeed.
+        if (maxAgeMs !== null) {
+          const sessionTime = data.session.updated_at || data.session.created_at;
+          if (sessionTime && Date.now() - new Date(sessionTime).getTime() > maxAgeMs) return false;
+        }
+
         sessionIdRef.current = data.session.id;
         localStorage.setItem('chat_session_id', String(data.session.id));
         const cache = loadCachedSession(sessionIdRef.current);
@@ -756,14 +787,18 @@ export default function ChatSupport() {
 
         setHandoffActive(data.session.status === 'escalated');
         setInitPhase('chat');
-        showInput(data.session.status === 'escalated' ? 'Type your reply to the agent...' : 'Describe your issue...');
+        if (data.session.status === 'resolved') {
+          hideInput();
+        } else {
+          showInput(data.session.status === 'escalated' ? 'Type your reply to the agent...' : 'Describe your issue...');
+        }
         joinSocketSession();
         resumeNeededRef.current = true;
         return true;
       }
     } catch {}
     return false;
-  }, [hydrateHistory, joinSocketSession, showInput, addMessage]);
+  }, [hydrateHistory, joinSocketSession, showInput, hideInput, addMessage]);
 
   const lastSeenMsgIdRef = useRef(0);
 
@@ -1317,15 +1352,28 @@ export default function ChatSupport() {
     (async () => {
       const params = new URLSearchParams(window.location.search);
       const resumeId = params.get('resume');
-      if (resumeId) { try { const data = await apiGet(`/api/chat/session/${resumeId}`); if (data?.session) { resumeChat(data.session, data.messages || []); return; } } catch {} }
+      if (resumeId) {
+        // Try restoreSession first — uses localStorage cache so all visual components
+        // (sector-menu, subprocess-grid, diagnostic cards, etc.) are fully restored.
+        const restored = await restoreSession({ sessionId: resumeId });
+        if (restored) return;
+        // Fallback: if restoreSession failed (e.g. network error), use resumeChat with DB messages.
+        try { const data = await apiGet(`/api/chat/session/${resumeId}`); if (data?.session) { resumeChat(data.session, data.messages || []); return; } } catch {}
+      }
+      // Direct navigation (no resume param): only restore sessions active within the last hour.
+      const ONE_HOUR_MS = 60 * 60 * 1000;
       const storedId = localStorage.getItem('chat_session_id');
-      if (storedId) { const restored = await restoreSession({ sessionId: storedId }); if (restored) return; }
+      if (storedId) { const restored = await restoreSession({ sessionId: storedId, maxAgeMs: ONE_HOUR_MS }); if (restored) return; }
       try {
         const active = await apiGet('/api/chat/session/active');
         if (active?.session && active.session.status !== 'resolved') {
-          const cache = loadCachedSession(active.session.id);
-          if (cache?.messages?.length) { const restored = await restoreSession({ sessionId: active.session.id }); if (restored) return; }
-          setResumeCandidate(active.session); setResumeMessages(active.messages || []); setInitPhase('resume-prompt'); return;
+          const sessionTime = active.session.updated_at || active.session.created_at;
+          const isRecent = !sessionTime || Date.now() - new Date(sessionTime).getTime() <= ONE_HOUR_MS;
+          if (isRecent) {
+            const cache = loadCachedSession(active.session.id);
+            if (cache?.messages?.length) { const restored = await restoreSession({ sessionId: active.session.id }); if (restored) return; }
+            setResumeCandidate(active.session); setResumeMessages(active.messages || []); setInitPhase('resume-prompt'); return;
+          }
         }
       } catch {}
       setInitPhase('start-gate');
@@ -1344,11 +1392,11 @@ export default function ChatSupport() {
 
     switch (msg.type) {
       case 'connection-check-offer':
-        return <ConnectionCheckOffer key={msg.id} groupId={msg.groupId} disabled={isDisabled} queryText={msg.queryText} disableGroup={disableGroup} addMessage={addMessage} fetchSolution={fetchSolution} stateRef={stateRef} />;
+        return <ConnectionCheckOffer key={msg.id} msgId={msg.id} groupId={msg.groupId} disabled={isDisabled} queryText={msg.queryText} disableGroup={disableGroup} addMessage={addMessage} fetchSolution={fetchSolution} stateRef={stateRef} updateMessage={updateMessage} initialShowWidget={msg.showWidget || false} />;
       case 'live-connection':
         return <LiveConnectionCard key={msg.id} groupId={msg.groupId} disabled={isDisabled} autoStart={msg.autoStart} {...cardProps} />;
       case 'speed-test':
-        return <SpeedTestCard key={msg.id} groupId={msg.groupId} disabled={isDisabled} {...cardProps} />;
+        return <SpeedTestCard key={msg.id} msgId={msg.id} groupId={msg.groupId} disabled={isDisabled} {...cardProps} updateMessage={updateMessage} initialPhase={msg.phase} initialResults={msg.results} initialReported={msg.reported} />;
       case 'bot':
         return <div key={msg.id} className="message bot" dangerouslySetInnerHTML={{ __html: msg.html }} />;
       case 'user':
@@ -1422,12 +1470,6 @@ export default function ChatSupport() {
         return (
           <div key={msg.id} className="post-feedback-actions">
             <button className={`action-btn menu-btn${isDisabled ? ' disabled' : ''}`} onClick={() => !isDisabled && handleBackToMenu(msg.groupId)}>Main Menu</button>
-            <button className={`action-btn speed-btn${isDisabled ? ' disabled' : ''}`} onClick={() => {
-              if (isDisabled) return;
-              disableGroup(msg.groupId);
-              addMessage({ type: 'bot', html: 'Sure! Let me run a live speed test. This measures your <strong>ping</strong>, <strong>download</strong>, and <strong>upload</strong> speed.' });
-              addMessage({ type: 'speed-test', groupId: nextId() });
-            }}>Run Speed Test</button>
             <button className={`action-btn exit-btn${isDisabled ? ' disabled' : ''}`} onClick={() => !isDisabled && handleExit(msg.groupId)}>Exit</button>
           </div>
         );
