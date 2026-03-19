@@ -364,7 +364,7 @@ function LiveConnectionCard({ groupId, disabled, autoStart, saveMessage, stateRe
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-function ConnectionCheckOffer({ msgId, groupId, disabled, queryText, disableGroup, addMessage, fetchSolution, stateRef, updateMessage, initialShowWidget }) {
+function ConnectionCheckOffer({ msgId, groupId, disabled, queryText, disableGroup, addMessage, fetchSolution, stateRef, updateMessage, initialShowWidget, runDiagnostics }) {
   const [showWidget, setShowWidget] = useState(initialShowWidget || false);
   const isFirstRender = useRef(true);
 
@@ -398,7 +398,7 @@ function ConnectionCheckOffer({ msgId, groupId, disabled, queryText, disableGrou
               }}>Check My Connection</button>
             <button disabled={disabled}
               style={{ background: 'transparent', color: '#005EB8', border: '1px solid #005EB8', borderRadius: 8, padding: '9px 20px', fontSize: 13, fontWeight: 600, fontFamily: 'inherit', cursor: disabled ? 'not-allowed' : 'pointer' }}
-              onClick={() => { if (disabled) return; disableGroup(groupId); fetchSolution(queryText); }}>
+              onClick={() => { if (disabled) return; disableGroup(groupId); runDiagnostics ? runDiagnostics().then(() => fetchSolution(queryText)) : fetchSolution(queryText); }}>
               Skip, just help me
             </button>
           </div>
@@ -417,7 +417,7 @@ function ConnectionCheckOffer({ msgId, groupId, disabled, queryText, disableGrou
           <div style={{ marginTop: 10, display: 'flex', gap: 10, flexWrap: 'wrap' }}>
             <button
               style={{ background: '#005EB8', color: '#fff', border: 'none', borderRadius: 8, padding: '8px 18px', fontSize: 12, fontWeight: 600, fontFamily: 'inherit', cursor: 'pointer' }}
-              onClick={() => { disableGroup(groupId); fetchSolution(queryText); }}>
+              onClick={() => { disableGroup(groupId); runDiagnostics ? runDiagnostics().then(() => fetchSolution(queryText)) : fetchSolution(queryText); }}>
               Done — Help me now
             </button>
           </div>
@@ -633,11 +633,12 @@ export default function ChatSupport() {
     if (!isBroadbandSector(stateRef.current.sectorKey, stateRef.current.sectorName)) return null;
     const name = (stateRef.current.subprocessName || '').toLowerCase();
     const isBilling = name.includes('billing');
-    if (!isBilling || stateRef.current.step === 'exited') return null;
+    const isWifi = name.includes('wifi') || name.includes('signal slow');
+    if ((!isBilling && !isWifi) || stateRef.current.step === 'exited') return null;
     if (broadbandDiagStatusRef.current === 'running' || broadbandDiagStatusRef.current === 'done') return broadbandDiagResultRef.current;
 
     broadbandDiagStatusRef.current = 'running';
-    addMessage({ type: 'bot', html: 'Running broadband billing diagnostics...', skipPersist: true });
+    addMessage({ type: 'bot', html: 'Checking your billing and plan details...', skipPersist: true });
     setIsTyping(true);
     const diag = { billing: null, connection: null, quality: null, errors: {} };
     let planSpeed = null;
@@ -1392,7 +1393,7 @@ export default function ChatSupport() {
 
     switch (msg.type) {
       case 'connection-check-offer':
-        return <ConnectionCheckOffer key={msg.id} msgId={msg.id} groupId={msg.groupId} disabled={isDisabled} queryText={msg.queryText} disableGroup={disableGroup} addMessage={addMessage} fetchSolution={fetchSolution} stateRef={stateRef} updateMessage={updateMessage} initialShowWidget={msg.showWidget || false} />;
+        return <ConnectionCheckOffer key={msg.id} msgId={msg.id} groupId={msg.groupId} disabled={isDisabled} queryText={msg.queryText} disableGroup={disableGroup} addMessage={addMessage} fetchSolution={fetchSolution} stateRef={stateRef} updateMessage={updateMessage} initialShowWidget={msg.showWidget || false} runDiagnostics={runBroadbandDiagnostics} />;
       case 'live-connection':
         return <LiveConnectionCard key={msg.id} groupId={msg.groupId} disabled={isDisabled} autoStart={msg.autoStart} {...cardProps} />;
       case 'speed-test':
@@ -1540,15 +1541,12 @@ export default function ChatSupport() {
           </div>
         );
       case 'broadband-diagnostic': {
-        const billing = msg.billing || {}, quality = msg.quality || {}, errors = msg.errors || {};
+        const billing = msg.billing || {}, errors = msg.errors || {};
         const planSpeed = msg.planSpeed || billing.plan_speed_mbps || null;
-        const speedLabel = quality.speedLabel || 'Unknown';
-        const speedColor = speedLabel === 'Good' ? '#00875a' : speedLabel === 'Degraded' ? '#c87d0a' : speedLabel === 'Poor' ? '#c42b1c' : '#8596ab';
         const accountActive = billing.account_active !== false;
         return (
           <div key={msg.id} style={{ background: '#f7f9fc', border: '1px solid #d8e0ec', borderLeft: '4px solid #00338d', borderRadius: 12, padding: '16px 18px', margin: '8px 0' }}>
-            <div style={{ fontWeight: 700, fontSize: 14, color: '#0f1d33', marginBottom: 6 }}>Broadband Diagnostic</div>
-            <div style={{ fontSize: 12, color: '#3d5068', marginBottom: 10 }}>Plan info + live browser speed measurement</div>
+            <div style={{ fontWeight: 700, fontSize: 14, color: '#0f1d33', marginBottom: 6 }}>Billing & Plan Details</div>
             <div style={{ background: '#fff', border: '1px solid #d8e0ec', borderRadius: 10, padding: '12px 14px', marginTop: 10 }}>
               <div style={{ fontSize: 11, letterSpacing: '0.04em', color: '#00338d', fontWeight: 700, textTransform: 'uppercase', marginBottom: 6 }}>Plan Details</div>
               {errors.billing ? <div style={{ color: '#c42b1c', fontSize: 12 }}>{errors.billing}</div> : (
@@ -1559,19 +1557,6 @@ export default function ChatSupport() {
                   <div><span style={{ color: '#8596ab' }}>Bill Paid:</span> <strong style={{ color: billing.bill_paid === false ? '#c42b1c' : '#0f1d33' }}>{billing.bill_paid === false ? 'No' : 'Yes'}</strong></div>
                 </div>
               )}
-            </div>
-            <div style={{ background: '#fff', border: '1px solid #d8e0ec', borderRadius: 10, padding: '12px 14px', marginTop: 10 }}>
-              <div style={{ fontSize: 11, letterSpacing: '0.04em', color: '#00338d', fontWeight: 700, textTransform: 'uppercase', marginBottom: 6 }}>Live Speed Measurement</div>
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '10px 12px', alignItems: 'center' }}>
-                {planSpeed != null && <div style={{ fontSize: 12 }}><div style={{ color: '#8596ab', fontSize: 11 }}>Plan Speed</div><div style={{ fontSize: 14, fontWeight: 700 }}>{planSpeed} Mbps</div></div>}
-                <div style={{ fontSize: 12 }}>
-                  <div style={{ color: '#8596ab', fontSize: 11 }}>Measured Download</div>
-                  <div style={{ fontSize: 22, fontWeight: 800, color: quality.speedMbps != null ? '#0f1d33' : '#c42b1c' }}>{quality.speedMbps != null ? `${quality.speedMbps} Mbps` : 'Failed'}</div>
-                  {quality.speedPercent != null && <div style={{ fontSize: 11, color: '#64748b' }}>{quality.speedPercent}% of plan speed</div>}
-                  <div style={{ marginTop: 4, display: 'inline-block', padding: '3px 10px', borderRadius: 12, background: `${speedColor}18`, color: speedColor, fontWeight: 700, fontSize: 11 }}>{speedLabel}</div>
-                </div>
-                {quality.latencyMs != null && <div style={{ fontSize: 12 }}><div style={{ color: '#8596ab', fontSize: 11 }}>Ping / Latency</div><div style={{ fontSize: 22, fontWeight: 800, color: '#0f1d33' }}>{quality.latencyMs} ms</div><div style={{ fontSize: 11, color: '#64748b' }}>{quality.latencyLabel}</div></div>}
-              </div>
             </div>
           </div>
         );
