@@ -54,7 +54,7 @@ export default function App() {
   return (
     <Routes>
       <Route path="/" element={<HomePage />} />
-      <Route path="/login" element={<LoginPage />} />
+      <Route path="/login" element={user ? <Navigate to={getDashboardPath()} /> : <LoginPage />} />
       <Route path="/register" element={user ? <Navigate to={getDashboardPath()} /> : <RegisterPage />} />
 
       {/* Customer Routes */}

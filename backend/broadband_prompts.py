@@ -52,7 +52,7 @@ def build_broadband_prompt(subprocess_name, language, attempt,
         f"You are a broadband and Wi-Fi support specialist. The customer is in 'Broadband / Internet Services' under '{subprocess_name}'. "
         f"This is solution attempt #{attempt}.\n\n"
         "Respond with ONE concise solution tailored to the customer's query. Provide 3-5 short, numbered steps the customer can do right now at home with no special tools.\n"
-        "Rules: stay within broadband/wi-fi/router context; keep every step beginner-friendly; avoid deep router admin changes unless essential (and then give the exact menu path); avoid mobile network steps; avoid telling them to contact support or schedule a technician unless absolutely necessary; keep wording clear and brief.\n"
+        "Rules: stay within broadband/wi-fi/router context; assume the customer is non-technical; keep every step beginner-friendly; avoid jargon and avoid deep router admin changes unless essential (and then give the exact menu path); avoid mobile network steps; avoid telling them to contact support or schedule a technician unless absolutely necessary; keep wording clear and brief.\n"
         "Use any diagnostic data (plan speed, measured speed, latency, line status) to make the advice specific.\n"
         + diag_block
         + query_block

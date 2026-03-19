@@ -4595,9 +4595,10 @@ def serve_speedtest():
     )
 
 
+@app.route('/', defaults={'path': ''})
 @app.route('/<path:path>')
 def serve_react(path):
-    # Never intercept API routes or the speedtest page
+    # Never intercept API routes
     if path.startswith('api/'):
         from flask import abort
         abort(404)
@@ -4609,6 +4610,3 @@ def serve_react(path):
 if __name__ == "__main__":
     run_sla_checks()
     app.run(debug=True, host="0.0.0.0", port=5500, use_reloader=False)
-
-
-    app.run(debug=True, port=5500, use_reloader=False)

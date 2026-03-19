@@ -41,6 +41,24 @@ function isBroadbandSector(sectorKey, sectorName) {
   return sectorName?.toLowerCase().includes('broadband / internet services');
 }
 
+function reduceBroadbandSubprocesses(subprocesses, sectorKey) {
+  if (String(sectorKey) !== '2') return subprocesses;
+  const desired = [
+    { slug: 'wifi',   label: 'WiFi Signal Slow',      match: (n) => n.includes('wifi') || n.includes('slow') },
+    { slug: 'billing',label: 'Billing and Plan Issues', match: (n) => n.includes('bill') || n.includes('plan') },
+    { slug: 'drops',  label: 'Frequent Disconnections', match: (n) => n.includes('disconnect') || n.includes('drop') },
+    { slug: 'other',  label: 'Others',               match: (n) => n.includes('other') },
+  ];
+  const entries = Object.entries(subprocesses || {}).map(([k, v]) => [k, String(v)]);
+  const picked = {};
+  desired.forEach((d) => {
+    const found = entries.find(([, name]) => d.match(name.toLowerCase()));
+    if (found) picked[found[0]] = d.label;
+    else picked[`bb-${d.slug}`] = d.label; // synthetic key fallback
+  });
+  return picked;
+}
+
 function limitSubprocesses(subprocesses) {
   const entries = Object.entries(subprocesses);
   const others = entries.filter(([, v]) => v === 'Others' || v.toLowerCase().includes('other'));
@@ -338,8 +356,7 @@ function LiveConnectionCard({ groupId, disabled, autoStart, saveMessage, stateRe
 // ─────────────────────────────────────────────────────────────────────────────
 
 function ConnectionCheckOffer({ groupId, disabled, queryText, disableGroup, addMessage, fetchSolution, stateRef }) {
-  const nextIdLocal = useRef(0);
-  const nid = () => ++nextIdLocal.current + Date.now(); // good-enough unique id for nested cards
+  const [showWidget, setShowWidget] = useState(false);
 
   return (
     <div style={{ background: 'rgba(0,94,184,0.07)', border: '1px solid rgba(0,94,184,0.2)', borderRadius: 12, padding: '16px 18px', margin: '6px 0' }}>
@@ -349,26 +366,47 @@ function ConnectionCheckOffer({ groupId, disabled, queryText, disableGroup, addM
         </svg>
         <span style={{ fontWeight: 700, fontSize: 14, color: '#00338D' }}>Connection issue detected</span>
       </div>
-      <p style={{ fontSize: 13, color: '#3d5068', margin: '0 0 14px', lineHeight: 1.6 }}>
-        It looks like you're experiencing a network issue. Would you like to run a quick live connection check first?
-      </p>
-      <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
-        <button disabled={disabled}
-          style={{ background: disabled ? '#8596ab' : '#005EB8', color: '#fff', border: 'none', borderRadius: 8, padding: '9px 20px', fontSize: 13, fontWeight: 600, fontFamily: 'inherit', cursor: disabled ? 'not-allowed' : 'pointer' }}
-          onClick={() => {
-            if (disabled) return;
-            disableGroup(groupId);
-            addMessage({ type: 'user', text: 'Check my connection' });
-            const ccGroupId = nid();
-            addMessage({ type: 'live-connection', groupId: ccGroupId, autoStart: true });
-            stateRef.current.step = 'connection-check';
-          }}>Check My Connection</button>
-        <button disabled={disabled}
-          style={{ background: 'transparent', color: '#005EB8', border: '1px solid #005EB8', borderRadius: 8, padding: '9px 20px', fontSize: 13, fontWeight: 600, fontFamily: 'inherit', cursor: disabled ? 'not-allowed' : 'pointer' }}
-          onClick={() => { if (disabled) return; disableGroup(groupId); fetchSolution(queryText); }}>
-          Skip, just help me
-        </button>
-      </div>
+
+      {!showWidget && (
+        <>
+          <p style={{ fontSize: 13, color: '#3d5068', margin: '0 0 14px', lineHeight: 1.6 }}>
+            It looks like you're experiencing a network issue. Would you like to run a quick live connection check first?
+          </p>
+          <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+            <button disabled={disabled}
+              style={{ background: disabled ? '#8596ab' : '#005EB8', color: '#fff', border: 'none', borderRadius: 8, padding: '9px 20px', fontSize: 13, fontWeight: 600, fontFamily: 'inherit', cursor: disabled ? 'not-allowed' : 'pointer' }}
+              onClick={() => {
+                if (disabled) return;
+                setShowWidget(true);
+                stateRef.current.step = 'connection-check';
+              }}>Check My Connection</button>
+            <button disabled={disabled}
+              style={{ background: 'transparent', color: '#005EB8', border: '1px solid #005EB8', borderRadius: 8, padding: '9px 20px', fontSize: 13, fontWeight: 600, fontFamily: 'inherit', cursor: disabled ? 'not-allowed' : 'pointer' }}
+              onClick={() => { if (disabled) return; disableGroup(groupId); fetchSolution(queryText); }}>
+              Skip, just help me
+            </button>
+          </div>
+        </>
+      )}
+
+      {showWidget && (
+        <div style={{ marginTop: 8 }}>
+          <div style={{ position: 'relative', width: '100%', maxWidth: 720, margin: '0 auto', paddingBottom: '30%', minHeight: 160, borderRadius: 10, overflow: 'hidden', border: '1px solid #1e3a5f' }}>
+            <iframe
+              src="//openspeedtest.com/speedtest"
+              title="Speed Test"
+              style={{ border: 'none', position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', minHeight: 160, overflow: 'hidden' }}
+            />
+          </div>
+          <div style={{ marginTop: 10, display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+            <button
+              style={{ background: '#005EB8', color: '#fff', border: 'none', borderRadius: 8, padding: '8px 18px', fontSize: 12, fontWeight: 600, fontFamily: 'inherit', cursor: 'pointer' }}
+              onClick={() => { disableGroup(groupId); fetchSolution(queryText); }}>
+              Done — Help me now
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -836,7 +874,8 @@ export default function ChatSupport() {
     saveMessage('user', name, { sector_name: name, current_step: 'sector' });
     addMessage({ type: 'system', text: `Selected: ${name}` });
     setIsTyping(true);
-    const data = await chatApiCall('/api/subprocesses', { sector_key: key, language: stateRef.current.language });
+    let data = await chatApiCall('/api/subprocesses', { sector_key: key, language: stateRef.current.language });
+    data = { ...data, subprocesses: reduceBroadbandSubprocesses(data.subprocesses, key) };
     setIsTyping(false);
     addMessage({ type: 'bot', html: `Great choice! Now please select the <strong>type of issue</strong> you're facing with <strong>${name}</strong>:` });
     addMessage({ type: 'subprocess-grid', subprocesses: limitSubprocesses(data.subprocesses), groupId: nextId() });
@@ -1246,7 +1285,8 @@ export default function ChatSupport() {
       if (!session.sector_name) { addMessage({ type: 'bot', html: 'Please select your <strong>telecom service category</strong>:' }); loadSectorMenu(); }
       else if (!session.subprocess_name) {
         addMessage({ type: 'bot', html: `Please select the <strong>type of issue</strong> with <strong>${session.sector_name}</strong>:` });
-        const data = await chatApiCall('/api/subprocesses', { sector_key: stateRef.current.sectorKey, language: stateRef.current.language });
+        let data = await chatApiCall('/api/subprocesses', { sector_key: stateRef.current.sectorKey, language: stateRef.current.language });
+        data = { ...data, subprocesses: reduceBroadbandSubprocesses(data.subprocesses, stateRef.current.sectorKey) };
         addMessage({ type: 'subprocess-grid', subprocesses: limitSubprocesses(data.subprocesses), groupId: nextId() }); stateRef.current.step = 'subprocess';
       } else if (session.resolution) { addMessage({ type: 'bot', html: `Did this help? If not, please describe what's still not working.` }); showInput('Type your response...'); stateRef.current.step = 'conversation'; }
       else { addMessage({ type: 'bot', html: 'Please <strong>describe your specific issue</strong> so I can provide the best resolution.' }); showInput('Describe your issue in any language...'); stateRef.current.step = 'query'; }
