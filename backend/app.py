@@ -4586,10 +4586,18 @@ with app.app_context():
 # so that React Router can handle client-side navigation without 404s on refresh.
 BUILD_DIR = os.path.join(os.path.dirname(__file__), '..', 'frontend', 'build')
 
-@app.route('/', defaults={'path': ''})
+@app.route("/api/speedtest-widget")
+def serve_speedtest():
+    """Serve the self-hosted speed test page under /api/ so React Router never intercepts it."""
+    return send_from_directory(
+        os.path.join(os.path.dirname(__file__), 'static', 'speedtest'),
+        'index.html'
+    )
+
+
 @app.route('/<path:path>')
 def serve_react(path):
-    # Never intercept API routes
+    # Never intercept API routes or the speedtest page
     if path.startswith('api/'):
         from flask import abort
         abort(404)

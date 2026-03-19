@@ -68,9 +68,10 @@ def build_broadband_prompt(subprocess_name, language, attempt,
 def register_routes(app):
     """Register all /api/broadband/* routes on the Flask app."""
 
-    # Pre-generate a 10MB payload for the speed test endpoint — larger payload
-    # gives more accurate download speed readings especially on fast connections.
-    speedtest_bytes = b"0" * (10 * 1024 * 1024)
+    # 25 MB of pseudo-random bytes — large enough for accurate measurements,
+    # random-ish so gzip compression cannot shrink it (which would skew results).
+    import os as _os
+    _speedtest_payload = _os.urandom(25 * 1024 * 1024)
 
     @app.route("/api/broadband/billing-check", methods=["GET"])
     @jwt_required()
@@ -128,28 +129,38 @@ def register_routes(app):
     @app.route("/api/broadband/speedtest-file", methods=["GET"])
     @jwt_required()
     def broadband_speedtest_file():
-        """Returns a 2MB dummy payload to measure download speed from the browser."""
-        resp = Response(speedtest_bytes, mimetype="application/octet-stream")
-        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
-        resp.headers["Pragma"] = "no-cache"
-        resp.headers["Expires"] = "0"
-        resp.headers["Content-Length"] = str(len(speedtest_bytes))
-        resp.headers["Content-Disposition"] = 'attachment; filename="speedtest.bin"'
+        """
+        Serves a 25 MB random payload for browser-side download speed measurement.
+        - Random bytes prevent gzip/brotli compression from shrinking the payload (which would give falsely high speeds).
+        - Content-Length is set so the browser can track progress accurately.
+        - CORS headers expose Content-Length to JS fetch.
+        """
+        resp = Response(_speedtest_payload, mimetype="application/octet-stream")
+        resp.headers["Cache-Control"]             = "no-store, no-cache, must-revalidate, max-age=0"
+        resp.headers["Pragma"]                    = "no-cache"
+        resp.headers["Content-Encoding"]          = "identity"   # disable any server-side compression
+        resp.headers["Content-Length"]            = str(len(_speedtest_payload))
+        resp.headers["Content-Disposition"]       = 'attachment; filename="speedtest.bin"'
+        resp.headers["Access-Control-Allow-Origin"]   = "*"
+        resp.headers["Access-Control-Expose-Headers"] = "Content-Length"
         return resp
 
     @app.route("/api/broadband/ping", methods=["GET"])
     @jwt_required()
     def broadband_ping():
-        """Lightweight latency check endpoint — measures round-trip time."""
+        """Lightweight latency check endpoint."""
         ts_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
         return jsonify({"ok": True, "timestamp": ts_ms}), 200
 
     @app.route("/api/broadband/speedtest-upload", methods=["POST"])
     @jwt_required()
     def broadband_speedtest_upload():
-        """Accepts a binary payload and echoes bytes received — used to measure upload speed."""
+        """
+        Accepts binary upload for upload speed measurement.
+        Reads and discards the body — just measures bytes received.
+        """
         from flask import request as _req
-        body = _req.get_data()
+        body = _req.get_data(cache=False)
         return jsonify({"ok": True, "received_bytes": len(body)}), 200
 
     @app.route("/api/broadband/classify-connection-issue", methods=["POST"])

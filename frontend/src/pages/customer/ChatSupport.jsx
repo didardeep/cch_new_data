@@ -121,166 +121,112 @@ const isConnectionSummary = (msg) => {
 // All parent-scope callbacks are received as props.
 // ══════════════════════════════════════════════════════════════════
 
-function SpeedTestCard({ groupId, disabled, saveMessage, stateRef, disableGroup, addMessage, fetchSolution }) {
-  const [phase, setPhase]           = useState('idle');
-  const [pct, setPct]               = useState(0);
-  const [phaseText, setPhaseText]   = useState('Ready to test');
-  const [ping, setPing]             = useState(null);
-  const [jitter, setJitter]         = useState(null);
-  const [downMbps, setDownMbps]     = useState(null);
-  const [upMbps, setUpMbps]         = useState(null);
-  const [logLines, setLogLines]     = useState(['— Waiting to start —']);
-  const [signalLevel, setSignalLevel] = useState(0);
+function SpeedTestCard({ groupId, disabled, disableGroup, addMessage, fetchSolution, saveMessage, stateRef }) {
+  const [phase, setPhase]       = useState('idle');   // idle | running | done | error
+  const [results, setResults]   = useState(null);
+  const [reported, setReported] = useState(false);
+  const iframeRef               = useRef(null);
 
-  const appendLog = (line) => {
-    const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
-    setLogLines(prev => [...prev.filter(l => l !== '— Waiting to start —'), `[${ts}] ${line}`].slice(-20));
-  };
+  // Listen for postMessage from our self-hosted speed test iframe
+  useEffect(() => {
+    const handler = (e) => {
+      if (!e.data || e.data.type !== 'speedtest-results') return;
+      const { download, upload, ping } = e.data;
+      setResults({ download, upload, ping });
+      setPhase('done');
+    };
+    window.addEventListener('message', handler);
+    return () => window.removeEventListener('message', handler);
+  }, []);
 
-  const getSignalLevel = (mbps) => {
-    if (mbps >= 100) return 5; if (mbps >= 50) return 4;
-    if (mbps >= 20) return 3;  if (mbps >= 5)  return 2; return 1;
-  };
-  const signalColor = (level) => level >= 4 ? '#00875a' : level >= 3 ? '#c87d0a' : '#c42b1c';
-  const barHeights = [8, 13, 18, 23, 28];
-
-  const runTest = async () => {
-    if (phase === 'running') return;
-    setPhase('running');
-    setPct(0); setPing(null); setJitter(null); setDownMbps(null); setUpMbps(null);
-    setSignalLevel(0); setLogLines([]); setPhaseText('Starting test…');
-    appendLog('=== Network speed test started ===');
-
+  // Send auth token into iframe once it loads
+  const handleIframeLoad = () => {
     const token = getToken();
-    const authHeader = token ? { Authorization: `Bearer ${token}` } : {};
-    const pingTimes = [];
-
-    for (let i = 0; i < 8; i++) {
-      try {
-        const t0 = performance.now();
-        await fetch(`${API_BASE}/api/broadband/ping?_=${Date.now()}`, { headers: authHeader, cache: 'no-store' });
-        const rtt = performance.now() - t0;
-        pingTimes.push(rtt);
-        setPing(Math.round(pingTimes.reduce((a, b) => a + b) / pingTimes.length));
-        appendLog(`Ping #${i + 1}: ${rtt.toFixed(1)} ms`);
-      } catch { appendLog(`Ping #${i + 1}: error`); }
-      setPct(Math.round(5 + (i / 8) * 20));
-      await new Promise(r => setTimeout(r, 60));
+    if (iframeRef.current && token) {
+      iframeRef.current.contentWindow.postMessage({ type: 'set-token', token }, '*');
     }
-    if (pingTimes.length) {
-      const avg = pingTimes.reduce((a, b) => a + b) / pingTimes.length;
-      const jit = Math.sqrt(pingTimes.reduce((s, t) => s + (t - avg) ** 2, 0) / pingTimes.length);
-      setPing(Math.round(avg)); setJitter(parseFloat(jit.toFixed(1)));
-      appendLog(`Avg ping: ${avg.toFixed(1)} ms | Jitter: ${jit.toFixed(1)} ms`);
-    }
+    setPhase('running');
+  };
 
-    setPhaseText('Measuring download speed…');
-    const downResults = [];
-    for (let i = 0; i < 5; i++) {
-      try {
-        const t0 = performance.now();
-        const resp = await fetch(`${API_BASE}/api/broadband/speedtest-file?_=${Date.now()}`, { headers: authHeader, cache: 'no-store' });
-        let bytes = 0;
-        if (resp.body?.getReader) {
-          const reader = resp.body.getReader();
-          while (true) { const { done, value } = await reader.read(); if (done) break; bytes += value?.length || 0; }
-        } else { bytes = (await resp.arrayBuffer()).byteLength; }
-        const mbps = parseFloat(((bytes * 8) / ((performance.now() - t0) / 1000 * 1e6)).toFixed(2));
-        downResults.push(mbps);
-        const avg = parseFloat((downResults.reduce((a, b) => a + b) / downResults.length).toFixed(2));
-        setDownMbps(avg); setSignalLevel(getSignalLevel(avg));
-        appendLog(`Download chunk ${i + 1}: ${mbps} Mbps`);
-      } catch (e) { appendLog(`Download chunk ${i + 1}: error — ${e.message}`); }
-      setPct(Math.round(25 + (i / 5) * 35));
-    }
-    const finalDown = downResults.length ? parseFloat((downResults.reduce((a, b) => a + b) / downResults.length).toFixed(2)) : 0;
-    setDownMbps(finalDown); setSignalLevel(getSignalLevel(finalDown));
-    appendLog(`Avg download: ${finalDown} Mbps`);
-
-    setPhaseText('Measuring upload speed…');
-    const uploadPayload = new Uint8Array(1 * 1024 * 1024);
-    const upResults = [];
-    for (let i = 0; i < 4; i++) {
-      try {
-        const t0 = performance.now();
-        const resp = await fetch(`${API_BASE}/api/broadband/speedtest-upload`, {
-          method: 'POST', headers: { ...authHeader, 'Content-Type': 'application/octet-stream' },
-          body: uploadPayload, cache: 'no-store',
-        });
-        if (resp.ok) {
-          const mbps = parseFloat(((uploadPayload.byteLength * 8) / ((performance.now() - t0) / 1000 * 1e6)).toFixed(2));
-          upResults.push(mbps);
-          setUpMbps(parseFloat((upResults.reduce((a, b) => a + b) / upResults.length).toFixed(2)));
-          appendLog(`Upload chunk ${i + 1}: ${mbps} Mbps`);
-        } else { appendLog(`Upload chunk ${i + 1}: HTTP ${resp.status}`); }
-      } catch (e) { appendLog(`Upload chunk ${i + 1}: error — ${e.message}`); }
-      setPct(Math.round(60 + (i / 4) * 38));
-    }
-    const finalUp = upResults.length ? parseFloat((upResults.reduce((a, b) => a + b) / upResults.length).toFixed(2)) : 0;
-    setUpMbps(finalUp); appendLog(`Avg upload: ${finalUp} Mbps`);
-    appendLog('=== Test complete ===');
-    setPct(100); setPhaseText('Test complete'); setPhase('done');
-
-    const summary = `Speed test results — Ping: ${Math.round(pingTimes.reduce((a,b)=>a+b,0)/Math.max(pingTimes.length,1))} ms, Download: ${finalDown} Mbps, Upload: ${finalUp} Mbps`;
+  const handleUseResults = () => {
+    if (!results || reported) return;
+    const parts = [];
+    if (results.download != null) parts.push(`Download: ${results.download} Mbps`);
+    if (results.upload   != null) parts.push(`Upload: ${results.upload} Mbps`);
+    if (results.ping     != null) parts.push(`Ping: ${results.ping} ms`);
+    const summary = `Speed test results — ${parts.join(', ')}`;
+    setReported(true);
+    disableGroup(groupId);
     saveMessage('user', summary, { current_step: stateRef.current.step });
     stateRef.current.diagnosisSummary = (stateRef.current.diagnosisSummary ? stateRef.current.diagnosisSummary + ' | ' : '') + summary;
+    addMessage({ type: 'user', text: summary });
+    addMessage({ type: 'bot', html: `Thanks! Using your speed test results to provide a tailored solution.` });
+    fetchSolution(`${summary}. Please help diagnose and fix my original issue.`);
   };
 
-  const level = signalLevel;
-  const col = level > 0 ? signalColor(level) : '#d8e0ec';
+  const quality = (dl) => {
+    if (!dl) return null;
+    if (dl >= 100) return { label: 'Excellent', color: '#00875a' };
+    if (dl >= 50)  return { label: 'Good',      color: '#00875a' };
+    if (dl >= 20)  return { label: 'Fair',       color: '#c87d0a' };
+    if (dl >= 5)   return { label: 'Poor',       color: '#c42b1c' };
+    return { label: 'Very Poor', color: '#c42b1c' };
+  };
+  const q = quality(results?.download);
 
   return (
-    <div className="speed-test-card">
-      <div className="speed-test-card__header">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke={col} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
-        <span className="speed-test-card__title">Live Network Speed Test</span>
-      </div>
-      <div className="speed-test-card__subtitle">Measures your real ping, download and upload speed against our servers.</div>
-      <div className="speed-test-signal">
-        <div className="speed-test-signal__bars">
-          {barHeights.map((h, i) => <div key={i} className="speed-test-signal__bar" style={{ height: h, background: i < level ? col : '#d8e0ec' }} />)}
-        </div>
-        <div>
-          <div className="speed-test-signal__label" style={{ color: level > 0 ? col : '#8596ab' }}>
-            {level === 0 ? 'Not tested' : level === 1 ? '< 5 Mbps' : level === 2 ? '5 – 20 Mbps' : level === 3 ? '20 – 50 Mbps' : level === 4 ? '50 – 100 Mbps' : '100+ Mbps'}
-          </div>
-          <div className="speed-test-signal__sublabel">{downMbps !== null ? `${downMbps} Mbps download` : 'Run test to measure'}</div>
-        </div>
-      </div>
-      <div className="speed-test-metrics">
-        {[
-          { label: 'Ping', value: ping, unit: 'ms', color: '#005EB8', max: 300 },
-          { label: 'Jitter', value: jitter, unit: 'ms', color: '#c87d0a', max: 100 },
-          { label: 'Download', value: downMbps, unit: 'Mbps', color: '#00875a', max: 200 },
-          { label: 'Upload', value: upMbps, unit: 'Mbps', color: '#483698', max: 100 },
-        ].map(({ label, value, unit, color, max }) => (
-          <div className="speed-metric" key={label}>
-            <div className="speed-metric__label">{label}</div>
-            <div className="speed-metric__value" style={{ color: value !== null ? '#0f1d33' : '#c8d0dc' }}>{value !== null ? value : '—'}</div>
-            <div className="speed-metric__unit">{unit}</div>
-            <div className="speed-metric__bar"><div className="speed-metric__bar-fill" style={{ width: value !== null ? `${Math.min(100, (value / max) * 100)}%` : '0%', background: color }} /></div>
-          </div>
-        ))}
-      </div>
-      <div className="speed-test-progress">
-        <div className="speed-test-progress__labels"><span>{phaseText}</span><span>{pct}%</span></div>
-        <div className="speed-test-progress__track"><div className="speed-test-progress__fill" style={{ width: `${pct}%` }} /></div>
-      </div>
-      <div className="speed-test-log">{logLines.join('\n')}</div>
-      <div className="speed-test-actions">
-        <button className="speed-test-btn" onClick={runTest} disabled={disabled || phase === 'running'}>
-          {phase === 'running' ? 'Testing…' : phase === 'done' ? 'Re-run Test' : 'Run Speed Test'}
-        </button>
-        {phase === 'done' && (
-          <button className="speed-test-btn speed-test-btn--secondary" onClick={() => {
-            disableGroup(groupId);
-            addMessage({ type: 'user', text: `Speed test complete — Download: ${downMbps} Mbps, Upload: ${upMbps} Mbps, Ping: ${ping} ms` });
-            addMessage({ type: 'bot', html: `Thanks for running the speed test. Let me use these results to provide a better solution.` });
-            fetchSolution(`My speed test shows — Download: ${downMbps} Mbps, Upload: ${upMbps} Mbps, Ping: ${ping} ms, Jitter: ${jitter} ms`);
-          }}>Use Results &amp; Continue</button>
+    <div className="speed-test-card" style={{ padding: '12px 14px' }}>
+      {/* Header */}
+      <div className="speed-test-card__header" style={{ marginBottom: 8 }}>
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#005EB8" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/>
+        </svg>
+        <span className="speed-test-card__title" style={{ fontSize: 12 }}>Network Speed Test</span>
+        {phase === 'done' && q && (
+          <span style={{ marginLeft: 'auto', fontSize: 10, fontWeight: 700, color: q.color, background: q.color + '18', padding: '2px 8px', borderRadius: 99 }}>
+            {q.label}
+          </span>
         )}
       </div>
-      <div className="speed-test-note">All traffic stays within your company network. No data is sent externally.</div>
+
+      {/* Compact iframe — 220px tall */}
+      <div style={{ borderRadius: 10, overflow: 'hidden', border: '1px solid #1e3a5f', marginBottom: 8, height: 220 }}>
+        <iframe
+          ref={iframeRef}
+          src={`${API_BASE}/api/speedtest-widget?Run`}
+          title="Speed Test"
+          onLoad={handleIframeLoad}
+          style={{ width: '100%', height: '100%', border: 'none', display: 'block' }}
+        />
+      </div>
+
+      {/* Results row — shown after test completes */}
+      {phase === 'done' && results && !reported && (
+        <div style={{ background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: 8, padding: '8px 12px', marginBottom: 8, display: 'flex', alignItems: 'center', gap: 8 }}>
+          <div style={{ flex: 1, fontSize: 11, color: '#166534', fontWeight: 600 }}>
+            ⬇ {results.download} &nbsp;⬆ {results.upload} &nbsp;📡 {results.ping ?? '—'} ms
+          </div>
+          <button
+            onClick={handleUseResults}
+            disabled={disabled}
+            style={{ background: '#00875a', color: '#fff', border: 'none', borderRadius: 7, padding: '6px 14px', fontSize: 11, fontWeight: 700, fontFamily: 'inherit', cursor: disabled ? 'not-allowed' : 'pointer', whiteSpace: 'nowrap' }}
+          >
+            Use Results &amp; Get Help
+          </button>
+        </div>
+      )}
+
+      {reported && (
+        <div style={{ background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: 8, padding: '8px 12px', marginBottom: 8, fontSize: 11, color: '#166534', fontWeight: 600 }}>
+          ✓ Results submitted — AI is analysing your connection.
+        </div>
+      )}
+
+      {phase === 'running' && (
+        <div style={{ fontSize: 10, color: '#8596ab', textAlign: 'center' }}>
+          Test running — results will auto-detect when complete
+        </div>
+      )}
     </div>
   );
 }
@@ -288,210 +234,103 @@ function SpeedTestCard({ groupId, disabled, saveMessage, stateRef, disableGroup,
 // ─────────────────────────────────────────────────────────────────────────────
 
 function LiveConnectionCard({ groupId, disabled, autoStart, saveMessage, stateRef, sessionIdRef, disableGroup, addMessage, fetchSolution }) {
-  const [phase, setPhase]         = useState('idle');
-  const [pct, setPct]             = useState(0);
-  const [phaseText, setPhaseText] = useState('Ready');
-  const [pingVal, setPingVal]     = useState(null);
-  const [jitterVal, setJitterVal] = useState(null);
-  const [downVal, setDownVal]     = useState(null);
-  const [upVal, setUpVal]         = useState(null);
-  const [logLines, setLogLines]   = useState([]);
-  const [sigLevel, setSigLevel]   = useState(0);
-  const [showLog, setShowLog]     = useState(false);
-  const [errorMsg, setErrorMsg]   = useState('');
+  const [phase, setPhase]     = useState('running');
+  const [results, setResults] = useState(null);
+  const [reported, setReported] = useState(false);
+  const iframeRef             = useRef(null);
 
-  // startedRef prevents the autoStart effect from firing more than once.
-  const startedRef = useRef(false);
-
-  const log = useCallback((line) => {
-    const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
-    setLogLines(prev => [...prev.slice(-18), `[${ts}] ${line}`]);
+  useEffect(() => {
+    const handler = (e) => {
+      if (!e.data || e.data.type !== 'speedtest-results') return;
+      const { download, upload, ping } = e.data;
+      setResults({ download, upload, ping });
+      setPhase('done');
+    };
+    window.addEventListener('message', handler);
+    return () => window.removeEventListener('message', handler);
   }, []);
 
-  const sigColor = (lvl) => lvl >= 4 ? '#00875a' : lvl >= 3 ? '#c87d0a' : '#c42b1c';
-  const sigLabel = (lvl, mbps) => {
-    if (!mbps) return 'Not tested';
-    return lvl >= 5 ? `${mbps} Mbps — Excellent` : lvl >= 4 ? `${mbps} Mbps — Good` : lvl >= 3 ? `${mbps} Mbps — Fair` : lvl >= 2 ? `${mbps} Mbps — Weak` : `${mbps} Mbps — Poor`;
-  };
-  const getLevel = (mbps) => mbps >= 100 ? 5 : mbps >= 50 ? 4 : mbps >= 20 ? 3 : mbps >= 5 ? 2 : 1;
-
-  const fetchWithTimeout = async (url, opts = {}, ms = 5000) => {
-    const controller = new AbortController();
-    const t = setTimeout(() => controller.abort(), ms);
-    try { return await fetch(url, { ...opts, signal: controller.signal }); }
-    finally { clearTimeout(t); }
-  };
-
-  // run is stable — useCallback with [] deps. It reads no React state directly;
-  // all setters are stable references and the parent props don't change identity.
-  const run = useCallback(async () => {
-    setErrorMsg(''); setPhase('running');
-    setPct(0); setPingVal(null); setJitterVal(null); setDownVal(null); setUpVal(null);
-    setSigLevel(0); setLogLines([]);
-    setPhaseText('Measuring ping…');
-    log('=== Connection check started ===');
-
+  const handleIframeLoad = () => {
     const token = getToken();
-    const auth = token ? { Authorization: `Bearer ${token}` } : {};
-
-    // ── Ping (8 rounds) ────────────────────────────────────────────────────────
-    const times = [];
-    let consecutiveFails = 0;
-    for (let i = 0; i < 8; i++) {
-      try {
-        const t0 = performance.now();
-        const res = await fetchWithTimeout(`${API_BASE}/api/broadband/ping?_=${Date.now()}`, { headers: auth, cache: 'no-store' });
-        if (res.ok) {
-          await res.json();
-          times.push(performance.now() - t0);
-          consecutiveFails = 0;
-        } else { consecutiveFails += 1; log(`Ping #${i + 1}: HTTP ${res.status}`); }
-      } catch (e) { consecutiveFails += 1; log(`Ping #${i + 1}: ${e.name === 'AbortError' ? 'Timeout' : e.message}`); }
-
-      if (consecutiveFails >= 3) {
-        log('Ping test failed repeatedly — please retry.');
-        setPhase('error'); setPhaseText('Could not reach test server');
-        setErrorMsg('Ping test failed repeatedly — please retry.'); setPct(100);
-        return;
-      }
-      if (times.length) {
-        const avg = times.reduce((a, b) => a + b) / times.length;
-        setPingVal(Math.round(avg));
-        setJitterVal(parseFloat(Math.sqrt(times.reduce((s, t) => s + (t - avg) ** 2, 0) / times.length).toFixed(1)));
-      }
-      setPct(Math.round(5 + (i / 8) * 20));
-      await new Promise(r => setTimeout(r, 60));
+    if (iframeRef.current && token) {
+      iframeRef.current.contentWindow.postMessage({ type: 'set-token', token }, '*');
     }
-    if (times.length) log(`Avg ping: ${Math.round(times.reduce((a, b) => a + b) / times.length)} ms`);
+  };
 
-    // ── Download (5 chunks) ────────────────────────────────────────────────────
-    setPhaseText('Measuring download speed…');
-    const downs = [];
-    for (let i = 0; i < 5; i++) {
-      try {
-        const t0 = performance.now();
-        const res = await fetchWithTimeout(`${API_BASE}/api/broadband/speedtest-file?_=${Date.now()}`, { headers: auth, cache: 'no-store' });
-        if (!res.ok) { log(`Download chunk ${i + 1}: HTTP ${res.status}`); continue; }
-        let bytes = 0;
-        if (res.body?.getReader) {
-          const rdr = res.body.getReader();
-          while (true) { const { done, value } = await rdr.read(); if (done) break; bytes += value?.length || 0; }
-        } else { bytes = (await res.arrayBuffer()).byteLength; }
-        const mbps = parseFloat(((bytes * 8) / ((performance.now() - t0) / 1000 * 1e6)).toFixed(2));
-        downs.push(mbps);
-        const avg = parseFloat((downs.reduce((a, b) => a + b) / downs.length).toFixed(2));
-        setDownVal(avg); setSigLevel(getLevel(avg));
-        log(`Download chunk ${i + 1}: ${mbps} Mbps`);
-      } catch (e) { log(`Download chunk ${i + 1}: ${e.message}`); }
-      setPct(Math.round(25 + (i / 5) * 35));
-    }
-    const finalDown = downs.length ? parseFloat((downs.reduce((a, b) => a + b) / downs.length).toFixed(2)) : null;
-    if (finalDown) log(`Avg download: ${finalDown} Mbps`);
-
-    // ── Upload (3 chunks — skipped gracefully if endpoint missing) ─────────────
-    setPhaseText('Measuring upload speed…');
-    const payload = new Uint8Array(1 * 1024 * 1024);
-    const ups = [];
-    for (let i = 0; i < 3; i++) {
-      try {
-        const t0 = performance.now();
-        const res = await fetchWithTimeout(`${API_BASE}/api/broadband/speedtest-upload`, {
-          method: 'POST', headers: { ...auth, 'Content-Type': 'application/octet-stream' },
-          body: payload, cache: 'no-store',
-        });
-        if (res.ok) {
-          const mbps = parseFloat(((payload.byteLength * 8) / ((performance.now() - t0) / 1000 * 1e6)).toFixed(2));
-          ups.push(mbps);
-          setUpVal(parseFloat((ups.reduce((a, b) => a + b) / ups.length).toFixed(2)));
-          log(`Upload chunk ${i + 1}: ${mbps} Mbps`);
-        } else { log(`Upload chunk ${i + 1}: HTTP ${res.status} (skipped)`); }
-      } catch (e) { log(`Upload chunk ${i + 1}: ${e.message} (skipped)`); }
-      setPct(Math.round(60 + (i / 3) * 38));
-    }
-    const finalUp = ups.length ? parseFloat((ups.reduce((a, b) => a + b) / ups.length).toFixed(2)) : null;
-    if (finalUp) log(`Avg upload: ${finalUp} Mbps`);
-
-    log('=== Check complete ===');
-    setPct(100); setPhaseText('Check complete'); setPhase('done');
-
-    const finalPing = times.length ? Math.round(times.reduce((a, b) => a + b) / times.length) : null;
-    const summary = `Connection check — Download: ${finalDown ?? 'N/A'} Mbps, Upload: ${finalUp ?? 'N/A'} Mbps, Ping: ${finalPing ?? 'N/A'} ms`;
+  const handleUseResults = () => {
+    if (!results || reported) return;
+    const parts = [];
+    if (results.download != null) parts.push(`Download: ${results.download} Mbps`);
+    if (results.upload   != null) parts.push(`Upload: ${results.upload} Mbps`);
+    if (results.ping     != null) parts.push(`Ping: ${results.ping} ms`);
+    const summary = `Connection check results — ${parts.join(', ')}`;
+    setReported(true);
+    disableGroup(groupId);
     saveMessage('user', summary, { current_step: stateRef.current.step });
     stateRef.current.diagnosisSummary = (stateRef.current.diagnosisSummary ? stateRef.current.diagnosisSummary + ' | ' : '') + summary;
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+    addMessage({ type: 'user', text: summary });
+    addMessage({ type: 'bot', html: `Thanks! Using your connection results to provide a tailored solution.` });
+    fetchSolution(`${summary}. Now please help with my original issue.`);
+  };
 
-  // Fires exactly once on mount if autoStart is true.
-  useEffect(() => {
-    if (autoStart && !startedRef.current) { startedRef.current = true; run(); }
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
-
-  const lvl = sigLevel;
-  const col = lvl > 0 ? sigColor(lvl) : '#8596ab';
-  const barHeights = [8, 13, 18, 23, 28];
-  const visibleLog = showLog ? logLines : logLines.slice(-5);
+  const quality = (dl) => {
+    if (!dl) return null;
+    if (dl >= 100) return { label: 'Excellent', color: '#00875a' };
+    if (dl >= 50)  return { label: 'Good',      color: '#00875a' };
+    if (dl >= 20)  return { label: 'Fair',       color: '#c87d0a' };
+    if (dl >= 5)   return { label: 'Poor',       color: '#c42b1c' };
+    return { label: 'Very Poor', color: '#c42b1c' };
+  };
+  const q = quality(results?.download);
 
   return (
-    <div className="speed-test-card">
-      <div className="speed-test-card__header">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke={col} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+    <div className="speed-test-card" style={{ padding: '12px 14px' }}>
+      <div className="speed-test-card__header" style={{ marginBottom: 8 }}>
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#005EB8" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
           <path d="M1 6s4-2 11-2 11 2 11 2"/><path d="M1 10s4-2 11-2 11 2 11 2"/>
           <circle cx="12" cy="15" r="3"/><line x1="12" y1="12" x2="12" y2="15"/>
         </svg>
-        <span className="speed-test-card__title">Live Connection Check</span>
-      </div>
-      <div className="speed-test-card__subtitle">Measuring real-time download, upload and ping against our servers.</div>
-      <div className="speed-test-signal">
-        <div className="speed-test-signal__bars">
-          {barHeights.map((h, i) => <div key={i} className="speed-test-signal__bar" style={{ height: h, background: i < lvl ? col : '#d8e0ec' }} />)}
-        </div>
-        <div>
-          <div className="speed-test-signal__label" style={{ color: col }}>{sigLabel(lvl, downVal)}</div>
-          <div className="speed-test-signal__sublabel">
-            {phase === 'running' ? 'Measuring…' : phase === 'done' ? 'Based on live download speed' : 'Run check to measure'}
-          </div>
-        </div>
-      </div>
-      <div className="speed-test-metrics">
-        {[
-          { label: 'Ping', value: pingVal, unit: 'ms', color: '#005EB8', max: 300 },
-          { label: 'Jitter', value: jitterVal, unit: 'ms', color: '#c87d0a', max: 80 },
-          { label: 'Download', value: downVal, unit: 'Mbps', color: '#00875a', max: 200 },
-          { label: 'Upload', value: upVal, unit: 'Mbps', color: '#483698', max: 100 },
-        ].map(({ label, value, unit, color, max }) => (
-          <div className="speed-metric" key={label}>
-            <div className="speed-metric__label">{label}</div>
-            <div className="speed-metric__value" style={{ color: value != null ? '#0f1d33' : '#c8d0dc' }}>{value != null ? value : '—'}</div>
-            <div className="speed-metric__unit">{unit}</div>
-            <div className="speed-metric__bar"><div className="speed-metric__bar-fill" style={{ width: value != null ? `${Math.min(100,(value/max)*100)}%` : '0%', background: color }} /></div>
-          </div>
-        ))}
-      </div>
-      <div className="speed-test-progress">
-        <div className="speed-test-progress__labels"><span>{phaseText}</span><span>{pct}%</span></div>
-        <div className="speed-test-progress__track"><div className="speed-test-progress__fill" style={{ width: `${pct}%` }} /></div>
-      </div>
-      <div className="speed-test-log">{visibleLog.join('\n') || '— Waiting to start —'}</div>
-      {logLines.length > 5 && (
-        <button type="button" className="speed-test-btn speed-test-btn--link" onClick={() => setShowLog(v => !v)}>
-          {showLog ? 'Hide raw log' : 'View full log'}
-        </button>
-      )}
-      <div className="speed-test-actions">
-        <button className="speed-test-btn" onClick={run} disabled={disabled || phase === 'running'}>
-          {phase === 'running' ? 'Checking…' : phase === 'done' ? 'Re-run Check' : phase === 'error' ? 'Retry Check' : 'Check My Connection'}
-        </button>
-        {phase === 'done' && (
-          <button className="speed-test-btn speed-test-btn--secondary" onClick={() => {
-            disableGroup(groupId);
-            const summary = `Download: ${downVal} Mbps, Upload: ${upVal} Mbps, Ping: ${pingVal} ms`;
-            addMessage({ type: 'user', text: `Connection check done — ${summary}` });
-            fetchSolution(`My connection check results: ${summary}. Now please help with my original issue.`);
-          }}>Use Results &amp; Get Help</button>
+        <span className="speed-test-card__title" style={{ fontSize: 12 }}>Live Connection Check</span>
+        {phase === 'done' && q && (
+          <span style={{ marginLeft: 'auto', fontSize: 10, fontWeight: 700, color: q.color, background: q.color + '18', padding: '2px 8px', borderRadius: 99 }}>
+            {q.label}
+          </span>
         )}
       </div>
-      <div className="speed-test-note">
-        {errorMsg ? <span style={{ color: '#c42b1c' }}>{errorMsg}</span> : 'All traffic stays within your company network.'}
+
+      <div style={{ borderRadius: 10, overflow: 'hidden', border: '1px solid #1e3a5f', marginBottom: 8, height: 220 }}>
+        <iframe
+          ref={iframeRef}
+          src={`${API_BASE}/api/speedtest-widget?Run`}
+          title="Connection Check"
+          onLoad={handleIframeLoad}
+          style={{ width: '100%', height: '100%', border: 'none', display: 'block' }}
+        />
       </div>
+
+      {phase === 'done' && results && !reported && (
+        <div style={{ background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: 8, padding: '8px 12px', marginBottom: 8, display: 'flex', alignItems: 'center', gap: 8 }}>
+          <div style={{ flex: 1, fontSize: 11, color: '#166534', fontWeight: 600 }}>
+            ⬇ {results.download} &nbsp;⬆ {results.upload} &nbsp;📡 {results.ping ?? '—'} ms
+          </div>
+          <button onClick={handleUseResults} disabled={disabled}
+            style={{ background: '#00875a', color: '#fff', border: 'none', borderRadius: 7, padding: '6px 14px', fontSize: 11, fontWeight: 700, fontFamily: 'inherit', cursor: disabled ? 'not-allowed' : 'pointer', whiteSpace: 'nowrap' }}>
+            Use Results &amp; Get Help
+          </button>
+        </div>
+      )}
+
+      {reported && (
+        <div style={{ background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: 8, padding: '8px 12px', fontSize: 11, color: '#166534', fontWeight: 600 }}>
+          ✓ Results submitted — AI is analysing your connection.
+        </div>
+      )}
+
+      {phase === 'running' && (
+        <div style={{ fontSize: 10, color: '#8596ab', textAlign: 'center' }}>
+          Test running — results will auto-detect when complete
+        </div>
+      )}
     </div>
   );
 }
@@ -714,57 +553,6 @@ export default function ChatSupport() {
     }, 500);
   }, [addMessage, showInput]);
 
-  const classifySpeed = (speedMbps, planSpeedMbps) => {
-    if (typeof speedMbps !== 'number' || speedMbps <= 0) return { label: 'Unknown', percent: null };
-    if (planSpeedMbps) {
-      const percent = Math.round((speedMbps / planSpeedMbps) * 100);
-      return percent >= 80 ? { label: 'Good', percent } : percent >= 40 ? { label: 'Degraded', percent } : { label: 'Poor', percent };
-    }
-    return speedMbps >= 50 ? { label: 'Good', percent: null } : speedMbps >= 10 ? { label: 'Degraded', percent: null } : { label: 'Poor', percent: null };
-  };
-
-  const classifyLatency = (latencyMs) => {
-    if (typeof latencyMs !== 'number' || Number.isNaN(latencyMs) || latencyMs <= 0) return 'Unknown';
-    return latencyMs < 50 ? 'Good' : latencyMs <= 150 ? 'Moderate' : 'High';
-  };
-
-  const measurePing = useCallback(async () => {
-    const token = getToken();
-    const start = performance.now();
-    const resp = await fetch(`${API_BASE}/api/broadband/ping?ts=${Date.now()}`, {
-      headers: token ? { Authorization: `Bearer ${token}` } : {}, cache: 'no-store',
-    });
-    if (!resp.ok) throw new Error(`Ping failed: ${resp.status}`);
-    await resp.json();
-    return performance.now() - start;
-  }, []);
-
-  const measureDownloadSpeed = useCallback(async () => {
-    const token = getToken();
-    const start = performance.now();
-    const resp = await fetch(`${API_BASE}/api/broadband/speedtest-file?ts=${Date.now()}`, {
-      headers: token ? { Authorization: `Bearer ${token}` } : {}, cache: 'no-store',
-    });
-    if (!resp.ok) throw new Error(`Speed test failed: ${resp.status}`);
-    let bytes = 0;
-    if (resp.body?.getReader) {
-      const reader = resp.body.getReader();
-      while (true) { const { done, value } = await reader.read(); if (done) break; bytes += value?.length || 0; }
-    } else { bytes = (await resp.arrayBuffer()).byteLength; }
-    if (bytes === 0) throw new Error('No bytes received');
-    const durationSec = (performance.now() - start) / 1000;
-    return { mbps: Number(((bytes * 8) / (durationSec * 1e6)).toFixed(2)), bytes, durationSec };
-  }, []);
-
-  const runBrowserQualityChecks = useCallback(async (planSpeedMbps) => {
-    const connectionType = navigator.connection?.effectiveType || 'unknown';
-    let latencyMs = null, latencyError = null, speedMbps = null, speedError = null;
-    try { latencyMs = Math.round(await measurePing()); } catch (e) { latencyError = e?.message || 'Latency check failed'; }
-    try { const speed = await measureDownloadSpeed(); speedMbps = speed.mbps; } catch (e) { speedError = e?.message || 'Speed test failed'; }
-    const speedMeta = classifySpeed(speedMbps, planSpeedMbps);
-    return { speedMbps, speedPercent: speedMeta.percent, speedLabel: speedMeta.label, latencyMs, latencyLabel: classifyLatency(latencyMs), connectionType, latencyError, speedError };
-  }, [measurePing, measureDownloadSpeed]);
-
   const buildConnectionContext = useCallback((billing, connection, quality) => {
     const parts = [];
     if (billing?.plan_speed_mbps) parts.push(`Plan speed: ${billing.plan_speed_mbps} Mbps`);
@@ -807,23 +595,19 @@ export default function ChatSupport() {
       try { diag.connection = await apiGet('/api/broadband/connection-check'); }
       catch { diag.errors.connection = 'Connection check failed'; }
 
-      try { diag.quality = await runBrowserQualityChecks(planSpeed); }
-      catch { diag.errors.quality = 'Browser checks failed'; }
-
-      stateRef.current.connectionContext = buildConnectionContext(diag.billing, diag.connection, diag.quality) || null;
+      stateRef.current.connectionContext = buildConnectionContext(diag.billing, diag.connection, null) || null;
       stateRef.current.planSpeedMbps = planSpeed;
       broadbandDiagResultRef.current = diag;
 
       if (!stateRef.current.broadbandDiagShown) {
-        addMessage({ type: 'broadband-diagnostic', billing: diag.billing, connection: diag.connection, quality: diag.quality, errors: diag.errors, planSpeed });
+        addMessage({ type: 'broadband-diagnostic', billing: diag.billing, connection: diag.connection, quality: null, errors: diag.errors, planSpeed });
         stateRef.current.broadbandDiagShown = true;
       }
-      return diag;
     } finally {
       setIsTyping(false);
       broadbandDiagStatusRef.current = 'done';
     }
-  }, [addMessage, buildConnectionContext, runBrowserQualityChecks]);
+  }, [addMessage, buildConnectionContext]);
 
   const hydrateHistory = useCallback((history = []) => {
     const restored = [];
@@ -1204,6 +988,17 @@ export default function ChatSupport() {
 
     let userSaved = false;
     const saveUserOnce = (meta = {}) => { if (userSaved) return; saveMessage('user', text, meta); userSaved = true; };
+
+    // ── Speed test keyword shortcut — works in any sector / step ──────────────
+    const lowerText = text.toLowerCase();
+    const speedKeywords = ['speed test', 'speedtest', 'check speed', 'test speed', 'internet speed', 'network speed', 'run speed', 'check my speed', 'check internet', 'test my internet', 'test internet'];
+    if (speedKeywords.some(kw => lowerText.includes(kw))) {
+      saveUserOnce({ current_step: stateRef.current.step });
+      addMessage({ type: 'bot', html: 'Sure! Let me run a live speed test for you. This will measure your <strong>ping</strong>, <strong>download</strong>, and <strong>upload</strong> speed against our servers.' });
+      addMessage({ type: 'speed-test', groupId: nextId() });
+      return;
+    }
+    // ─────────────────────────────────────────────────────────────────────────
 
     if (stateRef.current.step === 'greeting') {
       saveUserOnce({ current_step: 'greeting' });
@@ -1587,6 +1382,12 @@ export default function ChatSupport() {
         return (
           <div key={msg.id} className="post-feedback-actions">
             <button className={`action-btn menu-btn${isDisabled ? ' disabled' : ''}`} onClick={() => !isDisabled && handleBackToMenu(msg.groupId)}>Main Menu</button>
+            <button className={`action-btn speed-btn${isDisabled ? ' disabled' : ''}`} onClick={() => {
+              if (isDisabled) return;
+              disableGroup(msg.groupId);
+              addMessage({ type: 'bot', html: 'Sure! Let me run a live speed test. This measures your <strong>ping</strong>, <strong>download</strong>, and <strong>upload</strong> speed.' });
+              addMessage({ type: 'speed-test', groupId: nextId() });
+            }}>Run Speed Test</button>
             <button className={`action-btn exit-btn${isDisabled ? ' disabled' : ''}`} onClick={() => !isDisabled && handleExit(msg.groupId)}>Exit</button>
           </div>
         );
