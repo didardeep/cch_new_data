@@ -650,7 +650,9 @@ export default function ChatSupport() {
         const billSummary = [];
         if (diag.billing?.plan_name) billSummary.push(`Plan: ${diag.billing.plan_name}`);
         if (diag.billing?.plan_speed_mbps) billSummary.push(`Speed: ${diag.billing.plan_speed_mbps} Mbps`);
+        if (diag.billing?.account_active !== undefined) billSummary.push(`Account: ${diag.billing.account_active ? 'Active' : 'Inactive'}`);
         if (diag.billing?.bill_paid !== undefined) billSummary.push(`Bill paid: ${diag.billing.bill_paid ? 'Yes' : 'No'}`);
+        if (diag.billing?.outstanding_amount) billSummary.push(`Outstanding: ${diag.billing.outstanding_amount}`);
         if (diag.billing?.fup_hit !== undefined) billSummary.push(`FUP hit: ${diag.billing.fup_hit ? 'Yes' : 'No'}`);
         stateRef.current.billingContext = billSummary.join('; ');
       } catch { diag.errors.billing = 'Billing check failed'; stateRef.current.billingContext = null; }

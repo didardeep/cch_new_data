@@ -37,29 +37,52 @@ def is_broadband_sector(sector_key) -> bool:
 def build_broadband_prompt(subprocess_name, language, attempt,
                             billing_context=None, connection_context=None,
                             query_block="", context_block="", prev_block=""):
-    """Builds a concise, generic broadband prompt."""
+    """Builds a context-aware broadband prompt that uses pre-run diagnostic results."""
 
     diag_block = ""
     if billing_context or connection_context:
-        diag_block = "\n\nAUTOMATED DIAGNOSTICS -- reference these values directly in your steps:\n"
+        diag_block = (
+            "\n\nAUTOMATED CHECKS ALREADY COMPLETED — the system has already run a billing check and "
+            "connection check on the customer's account before this conversation. "
+            "Do NOT ask the customer to check their bill, verify their plan, check account status, "
+            "test their connection, or confirm if their service is active — all of this is already done.\n\n"
+            "Diagnostic results:\n"
+        )
         if billing_context:
-            diag_block += f"Billing check: {billing_context}\n"
+            diag_block += f"  Billing: {billing_context}\n"
         if connection_context:
-            diag_block += f"Connection check: {connection_context}\n"
-        diag_block += "Use the diagnostic data explicitly when it helps the customer.\n"
+            diag_block += f"  Connection: {connection_context}\n"
+        diag_block += (
+            "\nHow to use these results:\n"
+            "- 'Bill paid: No' or outstanding_amount > 0 → the unpaid bill is the likely cause; "
+            "tell the customer to clear their dues and explain service will restore shortly after payment.\n"
+            "- 'FUP hit: Yes' → Fair Usage Policy limit reached; speed is throttled by the provider; "
+            "advise them to upgrade their plan or wait for the next billing cycle reset — "
+            "no router fix will help here.\n"
+            "- 'Account: Inactive' → account is suspended; advise contacting billing to reactivate — "
+            "skip all router troubleshooting.\n"
+            "- Bill paid, account active, FUP not hit → billing is clear; focus ONLY on "
+            "router/Wi-Fi troubleshooting steps the customer can do at home right now.\n"
+        )
 
     return (
-        f"You are a broadband and Wi-Fi support specialist. The customer is in 'Broadband / Internet Services' under '{subprocess_name}'. "
+        f"You are a broadband and Wi-Fi support specialist. "
+        f"The customer is in 'Broadband / Internet Services' under '{subprocess_name}'. "
         f"This is solution attempt #{attempt}.\n\n"
-        "Respond with ONE concise solution tailored to the customer's query. Provide 3-5 short, numbered steps the customer can do right now at home with no special tools.\n"
-        "Rules: stay within broadband/wi-fi/router context; assume the customer is non-technical; keep every step beginner-friendly; avoid jargon and avoid deep router admin changes unless essential (and then give the exact menu path); avoid mobile network steps; avoid telling them to contact support or schedule a technician unless absolutely necessary; keep wording clear and brief.\n"
-        "Use any diagnostic data (plan speed, measured speed, latency, line status) to make the advice specific.\n"
+        "Respond with ONE concise solution. Provide 3-5 short, numbered steps.\n\n"
+        "Rules:\n"
+        "- Stay within broadband/Wi-Fi/router context only\n"
+        "- Assume the customer is non-technical — every step must be beginner-friendly, no jargon\n"
+        "- Do NOT tell the customer to check their bill, verify their account, check if their plan is "
+        "active, or test their connection speed — these have already been handled\n"
+        "- Do NOT repeat any step that appears in previous solutions\n"
+        "- Do NOT include URLs or hyperlinks\n"
+        "- Avoid scheduling technician visits unless it is the only remaining option\n"
         + diag_block
         + query_block
         + context_block
         + prev_block
-        + "\nDo NOT include any URLs or hyperlinks.\n"
-        f"Respond entirely in {language}."
+        + f"\nRespond entirely in {language}."
     )
 
 

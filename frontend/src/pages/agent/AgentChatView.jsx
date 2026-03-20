@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { useParams, useNavigate, useSearchParams } from 'react-router-dom';
+import { useParams, useNavigate } from 'react-router-dom';
 import { apiGet, apiPost, apiPut, getToken } from '../../api';
 import { io } from 'socket.io-client';
 
@@ -110,12 +110,185 @@ const BUBBLE = {
   },
 };
 
+/* ── Rich payload renderer (read-only view of bot visualizations) ─────── */
+function renderRichMessage(p) {
+  if (!p || !p.type) return null;
+  switch (p.type) {
+    case 'sector-menu': {
+      const names = Object.values(p.sectors || {});
+      if (!names.length) return null;
+      return (
+        <div style={{ background: '#f7f9fc', border: '1px solid #d8e0ec', borderRadius: 10, padding: '12px 14px', width: '100%' }}>
+          <div style={{ fontSize: 11, color: '#00338d', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 8 }}>Sector Menu</div>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+            {names.map((n, i) => <div key={i} style={{ background: '#e8eef8', color: '#00338d', borderRadius: 6, padding: '5px 12px', fontSize: 12, fontWeight: 600 }}>{n}</div>)}
+          </div>
+        </div>
+      );
+    }
+    case 'subprocess-grid': {
+      const names = Object.values(p.subprocesses || {});
+      if (!names.length) return null;
+      return (
+        <div style={{ background: '#f7f9fc', border: '1px solid #d8e0ec', borderRadius: 10, padding: '12px 14px', width: '100%' }}>
+          <div style={{ fontSize: 11, color: '#00338d', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 8 }}>Issue Categories</div>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+            {names.map((n, i) => <div key={i} style={{ background: '#e8eef8', color: '#00338d', borderRadius: 6, padding: '5px 12px', fontSize: 12, fontWeight: 600 }}>{n}</div>)}
+          </div>
+        </div>
+      );
+    }
+    case 'network-subissue-grid': {
+      const opts = p.options || [];
+      if (!opts.length) return null;
+      return (
+        <div style={{ background: '#f7f9fc', border: '1px solid #d8e0ec', borderRadius: 10, padding: '12px 14px', width: '100%' }}>
+          <div style={{ fontSize: 11, color: '#00338d', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 8 }}>Sub-Issue Options</div>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+            {opts.map((n, i) => <div key={i} style={{ background: '#e8eef8', color: '#00338d', borderRadius: 6, padding: '5px 12px', fontSize: 12, fontWeight: 600 }}>{n}</div>)}
+          </div>
+        </div>
+      );
+    }
+    case 'resolution': {
+      const html = p.html || p.text || '';
+      return (
+        <div style={{ background: '#f0f7ff', border: '1px solid #bfdbfe', borderLeft: '4px solid #1d4ed8', borderRadius: 10, padding: '14px 16px', width: '100%' }}>
+          <div style={{ fontSize: 11, color: '#1d4ed8', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 8 }}>AI Solution</div>
+          <div style={{ fontSize: 13, color: '#1e293b', lineHeight: 1.7 }} dangerouslySetInnerHTML={{ __html: html }} />
+        </div>
+      );
+    }
+    case 'broadband-diagnostic': {
+      const billing = p.billing || {}, errors = p.errors || {};
+      const planSpeed = p.planSpeed || billing.plan_speed_mbps || null;
+      const accountActive = billing.account_active !== false;
+      return (
+        <div style={{ background: '#f7f9fc', border: '1px solid #d8e0ec', borderLeft: '4px solid #00338d', borderRadius: 12, padding: '16px 18px', width: '100%' }}>
+          <div style={{ fontWeight: 700, fontSize: 14, color: '#0f1d33', marginBottom: 6 }}>Billing & Plan Details</div>
+          <div style={{ background: '#fff', border: '1px solid #d8e0ec', borderRadius: 10, padding: '12px 14px', marginTop: 10 }}>
+            <div style={{ fontSize: 11, color: '#00338d', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.04em', marginBottom: 6 }}>Plan Details</div>
+            {errors.billing ? <div style={{ color: '#c42b1c', fontSize: 12 }}>{errors.billing}</div> : (
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: '8px 12px', fontSize: 12, color: '#1a2b42' }}>
+                <div><span style={{ color: '#8596ab' }}>Plan:</span> <strong>{billing.plan_name || 'Not on record'}</strong></div>
+                <div><span style={{ color: '#8596ab' }}>Speed:</span> <strong>{planSpeed != null ? `${planSpeed} Mbps` : 'Not on record'}</strong></div>
+                <div><span style={{ color: '#8596ab' }}>Account:</span> <strong style={{ color: accountActive ? '#0f1d33' : '#c42b1c' }}>{accountActive ? 'Active' : 'Inactive'}</strong></div>
+                <div><span style={{ color: '#8596ab' }}>Bill Paid:</span> <strong style={{ color: billing.bill_paid === false ? '#c42b1c' : '#0f1d33' }}>{billing.bill_paid === false ? 'No' : 'Yes'}</strong></div>
+              </div>
+            )}
+          </div>
+        </div>
+      );
+    }
+    case 'connection-check-offer':
+      return (
+        <div style={{ background: 'rgba(0,94,184,0.07)', border: '1px solid rgba(0,94,184,0.2)', borderRadius: 12, padding: '12px 16px', width: '100%' }}>
+          <div style={{ fontWeight: 700, fontSize: 13, color: '#00338D', marginBottom: 4 }}>Connection Check</div>
+          <div style={{ fontSize: 12, color: '#3d5068' }}>The bot offered the customer a live connection check before providing a solution.</div>
+        </div>
+      );
+    case 'speed-test': {
+      const r = p.results;
+      return (
+        <div style={{ background: '#f7f9fc', border: '1px solid #d8e0ec', borderRadius: 10, padding: '14px 16px', width: '100%' }}>
+          <div style={{ fontWeight: 700, fontSize: 13, color: '#0f1d33', marginBottom: r ? 10 : 4 }}>Speed Test</div>
+          {r ? (
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(100px, 1fr))', gap: 10 }}>
+              {r.download != null && <div><div style={{ color: '#8596ab', fontSize: 11 }}>Download</div><div style={{ fontSize: 18, fontWeight: 800 }}>{r.download} Mbps</div></div>}
+              {r.upload != null && <div><div style={{ color: '#8596ab', fontSize: 11 }}>Upload</div><div style={{ fontSize: 18, fontWeight: 800 }}>{r.upload} Mbps</div></div>}
+              {r.ping != null && <div><div style={{ color: '#8596ab', fontSize: 11 }}>Ping</div><div style={{ fontSize: 18, fontWeight: 800 }}>{r.ping} ms</div></div>}
+            </div>
+          ) : <div style={{ fontSize: 12, color: '#3d5068' }}>A speed test was performed during this session.</div>}
+        </div>
+      );
+    }
+    case 'diagnosis-result': {
+      const d = p.diagnosis || {};
+      const colorMap = { green: '#00875a', amber: '#c87d0a', red: '#c42b1c', unknown: '#8596ab' };
+      const bgMap = { green: '#f0fdf4', amber: '#fffbeb', red: '#fef2f2', unknown: '#f7f9fc' };
+      const st = d.overall_status || 'unknown';
+      return (
+        <div style={{ background: bgMap[st], border: '1px solid #d8e0ec', borderLeft: `4px solid ${colorMap[st]}`, borderRadius: 10, padding: '14px 16px', width: '100%' }}>
+          <div style={{ display: 'flex', gap: 8, marginBottom: 8, flexWrap: 'wrap' }}>
+            <div style={{ background: colorMap[st], color: '#fff', borderRadius: 12, padding: '3px 12px', fontSize: 12, fontWeight: 700 }}>Signal: {d.overall_label || 'Unknown'}</div>
+            {d.is_busy_hour && <div style={{ background: '#c87d0a', color: '#fff', borderRadius: 12, padding: '3px 12px', fontSize: 12, fontWeight: 700 }}>Peak Hours</div>}
+          </div>
+          <div style={{ fontSize: 13, color: '#1a2b42', lineHeight: 1.6 }}>{d.summary}</div>
+          {d.nearest_sites?.length > 0 && (
+            <div style={{ marginTop: 12, borderTop: '1px solid #d8e0ec', paddingTop: 12 }}>
+              <div style={{ fontSize: 11, fontWeight: 700, color: '#00338D', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 8 }}>Nearest Tower Sites</div>
+              {d.nearest_sites.map((site, idx) => {
+                const sc = site.status === 'ON AIR' ? '#00875a' : '#c42b1c';
+                return (
+                  <div key={idx} style={{ background: '#fff', border: '1px solid #d8e0ec', borderRadius: 8, padding: '10px 12px', marginBottom: idx < d.nearest_sites.length - 1 ? 6 : 0 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
+                      <span style={{ fontWeight: 700, fontSize: 13 }}>{site.site_id}</span>
+                      <span style={{ fontSize: 11, fontWeight: 700, color: sc, background: site.status === 'ON AIR' ? 'rgba(0,135,90,0.08)' : 'rgba(196,43,28,0.08)', padding: '2px 8px', borderRadius: 6 }}>{site.status}</span>
+                    </div>
+                    <div style={{ fontSize: 12, color: '#3d5068' }}><span style={{ color: '#8596ab' }}>Distance:</span> {site.distance_km} km{site.alarm && site.alarm !== 'None' ? ` | Alarm: ${site.alarm}` : ''}</div>
+                    {site.solution && site.solution !== 'No action required' && <div style={{ fontSize: 12, color: '#00338D', marginTop: 4, fontWeight: 600 }}>Action: {site.solution}</div>}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      );
+    }
+    case 'thankyou':
+      return (
+        <div style={{ background: '#f0fdf4', border: '1px solid #86efac', borderRadius: 12, padding: '14px 18px', width: '100%', textAlign: 'center' }}>
+          <div style={{ fontSize: 22, color: '#16a34a', marginBottom: 4 }}>✓</div>
+          <div style={{ fontWeight: 700, fontSize: 14, color: '#166534' }}>Customer Satisfied</div>
+          <div style={{ fontSize: 12, color: '#166534', marginTop: 4 }}>The customer indicated the issue was resolved.</div>
+        </div>
+      );
+    case 'exit-box':
+      return (
+        <div style={{ background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 10, padding: '12px 16px', width: '100%', textAlign: 'center' }}>
+          <div style={{ fontWeight: 700, fontSize: 13, color: '#475569' }}>Session ended by customer</div>
+        </div>
+      );
+    case 'handoff':
+      return (
+        <div style={{ background: '#eff6ff', border: '1px solid #bfdbfe', borderRadius: 10, padding: '12px 14px', width: '100%' }}>
+          <div style={{ fontWeight: 700, fontSize: 13, color: '#1d4ed8', marginBottom: 4 }}>Escalated to Human Agent</div>
+          <div style={{ fontSize: 12, color: '#1e40af' }}>The customer was transferred to a live agent for further assistance.</div>
+        </div>
+      );
+    case 'non-telecom-warning':
+      return (
+        <div style={{ background: '#fffbeb', border: '1px solid #fde68a', borderLeft: '4px solid #f59e0b', borderRadius: 10, padding: '12px 14px', width: '100%' }}
+          dangerouslySetInnerHTML={{ __html: p.html || p.text || '' }} />
+      );
+    case 'signal-offer':
+      return (
+        <div style={{ background: '#f7f9fc', border: '1px solid #d8e0ec', borderRadius: 10, padding: '12px 14px', width: '100%', fontSize: 12, color: '#3d5068' }}>
+          A signal diagnosis was offered to the customer.
+        </div>
+      );
+    case 'post-actions':
+      return (
+        <div style={{ background: '#f7f9fc', border: '1px solid #d8e0ec', borderRadius: 10, padding: '10px 14px', width: '100%', fontSize: 12, color: '#3d5068' }}>
+          Post-resolution options were shown to the customer (Main Menu / Exit).
+        </div>
+      );
+    case 'user-image':
+      return p.imageSrc ? (
+        <div style={{ background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 10, padding: 10 }}>
+          <div style={{ fontSize: 11, color: '#475569', marginBottom: 6 }}>Customer screenshot</div>
+          <img src={p.imageSrc} alt="Customer screenshot" style={{ maxWidth: '100%', maxHeight: 300, borderRadius: 8 }} />
+        </div>
+      ) : null;
+    default:
+      return null;
+  }
+}
+
 /* ── Main Component ───────────────────────────────────────────────────── */
 export default function AgentChatView() {
   const { sessionId } = useParams();
   const navigate = useNavigate();
-  const [searchParams] = useSearchParams();
-  const ticketId = searchParams.get('ticketId');
 
   const [session, setSession] = useState(null);
   const [messages, setMessages] = useState([]);
@@ -123,7 +296,6 @@ export default function AgentChatView() {
   const [newMessage, setNewMessage] = useState('');
   const [sending, setSending] = useState(false);
   const [ending, setEnding] = useState(false);
-  const [resolving, setResolving] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [activePanel, setActivePanel] = useState(null);
@@ -233,20 +405,6 @@ export default function AgentChatView() {
     }
   };
 
-  const handleResolve = async () => {
-    if (!ticketId || resolving) return;
-    const confirmEnd = window.confirm('End this chat and mark the ticket as resolved?');
-    if (!confirmEnd) return;
-    setResolving(true);
-    try {
-      await apiPut(`/api/agent/tickets/${ticketId}/resolve`, { resolution_notes: '' });
-      await fetchChat();
-    } catch {
-      alert('Failed to end the chat. Please try again.');
-    } finally {
-      setResolving(false);
-    }
-  };
 
   const handleKeyDown = (e) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -401,22 +559,6 @@ export default function AgentChatView() {
             {IC.refresh} Refresh
           </button>
 
-          <button
-            onClick={handleResolve}
-            className="btn btn-ghost btn-sm"
-            disabled={!ticketId || session?.status === 'resolved' || resolving}
-            style={{
-              color: '#fff',
-              borderColor: 'rgba(255,255,255,0.35)',
-              background: 'rgba(34,197,94,0.25)',
-              display: 'flex', alignItems: 'center', gap: 5,
-              opacity: !ticketId || session?.status === 'resolved' || resolving ? 0.6 : 1,
-              cursor: !ticketId || session?.status === 'resolved' || resolving ? 'not-allowed' : 'pointer',
-            }}
-            title={!ticketId ? 'Ticket ID missing' : session?.status === 'resolved' ? 'Already resolved' : 'End chat'}
-          >
-            {IC.check} {resolving ? 'Ending…' : 'End Chat'}
-          </button>
         </div>
 
         {session?.status === 'escalated' && (
@@ -496,50 +638,60 @@ export default function AgentChatView() {
             }
 
             const cfg = BUBBLE[msg.sender] || BUBBLE.customer;
+            const timeStr = msg.created_at
+              ? new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+              : '';
+            const senderLabel = (
+              <div style={{ fontSize: 10, color: cfg.labelColor, marginBottom: 4, display: 'flex', alignItems: 'center', gap: 4, fontWeight: 600 }}>
+                {cfg.icon}
+                <span>{cfg.label}</span>
+                <span style={{ opacity: 0.5, fontWeight: 400 }}>·</span>
+                <span style={{ opacity: 0.7, fontWeight: 400 }}>{timeStr}</span>
+                {renderAgentTicks(msg)}
+              </div>
+            );
+
+            // Rich payload types (visualizations, cards, grids)
+            const RICH_TYPES = new Set([
+              'sector-menu', 'subprocess-grid', 'network-subissue-grid',
+              'resolution', 'broadband-diagnostic', 'connection-check-offer',
+              'speed-test', 'diagnosis-result', 'thankyou', 'exit-box',
+              'handoff', 'non-telecom-warning', 'signal-offer', 'post-actions', 'user-image',
+            ]);
+            const payloadType = msg.payload?.type;
+            if (payloadType && RICH_TYPES.has(payloadType)) {
+              const richEl = renderRichMessage(msg.payload);
+              if (richEl) {
+                return (
+                  <div key={msg.id} style={{ display: 'flex', flexDirection: 'column', maxWidth: '88%', alignSelf: 'flex-start', alignItems: 'flex-start' }}>
+                    {senderLabel}
+                    {richEl}
+                  </div>
+                );
+              }
+            }
+
+            // Bot messages: render HTML from payload
+            if (msg.sender === 'bot') {
+              const html = msg.payload?.html || msg.content || '';
+              return (
+                <div key={msg.id} style={{ display: 'flex', flexDirection: 'column', maxWidth: '72%', ...cfg.wrapper }}>
+                  {senderLabel}
+                  <div style={{ padding: '10px 14px', fontSize: 13, lineHeight: 1.65, wordBreak: 'break-word', boxShadow: '0 1px 3px rgba(0,0,0,0.06)', ...cfg.bubble }}
+                    dangerouslySetInnerHTML={{ __html: html }} />
+                </div>
+              );
+            }
+
+            // Customer / agent messages: plain text
             const isImage = typeof msg.content === 'string' && msg.content.startsWith('data:image/');
             return (
-              <div key={msg.id} style={{
-                display: 'flex', flexDirection: 'column',
-                maxWidth: '72%',
-                ...cfg.wrapper,
-              }}>
-                {/* Sender label row */}
-                <div style={{
-                  fontSize: 10,
-                  color: cfg.labelColor,
-                  marginBottom: 4,
-                  display: 'flex', alignItems: 'center', gap: 4,
-                  fontWeight: 600,
-                }}>
-                  {cfg.icon}
-                  <span>{cfg.label}</span>
-                  <span style={{ opacity: 0.5, fontWeight: 400 }}>·</span>
-                  <span style={{ opacity: 0.7, fontWeight: 400 }}>
-                    {msg.created_at
-                      ? new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-                      : ''}
-                  </span>
-                  {renderAgentTicks(msg)}
-                </div>
-
-                {/* Bubble */}
-                <div style={{
-                  padding: '10px 14px',
-                  fontSize: 13,
-                  lineHeight: 1.65,
-                  wordBreak: 'break-word',
-                  boxShadow: '0 1px 3px rgba(0,0,0,0.06)',
-                  ...cfg.bubble,
-                }}>
-                  {isImage ? (
-                    <img
-                      src={msg.content}
-                      alt="Customer screenshot"
-                      style={{ maxWidth: '220px', borderRadius: 8, display: 'block' }}
-                    />
-                  ) : (
-                    msg.content
-                  )}
+              <div key={msg.id} style={{ display: 'flex', flexDirection: 'column', maxWidth: '72%', ...cfg.wrapper }}>
+                {senderLabel}
+                <div style={{ padding: '10px 14px', fontSize: 13, lineHeight: 1.65, wordBreak: 'break-word', boxShadow: '0 1px 3px rgba(0,0,0,0.06)', ...cfg.bubble }}>
+                  {isImage
+                    ? <img src={msg.content} alt="Customer screenshot" style={{ maxWidth: '220px', borderRadius: 8, display: 'block' }} />
+                    : msg.content}
                 </div>
               </div>
             );

@@ -3402,7 +3402,7 @@ def reports_agents():
 
         if resolved_tickets:
             avg_time = round(sum(
-                (t.resolved_at - t.created_at).total_seconds() / 3600
+                max(0, (t.resolved_at - t.created_at).total_seconds() / 3600)
                 for t in resolved_tickets
             ) / len(resolved_tickets), 1)
         else:
@@ -3793,7 +3793,7 @@ def agent_dashboard():
         ra = _utc(t.resolved_at)
         ca = _utc(t.created_at)
         if ra and ca:
-            resolve_times.append((ra - ca).total_seconds() / 3600)
+            resolve_times.append(max(0, (ra - ca).total_seconds() / 3600))
     mttr = round(sum(resolve_times) / len(resolve_times), 2) if resolve_times else 0
 
     # SLA Compliance Rate
@@ -3828,7 +3828,7 @@ def agent_dashboard():
             ra = _utc(t.resolved_at)
             ca = _utc(t.created_at)
             if ra and ca:
-                hs_times.append((ra - ca).total_seconds() / 3600)
+                hs_times.append(max(0, (ra - ca).total_seconds() / 3600))
     hs_resolution_time = round(sum(hs_times) / len(hs_times), 2) if hs_times else 0
 
     # High Severity Response Time (time from creation to status change from pending, approximation = 0 since not tracked)
@@ -3846,7 +3846,7 @@ def agent_dashboard():
         if t.status in ("pending", "in_progress"):
             ca = _utc(t.created_at)
             if ca:
-                aging_hours.append((now - ca).total_seconds() / 3600)
+                aging_hours.append(max(0, (now - ca).total_seconds() / 3600))
     avg_aging = round(sum(aging_hours) / len(aging_hours), 2) if aging_hours else 0
 
     # Monthly trend – tickets resolved per month (last 6 months)
