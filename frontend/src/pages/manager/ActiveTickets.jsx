@@ -1,7 +1,10 @@
 import { useState, useEffect } from 'react';
 import { apiGet, apiPut } from '../../api';
+import { useAuth } from '../../AuthContext';
 
 export default function ActiveTickets() {
+  const { user } = useAuth();
+  const isAdmin = user?.role === 'admin';
   const [tickets, setTickets] = useState([]);
   const [loading, setLoading] = useState(true);
   const [changesLoading, setChangesLoading] = useState(true);
@@ -233,7 +236,7 @@ export default function ActiveTickets() {
                   <th>Status</th>
                   <th>Priority</th>
                   <th>Created</th>
-                  <th>Actions</th>
+                  {!isAdmin && <th>Actions</th>}
                 </tr>
               </thead>
               <tbody>
@@ -247,7 +250,7 @@ export default function ActiveTickets() {
                     <td style={{ fontSize: 13 }}>{t.category}</td>
                     <td style={{ maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 13 }}>{t.description}</td>
                     <td>
-                      {editingId === t.id ? (
+                      {!isAdmin && editingId === t.id ? (
                         <select className="filter-select" value={editData.status || t.status}
                           onChange={e => setEditData(d => ({ ...d, status: e.target.value }))}>
                           <option value="pending">Pending</option>
@@ -260,7 +263,7 @@ export default function ActiveTickets() {
                       )}
                     </td>
                     <td>
-                      {editingId === t.id ? (
+                      {!isAdmin && editingId === t.id ? (
                         <select className="filter-select" value={editData.priority || t.priority}
                           onChange={e => setEditData(d => ({ ...d, priority: e.target.value }))}>
                           <option value="low">Low</option>
@@ -275,16 +278,18 @@ export default function ActiveTickets() {
                     <td style={{ fontSize: 12, color: '#94a3b8', whiteSpace: 'nowrap' }}>
                       {t.created_at ? new Date(t.created_at).toLocaleString() : '—'}
                     </td>
-                    <td>
-                      {editingId === t.id ? (
-                        <div style={{ display: 'flex', gap: 4 }}>
-                          <button className="btn btn-success btn-sm" onClick={() => handleUpdate(t.id)}>Save</button>
-                          <button className="btn btn-ghost btn-sm" onClick={() => { setEditingId(null); setEditData({}); }}>Cancel</button>
-                        </div>
-                      ) : (
-                        <button className="btn btn-outline btn-sm" onClick={() => { setEditingId(t.id); setEditData({ status: t.status, priority: t.priority }); }}>Edit</button>
-                      )}
-                    </td>
+                    {!isAdmin && (
+                      <td>
+                        {editingId === t.id ? (
+                          <div style={{ display: 'flex', gap: 4 }}>
+                            <button className="btn btn-success btn-sm" onClick={() => handleUpdate(t.id)}>Save</button>
+                            <button className="btn btn-ghost btn-sm" onClick={() => { setEditingId(null); setEditData({}); }}>Cancel</button>
+                          </div>
+                        ) : (
+                          <button className="btn btn-outline btn-sm" onClick={() => { setEditingId(t.id); setEditData({ status: t.status, priority: t.priority }); }}>Edit</button>
+                        )}
+                      </td>
+                    )}
                   </tr>
                 ))}
               </tbody>

@@ -152,12 +152,11 @@ function OverviewTab({ data }) {
 // ─── Agents Tab ───
 function AgentsTab({ data }) {
   if (!data) return null;
-  const { agents, top_performer, fastest_agent, highest_rated, total_agents } = data;
+  const { agents, fastest_agent, highest_rated, total_agents } = data;
   return (
     <>
       <div className="rpt-stat-grid">
         <StatCard label="Total Agents" value={total_agents} color={COLORS.brand} />
-        <StatCard label="Top Performer" value={top_performer?.name || 'N/A'} sub={top_performer ? `${top_performer.resolved} resolved` : ''} color={COLORS.green} />
         <StatCard label="Fastest Resolution" value={fastest_agent?.name || 'N/A'} sub={fastest_agent ? `${fastest_agent.hours}h avg` : ''} color={COLORS.blue} />
         <StatCard label="Highest Rated" value={highest_rated?.name || 'N/A'} sub={highest_rated ? `${highest_rated.rating}/5` : ''} color={COLORS.purple} />
       </div>

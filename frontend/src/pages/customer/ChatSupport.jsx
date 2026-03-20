@@ -122,8 +122,8 @@ function clearCachedSession(sessionId) {
 }
 
 function clearStoredSession() {
-  const sid = localStorage.getItem('chat_session_id');
-  if (sid) clearCachedSession(sid);
+  // Only remove the active-session pointer — keep the cache intact so the
+  // user can resume any previous chat from the Dashboard with full UI state.
   localStorage.removeItem('chat_session_id');
 }
 
@@ -486,6 +486,7 @@ export default function ChatSupport() {
 
   const broadbandDiagStatusRef = useRef('idle');
   const broadbandDiagResultRef = useRef(null);
+  const fetchSolutionRef = useRef(null);
 
   const scrollToBottom = useCallback(() => {
     setTimeout(() => { if (chatAreaRef.current) chatAreaRef.current.scrollTop = chatAreaRef.current.scrollHeight; }, 100);
@@ -743,8 +744,8 @@ export default function ChatSupport() {
     }
 
     // Speed poor or no speed data — proceed with AI solution
-    await fetchSolution(queryText);
-  }, [closeSessionWithMessage, addMessage, fetchSolution]);
+    await fetchSolutionRef.current(queryText);
+  }, [closeSessionWithMessage, addMessage]);
 
   // Called when customer clicks "Skip, just help me" — checks billing issues only (no speed test ran).
   const handleConnectionCheckSkip = useCallback(async (queryText) => {
@@ -766,8 +767,8 @@ export default function ChatSupport() {
       return;
     }
 
-    await fetchSolution(queryText);
-  }, [closeSessionWithMessage, fetchSolution]);
+    await fetchSolutionRef.current(queryText);
+  }, [closeSessionWithMessage]);
 
   const hydrateHistory = useCallback((history = []) => {
     const restored = [];
@@ -1115,6 +1116,7 @@ export default function ChatSupport() {
     setTimeout(() => { addMessage({ type: 'bot', html: `Did this help? If not, please describe what's still not working.` }); showInput('Type your response...'); }, 800);
     st.step = 'conversation';
   }, [addMessage, saveMessage, showInput, ensureSession, autoRaiseTicket]);
+  fetchSolutionRef.current = fetchSolution;
 
   const selectSubprocess = useCallback(async (key, name, groupId) => {
     const followupOptions = getFollowupOptions(name);
@@ -1458,22 +1460,7 @@ export default function ChatSupport() {
         // Fallback: if restoreSession failed (e.g. network error), use resumeChat with DB messages.
         try { const data = await apiGet(`/api/chat/session/${resumeId}`); if (data?.session) { resumeChat(data.session, data.messages || []); return; } } catch {}
       }
-      // Direct navigation (no resume param): only restore sessions active within the last hour.
-      const ONE_HOUR_MS = 60 * 60 * 1000;
-      const storedId = localStorage.getItem('chat_session_id');
-      if (storedId) { const restored = await restoreSession({ sessionId: storedId, maxAgeMs: ONE_HOUR_MS }); if (restored) return; }
-      try {
-        const active = await apiGet('/api/chat/session/active');
-        if (active?.session && active.session.status !== 'resolved') {
-          const sessionTime = active.session.updated_at || active.session.created_at;
-          const isRecent = !sessionTime || Date.now() - new Date(sessionTime).getTime() <= ONE_HOUR_MS;
-          if (isRecent) {
-            const cache = loadCachedSession(active.session.id);
-            if (cache?.messages?.length) { const restored = await restoreSession({ sessionId: active.session.id }); if (restored) return; }
-            setResumeCandidate(active.session); setResumeMessages(active.messages || []); setInitPhase('resume-prompt'); return;
-          }
-        }
-      } catch {}
+      // Direct navigation (no resume param): always show the start gate.
       setInitPhase('start-gate');
     })();
   }, [searchParams, resumeChat, restoreSession]);

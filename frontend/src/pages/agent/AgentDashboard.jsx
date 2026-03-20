@@ -29,7 +29,7 @@ const IC = {
   aging:  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>,
 };
 
-function KpiCard({ label, value, unit, icon, sub, alert }) {
+function KpiCard({ label, value, unit, sub, alert }) {
   return (
     <div style={{
       background: '#fff',
@@ -39,12 +39,10 @@ function KpiCard({ label, value, unit, icon, sub, alert }) {
       display: 'flex',
       flexDirection: 'column',
       gap: 6,
-      boxShadow: '0 1px 3px rgba(0,0,0,0.04)',
       borderLeft: alert ? '3px solid #ef4444' : '3px solid #00338d',
     }}>
-      {/* Icon + label row */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
-        <span style={{ color: alert ? '#ef4444' : '#94a3b8', display: 'flex' }}>{icon}</span>
+      {/* Label row */}
+      <div style={{ display: 'flex', alignItems: 'center' }}>
         <span style={{ fontSize: 10.5, fontWeight: 600, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.04em', lineHeight: 1.3 }}>{label}</span>
       </div>
 
@@ -143,17 +141,20 @@ export default function AgentDashboard() {
   const pChart  = data?.priority_chart   || [];
   const sChart  = data?.sla_priority_chart || [];
 
+  const nn = (v) => Math.max(0, v ?? 0); // clamp: never display negative
+  const nh = (v) => +Math.max(0, v ?? 0).toFixed(1); // clamp + 1 decimal for hour values
+
   const kpiRows = [
-    { label: 'MTTR',                       value: kpis.mttr ?? 0,                         unit: 'hrs', icon: IC.clock,  sub: 'Mean Time To Resolve' },
-    { label: 'SLA Compliance Rate',        value: `${kpis.sla_compliance_rate ?? 0}`,     unit: '%',   icon: IC.check,  sub: 'Resolved within SLA' },
-    { label: 'First Contact Resolution',   value: `${kpis.first_contact_resolution ?? 0}`,unit: '%',   icon: IC.target, sub: 'No re-open needed' },
-    { label: 'CSAT Score',                 value: kpis.csat ?? 0,                         unit: '/ 5', icon: IC.star,   sub: `${kpis.csat_pct ?? 0}% rated 4+` },
-    { label: 'Reopen Rate',                value: `${kpis.reopen_rate ?? 0}`,             unit: '%',   icon: IC.repeat, sub: 'Tickets re-opened', alert: (kpis.reopen_rate ?? 0) > 10 },
-    { label: 'H/S Incident Resolution',    value: kpis.hs_incident_resolution_time ?? 0,  unit: 'hrs', icon: IC.alert,  sub: 'Critical & High tickets', alert: true },
-    { label: 'H/S Incident Response',      value: kpis.hs_incident_response_time ?? 0,    unit: 'hrs', icon: IC.zap,    sub: 'Avg first response' },
-    { label: 'Complaint Resolution Time',  value: kpis.complaint_resolution_time ?? 0,    unit: 'hrs', icon: IC.clip,   sub: 'All priorities' },
-    { label: 'RCA Timely Completion',      value: `${kpis.rca_timely_completion ?? 0}`,   unit: '%',   icon: IC.search, sub: 'On-time root cause analyses' },
-    { label: 'Avg Open Ticket Age',        value: kpis.avg_aging_hours ?? 0,              unit: 'hrs', icon: IC.aging,  sub: 'Unresolved tickets', alert: (kpis.avg_aging_hours ?? 0) > 48 },
+    { label: 'MTTR',                       value: nh(kpis.mttr),                         unit: 'hrs', icon: IC.clock,  sub: 'Mean Time To Resolve' },
+    { label: 'SLA Compliance Rate',        value: `${nn(kpis.sla_compliance_rate)}`,     unit: '%',   icon: IC.check,  sub: 'Resolved within SLA' },
+    { label: 'First Contact Resolution',   value: `${nn(kpis.first_contact_resolution)}`,unit: '%',   icon: IC.target, sub: 'No re-open needed' },
+    { label: 'CSAT Score',                 value: nn(kpis.csat),                         unit: '/ 5', icon: IC.star,   sub: `${nn(kpis.csat_pct)}% rated 4+` },
+    { label: 'Reopen Rate',                value: `${nn(kpis.reopen_rate)}`,             unit: '%',   icon: IC.repeat, sub: 'Tickets re-opened', alert: nn(kpis.reopen_rate) > 10 },
+    { label: 'H/S Incident Resolution',    value: nh(kpis.hs_incident_resolution_time),  unit: 'hrs', icon: IC.alert,  sub: 'Critical & High tickets', alert: true },
+    { label: 'H/S Incident Response',      value: nh(kpis.hs_incident_response_time),    unit: 'hrs', icon: IC.zap,    sub: 'Avg first response' },
+    { label: 'Complaint Resolution Time',  value: nh(kpis.complaint_resolution_time),    unit: 'hrs', icon: IC.clip,   sub: 'All priorities' },
+    { label: 'RCA Timely Completion',      value: `${nn(kpis.rca_timely_completion)}`,   unit: '%',   icon: IC.search, sub: 'On-time root cause analyses' },
+    { label: 'Avg Open Ticket Age',        value: nh(kpis.avg_aging_hours),              unit: 'hrs', icon: IC.aging,  sub: 'Unresolved tickets', alert: nn(kpis.avg_aging_hours) > 48 },
   ];
 
   return (

@@ -3,9 +3,10 @@ import { useAuth } from '../AuthContext';
 
 export default function HomePage() {
   const navigate = useNavigate();
-  const { user } = useAuth();
+  const { user, logout } = useAuth();
 
   const handleGetStarted = () => {
+    if (user) logout();
     navigate('/login');
   };
 

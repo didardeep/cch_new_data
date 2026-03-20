@@ -38,7 +38,7 @@ BILLING = {
     },
     "vihaan.gupta34@yahoo.com": {
         "plan_name": "50 Mbps Basic",
-        "plan_speed_mbps": 50,
+        "plan_speed_mbps": 100,
         "account_active": True,
         "bill_paid": False,
         "outstanding_amount": 1500.0,
@@ -53,7 +53,7 @@ BILLING = {
 # ─── Default fallback billing for any other customer without a specific entry ─
 DEFAULT_PLAN = {
     "plan_name": "100 Mbps Fiber",
-    "plan_speed_mbps": 100,
+    "plan_speed_mbps": 150,
     "account_active": True,
     "bill_paid": True,
     "outstanding_amount": 0.0,

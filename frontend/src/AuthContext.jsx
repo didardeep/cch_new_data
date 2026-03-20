@@ -29,8 +29,8 @@ export function AuthProvider({ children }) {
           }
         })
         .catch(() => {
-          clearToken();
-          setUser(null);
+          // Network error (backend temporarily down) — keep stored credentials.
+          // Only a server-confirmed auth failure (data without user) clears them.
         })
         .finally(() => setLoading(false));
     } else {
@@ -49,8 +49,13 @@ export function AuthProvider({ children }) {
     setUser(null);
   };
 
+  const updateUser = (userData) => {
+    setUser(userData);
+    try { localStorage.setItem('user', JSON.stringify(userData)); } catch {}
+  };
+
   return (
-    <AuthContext.Provider value={{ user, loading, login, logout }}>
+    <AuthContext.Provider value={{ user, loading, login, logout, updateUser }}>
       {children}
     </AuthContext.Provider>
   );

@@ -648,6 +648,45 @@ def get_me():
     return jsonify({"user": user.to_dict()})
 
 
+@app.route("/api/user/settings", methods=["PUT"])
+@jwt_required()
+def update_user_settings():
+    user = db.session.get(User, int(get_jwt_identity()))
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+    data = request.json or {}
+    if 'name' in data and data['name'].strip():
+        user.name = data['name'].strip()
+    if 'phone_number' in data:
+        user.phone_number = (data['phone_number'] or '').strip() or None
+    if 'email' in data and data['email'].strip():
+        new_email = data['email'].strip().lower()
+        if new_email != user.email:
+            existing = User.query.filter_by(email=new_email).first()
+            if existing:
+                return jsonify({"error": "Email already in use"}), 409
+            user.email = new_email
+    db.session.commit()
+    return jsonify({"user": user.to_dict()})
+
+
+@app.route("/api/user/password", methods=["PUT"])
+@jwt_required()
+def update_user_password():
+    user = db.session.get(User, int(get_jwt_identity()))
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+    data = request.json or {}
+    current_password = data.get('current_password', '')
+    new_password = data.get('new_password', '')
+    if not user.check_password(current_password):
+        return jsonify({"error": "Current password is incorrect"}), 400
+    if len(new_password) < 6:
+        return jsonify({"error": "New password must be at least 6 characters"}), 400
+    user.set_password(new_password)
+    db.session.commit()
+    return jsonify({"message": "Password updated successfully"})
+
 
 # CHATBOT ROUTES 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3841,13 +3880,17 @@ def agent_dashboard():
     rca_completion = sla_compliance
 
     # Aging – avg age in hours of open tickets assigned to agent
+    # Only include tickets with a non-negative age (skip future-dated anomalies
+    # so they don't pull the average down to zero).
     aging_hours = []
     for t in my_tickets:
         if t.status in ("pending", "in_progress"):
             ca = _utc(t.created_at)
             if ca:
-                aging_hours.append(max(0, (now - ca).total_seconds() / 3600))
-    avg_aging = round(sum(aging_hours) / len(aging_hours), 2) if aging_hours else 0
+                elapsed = (now - ca).total_seconds() / 3600
+                if elapsed >= 0:
+                    aging_hours.append(elapsed)
+    avg_aging = max(0.0, round(sum(aging_hours) / len(aging_hours), 2)) if aging_hours else 0
 
     # Monthly trend – tickets resolved per month (last 6 months)
     monthly_data = {}

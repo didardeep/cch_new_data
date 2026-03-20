@@ -185,7 +185,7 @@ export default function DataUpload() {
         </div>
         <div className="section-card-body">
           <p style={{ fontSize: 13, color: '#64748b', marginBottom: 16 }}>
-            Upload an Excel file (.xlsx) with columns (names can vary): <strong>Site name/Site_ID, Cell ID, Zone, Longitude, Latitude, Status, Alarm, Bandwidth (MHz), Antenna Gain (dBi), RF Power (EIRP) [dBm], Antenna height (AGL) (M), E-tilt (Degree), Standard Solution Step, CRS Gain</strong>
+            Upload an Excel file (.xlsx) containing site data.
           </p>
           <div style={{ display: 'flex', gap: 16, alignItems: 'center', marginBottom: 16 }}>
             <div style={{ background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 8, padding: '10px 16px' }}>
@@ -234,8 +234,7 @@ export default function DataUpload() {
           </div>
           <div className="section-card-body">
             <p style={{ fontSize: 13, color: '#64748b', marginBottom: 12 }}>
-            Upload an Excel workbook (.xlsx/.xlsm) with <strong>27 sheets</strong>. Each sheet name = KPI name.<br/>
-              Sheet columns: <strong>Site_ID</strong>, then <strong>date columns</strong> with values.
+              Upload an Excel workbook (.xlsx/.xlsm) with site-level KPI data.
             </p>
             <div style={{ background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 8, padding: '10px 14px', marginBottom: 12 }}>
               <div style={{ fontSize: 12, color: '#64748b' }}>Site-level KPIs uploaded: <strong style={{ color: '#00338D' }}>{siteKpiList.length}</strong></div>
@@ -278,8 +277,7 @@ export default function DataUpload() {
           </div>
           <div className="section-card-body">
             <p style={{ fontSize: 13, color: '#64748b', marginBottom: 12 }}>
-            Upload an Excel workbook (.xlsx/.xlsm) with <strong>27 sheets</strong>. Each sheet name = KPI name.<br/>
-              Sheet columns: <strong>Site_ID, Cell_ID, Cell_Site_ID</strong>, then <strong>date columns</strong> with values.
+              Upload an Excel workbook (.xlsx/.xlsm) with cell-level KPI data.
             </p>
             <div style={{ background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 8, padding: '10px 14px', marginBottom: 12 }}>
               <div style={{ fontSize: 12, color: '#64748b' }}>Cell-level KPIs uploaded: <strong style={{ color: '#00338D' }}>{cellKpiList.length}</strong></div>

@@ -29,6 +29,7 @@ import AgentLayout from './pages/agent/AgentLayout';
 import AgentDashboard from './pages/agent/AgentDashboard';
 import AgentTicketBucket from './pages/agent/AgentTicketBucket';
 import AgentChatView from './pages/agent/AgentChatView';
+import SettingsPage from './pages/SettingsPage';
 
 function ProtectedRoute({ children, roles }) {
   const { user, loading } = useAuth();
@@ -62,6 +63,7 @@ export default function App() {
         <Route path="dashboard" element={<CustomerDashboard />} />
         <Route path="chat" element={<ChatSupport />} />
         <Route path="feedback" element={<FeedbackPage />} />
+        <Route path="settings" element={<SettingsPage />} />
       </Route>
 
       {/* Manager Routes */}
@@ -73,6 +75,7 @@ export default function App() {
         <Route path="chat-detail/:id" element={<ChatDetail />} />
         <Route path="reports" element={<ReportsPage />} />
         <Route path="alerts" element={<ManagerAlertBox />} />
+        <Route path="settings" element={<SettingsPage />} />
       </Route>
 
       {/* CTO Routes */}
@@ -83,6 +86,7 @@ export default function App() {
         <Route path="chat-detail/:id" element={<ChatDetail />} />
         <Route path="alerts" element={<CTOAlertBox />} />
         <Route path="roster" element={<CTODutyRoster />} />
+        <Route path="settings" element={<SettingsPage />} />
       </Route>
 
       {/* Admin Routes */}
@@ -96,6 +100,7 @@ export default function App() {
         <Route path="feedback" element={<AdminFeedback />} />
         <Route path="reports" element={<ReportsPage />} />
         <Route path="data-upload" element={<DataUpload />} />
+        <Route path="settings" element={<SettingsPage />} />
       </Route>
 
       {/* Human Agent Routes */}
@@ -103,6 +108,7 @@ export default function App() {
         <Route path="dashboard" element={<AgentDashboard />} />
         <Route path="tickets" element={<AgentTicketBucket />} />
         <Route path="chat/:sessionId" element={<AgentChatView />} />
+        <Route path="settings" element={<SettingsPage />} />
       </Route>
 
       <Route path="*" element={<Navigate to="/" />} />
