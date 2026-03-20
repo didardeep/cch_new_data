@@ -27,7 +27,21 @@ export async function apiCall(endpoint, options = {}) {
     return Promise.reject(new Error('unauthorized'));
   }
 
-  return resp.json();
+  // Parse JSON — if the server returned a non-JSON body (e.g. HTML 500 page)
+  // surface a clear error instead of a cryptic SyntaxError.
+  let data;
+  try {
+    data = await resp.json();
+  } catch {
+    throw new Error(`Server error (${resp.status})`);
+  }
+
+  // For non-2xx responses, throw so callers can catch and show the message.
+  if (!resp.ok) {
+    throw new Error(data?.error || `Request failed (${resp.status})`);
+  }
+
+  return data;
 }
 
 export async function apiGet(endpoint) {

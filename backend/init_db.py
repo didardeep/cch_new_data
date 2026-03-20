@@ -43,21 +43,6 @@ with app.app_context():
     else:
         print("⚠️ Manager already exists, skipping!")
 
-    # Create Human Agent user
-    if not User.query.filter_by(email="agent@telecom.com").first() and \
-       not User.query.filter_by(employee_id="HA00001").first():
-        agent = User(
-            name="Human Agent",
-            email="agent@telecom.com",
-            role="human_agent",
-            employee_id="HA00001"
-        )
-        agent.set_password("agent123")
-        db.session.add(agent)
-        print("✅ Agent user created!")
-    else:
-        print("⚠️ Agent already exists, skipping!")
-
     # Create CTO user
     if not User.query.filter_by(email="cto@telecom.com").first() and \
        not User.query.filter_by(employee_id="CTO00001").first():
@@ -72,6 +57,51 @@ with app.app_context():
         print("✅ CTO user created!")
     else:
         print("⚠️ CTO already exists, skipping!")
+
+    # ── Domain Experts (human_agents with domain/location/capacity) ──────────
+    EXPERTS = [
+        # Mobile experts
+        {"name": "Mobile Expert 1",     "email": "mobile.expert1@example.com",     "employee_id": "HA00001", "domain": "mobile",     "location": "Delhi",  "bandwidth_capacity": 8},
+        {"name": "Mobile Expert 2",     "email": "mobile.expert2@example.com",     "employee_id": "HA00002", "domain": "mobile",     "location": "Mumbai", "bandwidth_capacity": 8},
+        # Broadband experts
+        {"name": "Broadband Expert 1",  "email": "broadband.expert1@example.com",  "employee_id": "HA00003", "domain": "broadband",  "location": "Delhi",  "bandwidth_capacity": 8},
+        {"name": "Broadband Expert 2",  "email": "broadband.expert2@example.com",  "employee_id": "HA00004", "domain": "broadband",  "location": "Mumbai", "bandwidth_capacity": 8},
+        # DTH experts
+        {"name": "DTH Expert 1",        "email": "dth.expert1@example.com",        "employee_id": "HA00005", "domain": "dth",        "location": "Delhi",  "bandwidth_capacity": 8},
+        {"name": "DTH Expert 2",        "email": "dth.expert2@example.com",        "employee_id": "HA00006", "domain": "dth",        "location": "Mumbai", "bandwidth_capacity": 8},
+        # Landline experts
+        {"name": "Landline Expert 1",   "email": "landline.expert1@example.com",   "employee_id": "HA00007", "domain": "landline",   "location": "Delhi",  "bandwidth_capacity": 8},
+        {"name": "Landline Expert 2",   "email": "landline.expert2@example.com",   "employee_id": "HA00008", "domain": "landline",   "location": "Mumbai", "bandwidth_capacity": 8},
+        # Enterprise experts
+        {"name": "Enterprise Expert 1", "email": "enterprise.expert1@example.com", "employee_id": "HA00009", "domain": "enterprise", "location": "Delhi",  "bandwidth_capacity": 6},
+        {"name": "Enterprise Expert 2", "email": "enterprise.expert2@example.com", "employee_id": "HA00010", "domain": "enterprise", "location": "Mumbai", "bandwidth_capacity": 6},
+    ]
+
+    for e in EXPERTS:
+        existing = User.query.filter_by(employee_id=e["employee_id"]).first()
+        if existing:
+            # Update domain/location/capacity in case they were missing
+            existing.domain = e["domain"]
+            existing.location = e["location"]
+            existing.bandwidth_capacity = e["bandwidth_capacity"]
+            print(f"  [UPDATE] {e['employee_id']} {e['name']} -> domain={e['domain']}, loc={e['location']}")
+        elif not User.query.filter_by(email=e["email"]).first():
+            expert = User(
+                name=e["name"],
+                email=e["email"],
+                role="human_agent",
+                employee_id=e["employee_id"],
+                domain=e["domain"],
+                location=e["location"],
+                bandwidth_capacity=e["bandwidth_capacity"],
+            )
+            expert.set_password("agent123")
+            db.session.add(expert)
+            print(f"  [CREATE] {e['employee_id']} {e['name']} (domain={e['domain']}, loc={e['location']})")
+        else:
+            print(f"  [SKIP]   {e['email']} already exists")
+
+    print("Domain experts seeded!")
 
     # Add default system settings
     settings = [

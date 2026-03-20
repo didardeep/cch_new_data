@@ -10,6 +10,7 @@ const links = [
   { path: '/manager/tracking', label: 'Issue Tracking', icon: ICON("M12 20V10M18 20V4M6 20v-4") },
   { path: '/manager/reports', label: 'Reports & Analytics', icon: ICON("M3 3v18h18M9 17V9m4 8V5m4 12v-4") },
   { path: '/manager/alerts', label: 'Alert Box', icon: ICON("M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0zM12 9v4M12 17h.01") },
+  { path: '/manager/approvals', label: 'Approvals', icon: ICON("M9 11l3 3L22 4M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11") },
 ];
 
 export default function ManagerLayout() {

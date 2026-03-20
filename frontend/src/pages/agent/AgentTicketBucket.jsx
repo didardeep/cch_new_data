@@ -16,6 +16,14 @@ const IC = {
   tune:    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>,
 };
 
+/* ── Customer tier config ────────────────────────────────────────────────────────── */
+const TIER_CFG = {
+  platinum: { bg: '#f5f3ff', color: '#6d28d9', border: '#c4b5fd', label: 'Platinum' },
+  gold:     { bg: '#fffbeb', color: '#b45309', border: '#fde68a', label: 'Gold'     },
+  silver:   { bg: '#f1f5f9', color: '#475569', border: '#cbd5e1', label: 'Silver'   },
+  bronze:   { bg: '#fff7ed', color: '#c2410c', border: '#fdba74', label: 'Bronze'   },
+};
+
 /* ── Priority config ────────────────────────────────────────────────────────────── */
 const P_CFG = {
   critical: { bar: '#dc2626', badgeClass: 'badge-critical', label: 'Critical' },
@@ -1110,11 +1118,13 @@ function TrendMiniChart({ kpiName, data, color = '#00338D' }) {
 
 /* ── Parameter Change Modal ──────────────────────────────────────────────────────── */
 function ParameterChangeModal({ ticket, onClose }) {
-  const [proposed, setProposed]     = useState('');
-  const [change, setChange]         = useState(null);
-  const [loading, setLoading]       = useState(true);
-  const [submitting, setSubmitting] = useState(false);
-  const [msg, setMsg]               = useState('');
+  const [proposed, setProposed]       = useState('');
+  const [change, setChange]           = useState(null);
+  const [loading, setLoading]         = useState(true);
+  const [submitting, setSubmitting]   = useState(false);
+  const [errMsg, setErrMsg]           = useState('');
+  const [submitted, setSubmitted]     = useState(false);
+  const [managerName, setManagerName] = useState('');
 
   const loadStatus = useCallback(async () => {
     setLoading(true);
@@ -1130,57 +1140,149 @@ function ParameterChangeModal({ ticket, onClose }) {
   const submit = async () => {
     if (!proposed.trim()) return;
     setSubmitting(true);
-    setMsg('');
+    setErrMsg('');
     try {
       const d = await apiPost(`/api/agent/tickets/${ticket.id}/parameter-change`, { proposed_change: proposed.trim() });
-      setMsg(d?.message || 'Request submitted.');
+      setManagerName(d?.assigned_manager?.name || '');
+      setSubmitted(true);
       setProposed('');
-      await loadStatus();
-    } catch (_) { setMsg('Failed to submit request.'); }
+      loadStatus();
+    } catch (err) {
+      setErrMsg(err?.message || 'Failed to submit request. Please try again.');
+    }
     setSubmitting(false);
   };
 
   return (
     <Modal title="Parameter Change Request" onClose={onClose} width={560}>
-      <div style={{ marginBottom: 12, fontSize: 13, color: 'var(--text-secondary)', lineHeight: 1.55 }}>
-        Submit a technical parameter change for manager approval for ticket <strong>{ticket.reference_number}</strong>.
-      </div>
 
-      {loading ? (
-        <div className="page-loader" style={{ height: 100 }}><div className="spinner" /></div>
-      ) : change ? (
-        <div style={{ background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', padding: 12, marginBottom: 14 }}>
-          <div style={{ fontSize: 11, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 6 }}>Latest Request Status</div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
-            <span className={`badge badge-${change.status === 'approved' ? 'resolved' : change.status === 'disapproved' ? 'critical' : 'pending'}`}>
-              {change.status}
-            </span>
-            {change.reviewed_at && <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>Reviewed {new Date(change.reviewed_at).toLocaleString()}</span>}
+      {/* ── Success screen ── */}
+      {submitted ? (
+        <div style={{ textAlign: 'center', padding: '24px 16px 12px' }}>
+          <div style={{
+            width: 64, height: 64, borderRadius: '50%',
+            background: 'linear-gradient(135deg, #ecfdf5, #d1fae5)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            fontSize: 28, margin: '0 auto 16px',
+            boxShadow: '0 4px 12px rgba(22,163,74,0.2)',
+          }}>
+            ✓
           </div>
-          <div style={{ fontSize: 12, color: 'var(--text)' }}><strong>Proposed:</strong> {change.proposed_change}</div>
-          {change.manager_note && <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 6 }}><strong>Manager Note:</strong> {change.manager_note}</div>}
+          <h3 style={{ margin: '0 0 8px', fontSize: 17, fontWeight: 700, color: '#0f172a' }}>
+            Approval Request Sent!
+          </h3>
+          <p style={{ margin: '0 0 6px', fontSize: 13, color: '#475569', lineHeight: 1.55 }}>
+            Your request has been sent to{' '}
+            <strong style={{ color: '#0f172a' }}>
+              {managerName ? `Manager ${managerName}` : 'your manager'}
+            </strong>{' '}
+            for review.
+          </p>
+          <p style={{ margin: '0 0 20px', fontSize: 12, color: '#94a3b8' }}>
+            You'll be notified once a decision is made.
+          </p>
+          {/* Show the submitted change status */}
+          {change && (
+            <div style={{
+              background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 8,
+              padding: '10px 14px', marginBottom: 20, textAlign: 'left',
+            }}>
+              <div style={{ fontSize: 10, fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 6 }}>
+                Submitted Request
+              </div>
+              <div style={{ fontSize: 13, color: '#374151', lineHeight: 1.5 }}>{change.proposed_change}</div>
+              <div style={{ marginTop: 8, display: 'flex', alignItems: 'center', gap: 8 }}>
+                <span style={{
+                  fontSize: 11, fontWeight: 700, padding: '2px 8px', borderRadius: 4,
+                  background: '#fffbeb', color: '#92400e', border: '1px solid #fde68a',
+                }}>
+                  Pending Review
+                </span>
+                <span style={{ fontSize: 11, color: '#94a3b8' }}>
+                  {change.created_at ? new Date(change.created_at).toLocaleString() : ''}
+                </span>
+              </div>
+            </div>
+          )}
+          <button
+            className="btn btn-primary btn-sm"
+            onClick={onClose}
+            style={{ minWidth: 120 }}
+          >
+            Done
+          </button>
         </div>
-      ) : null}
+      ) : (
+        /* ── Normal form ── */
+        <>
+          <div style={{ marginBottom: 12, fontSize: 13, color: 'var(--text-secondary)', lineHeight: 1.55 }}>
+            Submit a parameter change request for manager approval — Ticket{' '}
+            <strong style={{ color: 'var(--text)', fontFamily: 'monospace' }}>{ticket.reference_number}</strong>.
+          </div>
 
-      <div className="form-group">
-        <label>Proposed Change</label>
-        <textarea
-          className="feedback-textarea"
-          rows={4}
-          value={proposed}
-          onChange={e => setProposed(e.target.value)}
-          placeholder="Describe the parameter/configuration change and expected impact..."
-        />
-      </div>
+          {/* Existing change status */}
+          {loading ? (
+            <div className="page-loader" style={{ height: 80 }}><div className="spinner" /></div>
+          ) : change ? (
+            <div style={{
+              background: 'var(--bg)', border: '1px solid var(--border)',
+              borderRadius: 'var(--radius-sm)', padding: 12, marginBottom: 14,
+            }}>
+              <div style={{ fontSize: 11, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 6 }}>
+                Latest Request Status
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+                <span className={`badge badge-${change.status === 'approved' ? 'resolved' : change.status === 'disapproved' ? 'critical' : 'pending'}`}>
+                  {change.status === 'disapproved' ? 'Rejected' : change.status}
+                </span>
+                {change.reviewed_at && (
+                  <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                    Reviewed {new Date(change.reviewed_at).toLocaleString()}
+                  </span>
+                )}
+              </div>
+              <div style={{ fontSize: 12, color: 'var(--text)' }}>
+                <strong>Proposed:</strong> {change.proposed_change}
+              </div>
+              {change.manager_note && (
+                <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 6 }}>
+                  <strong>Manager Note:</strong> {change.manager_note}
+                </div>
+              )}
+            </div>
+          ) : null}
 
-      {msg && <div style={{ marginTop: 8, fontSize: 12, color: '#475569' }}>{msg}</div>}
+          <div className="form-group">
+            <label>Describe the Requested Change</label>
+            <textarea
+              className="feedback-textarea"
+              rows={4}
+              value={proposed}
+              onChange={e => setProposed(e.target.value)}
+              placeholder="Describe the parameter/configuration change needed and the expected impact..."
+            />
+          </div>
 
-      <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end', marginTop: 16 }}>
-        <button className="btn btn-ghost btn-sm" onClick={onClose}>Close</button>
-        <button className="btn btn-primary btn-sm" onClick={submit} disabled={submitting || !proposed.trim()}>
-          {submitting ? 'Submitting...' : 'Submit for Approval'}
-        </button>
-      </div>
+          {errMsg && (
+            <div style={{ marginTop: 6, padding: '8px 12px', borderRadius: 6, background: '#fef2f2', border: '1px solid #fecaca', fontSize: 12, color: '#dc2626' }}>
+              {errMsg}
+            </div>
+          )}
+
+          <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end', marginTop: 16 }}>
+            <button className="btn btn-ghost btn-sm" onClick={onClose} disabled={submitting}>
+              Cancel
+            </button>
+            <button
+              className="btn btn-primary btn-sm"
+              onClick={submit}
+              disabled={submitting || !proposed.trim()}
+            >
+              {submitting ? 'Sending...' : 'Send Approval Request'}
+            </button>
+          </div>
+        </>
+      )}
     </Modal>
   );
 }
@@ -1357,7 +1459,21 @@ export default function AgentTicketBucket() {
                   {/* Customer */}
                   <div>
                     <div style={{ fontSize: 10, fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 3 }}>Customer</div>
-                    <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--text)' }}>{ticket.user_name}</div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                      <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--text)' }}>{ticket.user_name}</span>
+                      {(() => {
+                        const t = TIER_CFG[ticket.user_type] || TIER_CFG.bronze;
+                        return (
+                          <span style={{
+                            fontSize: 10, fontWeight: 700, padding: '2px 6px', borderRadius: 4,
+                            background: t.bg, color: t.color, border: `1px solid ${t.border}`,
+                            textTransform: 'uppercase', letterSpacing: '0.04em',
+                          }}>
+                            {t.label}
+                          </span>
+                        );
+                      })()}
+                    </div>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 12, color: 'var(--text-secondary)', marginTop: 2 }}>
                       <span style={{ color: 'var(--primary)' }}>{IC.phone}</span>
                       {ticket.user_phone || ' - '}

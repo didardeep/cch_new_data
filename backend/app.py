@@ -21,7 +21,7 @@ from flask_jwt_extended import (
 )
 from flask_mail import Mail, Message
 from flask_socketio import SocketIO, join_room, emit
-from openai import AzureOpenAI
+from openai import AzureOpenAI, OpenAI
 from dotenv import load_dotenv
 from types import SimpleNamespace
 import urllib.request
@@ -46,7 +46,7 @@ def _get_jwt_secret():
         if len(raw) >= 32:
             return raw
         # Upgrade short secrets to a SHA-256 derived key to avoid insecure length warnings.
-        print("⚠️ JWT_SECRET is shorter than 32 bytes; deriving a stronger key.")
+        print("[WARN] JWT_SECRET is shorter than 32 bytes; deriving a stronger key.")
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
     return os.urandom(32).hex()
 
@@ -87,6 +87,63 @@ CORS(
     supports_credentials=True,
 )
 
+# ─── Global JSON error handlers ──────────────────────────────────────────────
+# Flask returns HTML by default for 404/405/500 — override so API callers
+# always get a JSON body instead of an HTML error page.
+@app.errorhandler(404)
+def handle_404(e):
+    return jsonify({"error": "Not found", "detail": str(e)}), 404
+
+@app.errorhandler(405)
+def handle_405(e):
+    return jsonify({"error": "Method not allowed", "detail": str(e)}), 405
+
+@app.errorhandler(500)
+def handle_500(e):
+    return jsonify({"error": "Internal server error", "detail": str(e)}), 500
+
+# ─── LLM Configuration (Azure OpenAI / OpenAI-compatible) ───────────────────
+def _build_llm_client():
+    azure_api_key = os.environ.get("AZURE_OPENAI_API_KEY")
+    azure_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
+    if azure_api_key and azure_endpoint:
+        print(">>> Using Azure OpenAI configuration")
+        return (
+            AzureOpenAI(
+                api_key=azure_api_key,
+                azure_endpoint=azure_endpoint,
+                api_version=os.environ.get("AZURE_OPENAI_API_VERSION", "2023-07-01-preview"),
+            ),
+            os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini"),
+        )
+
+    gemini_api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("OPENAI_API_KEY")
+    gemini_base_url = os.environ.get("GEMINI_BASE_URL")
+    if gemini_api_key and gemini_base_url:
+        print(">>> Using Gemini OpenAI-compatible configuration")
+        return (
+            OpenAI(
+                api_key=gemini_api_key,
+                base_url=gemini_base_url.rstrip("/") + "/",
+            ),
+            os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"),
+        )
+
+    openai_api_key = os.environ.get("OPENAI_API_KEY")
+    if openai_api_key:
+        print(">>> Using OpenAI configuration")
+        return (
+            OpenAI(api_key=openai_api_key),
+            os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
+        )
+
+    raise RuntimeError(
+        "No LLM credentials found. Configure either AZURE_OPENAI_API_KEY + AZURE_OPENAI_ENDPOINT, "
+        "or GEMINI_API_KEY + GEMINI_BASE_URL, or OPENAI_API_KEY."
+    )
+
+
+client, DEPLOYMENT_NAME = _build_llm_client()
 # ─── Azure OpenAI Configuration (pulled from .env) ───────────────────────────
 client = AzureOpenAI(
     api_key=os.environ.get("AZURE_OPENAI_API_KEY"),
@@ -572,6 +629,161 @@ def validate_password(password):
     return None
 
 
+# ─── Priority Ranking System ──────────────────────────────────────────────────
+
+# Numeric rank for each priority level — higher is more urgent.
+PRIORITY_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1}
+
+# Customer tier → priority floor.
+# A Platinum customer's ticket is always at least Critical regardless of content.
+USER_TYPE_PRIORITY = {
+    "platinum": "critical",
+    "gold":     "high",
+    "silver":   "medium",
+    "bronze":   "low",
+}
+
+VALID_USER_TYPES = set(USER_TYPE_PRIORITY.keys())
+
+
+# ─── Subprocess → base severity ──────────────────────────────────────────────
+# The subprocess name is selected by the chatbot flow and is the most reliable
+# signal for how urgent a ticket is.  Map every known subprocess to a base
+# severity; keyword scanning then upgrades (never downgrades) from that base.
+#
+# MOBILE
+#   Critical  – nothing at subprocess level (needs query-text signal)
+#   High      – Network/Signal, SIM issues, Call/SMS failures, MNP
+#   Medium    – Billing, Data plan, Roaming
+#   Low       – Others
+#
+# BROADBAND
+#   Critical  – (needs query-text: "no internet at all")
+#   High      – Slow/No Connectivity, Frequent Disconnections, Router/Equipment
+#   Medium    – Billing, New Connection, IP/DNS
+#   Low       – Others
+#
+# DTH
+#   Critical  – (needs query-text: "stb dead", "dish fallen")
+#   High      – Signal/Picture Quality, Set-Top Box Issues
+#   Medium    – Channel Missing, Billing, Package Changes
+#   Low       – Others
+#
+# LANDLINE
+#   Critical  – No Dial Tone / Dead Line
+#   High      – Fault Repair Request
+#   Medium    – Call Quality, Billing, New Connection
+#   Low       – Others
+#
+# ENTERPRISE
+#   Critical  – SLA Breach/Downtime, Leased Line, Cloud/VPN/MPLS
+#   High      – Technical Support Escalation, Bulk/Corporate Issues
+#   Medium    – Others within enterprise
+#   Low       – (nothing — enterprise is never low by default)
+
+SUBPROCESS_BASE_SEVERITY = {
+    # ── Mobile ────────────────────────────────────────────────────────────────
+    "Network / Signal Problems":          "high",
+    "SIM Card & Activation":              "high",
+    "Mobile Number Portability (MNP)":    "high",
+    "Call / SMS Failures":                "high",
+    "Data Plan & Recharge Issues":        "medium",
+    "Billing & Payment Issues":           "medium",
+    "International Roaming":              "medium",
+
+    # ── Broadband ─────────────────────────────────────────────────────────────
+    "Slow Speed / No Connectivity":       "high",
+    "Frequent Disconnections":            "high",
+    "Router / Equipment Problems":        "high",
+    "IP Address / DNS Issues":            "medium",
+    "Billing & Plan Issues":              "medium",
+    "New Connection / Installation":      "medium",
+
+    # ── DTH ───────────────────────────────────────────────────────────────────
+    "Signal / Picture Quality":           "high",
+    "Set-Top Box Issues":                 "high",
+    "Channel Not Working / Missing":      "medium",
+    "Billing & Subscription":             "medium",
+    "Package / Plan Changes":             "low",
+
+    # ── Landline ──────────────────────────────────────────────────────────────
+    "No Dial Tone / Dead Line":           "critical",
+    "Fault Repair Request":               "high",
+    "Call Quality Issues (Noise / Echo)": "medium",
+    "Billing & Charges":                  "medium",
+    "New Connection / Disconnection":     "medium",
+
+    # ── Enterprise ────────────────────────────────────────────────────────────
+    "SLA Breach / Service Downtime":      "critical",
+    "Leased Line / Dedicated Connection": "critical",
+    "Cloud / VPN / MPLS Issues":          "critical",
+    "Technical Support Escalation":       "high",
+    "Bulk / Corporate Plan Issues":       "high",
+}
+
+# ─── Query-text upgrade keywords ─────────────────────────────────────────────
+# These can RAISE severity above the subprocess base but never lower it.
+_UPGRADE_TO_CRITICAL = [
+    "no network", "complete outage", "area outage", "entire area",
+    "no internet at all", "totally down", "stb dead", "box dead",
+    "dish fallen", "dish damaged", "emergency", "urgent", "critical",
+    "fraud", "unauthorized", "sla breach", "business down", "production down",
+    "vpn down", "leased line down", "mpls down",
+]
+_UPGRADE_TO_HIGH = [
+    "not working", "no signal", "dead", "down", "failed", "outage",
+    "cannot call", "no internet", "no service", "unable to connect",
+    "disconnecting", "router dead", "modem dead",
+]
+_UPGRADE_TO_MEDIUM = [
+    "slow", "intermittent", "billing", "wrong charge", "refund",
+    "overcharged", "pixelat", "delay", "quality",
+]
+
+
+def _detect_severity(query_text: str, subprocess_name: str) -> str:
+    """
+    Returns one of: critical / high / medium / low.
+
+    Logic:
+    1. Look up subprocess name in SUBPROCESS_BASE_SEVERITY for a base severity.
+    2. Scan query text for upgrade keywords — severity can only go UP, never down.
+    3. Default base is 'low' if subprocess not found.
+    """
+    base = SUBPROCESS_BASE_SEVERITY.get((subprocess_name or "").strip(), "low")
+    text = (query_text or "").lower()
+
+    # Determine what the query text alone would rate
+    if any(w in text for w in _UPGRADE_TO_CRITICAL):
+        text_sev = "critical"
+    elif any(w in text for w in _UPGRADE_TO_HIGH):
+        text_sev = "high"
+    elif any(w in text for w in _UPGRADE_TO_MEDIUM):
+        text_sev = "medium"
+    else:
+        text_sev = "low"
+
+    # Return whichever is higher
+    return base if PRIORITY_RANK.get(base, 1) >= PRIORITY_RANK.get(text_sev, 1) else text_sev
+
+
+def _compute_final_priority(user_type: str | None, severity: str) -> str:
+    """
+    Final ticket priority = the higher of (user-type floor, issue severity).
+
+    Examples:
+      Platinum user  + medium severity  → critical   (user floor wins)
+      Bronze user    + critical severity → critical   (severity wins)
+      Gold user      + high severity     → high       (both equal)
+      Silver user    + low severity      → medium     (user floor wins)
+    """
+    user_floor = USER_TYPE_PRIORITY.get((user_type or "bronze").lower(), "low")
+    rank_floor = PRIORITY_RANK.get(user_floor, 1)
+    rank_sev   = PRIORITY_RANK.get(severity, 1)
+    return user_floor if rank_floor >= rank_sev else severity
+
+
+# Keep backward-compatible alias so any other callers still work.
 def auto_assign_priority(query_text, subprocess_name):
     """Simple priority assignment based on keywords."""
     text = (query_text + " " + subprocess_name).lower()
@@ -616,7 +828,11 @@ def register():
     if User.query.filter_by(email=email).first():
         return jsonify({"error": "Email already registered"}), 409
 
-    user = User(name=name, email=email, phone_number=phone_number, role="customer")  # ← UPDATED
+    user_type = (data.get("user_type") or "bronze").strip().lower()
+    if user_type not in VALID_USER_TYPES:
+        user_type = "bronze"
+
+    user = User(name=name, email=email, phone_number=phone_number, role="customer", user_type=user_type)
     user.set_password(password)
     db.session.add(user)
     db.session.commit()
@@ -962,13 +1178,11 @@ def save_session_location(session_id):
     if data.get("location_description"):
         session.location_description = data.get("location_description")
 
-    # ── Default coordinates (Gurgaon, Haryana) ────────────────────────────────
+    # Use coordinates sent by the client; fall back to Gurgaon only if missing
     DEFAULT_LATITUDE  = 28.4595
     DEFAULT_LONGITUDE = 77.0266
-
-    # Always use default lat/long regardless of what the client sends
-    session.latitude  = DEFAULT_LATITUDE
-    session.longitude = DEFAULT_LONGITUDE
+    session.latitude  = data.get("latitude")  or DEFAULT_LATITUDE
+    session.longitude = data.get("longitude") or DEFAULT_LONGITUDE
 
     db.session.commit()
 
@@ -1160,33 +1374,25 @@ def escalate_session(session_id):
     msgs = [{"sender": m.sender, "content": m.content} for m in session.messages]
     session.summary = generate_chat_summary(msgs, session.sector_name, session.subprocess_name)
 
-    # Auto-assign to least-occupied online human agent
-    priority = auto_assign_priority(session.query_text, session.subprocess_name)
+    # Derive ticket domain and customer city
+    ticket_domain = _resolve_ticket_domain(session.sector_name)
+    ticket_city = session.location_description  # may be None
+
+    # --- Priority calculation ---
+    # 1. Issue severity from query keywords
+    severity = _detect_severity(session.query_text, session.subprocess_name)
+    # 2. Customer tier floor (look up the session's owner)
+    customer = db.session.get(User, user_id)
+    customer_type = (customer.user_type or "bronze") if customer else "bronze"
+    # 3. Final priority = max(severity, user-type floor)
+    priority = _compute_final_priority(customer_type, severity)
+
     sla_targets = get_sla_targets()
     sla_h = sla_targets.get(priority, 48)
     now_utc = datetime.now(timezone.utc)
     sla_deadline = now_utc + timedelta(hours=sla_h)
 
-    assigned_agent = None
-    online_agents = User.query.filter_by(role="human_agent", is_online=True).all()
-    if online_agents:
-        # Find least occupied (fewest open tickets)
-        def open_ticket_count(agent):
-            return Ticket.query.filter(
-                Ticket.assigned_to == agent.id,
-                Ticket.status.in_(["pending", "in_progress"])
-            ).count()
-        assigned_agent = min(online_agents, key=open_ticket_count)
-    else:
-        # Fallback: assign to any human_agent with fewest open tickets
-        all_agents = User.query.filter_by(role="human_agent").all()
-        if all_agents:
-            def open_ticket_count_any(agent):
-                return Ticket.query.filter(
-                    Ticket.assigned_to == agent.id,
-                    Ticket.status.in_(["pending", "in_progress"])
-                ).count()
-            assigned_agent = min(all_agents, key=open_ticket_count_any)
+    assigned_agent = _find_best_expert(ticket_domain, ticket_city, priority)
 
     # Create ticket
     ref = generate_ref_number()
@@ -1196,8 +1402,10 @@ def escalate_session(session_id):
         reference_number=ref,
         category=session.sector_name,
         subcategory=session.subprocess_name,
+        domain=ticket_domain,
         description=session.query_text,
         status="pending",
+        severity=severity,
         priority=priority,
         assigned_to=assigned_agent.id if assigned_agent else None,
         sla_hours=sla_h,
@@ -1661,6 +1869,7 @@ def manager_dashboard():
     in_progress_tickets = ts_map.get("in_progress", 0)
     resolved_tickets = ts_map.get("resolved", 0)
     escalated_tickets = ts_map.get("escalated", 0)
+    manager_escalated_tickets = ts_map.get("manager_escalated", 0)
 
     # Critical/high pending tickets — single query
     urgent_stats = db.session.query(
@@ -1701,6 +1910,7 @@ def manager_dashboard():
             "in_progress_tickets": in_progress_tickets,
             "resolved_tickets": resolved_tickets,
             "escalated_tickets": escalated_tickets,
+            "manager_escalated_tickets": manager_escalated_tickets,
             "critical_tickets": critical_tickets,
             "high_tickets": high_tickets,
             "total_feedback": total_feedback,
@@ -1720,12 +1930,18 @@ def manager_tickets():
     if user.role not in ("manager", "cto", "admin"):
         return jsonify({"error": "Unauthorized"}), 403
 
-    status = request.args.get("status")
+    status   = request.args.get("status")
     priority = request.args.get("priority")
     category = request.args.get("category")
-    search = request.args.get("search")
+    search   = request.args.get("search")
 
     query = Ticket.query
+
+    # Managers see only tickets escalated to them.
+    # CTO and Admin retain a full view of all tickets.
+    if user.role == "manager":
+        query = query.filter_by(assigned_to=user_id)
+
     if status:
         query = query.filter_by(status=status)
     if priority:
@@ -1742,7 +1958,13 @@ def manager_tickets():
             )
         )
 
-    tickets = query.order_by(Ticket.created_at.desc()).all()
+    # Sort by priority rank (critical first) then by creation time
+    priority_order = sql_case(
+        {"critical": 1, "high": 2, "medium": 3, "low": 4},
+        value=Ticket.priority,
+        else_=5,
+    )
+    tickets = query.order_by(priority_order, Ticket.created_at.asc()).all()
     return jsonify({"tickets": [t.to_dict() for t in tickets]})
 
 
@@ -1793,6 +2015,68 @@ def manager_review_parameter_change(change_id):
     return jsonify({"change": change.to_dict()})
 
 
+@app.route("/api/manager/tickets/<int:ticket_id>/escalation-review", methods=["PUT"])
+@jwt_required()
+def manager_escalation_review(ticket_id):
+    """
+    Manager approves or rejects an escalated ticket.
+
+    Payload:
+      { "decision": "approved" | "rejected", "note": "<optional text>" }
+
+    Approved  → ticket status becomes "in_progress" (manager now owns it).
+    Rejected  → ticket is reassigned back to the original expert with status
+                "in_progress" so they can continue working on it.
+    """
+    user_id = int(get_jwt_identity())
+    user = db.session.get(User, user_id)
+    if not user or user.role != "manager":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    ticket = db.session.get(Ticket, ticket_id)
+    if not ticket:
+        return jsonify({"error": "Ticket not found"}), 404
+    if ticket.assigned_to != user_id:
+        return jsonify({"error": "Ticket not assigned to you"}), 403
+    if ticket.status != "manager_escalated":
+        return jsonify({"error": "Ticket is not in escalated state"}), 409
+
+    data = request.json or {}
+    decision = (data.get("decision") or "").strip().lower()
+    note = (data.get("note") or "").strip()
+
+    if decision not in ("approved", "rejected"):
+        return jsonify({"error": "decision must be 'approved' or 'rejected'"}), 400
+
+    # Update the linked ParameterChange record(s) that are still pending
+    pending_changes = ParameterChange.query.filter_by(
+        ticket_id=ticket_id, status="pending"
+    ).all()
+    for pc in pending_changes:
+        pc.status = "approved" if decision == "approved" else "disapproved"
+        pc.manager_note = note
+        pc.reviewed_at = datetime.now(timezone.utc)
+        pc.reviewed_by = user_id
+
+    if decision == "approved":
+        # Manager takes ownership — move ticket to in_progress
+        ticket.status = "in_progress"
+        if note:
+            ticket.resolution_notes = note
+    else:
+        # Reject — send back to the original expert
+        if ticket.escalated_by:
+            ticket.assigned_to = ticket.escalated_by
+        ticket.status = "in_progress"
+        if note:
+            ticket.resolution_notes = (
+                f"[Manager rejected escalation: {note}]\n" + (ticket.resolution_notes or "")
+            )
+
+    db.session.commit()
+    return jsonify({"ticket": ticket.to_dict(), "decision": decision})
+
+
 @app.route("/api/manager/tickets/<int:ticket_id>", methods=["PUT"])
 @jwt_required()
 def update_ticket(ticket_id):
@@ -1805,6 +2089,10 @@ def update_ticket(ticket_id):
     if not ticket:
         return jsonify({"error": "Ticket not found"}), 404
 
+    # Managers can only update tickets assigned to them
+    if user.role == "manager" and ticket.assigned_to != user_id:
+        return jsonify({"error": "Ticket not assigned to you"}), 403
+
     data = request.json
     if "status" in data:
         ticket.status = data["status"]
@@ -1812,7 +2100,8 @@ def update_ticket(ticket_id):
             ticket.resolved_at = datetime.now(timezone.utc)
     if "priority" in data:
         ticket.priority = data["priority"]
-    if "assigned_to" in data:
+    if "assigned_to" in data and user.role in ("cto", "admin"):
+        # Only CTO/admin can re-assign; managers cannot move tickets between themselves
         ticket.assigned_to = data["assigned_to"]
     if "resolution_notes" in data:
         ticket.resolution_notes = data["resolution_notes"]
@@ -2169,6 +2458,9 @@ def admin_create_user():
     new_user = User(name=name, email=email, role=role, employee_id=emp_id)
     if phone_number:
         new_user.phone_number = phone_number
+    if role == "customer":
+        ut = (data.get("user_type") or "bronze").strip().lower()
+        new_user.user_type = ut if ut in VALID_USER_TYPES else "bronze"
     new_user.set_password(password)
     db.session.add(new_user)
     db.session.commit()
@@ -2297,6 +2589,9 @@ def admin_update_user(uid):
         if pw_err:
             return jsonify({"error": pw_err}), 400
         target.set_password(data["password"])
+    if "user_type" in data and target.role == "customer":
+        ut = (data["user_type"] or "bronze").strip().lower()
+        target.user_type = ut if ut in VALID_USER_TYPES else "bronze"
 
     db.session.commit()
     return jsonify({"user": target.to_dict()})
@@ -2329,6 +2624,53 @@ def admin_delete_user(uid):
     db.session.delete(target)
     db.session.commit()
     return jsonify({"message": "User deleted"})
+
+
+@app.route("/api/admin/experts", methods=["GET"])
+@jwt_required()
+def admin_list_experts():
+    """List all domain experts (human_agents) with their domain/location/capacity."""
+    user = db.session.get(User, int(get_jwt_identity()))
+    if not user or user.role != "admin":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    experts = User.query.filter_by(role="human_agent").order_by(User.domain, User.name).all()
+    result = []
+    for e in experts:
+        d = e.to_dict()
+        d["open_tickets"] = _open_ticket_count(e.id)
+        result.append(d)
+    return jsonify({"experts": result})
+
+
+@app.route("/api/admin/experts/<int:uid>", methods=["PUT"])
+@jwt_required()
+def admin_update_expert(uid):
+    """Update domain, location, or bandwidth_capacity of an expert."""
+    user = db.session.get(User, int(get_jwt_identity()))
+    if not user or user.role != "admin":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    expert = db.session.get(User, uid)
+    if not expert or expert.role != "human_agent":
+        return jsonify({"error": "Expert not found"}), 404
+
+    data = request.json or {}
+    if "domain" in data:
+        if data["domain"] not in VALID_EXPERT_DOMAINS:
+            return jsonify({"error": f"Invalid domain. Valid: {sorted(VALID_EXPERT_DOMAINS)}"}), 400
+        expert.domain = data["domain"]
+    if "location" in data:
+        expert.location = (data["location"] or "").strip() or None
+    if "bandwidth_capacity" in data:
+        cap = int(data["bandwidth_capacity"])
+        if cap < 1:
+            return jsonify({"error": "bandwidth_capacity must be >= 1"}), 400
+        expert.bandwidth_capacity = cap
+    db.session.commit()
+    d = expert.to_dict()
+    d["open_tickets"] = _open_ticket_count(expert.id)
+    return jsonify({"expert": d})
 
 
 @app.route("/api/admin/agent-tickets", methods=["GET"])
@@ -4110,7 +4452,15 @@ def agent_get_parameter_change(ticket_id):
 @app.route("/api/agent/tickets/<int:ticket_id>/parameter-change", methods=["POST"])
 @jwt_required()
 def agent_create_parameter_change(ticket_id):
-    """Create a parameter change request for manager approval."""
+    """
+    Create a parameter-change request AND escalate the ticket to a manager.
+
+    Once submitted:
+    - A ParameterChange record is created (for the approval matrix).
+    - The ticket is reassigned to the best manager (priority-driven).
+    - Ticket status is set to 'manager_escalated'.
+    - The ticket disappears from the expert's queue immediately.
+    """
     user_id = int(get_jwt_identity())
     user = db.session.get(User, user_id)
     if not user or user.role != "human_agent":
@@ -4121,6 +4471,8 @@ def agent_create_parameter_change(ticket_id):
         return jsonify({"error": "Ticket not found"}), 404
     if ticket.assigned_to != user_id:
         return jsonify({"error": "Ticket not assigned to you"}), 403
+    if ticket.status == "manager_escalated":
+        return jsonify({"error": "Ticket is already escalated to a manager"}), 409
 
     data = request.json or {}
     proposed = (data.get("proposed_change") or "").strip()
@@ -4134,6 +4486,10 @@ def agent_create_parameter_change(ticket_id):
     if existing_pending:
         return jsonify({"error": "A pending change request already exists"}), 409
 
+    # ── Find best manager based on ticket priority ────────────────────────────
+    manager = _find_best_manager(ticket.priority)
+
+    # ── Create the parameter-change record ────────────────────────────────────
     change = ParameterChange(
         ticket_id=ticket_id,
         agent_id=user_id,
@@ -4141,9 +4497,27 @@ def agent_create_parameter_change(ticket_id):
         status="pending",
     )
     db.session.add(change)
+
+    # ── Escalate the ticket: reassign to manager, update status & audit fields ─
+    now_utc = datetime.now(timezone.utc)
+    ticket.status = "manager_escalated"
+    ticket.escalated_by = user_id
+    ticket.escalated_at = now_utc
+    ticket.escalation_note = proposed
+    if manager:
+        ticket.assigned_to = manager.id
+
     db.session.commit()
 
-    return jsonify(change.to_dict()), 201
+    return jsonify({
+        "change": change.to_dict(),
+        "ticket": ticket.to_dict(),
+        "assigned_manager": {
+            "id": manager.id,
+            "name": manager.name,
+            "email": manager.email,
+        } if manager else None,
+    }), 201
 
 
 # ── Network diagnosis routes (delegated to network_diagnosis.py) ──────────────
@@ -4166,6 +4540,13 @@ def agent_customer360(customer_user_id):
     customer = db.session.get(User, customer_user_id)
     if not customer:
         return jsonify({"error": "Customer not found"}), 404
+
+    # Verify this agent has at least one ticket assigned for this customer
+    has_access = Ticket.query.filter_by(
+        assigned_to=user_id, user_id=customer_user_id
+    ).first()
+    if not has_access:
+        return jsonify({"error": "No assigned ticket for this customer"}), 403
 
     # Past complaints / chat sessions
     sessions = ChatSession.query.filter_by(user_id=customer_user_id).order_by(ChatSession.created_at.desc()).limit(20).all()
@@ -4246,6 +4627,12 @@ def agent_view_chat(session_id):
     session = db.session.get(ChatSession, session_id)
     if not session:
         return jsonify({"error": "Session not found"}), 404
+    # Verify the agent has an assigned ticket for this session
+    assigned_ticket = Ticket.query.filter_by(
+        chat_session_id=session_id, assigned_to=user_id
+    ).first()
+    if not assigned_ticket:
+        return jsonify({"error": "Access denied: no assigned ticket for this session"}), 403
     return jsonify({
         "session": session.to_dict(),
         "messages": [m.to_dict() for m in session.messages],
@@ -4268,6 +4655,11 @@ def agent_send_message(session_id):
     session = db.session.get(ChatSession, session_id)
     if not session:
         return jsonify({"error": "Session not found"}), 404
+    assigned_ticket = Ticket.query.filter_by(
+        chat_session_id=session_id, assigned_to=user_id
+    ).first()
+    if not assigned_ticket:
+        return jsonify({"error": "Access denied: no assigned ticket for this session"}), 403
 
     data = request.json or {}
     content = data.get("content", "").strip()
