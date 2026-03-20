@@ -160,9 +160,12 @@ function renderRichMessage(p) {
       );
     }
     case 'broadband-diagnostic': {
-      const billing = p.billing || {}, errors = p.errors || {};
+      const billing = p.billing || {}, errors = p.errors || {}, conn = p.connection || {};
       const planSpeed = p.planSpeed || billing.plan_speed_mbps || null;
       const accountActive = billing.account_active !== false;
+      const syncSpeed = conn.sync_speed_mbps != null ? conn.sync_speed_mbps : null;
+      const lineQuality = conn.line_quality || null;
+      const qualityColor = lineQuality === 'good' ? '#00875a' : lineQuality === 'poor' ? '#c42b1c' : '#c87d0a';
       return (
         <div style={{ background: '#f7f9fc', border: '1px solid #d8e0ec', borderLeft: '4px solid #00338d', borderRadius: 12, padding: '16px 18px', width: '100%' }}>
           <div style={{ fontWeight: 700, fontSize: 14, color: '#0f1d33', marginBottom: 6 }}>Billing & Plan Details</div>
@@ -177,6 +180,17 @@ function renderRichMessage(p) {
               </div>
             )}
           </div>
+          {(syncSpeed != null || lineQuality) && (
+            <div style={{ background: '#fff', border: '1px solid #d8e0ec', borderRadius: 10, padding: '12px 14px', marginTop: 8 }}>
+              <div style={{ fontSize: 11, color: '#00338d', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.04em', marginBottom: 6 }}>Connection Check</div>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: '8px 12px', fontSize: 12, color: '#1a2b42' }}>
+                {syncSpeed != null && <div><span style={{ color: '#8596ab' }}>Sync Speed:</span> <strong>{syncSpeed} Mbps</strong></div>}
+                {lineQuality && <div><span style={{ color: '#8596ab' }}>Line Quality:</span> <strong style={{ color: qualityColor }}>{lineQuality.charAt(0).toUpperCase() + lineQuality.slice(1)}</strong></div>}
+                {conn.router_status && <div><span style={{ color: '#8596ab' }}>Router:</span> <strong>{conn.router_status}</strong></div>}
+                {conn.area_outage && <div style={{ color: '#c42b1c', fontWeight: 700 }}>⚠ Area outage detected</div>}
+              </div>
+            </div>
+          )}
         </div>
       );
     }
@@ -329,7 +343,15 @@ export default function AgentChatView() {
       }
 
       setSession(data.session);
-      setMessages(data.messages || []);
+      setMessages(prev => {
+        const incoming = data.messages || [];
+        if (!prev.length) return incoming;
+        // Preserve any locally-added messages (e.g. just sent via handleSend)
+        // that haven't been persisted to DB yet at the time of this fetch.
+        const incomingIds = new Set(incoming.map(m => String(m.id)));
+        const localOnly = prev.filter(m => m.id != null && !incomingIds.has(String(m.id)));
+        return localOnly.length ? [...incoming, ...localOnly] : incoming;
+      });
       // Sync diagnosis state from session
       if (data.session?.diagnosis_ran) setDiagnosisRequestSent(true);
       // Merge customer object with session-embedded user fields as fallback
@@ -373,6 +395,9 @@ export default function AgentChatView() {
     s.on('disconnect', () => setWsConnected(false));
     s.on('new_message', (m) => {
       if (!m || m.session_id !== parseInt(sessionId, 10)) return;
+      // Agent's own messages are already added optimistically by handleSend via
+      // the API response; skip the socket echo to prevent duplicates.
+      if (m.sender === 'agent') return;
       appendMessageIfNew(m);
     });
     s.on('session_updated', (payload) => {

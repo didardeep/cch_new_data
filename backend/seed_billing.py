@@ -74,7 +74,12 @@ if __name__ == "__main__":
         for c in CUSTOMERS:
             existing = User.query.filter_by(email=c["email"]).first()
             if existing:
-                print(f"  ⚠️  User already exists: {c['email']} (role: {existing.role}), skipping")
+                if existing.role != "customer":
+                    old_role = existing.role
+                    existing.role = "customer"
+                    print(f"  🔄 Fixed role → customer for {c['email']} (was: {old_role})")
+                else:
+                    print(f"  ⚠️  Already exists as customer: {c['email']}, skipping")
             else:
                 user = User(
                     name=c["name"],

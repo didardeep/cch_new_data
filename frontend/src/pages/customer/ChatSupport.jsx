@@ -364,7 +364,7 @@ function LiveConnectionCard({ groupId, disabled, autoStart, saveMessage, stateRe
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-function ConnectionCheckOffer({ msgId, groupId, disabled, queryText, disableGroup, addMessage, fetchSolution, stateRef, updateMessage, initialShowWidget, runDiagnostics }) {
+function ConnectionCheckOffer({ msgId, groupId, disabled, queryText, disableGroup, addMessage, fetchSolution, stateRef, updateMessage, initialShowWidget, runDiagnostics, onDone, onSkip }) {
   const [showWidget, setShowWidget] = useState(initialShowWidget || false);
   const isFirstRender = useRef(true);
 
@@ -398,7 +398,12 @@ function ConnectionCheckOffer({ msgId, groupId, disabled, queryText, disableGrou
               }}>Check My Connection</button>
             <button disabled={disabled}
               style={{ background: 'transparent', color: '#005EB8', border: '1px solid #005EB8', borderRadius: 8, padding: '9px 20px', fontSize: 13, fontWeight: 600, fontFamily: 'inherit', cursor: disabled ? 'not-allowed' : 'pointer' }}
-              onClick={() => { if (disabled) return; disableGroup(groupId); runDiagnostics ? runDiagnostics().then(() => fetchSolution(queryText)) : fetchSolution(queryText); }}>
+              onClick={() => {
+                if (disabled) return;
+                disableGroup(groupId);
+                const afterDiag = () => onSkip ? onSkip(queryText) : fetchSolution(queryText);
+                runDiagnostics ? runDiagnostics().then(afterDiag) : afterDiag();
+              }}>
               Skip, just help me
             </button>
           </div>
@@ -417,7 +422,11 @@ function ConnectionCheckOffer({ msgId, groupId, disabled, queryText, disableGrou
           <div style={{ marginTop: 10, display: 'flex', gap: 10, flexWrap: 'wrap' }}>
             <button
               style={{ background: '#005EB8', color: '#fff', border: 'none', borderRadius: 8, padding: '8px 18px', fontSize: 12, fontWeight: 600, fontFamily: 'inherit', cursor: 'pointer' }}
-              onClick={() => { disableGroup(groupId); runDiagnostics ? runDiagnostics().then(() => fetchSolution(queryText)) : fetchSolution(queryText); }}>
+              onClick={() => {
+                disableGroup(groupId);
+                const afterDiag = () => onDone ? onDone(queryText) : fetchSolution(queryText);
+                runDiagnostics ? runDiagnostics().then(afterDiag) : afterDiag();
+              }}>
               Done — Help me now
             </button>
           </div>
@@ -673,6 +682,92 @@ export default function ChatSupport() {
       broadbandDiagStatusRef.current = 'done';
     }
   }, [addMessage, buildConnectionContext]);
+
+  // Resolve the session and show a closing message + post-actions (shared by both Done/Skip handlers).
+  const closeSessionWithMessage = useCallback(async (html) => {
+    hideInput();
+    addMessage({ type: 'bot', html });
+    if (sessionIdRef.current) {
+      try {
+        const token = getToken();
+        await fetch(`${API_BASE}/api/chat/session/${sessionIdRef.current}/resolve`, {
+          method: 'PUT', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        });
+      } catch {}
+    }
+    setTimeout(() => {
+      addMessage({ type: 'bot', html: 'What would you like to do next?' });
+      addMessage({ type: 'post-actions', groupId: nextId() });
+    }, 700);
+    stateRef.current.step = 'resolved';
+  }, [addMessage, hideInput]);
+
+  // Called when customer clicks "Done — Help me now" after running the speed test.
+  // Checks billing issues first, then speed vs plan; closes chat if all looks good.
+  const handleConnectionCheckDone = useCallback(async (queryText) => {
+    const diag = broadbandDiagResultRef.current;
+    const billing = diag?.billing || {};
+    const connection = diag?.connection || {};
+
+    // Account suspended — close with billing message
+    if (billing.account_active === false) {
+      await closeSessionWithMessage(
+        'Your account is currently <strong>inactive or suspended</strong>. Please contact our billing team to reactivate your service. Your connection will be restored once the account is active again.'
+      );
+      return;
+    }
+
+    // Bill unpaid — close with payment message
+    if (billing.bill_paid === false) {
+      const amount = billing.outstanding_amount ? ` of <strong>₹${billing.outstanding_amount}</strong>` : '';
+      await closeSessionWithMessage(
+        `We found an <strong>unpaid bill${amount}</strong> on your account. Service may be restricted until payment is cleared. Please pay your bill and your connection will restore within a few minutes of payment.`
+      );
+      return;
+    }
+
+    // Compare live speed against plan speed
+    const planSpeed = billing.plan_speed_mbps || stateRef.current.planSpeedMbps;
+    const measuredSpeed = connection.sync_speed_mbps;
+    if (planSpeed && measuredSpeed) {
+      const pct = Math.round((measuredSpeed / planSpeed) * 100);
+      if (pct >= 70) {
+        // Speed is good — close with positive message
+        await closeSessionWithMessage(
+          `Your connection is performing <strong>well</strong> — measured speed is <strong>${measuredSpeed} Mbps</strong> (${pct}% of your ${planSpeed} Mbps plan). Everything looks normal from our end. If a specific device or app still feels slow, it may be a local Wi-Fi or device issue.`
+        );
+        return;
+      }
+      // Speed is poor — tell the customer before going into solution
+      addMessage({ type: 'bot', html: `Your measured speed is <strong>${measuredSpeed} Mbps</strong>, which is below your ${planSpeed} Mbps plan (${pct}%). Let me help you fix this.` });
+    }
+
+    // Speed poor or no speed data — proceed with AI solution
+    await fetchSolution(queryText);
+  }, [closeSessionWithMessage, addMessage, fetchSolution]);
+
+  // Called when customer clicks "Skip, just help me" — checks billing issues only (no speed test ran).
+  const handleConnectionCheckSkip = useCallback(async (queryText) => {
+    const diag = broadbandDiagResultRef.current;
+    const billing = diag?.billing || {};
+
+    if (billing.account_active === false) {
+      await closeSessionWithMessage(
+        'Your account is currently <strong>inactive or suspended</strong>. Please contact our billing team to reactivate your service.'
+      );
+      return;
+    }
+
+    if (billing.bill_paid === false) {
+      const amount = billing.outstanding_amount ? ` of <strong>₹${billing.outstanding_amount}</strong>` : '';
+      await closeSessionWithMessage(
+        `We found an <strong>unpaid bill${amount}</strong> on your account. Please clear your dues to restore your connection.`
+      );
+      return;
+    }
+
+    await fetchSolution(queryText);
+  }, [closeSessionWithMessage, fetchSolution]);
 
   const hydrateHistory = useCallback((history = []) => {
     const restored = [];
@@ -1395,7 +1490,7 @@ export default function ChatSupport() {
 
     switch (msg.type) {
       case 'connection-check-offer':
-        return <ConnectionCheckOffer key={msg.id} msgId={msg.id} groupId={msg.groupId} disabled={isDisabled} queryText={msg.queryText} disableGroup={disableGroup} addMessage={addMessage} fetchSolution={fetchSolution} stateRef={stateRef} updateMessage={updateMessage} initialShowWidget={msg.showWidget || false} runDiagnostics={runBroadbandDiagnostics} />;
+        return <ConnectionCheckOffer key={msg.id} msgId={msg.id} groupId={msg.groupId} disabled={isDisabled} queryText={msg.queryText} disableGroup={disableGroup} addMessage={addMessage} fetchSolution={fetchSolution} stateRef={stateRef} updateMessage={updateMessage} initialShowWidget={msg.showWidget || false} runDiagnostics={runBroadbandDiagnostics} onDone={handleConnectionCheckDone} onSkip={handleConnectionCheckSkip} />;
       case 'live-connection':
         return <LiveConnectionCard key={msg.id} groupId={msg.groupId} disabled={isDisabled} autoStart={msg.autoStart} {...cardProps} />;
       case 'speed-test':
