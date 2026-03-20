@@ -15,6 +15,7 @@ import IssueTracking from './pages/manager/IssueTracking';
 import ChatDetail from './pages/manager/ChatDetail';
 import ManagerAlertBox from './pages/manager/ManagerAlertBox';
 import ManagerApprovals from './pages/manager/ManagerApprovals';
+import ManagerChangeWorkflow from './pages/manager/ManagerChangeWorkflow';
 import CTOLayout from './pages/cto/CTOLayout';
 import CTODashboard from './pages/cto/CTODashboard';
 import CTOAlertBox from './pages/cto/CTOAlertBox';
@@ -75,6 +76,7 @@ export default function App() {
         <Route path="reports" element={<ReportsPage />} />
         <Route path="alerts" element={<ManagerAlertBox />} />
         <Route path="approvals" element={<ManagerApprovals />} />
+        <Route path="change-workflow" element={<ManagerChangeWorkflow />} />
       </Route>
 
       {/* CTO Routes */}

@@ -31,7 +31,7 @@ from flask_jwt_extended import decode_token
 
 from sqlalchemy import case as sql_case
 from sqlalchemy.orm import joinedload
-from models import db, bcrypt, User, ChatSession, ChatMessage, Ticket, Feedback, SystemSetting, SlaAlert, TelecomSite, KpiData, ParameterChange
+from models import db, bcrypt, User, ChatSession, ChatMessage, Ticket, Feedback, SystemSetting, SlaAlert, TelecomSite, KpiData, ParameterChange, ChangeRequest
 # Add this import after other imports
 from whatsapp_integration import send_whatsapp_message, format_chat_summary_for_whatsapp, format_ticket_alert_for_whatsapp
 load_dotenv()
@@ -2944,6 +2944,208 @@ def manager_review_parameter_change(change_id):
     return jsonify({"change": change.to_dict()})
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# CHANGE WORKFLOW (ITIL) — Manager Endpoints
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _cr_auth(user):
+    return user and user.role in ("manager", "cto", "admin")
+
+
+@app.route("/api/manager/change-requests", methods=["GET"])
+@jwt_required()
+def manager_list_change_requests():
+    user_id = int(get_jwt_identity())
+    user    = db.session.get(User, user_id)
+    if not _cr_auth(user):
+        return jsonify({"error": "Unauthorized"}), 403
+
+    status  = request.args.get("status")   # optional filter
+    query   = ChangeRequest.query
+    if status:
+        if status == "needs_action":
+            query = query.filter(ChangeRequest.status.in_(["created", "invalid", "validated", "classified", "implemented", "rolled_back"]))
+        else:
+            query = query.filter_by(status=status)
+
+    crs = query.order_by(ChangeRequest.created_at.desc()).all()
+    # Summary counts for stats bar
+    all_crs = ChangeRequest.query.all()
+    stats = {
+        "total":        len(all_crs),
+        "needs_action": sum(1 for c in all_crs if c.status in ("created","invalid","validated","classified","implemented","rolled_back")),
+        "approved":     sum(1 for c in all_crs if c.status in ("approved","implementing")),
+        "closed":       sum(1 for c in all_crs if c.status in ("closed","rejected","auto_rejected")),
+    }
+    return jsonify({"change_requests": [c.to_dict() for c in crs], "stats": stats})
+
+
+@app.route("/api/manager/change-requests/<int:cr_id>", methods=["GET"])
+@jwt_required()
+def manager_get_change_request(cr_id):
+    user_id = int(get_jwt_identity())
+    user    = db.session.get(User, user_id)
+    if not _cr_auth(user):
+        return jsonify({"error": "Unauthorized"}), 403
+    cr = db.session.get(ChangeRequest, cr_id)
+    if not cr:
+        return jsonify({"error": "Change request not found"}), 404
+    return jsonify({"cr": cr.to_dict()})
+
+
+@app.route("/api/manager/change-requests/<int:cr_id>/validate", methods=["PUT"])
+@jwt_required()
+def manager_validate_cr(cr_id):
+    """Stage 1: Manager validates whether the CR is acceptable."""
+    user_id = int(get_jwt_identity())
+    user    = db.session.get(User, user_id)
+    if not _cr_auth(user):
+        return jsonify({"error": "Unauthorized"}), 403
+
+    cr = db.session.get(ChangeRequest, cr_id)
+    if not cr:
+        return jsonify({"error": "Change request not found"}), 404
+    if cr.status not in ("created", "invalid"):
+        return jsonify({"error": f"CR cannot be validated in status '{cr.status}'"}), 409
+
+    data     = request.json or {}
+    decision = (data.get("decision") or "").strip()   # 'valid' | 'invalid'
+    remark   = (data.get("remark")   or "").strip()
+    if decision not in ("valid", "invalid"):
+        return jsonify({"error": "decision must be 'valid' or 'invalid'"}), 400
+
+    now = datetime.now(timezone.utc)
+    cr.validation_remark = remark
+    cr.validated_by      = user_id
+    cr.validated_at      = now
+    cr.updated_at        = now
+
+    if decision == "valid":
+        cr.status = "validated"
+    else:
+        cr.rejection_count += 1
+        if cr.rejection_count >= 2:
+            cr.status = "auto_rejected"
+        else:
+            cr.status = "invalid"
+
+    db.session.commit()
+    return jsonify({"cr": cr.to_dict()})
+
+
+@app.route("/api/manager/change-requests/<int:cr_id>/classify", methods=["PUT"])
+@jwt_required()
+def manager_classify_cr(cr_id):
+    """Stage 2: Manager classifies the change type."""
+    user_id = int(get_jwt_identity())
+    user    = db.session.get(User, user_id)
+    if not _cr_auth(user):
+        return jsonify({"error": "Unauthorized"}), 403
+
+    cr = db.session.get(ChangeRequest, cr_id)
+    if not cr:
+        return jsonify({"error": "Change request not found"}), 404
+    if cr.status != "validated":
+        return jsonify({"error": f"CR must be validated before classification (current: {cr.status})"}), 409
+
+    data        = request.json or {}
+    change_type = (data.get("change_type") or "").strip()
+    note        = (data.get("note")        or "").strip()
+    if change_type not in ("standard", "normal", "emergency"):
+        return jsonify({"error": "change_type must be standard, normal, or emergency"}), 400
+
+    now = datetime.now(timezone.utc)
+    cr.change_type        = change_type
+    cr.classification_note = note
+    cr.classified_by      = user_id
+    cr.classified_at      = now
+    cr.status             = "classified"
+    cr.updated_at         = now
+    db.session.commit()
+    return jsonify({"cr": cr.to_dict()})
+
+
+@app.route("/api/manager/change-requests/<int:cr_id>/approve", methods=["PUT"])
+@jwt_required()
+def manager_approve_cr(cr_id):
+    """Stage 3: Manager approves or rejects the classified CR."""
+    user_id = int(get_jwt_identity())
+    user    = db.session.get(User, user_id)
+    if not _cr_auth(user):
+        return jsonify({"error": "Unauthorized"}), 403
+
+    cr = db.session.get(ChangeRequest, cr_id)
+    if not cr:
+        return jsonify({"error": "Change request not found"}), 404
+    if cr.status != "classified":
+        return jsonify({"error": f"CR must be classified before approval (current: {cr.status})"}), 409
+
+    data     = request.json or {}
+    decision = (data.get("decision") or "").strip()   # 'approved' | 'rejected'
+    remark   = (data.get("remark")   or "").strip()
+    if decision not in ("approved", "rejected"):
+        return jsonify({"error": "decision must be 'approved' or 'rejected'"}), 400
+
+    now = datetime.now(timezone.utc)
+    cr.approval_remark = remark
+    cr.approved_by     = user_id
+    cr.approved_at     = now
+    cr.status          = decision   # 'approved' or 'rejected'
+    cr.updated_at      = now
+
+    # Sync the linked ParameterChange so the agent portal reflects the decision
+    if cr.parameter_change_id:
+        pc = db.session.get(ParameterChange, cr.parameter_change_id)
+        if pc:
+            pc.status          = "approved" if decision == "approved" else "disapproved"
+            pc.reviewed_by     = user_id
+            pc.reviewed_at     = now
+            pc.manager_note    = remark
+
+    db.session.commit()
+    return jsonify({"cr": cr.to_dict()})
+
+
+@app.route("/api/manager/change-requests/<int:cr_id>/close", methods=["PUT"])
+@jwt_required()
+def manager_close_cr(cr_id):
+    """Stage 5: Manager closes the CR after implementation (success or rollback)."""
+    user_id = int(get_jwt_identity())
+    user    = db.session.get(User, user_id)
+    if not _cr_auth(user):
+        return jsonify({"error": "Unauthorized"}), 403
+
+    cr = db.session.get(ChangeRequest, cr_id)
+    if not cr:
+        return jsonify({"error": "Change request not found"}), 404
+    if cr.status not in ("implemented", "rolled_back"):
+        return jsonify({"error": f"CR can only be closed after implementation (current: {cr.status})"}), 409
+
+    data = request.json or {}
+    now  = datetime.now(timezone.utc)
+    cr.closure_notes = (data.get("notes") or "").strip()
+    cr.closed_at     = now
+    cr.status        = "closed"
+    cr.updated_at    = now
+    db.session.commit()
+    return jsonify({"cr": cr.to_dict()})
+
+
+# ── Agent: get latest CR for a ticket ─────────────────────────────────────────
+@app.route("/api/agent/change-requests/ticket/<int:ticket_id>", methods=["GET"])
+@jwt_required()
+def agent_get_cr_for_ticket(ticket_id):
+    user_id = int(get_jwt_identity())
+    user    = db.session.get(User, user_id)
+    if not user or user.role != "human_agent":
+        return jsonify({"error": "Unauthorized"}), 403
+    cr = (ChangeRequest.query
+          .filter_by(ticket_id=ticket_id, raised_by=user_id)
+          .order_by(ChangeRequest.created_at.desc())
+          .first())
+    return jsonify({"cr": cr.to_dict() if cr else None})
+
+
 @app.route("/api/manager/tickets/<int:ticket_id>/escalation-review", methods=["PUT"])
 @jwt_required()
 def manager_escalation_review(ticket_id):
@@ -5225,7 +5427,11 @@ def agent_tickets():
     user = db.session.get(User, user_id)
     if not user or user.role != "human_agent":
         return jsonify({"error": "Unauthorized"}), 403
-    tickets = Ticket.query.filter_by(assigned_to=user_id).order_by(Ticket.created_at.desc()).all()
+    from sqlalchemy import or_
+    tickets = (Ticket.query
+               .filter(or_(Ticket.assigned_to == user_id, Ticket.escalated_by == user_id))
+               .order_by(Ticket.created_at.desc())
+               .all())
     return jsonify({"tickets": [t.to_dict() for t in tickets]})
 
 
@@ -5364,7 +5570,7 @@ def agent_get_parameter_change(ticket_id):
     ticket = db.session.get(Ticket, ticket_id)
     if not ticket:
         return jsonify({"error": "Ticket not found"}), 404
-    if ticket.assigned_to != user_id:
+    if ticket.assigned_to != user_id and ticket.escalated_by != user_id:
         return jsonify({"error": "Ticket not assigned to you"}), 403
 
     change = (ParameterChange.query
@@ -5374,17 +5580,24 @@ def agent_get_parameter_change(ticket_id):
     return jsonify({"change": change.to_dict() if change else None})
 
 
+def _generate_cr_number():
+    """Generate a unique CR number: CR-YYYYMMDD-XXXX."""
+    today = datetime.now(timezone.utc).strftime("%Y%m%d")
+    suffix = ''.join(random.choices(string.ascii_uppercase + string.digits, k=4))
+    candidate = f"CR-{today}-{suffix}"
+    # Ensure uniqueness
+    while ChangeRequest.query.filter_by(cr_number=candidate).first():
+        suffix = ''.join(random.choices(string.ascii_uppercase + string.digits, k=4))
+        candidate = f"CR-{today}-{suffix}"
+    return candidate
+
+
 @app.route("/api/agent/tickets/<int:ticket_id>/parameter-change", methods=["POST"])
 @jwt_required()
 def agent_create_parameter_change(ticket_id):
     """
     Create a parameter-change request AND escalate the ticket to a manager.
-
-    Once submitted:
-    - A ParameterChange record is created (for the approval matrix).
-    - The ticket is reassigned to the best manager (priority-driven).
-    - Ticket status is set to 'manager_escalated'.
-    - The ticket disappears from the expert's queue immediately.
+    Also creates a ChangeRequest (CR) for the full ITIL Change Workflow.
     """
     user_id = int(get_jwt_identity())
     user = db.session.get(User, user_id)
@@ -5400,7 +5613,9 @@ def agent_create_parameter_change(ticket_id):
         return jsonify({"error": "Ticket is already escalated to a manager"}), 409
 
     data = request.json or {}
-    proposed = (data.get("proposed_change") or "").strip()
+    proposed         = (data.get("proposed_change")    or "").strip()
+    impact           = (data.get("impact_assessment")  or "").strip()
+    rollback         = (data.get("rollback_plan")       or "").strip()
     if not proposed:
         return jsonify({"error": "Proposed change is required"}), 400
 
@@ -5411,10 +5626,9 @@ def agent_create_parameter_change(ticket_id):
     if existing_pending:
         return jsonify({"error": "A pending change request already exists"}), 409
 
-    # ── Find best manager based on ticket priority ────────────────────────────
     manager = _find_best_manager(ticket.priority)
 
-    # ── Create the parameter-change record ────────────────────────────────────
+    # ── ParameterChange record (legacy approval matrix) ───────────────────────
     change = ParameterChange(
         ticket_id=ticket_id,
         agent_id=user_id,
@@ -5422,12 +5636,28 @@ def agent_create_parameter_change(ticket_id):
         status="pending",
     )
     db.session.add(change)
+    db.session.flush()   # get change.id before CR creation
 
-    # ── Escalate the ticket: reassign to manager, update status & audit fields ─
+    # ── ChangeRequest (ITIL workflow) ─────────────────────────────────────────
+    cr_title = f"Parameter Change: {ticket.category or 'General'} — {ticket.reference_number}"
+    cr = ChangeRequest(
+        cr_number          = _generate_cr_number(),
+        ticket_id          = ticket_id,
+        parameter_change_id= change.id,
+        raised_by          = user_id,
+        title              = cr_title,
+        description        = proposed,
+        impact_assessment  = impact,
+        rollback_plan      = rollback,
+        status             = "created",
+    )
+    db.session.add(cr)
+
+    # ── Escalate ticket ───────────────────────────────────────────────────────
     now_utc = datetime.now(timezone.utc)
-    ticket.status = "manager_escalated"
-    ticket.escalated_by = user_id
-    ticket.escalated_at = now_utc
+    ticket.status        = "manager_escalated"
+    ticket.escalated_by  = user_id
+    ticket.escalated_at  = now_utc
     ticket.escalation_note = proposed
     if manager:
         ticket.assigned_to = manager.id
@@ -5435,14 +5665,109 @@ def agent_create_parameter_change(ticket_id):
     db.session.commit()
 
     return jsonify({
-        "change": change.to_dict(),
-        "ticket": ticket.to_dict(),
-        "assigned_manager": {
-            "id": manager.id,
-            "name": manager.name,
-            "email": manager.email,
-        } if manager else None,
+        "change":           change.to_dict(),
+        "cr":               cr.to_dict(),
+        "ticket":           ticket.to_dict(),
+        "assigned_manager": {"id": manager.id, "name": manager.name, "email": manager.email} if manager else None,
     }), 201
+
+
+# ── Agent: resubmit a rejected CR (after validation rejection) ───────────────
+@app.route("/api/agent/change-requests/<int:cr_id>/resubmit", methods=["PUT"])
+@jwt_required()
+def agent_resubmit_cr(cr_id):
+    user_id = int(get_jwt_identity())
+    user    = db.session.get(User, user_id)
+    if not user or user.role != "human_agent":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    cr = db.session.get(ChangeRequest, cr_id)
+    if not cr:
+        return jsonify({"error": "Change request not found"}), 404
+    if cr.raised_by != user_id:
+        return jsonify({"error": "Not your change request"}), 403
+    if cr.status != "invalid":
+        return jsonify({"error": "Only invalid CRs can be resubmitted"}), 409
+    if cr.rejection_count >= 2:
+        return jsonify({"error": "Maximum rejections reached. CR is permanently closed."}), 409
+
+    data        = request.json or {}
+    description = (data.get("description") or "").strip()
+    impact      = (data.get("impact_assessment") or "").strip()
+    rollback    = (data.get("rollback_plan") or "").strip()
+    if not description:
+        return jsonify({"error": "Description is required"}), 400
+
+    cr.description       = description
+    cr.impact_assessment = impact
+    cr.rollback_plan     = rollback
+    cr.status            = "created"
+    cr.updated_at        = datetime.now(timezone.utc)
+    db.session.commit()
+    return jsonify({"cr": cr.to_dict()})
+
+
+# ── Agent: report implementation result ──────────────────────────────────────
+@app.route("/api/agent/change-requests/<int:cr_id>/implement", methods=["PUT"])
+@jwt_required()
+def agent_implement_cr(cr_id):
+    user_id = int(get_jwt_identity())
+    user    = db.session.get(User, user_id)
+    if not user or user.role != "human_agent":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    cr = db.session.get(ChangeRequest, cr_id)
+    if not cr:
+        return jsonify({"error": "Change request not found"}), 404
+    if cr.raised_by != user_id:
+        return jsonify({"error": "Not your change request"}), 403
+    if cr.status not in ("approved", "implementing"):
+        return jsonify({"error": "CR is not in approved state"}), 409
+
+    data   = request.json or {}
+    result = (data.get("result") or "").strip()   # 'success' or 'failed'
+    notes  = (data.get("notes") or "").strip()
+    if result not in ("success", "failed"):
+        return jsonify({"error": "result must be 'success' or 'failed'"}), 400
+
+    now = datetime.now(timezone.utc)
+    if result == "success":
+        cr.status              = "implemented"
+        cr.implementation_notes = notes
+        cr.implemented_by      = user_id
+        cr.implemented_at      = now
+    else:
+        cr.status              = "failed"
+        cr.implementation_notes = notes
+        cr.implemented_by      = user_id
+        cr.implemented_at      = now
+    cr.updated_at = now
+    db.session.commit()
+    return jsonify({"cr": cr.to_dict()})
+
+
+# ── Agent: report rollback complete ──────────────────────────────────────────
+@app.route("/api/agent/change-requests/<int:cr_id>/rollback", methods=["PUT"])
+@jwt_required()
+def agent_rollback_cr(cr_id):
+    user_id = int(get_jwt_identity())
+    user    = db.session.get(User, user_id)
+    if not user or user.role != "human_agent":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    cr = db.session.get(ChangeRequest, cr_id)
+    if not cr or cr.raised_by != user_id:
+        return jsonify({"error": "Not found or unauthorized"}), 404
+    if cr.status != "failed":
+        return jsonify({"error": "CR is not in failed state"}), 409
+
+    data = request.json or {}
+    cr.status        = "rolled_back"
+    cr.rollback_notes = (data.get("notes") or "").strip()
+    cr.rollback_at   = datetime.now(timezone.utc)
+    cr.updated_at    = datetime.now(timezone.utc)
+    db.session.commit()
+    return jsonify({"cr": cr.to_dict()})
 
 
 @app.route("/api/agent/tickets/<int:ticket_id>/diagnose", methods=["POST"])

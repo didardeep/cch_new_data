@@ -367,6 +367,116 @@ class ParameterChange(db.Model):
         }
 
 
+class ChangeRequest(db.Model):
+    """
+    ITIL-aligned Change Request lifecycle:
+    created → validated → classified → approved → implementing → implemented → closed
+    Rejection at validation resets to 'invalid' (max 2 times → auto_rejected).
+    Rejection at approval → 'rejected'. Failed implementation → 'failed' → 'rolled_back'.
+    """
+    __tablename__ = "change_requests"
+
+    id          = db.Column(db.Integer, primary_key=True)
+    cr_number   = db.Column(db.String(30), unique=True, nullable=False)          # CR-20260320-A3F7
+    ticket_id   = db.Column(db.Integer, db.ForeignKey("tickets.id"), nullable=False)
+    parameter_change_id = db.Column(db.Integer, db.ForeignKey("parameter_changes.id"), nullable=True)
+    raised_by   = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
+
+    # Core content
+    title              = db.Column(db.String(200), nullable=False)
+    description        = db.Column(db.Text,        nullable=False)
+    impact_assessment  = db.Column(db.Text, default="")
+    rollback_plan      = db.Column(db.Text, default="")
+
+    # Status: created|invalid|auto_rejected|validated|classified|approved|rejected|
+    #         implementing|implemented|failed|rolled_back|closed
+    status      = db.Column(db.String(30), default="created")
+    change_type = db.Column(db.String(20), nullable=True)   # standard|normal|emergency
+
+    # ── Validation ──────────────────────────────────────────────────────────
+    rejection_count    = db.Column(db.Integer, default=0)
+    validation_remark  = db.Column(db.Text, default="")
+    validated_by       = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=True)
+    validated_at       = db.Column(db.DateTime, nullable=True)
+
+    # ── Classification ───────────────────────────────────────────────────────
+    classification_note = db.Column(db.Text, default="")
+    classified_by       = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=True)
+    classified_at       = db.Column(db.DateTime, nullable=True)
+
+    # ── Approval ─────────────────────────────────────────────────────────────
+    approval_remark = db.Column(db.Text, default="")
+    approved_by     = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=True)
+    approved_at     = db.Column(db.DateTime, nullable=True)
+
+    # ── Implementation ───────────────────────────────────────────────────────
+    implementation_notes = db.Column(db.Text, default="")
+    implemented_by       = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=True)
+    implemented_at       = db.Column(db.DateTime, nullable=True)
+
+    # ── Rollback ─────────────────────────────────────────────────────────────
+    rollback_notes = db.Column(db.Text, default="")
+    rollback_at    = db.Column(db.DateTime, nullable=True)
+
+    # ── Closure ──────────────────────────────────────────────────────────────
+    closure_notes = db.Column(db.Text, default="")
+    closed_at     = db.Column(db.DateTime, nullable=True)
+
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+
+    # Relationships
+    ticket            = db.relationship("Ticket",          foreign_keys=[ticket_id],   backref="change_requests")
+    parameter_change  = db.relationship("ParameterChange", foreign_keys=[parameter_change_id], backref="change_request", uselist=False)
+    raiser            = db.relationship("User", foreign_keys=[raised_by],     backref="raised_crs")
+    validator         = db.relationship("User", foreign_keys=[validated_by],  backref="validated_crs")
+    classifier        = db.relationship("User", foreign_keys=[classified_by], backref="classified_crs")
+    approver          = db.relationship("User", foreign_keys=[approved_by],   backref="approved_crs")
+    implementer       = db.relationship("User", foreign_keys=[implemented_by],backref="implemented_crs")
+
+    def to_dict(self):
+        t = self.ticket
+        return {
+            "id":                   self.id,
+            "cr_number":            self.cr_number,
+            "ticket_id":            self.ticket_id,
+            "ticket_ref":           t.reference_number if t else "",
+            "ticket_priority":      t.priority         if t else "medium",
+            "ticket_domain":        t.domain           if t else "",
+            "ticket_category":      t.category         if t else "",
+            "ticket_subcategory":   t.subcategory      if t else "",
+            "ticket_user_name":     t.user.name        if t and t.user else "",
+            "parameter_change_id":  self.parameter_change_id,
+            "raised_by":            self.raised_by,
+            "raised_by_name":       self.raiser.name   if self.raiser else "",
+            "title":                self.title,
+            "description":          self.description,
+            "impact_assessment":    self.impact_assessment  or "",
+            "rollback_plan":        self.rollback_plan       or "",
+            "status":               self.status,
+            "change_type":          self.change_type,
+            "rejection_count":      self.rejection_count,
+            "validation_remark":    self.validation_remark   or "",
+            "validated_by_name":    self.validator.name  if self.validator  else None,
+            "validated_at":         self.validated_at.isoformat()  if self.validated_at  else None,
+            "classification_note":  self.classification_note or "",
+            "classified_by_name":   self.classifier.name if self.classifier else None,
+            "classified_at":        self.classified_at.isoformat() if self.classified_at else None,
+            "approval_remark":      self.approval_remark     or "",
+            "approved_by_name":     self.approver.name   if self.approver   else None,
+            "approved_at":          self.approved_at.isoformat()   if self.approved_at   else None,
+            "implementation_notes": self.implementation_notes or "",
+            "implemented_by_name":  self.implementer.name if self.implementer else None,
+            "implemented_at":       self.implemented_at.isoformat() if self.implemented_at else None,
+            "rollback_notes":       self.rollback_notes      or "",
+            "rollback_at":          self.rollback_at.isoformat()    if self.rollback_at    else None,
+            "closure_notes":        self.closure_notes       or "",
+            "closed_at":            self.closed_at.isoformat()      if self.closed_at      else None,
+            "created_at":           self.created_at.isoformat()     if self.created_at     else None,
+            "updated_at":           self.updated_at.isoformat()     if self.updated_at     else None,
+        }
+
+
 class KpiData(db.Model):
     __tablename__ = "kpi_data"
 
