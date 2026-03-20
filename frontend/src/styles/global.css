@@ -829,6 +829,7 @@ a { text-decoration: none; color: inherit; }
 .badge-resolved { background: var(--success-bg); color: #047857; }
 .badge-pending { background: var(--warning-bg); color: #92400e; }
 .badge-escalated { background: var(--danger-bg); color: #991b1b; }
+.badge-manager_escalated { background: #fdf4ff; color: #6d28d9; border: 1px solid #e9d5ff; }
 .badge-active { background: #eff6ff; color: var(--primary); }
 .badge-in_progress { background: #eff6ff; color: var(--primary); }
 

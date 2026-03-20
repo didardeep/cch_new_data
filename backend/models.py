@@ -21,8 +21,14 @@ class User(db.Model):
     role = db.Column(db.String(20), nullable=False, default="customer")
     employee_id = db.Column(db.String(20), unique=True, nullable=True)
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+    # Customer tier — drives ticket priority floor (platinum > gold > silver > bronze)
+    user_type = db.Column(db.String(20), nullable=True, default="bronze")  # platinum/gold/silver/bronze
     # Human agent online/offline status
     is_online = db.Column(db.Boolean, default=False, nullable=False)
+    # Expert fields (applicable when role == "human_agent")
+    domain = db.Column(db.String(50), nullable=True)           # e.g. "mobile", "broadband", "dth", "landline", "enterprise", "fiber"
+    location = db.Column(db.String(100), nullable=True)        # City name, e.g. "Gurugram", "Mumbai"
+    bandwidth_capacity = db.Column(db.Integer, default=10, nullable=False)  # Max concurrent open tickets
 
     chat_sessions = db.relationship("ChatSession", backref="user", lazy=True)
     tickets = db.relationship("Ticket", backref="user", lazy=True, foreign_keys="Ticket.user_id")
@@ -43,6 +49,10 @@ class User(db.Model):
             "role": self.role,
             "employee_id": self.employee_id,
             "is_online": self.is_online,
+            "user_type": self.user_type or "bronze",
+            "domain": self.domain,
+            "location": self.location,
+            "bandwidth_capacity": self.bandwidth_capacity,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
 
@@ -95,6 +105,8 @@ class ChatSession(db.Model):
             "diagnosis_ran": bool(self.diagnosis_ran),
             "current_step": self.current_step or "greeting",
             "last_message_at": self.last_message_at.isoformat() if self.last_message_at else None,
+            "assignee_name": (self.ticket.assignee.name if self.ticket and self.ticket.assignee else None),
+            "assignee_domain": (self.ticket.assignee.domain if self.ticket and self.ticket.assignee else None),
         }
 
 
@@ -132,9 +144,11 @@ class Ticket(db.Model):
     reference_number = db.Column(db.String(50), unique=True, nullable=False)
     category = db.Column(db.String(200), default="General")
     subcategory = db.Column(db.String(200), default="")
+    domain = db.Column(db.String(50), nullable=True)           # Expert domain this ticket belongs to
     description = db.Column(db.Text, default="")
     status = db.Column(db.String(30), default="pending")
-    priority = db.Column(db.String(20), default="medium")
+    severity = db.Column(db.String(20), default="medium")   # issue urgency: critical/high/medium/low
+    priority = db.Column(db.String(20), default="medium")   # final priority = max(severity, user_type_priority)
     assigned_to = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=True)
     resolution_notes = db.Column(db.Text, default="")
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
@@ -148,8 +162,13 @@ class Ticket(db.Model):
     alert_750_sent = db.Column(db.Boolean, default=False)  # Alert at 75% of SLA time elapsed
     alert_875_sent = db.Column(db.Boolean, default=False)  # Alert at 87.5% of SLA time elapsed
     breach_alert_sent = db.Column(db.Boolean, default=False)  # Breach alert sent to CTO
+    # Escalation tracking (expert → manager via parameter-change button)
+    escalated_by = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=True)   # expert who escalated
+    escalated_at = db.Column(db.DateTime, nullable=True)                              # when escalated
+    escalation_note = db.Column(db.Text, default="")                                  # expert's note at escalation
 
     assignee = db.relationship("User", foreign_keys=[assigned_to], backref="assigned_tickets")
+    escalator = db.relationship("User", foreign_keys=[escalated_by], backref="escalated_tickets")
 
     def to_dict(self):
         return {
@@ -162,18 +181,27 @@ class Ticket(db.Model):
             "reference_number": self.reference_number,
             "category": self.category,
             "subcategory": self.subcategory,
+            "domain": self.domain,
             "description": self.description,
             "status": self.status,
+            "severity": self.severity,
             "priority": self.priority,
+            "user_type": (self.user.user_type or "bronze") if self.user else "bronze",
             "assigned_to": self.assigned_to,
             "assignee_name": self.assignee.name if self.assignee else "Unassigned",
             "assignee_phone": self.assignee.phone_number if self.assignee else None,
+            "assignee_domain": self.assignee.domain if self.assignee else None,
+            "assignee_location": self.assignee.location if self.assignee else None,
             "resolution_notes": self.resolution_notes,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "resolved_at": self.resolved_at.isoformat() if self.resolved_at else None,
             "sla_hours": self.sla_hours,
             "sla_deadline": self.sla_deadline.isoformat() if self.sla_deadline else None,
             "sla_breached": self.sla_breached,
+            "escalated_by": self.escalated_by,
+            "escalated_by_name": self.escalator.name if self.escalator else None,
+            "escalated_at": self.escalated_at.isoformat() if self.escalated_at else None,
+            "escalation_note": self.escalation_note or "",
         }
 
 
