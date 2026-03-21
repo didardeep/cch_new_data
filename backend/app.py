@@ -11,10 +11,9 @@ import time
 import math
 import random
 import string
-import hashlib
-from datetime import datetime, timezone, timedelta, date
+from datetime import datetime, timezone, timedelta
 
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_jwt_extended import (
     JWTManager, create_access_token, jwt_required, get_jwt_identity
@@ -27,14 +26,12 @@ from types import SimpleNamespace
 import urllib.request
 import urllib.parse
 import urllib.error
-from flask_jwt_extended import decode_token
 
-from sqlalchemy import case as sql_case
+from sqlalchemy import case as sql_case, text
 from sqlalchemy.orm import joinedload
-from models import db, bcrypt, User, ChatSession, ChatMessage, Ticket, Feedback, SystemSetting, SlaAlert, TelecomSite, KpiData, ParameterChange
+from models import db, bcrypt, User, ChatSession, ChatMessage, Ticket, Feedback, SystemSetting, SlaAlert, TelecomSite, KpiData, ParameterChange, ChangeRequest
 # Add this import after other imports
 from whatsapp_integration import send_whatsapp_message, format_chat_summary_for_whatsapp, format_ticket_alert_for_whatsapp
-from network_analytics import network_bp   # ← Predictive Network Analytics module
 load_dotenv()
 
 # ─── App Setup ────────────────────────────────────────────────────────────────
@@ -55,14 +52,7 @@ app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get(
     "postgresql://postgres:postgres@localhost:5432/telecom_complaints"
 )
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
-    "pool_size": 20,        # base connections kept open (was 5)
-    "max_overflow": 40,     # extra connections allowed under load (was 10)
-    "pool_timeout": 30,     # seconds to wait for a free connection
-    "pool_recycle": 1800,   # recycle connections after 30 min to avoid stale sockets
-    "pool_pre_ping": True,  # verify connection is alive before using it
-}
-app.config["JWT_SECRET_KEY"] = _get_jwt_secret()
+app.config["JWT_SECRET_KEY"] = os.environ.get("JWT_SECRET", "super-secret-jwt-key-change-in-prod")
 app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(hours=24)
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16MB max for image uploads
 
@@ -92,17 +82,13 @@ CORS(
     supports_credentials=True,
 )
 
-# ── Register blueprints ───────────────────────────────────────────────────────
-app.register_blueprint(network_bp)   # Predictive Network Analytics
-
-from openai import OpenAI
-# ─── Google Gemini Configuration (OpenAI-compatible endpoint) ────────────────
-client = OpenAI(
-    api_key=os.environ.get("GEMINI_API_KEY"),
-    base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
+# ─── Azure OpenAI Configuration (pulled from .env) ───────────────────────────
+client = AzureOpenAI(
+    api_key=os.environ.get("AZURE_OPENAI_API_KEY"),
+    azure_endpoint=os.environ.get("AZURE_OPENAI_ENDPOINT"),
+    api_version=os.environ.get("AZURE_OPENAI_API_VERSION", "2023-07-01-preview"),
 )
-
-DEPLOYMENT_NAME =  "gemini-3-flash-preview"
+DEPLOYMENT_NAME = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini")
 
 def _user_brief(u, off_days=None):
     return {
@@ -207,22 +193,10 @@ def _build_duty_roster(target_date):
 # ─── Nearest-Tower Lookup (loaded once at startup) ────────────────────────────
 _SITE_DATA = []
 
-def _load_site_data():
-    """Dynamically find and load the telecom site Excel file."""
-    global _SITE_DATA
-    backend_dir = os.path.dirname(__file__)
-    
-    # 1. Search for any .xlsx file in the folder that has "Sites" in the name
-    potential_files = [f for f in os.listdir(backend_dir) 
-                       if f.endswith('.xlsx') and 'Sites' in f]
-    
-    if not potential_files:
-        # Fallback: just take the first xlsx file found if the "Sites" keyword fails
-        potential_files = [f for f in os.listdir(backend_dir) if f.endswith('.xlsx')]
 
-    if not potential_files:
-        print(f"[WARN] No Excel site data found in {backend_dir} - tower lookup disabled")
-        return
+def _load_site_data():
+    """Legacy Excel loader (disabled). Site data is now loaded via admin upload into DB."""
+    return
 
 
 def _haversine(lat1, lon1, lat2, lon2):
@@ -238,48 +212,18 @@ def _haversine(lat1, lon1, lat2, lon2):
 
 NETWORK_PROBLEM_KPI_KEYWORDS = {
     "internet_signal": [
-        "throughput", "tput", "data rate", "pdcp", "user throughput",
-        "latency", "delay", "rtt", "packet loss",
-        "prb", "resource block", "utilization", "congestion",
-        "data volume", "traffic volume", "dl volume", "ul volume",
-        "active ue", "connected ue",
-        "sinr", "rsrp", "rsrq", "cqi",
-        "availability",
+        "internet", "speed", "bandwidth", "data", "throughput", "latency", "packet", "prb", "resource block",
+        "sinr", "rsrp", "rsrq", "cqi", "ul", "uplink", "dl", "downlink", "lte", "nr",
+        "4g", "5g", "availability", "session", "traffic", "interference", "coverage"
     ],
     "call_failure": [
-        "cssr", "call setup", "setup success", "accessibility",
-        "sdcch", "paging", "attach", "blocking", "asr", "volte",
-        "moc", "mtc",
+        "call setup", "cssr", "asr", "blocked", "failure", "accessibility", "sdcch",
+        "tch", "moc", "mtc", "paging", "attach", "volte", "voice", "srvcc"
     ],
     "call_drop": [
-        "drop", "call drop", "tch drop", "retainability",
-        "rlf", "radio link failure",
-        "handover", "ho success", "ho failure",
-        "speech", "voice",
+        "drop", "cdr", "dcr", "tch drop", "rlf", "radio link failure", "handover",
+        "ho ", "ho_", "speech", "retainability", "voice", "call"
     ],
-}
-
-# STRICT primary KPIs — these must match to be shown for the problem type
-NETWORK_PROBLEM_KPI_PRIMARY = {
-    "internet_signal": [
-        "throughput", "tput", "data rate", "pdcp", "user throughput",
-        "latency", "packet loss", "prb", "utilization",
-        "sinr", "rsrp", "rsrq", "cqi",
-    ],
-    "call_failure": [
-        "cssr", "call setup", "setup success", "accessibility",
-        "sdcch", "paging", "blocking", "asr", "volte", "attach",
-    ],
-    "call_drop": [
-        "drop", "call drop", "tch drop", "retainability",
-        "rlf", "radio link failure", "handover", "ho success", "ho failure",
-    ],
-}
-
-NETWORK_PROBLEM_KPI_STRONG = {
-    "internet_signal": ["throughput", "latency", "prb", "sinr", "rsrp", "rsrq", "cqi", "data volume"],
-    "call_failure": ["cssr", "call setup", "accessibility", "sdcch", "paging", "blocking"],
-    "call_drop": ["drop", "retainability", "rlf", "tch drop", "handover"],
 }
 
 
@@ -312,37 +256,14 @@ def _problem_type_label(problem_type: str) -> str:
 
 
 def _filter_kpi_names_for_problem(kpi_names, problem_type: str):
-    """
-    Return the KPIs most relevant to the problem type.
-    - Scores each KPI name against primary + secondary keyword lists.
-    - Returns up to 5 best-matched KPIs.
-    - If nothing matches at all, returns up to 5 KPIs sorted alphabetically
-      (so trend analysis always has something to show).
-    """
-    primary = NETWORK_PROBLEM_KPI_PRIMARY.get(problem_type, NETWORK_PROBLEM_KPI_PRIMARY["internet_signal"])
-    strong = NETWORK_PROBLEM_KPI_STRONG.get(problem_type, [])
     keys = NETWORK_PROBLEM_KPI_KEYWORDS.get(problem_type, NETWORK_PROBLEM_KPI_KEYWORDS["internet_signal"])
-
-    scored = []
-    for name in kpi_names:
-        lname = (name or "").lower()
-        # Primary match carries most weight
-        primary_score = sum(2 for k in primary if k in lname)
-        # Strong keyword bonus
-        strong_bonus = 3 if any(k in lname for k in strong) else 0
-        # Secondary keyword match
-        secondary_score = sum(1 for k in keys if k in lname)
-
-        total_score = primary_score + strong_bonus + secondary_score
-        if total_score > 0:
-            scored.append((total_score, name))
-
-    if scored:
-        scored.sort(key=lambda x: (-x[0], x[1]))
-        return [n for _, n in scored[:5]]
-
-    # Nothing matched — return the first 5 KPIs alphabetically so the chart still renders
-    return sorted(kpi_names)[:5]
+    selected = [
+        name for name in sorted(kpi_names)
+        if any(k in (name or "").lower() for k in keys)
+    ]
+    if not selected:
+        selected = sorted(kpi_names)[:8]
+    return selected
 
 
 def _period_key_for_row(row: KpiData, period: str) -> str:
@@ -453,17 +374,23 @@ def _force_numbered_points(raw_text: str, min_points: int, max_points: int, pref
     """
     lines = _normalize_ai_lines(raw_text)
 
-    # Keep lines in their ORIGINAL order — do not rerank.
-    # The AI already produces the output in priority order.
+    # Score lines: prefer those with technical/diagnostic keywords and longer content
+    ranked = sorted(
+        lines,
+        key=lambda l: (
+            1 if re.search(r"\b(root cause|cause|kpi|trend|alarm|site|cell|impact|action|recommend)\b", l, re.IGNORECASE) else 0,
+            len(l),
+        ),
+        reverse=True,
+    )
     picked = []
-    for line in lines:
+    for line in ranked:
         if len(line) < 12:
             continue
-        picked.append(line)
+        picked.append(line)  # No truncation — keep full sentence
         if len(picked) >= max_points:
             break
 
-    # Fill up to min_points from fallback if AI gave too few lines
     for line in (fallback_points or []):
         if len(picked) >= min_points:
             break
@@ -471,17 +398,8 @@ def _force_numbered_points(raw_text: str, min_points: int, max_points: int, pref
             picked.append(line)
 
     picked = picked[:max_points]
-
-    # Last resort: if truly nothing, generate from fallback directly
     if not picked:
-        for line in (fallback_points or []):
-            if line and len(line) >= 12:
-                picked.append(line)
-            if len(picked) >= max_points:
-                break
-
-    if not picked:
-        picked = ["Unable to generate recommendations — please ensure root cause analysis has been run first."]
+        picked = ["Analysis could not be generated from available data."]
 
     # prefix param ignored (was used for "**Crux:** " — removed)
     return "\n".join(f"{idx + 1}. {line}" for idx, line in enumerate(picked))
@@ -509,294 +427,34 @@ def _format_points_for_pdf(raw_text: str) -> str:
 
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _value_or_na(val, unit=""):
-    if val is None or val == "":
-        return "N/A"
-    return f"{val}{unit}"
-
-
-def _adjust_value(val, delta, min_val=None):
-    if val is None:
-        return None
-    try:
-        new_val = float(val) + float(delta)
-        if min_val is not None:
-            new_val = max(new_val, min_val)
-        return round(new_val, 2)
-    except Exception:
-        return None
-
-
-def _infer_issue_flags(text: str):
-    t = (text or "").lower()
-    flags = set()
-    if any(k in t for k in ["prb", "utilization", "congestion", "overload", "traffic spike"]):
-        flags.add("congestion")
-    if any(k in t for k in ["sinr", "rsrp", "rsrq", "weak signal", "coverage", "low signal"]):
-        flags.add("coverage")
-    if any(k in t for k in ["interference", "pilot pollution", "overshoot", "over-shoot"]):
-        flags.add("interference")
-    if any(k in t for k in ["latency", "packet loss", "delay", "jitter"]):
-        flags.add("latency")
-    if any(k in t for k in ["handover", "rlf", "drop", "call drop"]):
-        flags.add("handover")
-    if any(k in t for k in ["call setup", "cssr", "paging", "accessibility", "sdcch", "call failure"]):
-        flags.add("access")
-    if "off air" in t or "off_air" in t:
-        flags.add("off_air")
-    return flags
-
-
-def _build_parameter_recommendations(problem_type, root_cause, trend_summary, nearest):
-    text = f"{root_cause}\n{trend_summary}"
-    flags = _infer_issue_flags(text)
-
-    bw = nearest.get("bandwidth_mhz") if nearest else None
-    gain = nearest.get("antenna_gain_dbi") if nearest else None
-    eirp = nearest.get("rf_power_eirp_dbm") if nearest else None
-    height = nearest.get("antenna_height_agl_m") if nearest else None
-    tilt = nearest.get("e_tilt_degree") if nearest else None
-    crs = nearest.get("crs_gain") if nearest else None
-
-    recs = []
-
-    if "off_air" in flags:
-        recs.append(
-            f"**Restore Site to ON AIR**: Resolve active alarms first and validate recovery against KPI trends; "
-            f"then re-check RF parameters (EIRP {_value_or_na(eirp,' dBm')}, E-tilt {_value_or_na(tilt,'°')}) for post-recovery tuning."
-        )
-
-    if "congestion" in flags and bw is not None:
-        target_bw = bw + (10 if bw <= 10 else 5)
-        recs.append(
-            f"**Increase Bandwidth**: Bandwidth is {bw} MHz; expand to {target_bw} MHz (if spectrum/license allows) to reduce PRB congestion and improve throughput."
-        )
-    elif "congestion" in flags:
-        recs.append(
-            "**Increase Bandwidth**: Bandwidth value missing; increase carrier bandwidth (e.g., +5 to +10 MHz) to reduce PRB congestion and improve throughput."
-        )
-
-    if "interference" in flags and tilt is not None and eirp is not None:
-        target_tilt = _adjust_value(tilt, 1, min_val=0)
-        target_eirp = _adjust_value(eirp, -1)
-        recs.append(
-            f"**Reduce Overshoot/Interference**: E-tilt is {tilt}° and EIRP is {eirp} dBm; "
-            f"increase tilt to {target_tilt}° and lower EIRP to {target_eirp} dBm to reduce pilot pollution and stabilize SINR."
-        )
-    elif "coverage" in flags and tilt is not None and eirp is not None:
-        target_tilt = _adjust_value(tilt, -1, min_val=0)
-        target_eirp = _adjust_value(eirp, 1)
-        recs.append(
-            f"**Improve Coverage/RSS**: E-tilt is {tilt}° and EIRP is {eirp} dBm; "
-            f"reduce tilt to {target_tilt}° and raise EIRP to {target_eirp} dBm to lift RSRP and improve coverage."
-        )
-
-    if "handover" in flags and crs is not None:
-        target_crs = _adjust_value(crs, 3)
-        recs.append(
-            f"**Stabilize Handover**: CRS Gain is {crs}; raise to {target_crs} to improve reference signal quality and reduce RLF/call drops during mobility."
-        )
-    elif "access" in flags and gain is not None:
-        target_gain = _adjust_value(gain, 1)
-        recs.append(
-            f"**Improve Call Accessibility**: Antenna Gain is {gain} dBi; increase to {target_gain} dBi (or swap to higher-gain antenna) to improve call setup KPIs."
-        )
-
-    if "latency" in flags and height is not None:
-        target_height = _adjust_value(height, 2)
-        recs.append(
-            f"**Optimize Antenna Height**: Antenna height is {height} m AGL; adjust to {target_height} m to improve line-of-sight and reduce latency spikes."
-        )
-
-    # Ensure 4–5 points using unique parameter-based fill-up lines
-    padding_pool = []
-    if tilt is not None and eirp is not None:
-        padding_pool.append(
-            f"**RF Parameter Alignment**: Validate E-tilt ({tilt}°) and EIRP ({eirp} dBm) against the RCA-identified degradation window and confirm KPI recovery within 24 hours post-adjustment."
-        )
-    if bw is not None:
-        padding_pool.append(
-            f"**Capacity Confirmation**: Confirm bandwidth at {bw} MHz is adequate; if PRB utilization exceeds 70%, schedule a bandwidth expansion to {round(bw + 5, 1)} MHz."
-        )
-    if crs is not None:
-        padding_pool.append(
-            f"**CRS Gain Verification**: CRS Gain is currently {crs}; validate reference signal power across all sectors and adjust if RSRP drops below -105 dBm at cell edge."
-        )
-    if height is not None:
-        padding_pool.append(
-            f"**Antenna Height Review**: Antenna height is {height} m AGL; verify line-of-sight coverage and adjust mounting height if near-field obstruction is detected."
-        )
-    if gain is not None:
-        padding_pool.append(
-            f"**Antenna Gain Audit**: Antenna Gain is {gain} dBi; cross-check with drive test data and replace with higher-gain antenna if signal levels are below threshold."
-        )
-    # Generic always-available options
-    padding_pool += [
-        "**Drive Test Validation**: Conduct a drive test in the affected area post-parameter changes to confirm KPI recovery and customer experience improvement.",
-        "**Neighbor Cell Audit**: Review neighbor cell list for missing or unoptimized neighbors that may cause handover failures and increase call drops.",
-        "**Scheduler Tuning**: Adjust CQI-based scheduler parameters to prioritize users with degraded signal quality and improve cell-edge throughput by up to 15%.",
-    ]
-
-    for pad in padding_pool:
-        if len(recs) >= 5:
-            break
-        if pad not in recs:
-            recs.append(pad)
-
-    return recs[:5]
-
-
-def _recommendation_has_params(text: str):
-    t = (text or "").lower()
-    param_hits = 0
-    for p in ["bandwidth", "antenna gain", "eirp", "rf power", "antenna height", "e-tilt", "tilt", "crs gain"]:
-        if p in t:
-            param_hits += 1
-    has_numbers = bool(re.search(r"\d+(\.\d+)?", t))
-    return param_hits >= 2 and has_numbers
-
-
-def _filter_rca_lines(lines):
-    generic_patterns = [
-        r"\bsite status\b",
-        r"\bproblem classification\b",
-        r"\bproblem type\b",
-        r"\bprimary impact domain\b",
-        r"\bonly related kpi\b",
-        r"\btrend evidence\b",
-        r"\baction required\b",
-        r"\bfocus area\b",
-    ]
-    out = []
-    for line in lines:
-        l = line.lower()
-        if any(re.search(p, l) for p in generic_patterns):
-            continue
-        # Keep lines that mention KPI evidence or alarms/solutions
-        if re.search(r"\b(kpi|throughput|latency|prb|sinr|rsrp|rsrq|cqi|drop|handover|cssr|paging|rlf|alarm|off air|on air)\b", l):
-            out.append(line)
-            continue
-        # Keep lines with concrete numbers/percentages
-        if re.search(r"\d+(\.\d+)?", l):
-            out.append(line)
-    return out
-
-
-def _kpi_degradation_points(rows, selected_kpis, max_points=3):
-    from collections import defaultdict
-    grouped = defaultdict(list)
-    for r in rows:
-        if r.kpi_name in selected_kpis and r.value is not None:
-            grouped[r.kpi_name].append(r)
-    points = []
-    for kpi_name, kpi_rows in grouped.items():
-        kpi_rows.sort(key=lambda r: (r.date, r.hour))
-        vals = [float(r.value) for r in kpi_rows if r.value is not None]
-        if len(vals) < 2:
-            continue
-        overall = sum(vals) / len(vals)
-        latest_vals = [float(r.value) for r in kpi_rows[-min(8, len(kpi_rows)):] if r.value is not None]
-        latest = sum(latest_vals) / max(len(latest_vals), 1)
-        if overall == 0:
-            continue
-        delta_pct = (latest - overall) / overall * 100
-        if abs(delta_pct) < 20:
-            continue
-        direction = "drop" if delta_pct < 0 else "increase"
-        points.append((
-            abs(delta_pct),
-            f"**KPI Shift**: {kpi_name} shows a {direction} to {round(latest, 3)} vs baseline {round(overall, 3)} ({round(delta_pct, 1)}%)."
-        ))
-    points.sort(key=lambda x: -x[0])
-    return [p for _, p in points[:max_points]]
-
-
-# ─── Socket.IO Helpers ───────────────────────────────────────────────────────
-
-def _emit_session_message(msg: ChatMessage):
-    try:
-        socketio.emit("new_message", msg.to_dict(), room=f"session_{msg.session_id}")
-    except Exception:
-        pass
-
-
-def _emit_session_update(session: ChatSession):
-    try:
-        socketio.emit("session_updated", {"session_id": session.id, "status": session.status}, room=f"session_{session.id}")
-    except Exception:
-        pass
-
-
-@socketio.on("join_session")
-def on_join_session(data):
-    data = data or {}
-    token = data.get("token")
-    session_id = data.get("session_id")
-    if not token or not session_id:
-        emit("error", {"error": "token and session_id required"})
-        return
-    try:
-        decoded = decode_token(token)
-        user_id = int(decoded.get("sub"))
-    except Exception:
-        emit("error", {"error": "invalid token"})
-        return
-    session = db.session.get(ChatSession, session_id)
-    if not session:
-        emit("error", {"error": "session not found"})
-        return
-    user = db.session.get(User, user_id)
-    if not user:
-        emit("error", {"error": "user not found"})
-        return
-    if user.role != "human_agent" and session.user_id != user_id:
-        emit("error", {"error": "unauthorized"})
-        return
-    join_room(f"session_{session_id}")
-    emit("joined", {"session_id": session_id})
-
 
 def find_nearest_sites(lat, lon, n=3):
     """Return the n nearest telecom sites to the given coordinates from DB uploads."""
     if lat is None or lon is None:
         return []
 
-    rows = TelecomSite.query.all()
-    if not rows:
+    sites = TelecomSite.query.all()
+    if not sites:
         return []
 
-    best_by_site = {}
-    for site in rows:
+    scored = []
+    for site in sites:
         dist = _haversine(lat, lon, site.latitude, site.longitude)
-        existing = best_by_site.get(site.site_id)
-        if existing is None or dist < existing[0]:
-            best_by_site[site.site_id] = (dist, site)
+        scored.append((dist, site))
 
-    scored = sorted(best_by_site.values(), key=lambda x: x[0])
+    scored.sort(key=lambda x: x[0])
     results = []
     for dist, site in scored[:n]:
-        status = (site.site_status or "on_air").lower()
+        status = (site.site_status or "on_air").upper()
         results.append({
             "site_id": site.site_id,
-            "site_name": site.site_name or site.site_id,
-            "cell_id": site.cell_id or "",
             "zone": site.zone or "",
             "latitude": site.latitude,
             "longitude": site.longitude,
-            "site_status": status,
-            "alarms": site.alarms or "",
-            "solution": site.solution or site.standard_solution_step or "",
-            "standard_solution_step": site.standard_solution_step or "",
-            "bandwidth_mhz": site.bandwidth_mhz,
-            "antenna_gain_dbi": site.antenna_gain_dbi,
-            "rf_power_eirp_dbm": site.rf_power_eirp_dbm,
-            "antenna_height_agl_m": site.antenna_height_agl_m,
-            "e_tilt_degree": site.e_tilt_degree,
-            "crs_gain": site.crs_gain,
-            "distance_km": round(dist, 2),
-            # Backward-compatible keys
             "status": status,
-            "alarm": site.alarms or "",
+            "alarm": site.alarms or "None",
+            "solution": site.solution or "No action required",
+            "distance_km": round(dist, 2),
         })
     return results
 
@@ -877,6 +535,194 @@ TELECOM_MENU = {
         },
     },
 }
+
+
+# Maps TELECOM_MENU sector names → expert domain slugs.
+# Used to stamp tickets and to filter domain experts during assignment.
+SECTOR_TO_DOMAIN = {
+    "Mobile Services (Prepaid / Postpaid)": "mobile",
+    "Broadband / Internet Services": "broadband",
+    "DTH / Cable TV Services": "dth",
+    "Landline / Fixed Line Services": "landline",
+    "Enterprise / Business Solutions": "enterprise",
+}
+
+VALID_EXPERT_DOMAINS = {"mobile", "broadband", "dth", "landline", "enterprise", "fiber"}
+
+
+def _resolve_ticket_domain(sector_name: str) -> str:
+    """Return the domain slug for a sector name, defaulting to 'mobile'."""
+    return SECTOR_TO_DOMAIN.get(sector_name or "", "mobile")
+
+
+def _open_ticket_count(agent_id: int) -> int:
+    """Count open (pending/in_progress) tickets assigned to an agent."""
+    return Ticket.query.filter(
+        Ticket.assigned_to == agent_id,
+        Ticket.status.in_(["pending", "in_progress"]),
+    ).count()
+
+
+def _extract_city_from_address(address: str | None) -> str:
+    """
+    Extract a clean city name from a free-text address string.
+
+    The customer's location_description may look like:
+      "Sector 45, Gurugram, Haryana 122001"
+      "Andheri West, Mumbai"
+      "delhi"
+
+    We scan all known expert cities and return the first one found as a
+    substring (case-insensitive).  Falls back to the raw address if nothing
+    matches so the caller can still attempt a comparison.
+    """
+    if not address:
+        return ""
+    address_lower = address.strip().lower()
+    # Collect every city stored on any human_agent and check if it appears
+    # inside the address string (substring match).
+    cities = {
+        (u.location or "").strip().lower()
+        for u in User.query.filter_by(role="human_agent").with_entities(User.location).all()
+        if u.location
+    }
+    for city in sorted(cities, key=len, reverse=True):  # longest match first
+        if city and city in address_lower:
+            return city
+    return address_lower
+
+
+def _find_best_expert(domain: str, city: str | None, priority: str = "low") -> "User | None":
+    """
+    Domain-based expert assignment with geo-preference, bandwidth enforcement,
+    and priority-aware routing.
+
+    Priority behaviour
+    ------------------
+    Critical / High  → strict routing: only assign to an under-capacity expert;
+                       never spill onto over-capacity agents (Tier 3 skipped).
+                       Among eligible experts, the least-busy one is chosen so
+                       the most urgent work always reaches the freest expert.
+    Medium  / Low    → relaxed routing: if every online expert is full the
+                       least-loaded online expert still takes the ticket
+                       (original Tier 3 behaviour preserved).
+
+    Tier order
+    ----------
+      1. Online  + same domain + same city  + under capacity  → least loaded
+      2. Online  + same domain + other city + under capacity  → least loaded
+      3. Online  + same domain (any city)   + ignore capacity → least loaded
+             ↑ skipped for critical/high priority
+      4. Offline + same domain + same city  + under capacity  → least loaded
+      5. Offline + same domain              + under capacity  → least loaded
+             (for urgent: skip fully-loaded offline agents too)
+      6. Any human_agent – global fallback                    → least loaded
+    """
+    city_norm = _extract_city_from_address(city)
+    is_urgent = PRIORITY_RANK.get(priority, 1) >= PRIORITY_RANK["high"]  # critical or high
+
+    domain_agents = User.query.filter_by(role="human_agent", domain=domain).all()
+
+    def _under_capacity(agent):
+        return _open_ticket_count(agent.id) < (agent.bandwidth_capacity or 10)
+
+    def _same_city(agent):
+        return (agent.location or "").strip().lower() == city_norm
+
+    def _load(agent):
+        return _open_ticket_count(agent.id)
+
+    # Tier 1 – online, same city, under capacity
+    if city_norm:
+        pool = [a for a in domain_agents if a.is_online and _same_city(a) and _under_capacity(a)]
+        if pool:
+            return min(pool, key=_load)
+
+    # Tier 2 – online, any city, under capacity
+    pool = [a for a in domain_agents if a.is_online and _under_capacity(a)]
+    if pool:
+        return min(pool, key=_load)
+
+    # Tier 3 – online, any city, ignore capacity (skipped for critical/high)
+    if not is_urgent:
+        pool = [a for a in domain_agents if a.is_online]
+        if pool:
+            return min(pool, key=_load)
+
+    # Tier 4 – offline, same city, under capacity
+    if city_norm:
+        pool = [a for a in domain_agents if not a.is_online and _same_city(a) and _under_capacity(a)]
+        if pool:
+            return min(pool, key=_load)
+
+    # Tier 5 – offline, any city, under capacity
+    # For urgent tickets we still respect capacity; for low/medium any offline agent is fine
+    offline = [a for a in domain_agents if not a.is_online]
+    if offline:
+        under = [a for a in offline if _under_capacity(a)]
+        if under:
+            return min(under, key=_load)
+        if not is_urgent:
+            return min(offline, key=_load)
+
+    # Tier 6 – global fallback: any human_agent
+    all_agents = User.query.filter_by(role="human_agent").all()
+    if all_agents:
+        under = [a for a in all_agents if _under_capacity(a)]
+        return min(under or all_agents, key=_load)
+
+    return None
+
+
+def _manager_priority_load(manager_id: int) -> dict:
+    """
+    Return a breakdown of open tickets assigned to a manager, keyed by priority.
+    Only counts tickets that are still active (not resolved/closed).
+    """
+    OPEN_STATUSES = ["pending", "in_progress", "manager_escalated"]
+    counts = {"critical": 0, "high": 0, "medium": 0, "low": 0, "total": 0}
+    tickets = Ticket.query.filter(
+        Ticket.assigned_to == manager_id,
+        Ticket.status.in_(OPEN_STATUSES),
+    ).with_entities(Ticket.priority).all()
+    for (p,) in tickets:
+        level = (p or "low").lower()
+        counts[level] = counts.get(level, 0) + 1
+        counts["total"] += 1
+    return counts
+
+
+def _find_best_manager(priority: str) -> "User | None":
+    """
+    Assign an escalated ticket to the most suitable manager using
+    priority-driven load balancing.
+
+    Rules
+    -----
+    1. Only consider users with role == "manager".
+    2. For the incoming ticket's priority level, pick the manager who has the
+       FEWEST open tickets at that same priority level (least critical load for
+       a critical ticket, least high load for a high ticket, etc.).
+    3. If tied at the target priority level, break the tie by comparing total
+       open ticket count (overall least loaded manager wins).
+    4. If there are no managers at all, return None.
+
+    This ensures:
+    - Critical tickets always go to the manager with the most capacity for
+      critical work (strict load balance per priority bucket).
+    - Higher-priority buckets are never penalised by lower-priority volume.
+    """
+    managers = User.query.filter_by(role="manager").all()
+    if not managers:
+        return None
+    if len(managers) == 1:
+        return managers[0]
+
+    level = (priority or "low").lower()
+    loads = {m.id: _manager_priority_load(m.id) for m in managers}
+
+    # Sort by (load at this priority level ASC, total load ASC)
+    return min(managers, key=lambda m: (loads[m.id].get(level, 0), loads[m.id]["total"]))
 
 
 def get_subprocess_details(sector_key: str) -> str:
@@ -1079,6 +925,7 @@ def detect_language(text: str) -> str:
 
 def _friendly_ai_error(err: Exception) -> str:
     """Return a user-friendly message when the AI provider is unavailable."""
+    print(f"AI provider error: {type(err).__name__}: {err}")
     return (
         "I'm having trouble reaching the AI service right now. "
         "Please try again in a few moments."
@@ -1091,33 +938,19 @@ def generate_resolution(query, sector_name, subprocess_name, language):
             model=DEPLOYMENT_NAME,
             messages=[
                 {"role": "system", "content": (
-                    f"You are a senior telecom network support specialist. The customer has reported an issue "
-                    f"under: '{sector_name}' > '{subprocess_name}'.\n"
-                    "You must scope all solutions strictly to this subprocess. Do NOT mix solutions from sibling subprocesses. "
-                    "For example, if subprocess is 'Network / Signal Problems – Internet / Mobile Data', do NOT mention call drop or call failure steps.\n\n"
-                    "RESPONSE FORMAT:\n"
-                    "1. One-line empathetic acknowledgment of the specific issue.\n"
-                    "2. ONE precise, field-proven solution with 3-5 numbered steps.\n\n"
-                    "STEP QUALITY RULES — every step must be:\n"
-                    "• Specific: include exact menu paths, setting names, dial codes, or field values (e.g. 'Settings → Mobile Network → Preferred Network Type → 4G/LTE only').\n"
-                    "• Actionable: tell the user exactly what to tap, toggle, enter, or dial — never vague instructions like 'check your settings'.\n"
-                    "• Technically grounded: use industry-standard methods (APN reconfiguration, VoLTE/VoWiFi toggle, network band selection, USSD codes, eSIM re-provisioning, ONT/ONU LED diagnosis, transponder re-scan, UPC regeneration, etc.).\n\n"
-                    "BANNED SUGGESTIONS (never include):\n"
-                    "- Restart phone / toggle airplane mode\n"
-                    "- Restart router or modem\n"
-                    "- Move to open area or near a window\n"
-                    "- Wait for network congestion\n"
-                    "- Contact customer support / call care / raise ticket / visit service center\n\n"
-                    "ISSUE-SPECIFIC TECHNICAL GUIDANCE (apply the relevant section):\n"
-                    "Mobile data not working: Manually configure APN via Settings → SIM & Network → Access Point Names → Add New APN (enter operator APN name/type: default,supl; MCC/MNC per operator). Check Preferred Network Type (Settings → Mobile Network → set to LTE/4G), SIM slot assignment, and Data Roaming flag.\n"
-                    "Call drops / poor voice: Enable VoLTE at Settings → Mobile Network → VoLTE Calls → ON. Enable VoWiFi at Settings → Mobile Network → Wi-Fi Calling → ON. To check/lock band: dial *#2263# (Samsung) and select preferred band (Band 3 1800MHz / Band 40 2300MHz TDD-LTE per operator).\n"
-                    "Billing / wrong deduction: Dial *121# or *199# for itemised balance; *121*1# for data pack status; *123# for talktime ledger. To dispute: open carrier app → My Account → Bill Details → Dispute Transaction. Request CDR from Usage History in self-care app.\n"
-                    "Plan/pack not activated: Check provisioning via *199*2# or *121*2#. For eSIM: Settings → Cellular → Add eSIM → rescan operator QR; if error, generate new QR from operator self-care app. For prepaid: dial *444# to verify active pack; retry activation via USSD after top-up.\n"
-                    "Broadband / fiber slow: Diagnose via ONT LEDs — LOS red = fiber break (ISP fault); PON off = ODN issue; INTERNET amber = PPPoE auth failure. Fix PPPoE: router admin (192.168.1.1) → WAN → re-enter PPPoE credentials. Set DNS to 1.1.1.1 / 8.8.8.8 and MTU to 1492 (PPPoE) in router LAN settings.\n"
-                    "DTH signal loss: Check signal strength in TV menu (target >60%). Re-scan transponders: Dish TV → Setup → Edit TP → 11090 V 30000; Tata Play → 12515 H 22000. Reactivate smart card: carrier app → Manage Device → Reactivate Smart Card (provisioning takes ~15 min).\n"
-                    "MNP / Port-in stuck: Regenerate UPC by sending SMS 'PORT <10-digit number>' to 1900 (valid 4 days). Check port status: SMS 'PORTSTATUS' to 1900. If HLR not updated after 7 working days, the operator must trigger HLR refresh via NOC — initiate via self-care portal under 'Port Request Status'.\n\n"
-                    "Do NOT include any URLs or hyperlinks.\n"
-                    f"Respond entirely in {language}. Be concise, precise, and technically accurate."
+                    f"You are an expert telecom customer support agent. The user has a complaint "
+                    f"under the sector: '{sector_name}' and subprocess: '{subprocess_name}'.\n\n"
+                    "IMPORTANT: Base your response on BOTH the selected dropdown context "
+                    "(sector/subprocess) and the user's query. "
+                    "If they conflict, prioritize the user's query while staying within telecom scope.\n\n"
+                    "Provide a helpful response in the following format:\n"
+                    "1. Acknowledge the issue empathetically\n"
+                    "2. Provide ONE focused solution at a time with 3-6 clear, step-by-step actions that explain exactly how to carry out that solution\n\n"
+                    "STRICT RULE: Do NOT suggest the user to 'contact customer support', 'call customer care', "
+                    "'raise a ticket', 'reach out to support', or any form of escalation. "
+                    "Only provide self-help troubleshooting steps that the user can do on their own.\n\n"
+                    f"IMPORTANT: Respond entirely in {language}. "
+                    "Keep the tone professional, empathetic, and helpful."
                 )},
                 {"role": "user", "content": query},
             ],
@@ -1151,10 +984,9 @@ def generate_single_solution(sector_name, subprocess_name, language, user_query=
     if diagnosis_summary:
         diagnosis_block = (
             f"\n\nSIGNAL DIAGNOSIS RESULTS: {diagnosis_summary}\n"
-            "Use this diagnosis data to tailor your solution precisely. "
-            "If RSRP < -100 dBm or SINR < 0 dB: the issue is cell-edge coverage — suggest network band change (*#2263# to lock a stronger band), VoLTE/VoWiFi enablement, or SIM re-provisioning to trigger HLR re-attachment. "
-            "If RSRP -100 to -85 dBm: moderate signal — focus on device-side fixes (APN reconfiguration, preferred network type, VoLTE toggle). "
-            "If RSRP > -85 dBm and SINR > 5 dB: signal is adequate — focus on account/provisioning issues (pack activation via USSD, APN type mismatch, IPv6 toggle, MTU adjustment)."
+            "Use this diagnosis data to tailor your solution. If signal is poor/weak, suggest "
+            "signal-related fixes (relocate, check antenna, network mode). If signal is good, "
+            "focus on other causes (device settings, account issues, congestion)."
         )
 
     try:
@@ -1162,34 +994,25 @@ def generate_single_solution(sector_name, subprocess_name, language, user_query=
             model=DEPLOYMENT_NAME,
             messages=[
                 {"role": "system", "content": (
-                    f"You are a senior telecom network support specialist. The customer has an issue "
-                    f"under: '{sector_name}' > '{subprocess_name}'. This is solution attempt #{attempt}.\n"
-                    "Stay strictly within this subprocess. Do NOT mix steps from sibling subprocesses "
-                    "(e.g., if subprocess is 'Network / Signal Problems – Internet / Mobile Data', do not mention call-drop or call-failure steps).\n\n"
-                    "Provide exactly ONE precise, field-proven solution with 3-5 numbered steps. Each step must:\n"
-                    "• Include exact menu paths, setting names, dial codes, or field values.\n"
-                    "• Tell the user exactly what to tap, toggle, enter, or dial — no vague instructions.\n"
-                    "• Use industry-standard troubleshooting methods (APN config, VoLTE/VoWiFi toggle, band locking, USSD codes, PPPoE re-auth, ONT LED diagnosis, eSIM re-provisioning, etc.).\n\n"
-                    "BANNED SUGGESTIONS (never include):\n"
-                    "- Restart phone / toggle airplane mode\n"
-                    "- Restart router or modem\n"
-                    "- Move to open area or near a window\n"
-                    "- Wait for network congestion\n"
-                    "- Contact support / call care / raise ticket / visit service center\n\n"
-                    "ISSUE-SPECIFIC TECHNICAL GUIDANCE (apply relevant section):\n"
-                    "Mobile data: Configure APN (Settings → SIM & Network → Access Point Names → New APN → enter name/type/MCC/MNC). Set Preferred Network Type to LTE/4G. Check SIM slot assignment and Data Roaming flag.\n"
-                    "Call drops/voice: VoLTE: Settings → Mobile Network → VoLTE Calls → ON. VoWiFi: Settings → Mobile Network → Wi-Fi Calling → ON. Band lock: *#2263# (Samsung) → select Band 3/40 per operator.\n"
-                    "Billing: Balance: *121# or *199#. Data pack: *121*1#. Talktime: *123#. Dispute via carrier app → My Account → Bill Details → Dispute Transaction. CDR from app → Usage History.\n"
-                    "Plan activation: Provisioning: *199*2#. eSIM: Settings → Cellular → Add eSIM → rescan QR or generate new QR via self-care app. Prepaid pack: *444# to verify; retry via USSD post top-up.\n"
-                    "Broadband/fiber: ONT LEDs: LOS red = fiber break; INTERNET amber = PPPoE failure → re-enter credentials at 192.168.1.1 → WAN. DNS: 1.1.1.1/8.8.8.8, MTU: 1492.\n"
-                    "DTH: Signal check via TV menu (>60%). Dish TV transponder: 11090 V 30000. Tata Play: 12515 H 22000. Smart card: carrier app → Manage Device → Reactivate.\n"
-                    "MNP/port-in: UPC: SMS 'PORT <number>' to 1900. Status: SMS 'PORTSTATUS' to 1900. HLR refresh after 7 days via self-care → Port Request Status.\n\n"
-                    "Do NOT include any URLs or hyperlinks.\n"
+                    f"You are an expert telecom customer support agent. The user has an issue "
+                    f"under the sector: '{sector_name}' and subprocess: '{subprocess_name}'.\n\n"
+                    f"This is solution attempt #{attempt}.\n\n"
+                    "IMPORTANT: Base this solution on BOTH the selected dropdown context "
+                    "(sector/subprocess) and the user's latest query. "
+                    "If they conflict, prioritize the latest query while staying within telecom scope.\n\n"
+                    "Provide ONE focused, actionable solution at a time with steps that explain how to perform that action. "
+                    "Be concise and specific. Do not provide multiple alternative solutions -- just one.\n"
+                    "Do NOT include any URLs, links, or website references in your response.\n"
+                    "STRICT RULE: Do NOT suggest the user to 'contact customer support', 'call customer care', "
+                    "'raise a ticket', 'reach out to support', 'visit a service center', or any form of escalation. "
+                    "Only provide self-help troubleshooting steps that the user can do on their own.\n"
+                    "Acknowledge the issue briefly and give the steps."
                     + query_block
                     + context_block
                     + diagnosis_block
                     + prev_block +
-                    f"\n\nRespond entirely in {language}. Be concise, precise, and technically accurate."
+                    f"\n\nIMPORTANT: Respond entirely in {language}. "
+                    "Keep the tone professional, empathetic, and helpful."
                 )},
                 {"role": "user", "content": user_query if user_query else f"I have an issue with {subprocess_name} in {sector_name}"},
             ],
@@ -1392,16 +1215,163 @@ def validate_password(password):
     return None
 
 
+# ─── Priority Ranking System ──────────────────────────────────────────────────
+
+# Numeric rank for each priority level — higher is more urgent.
+PRIORITY_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1}
+
+# Customer tier → priority floor.
+# A Platinum customer's ticket is always at least Critical regardless of content.
+USER_TYPE_PRIORITY = {
+    "platinum": "critical",
+    "gold":     "high",
+    "silver":   "medium",
+    "bronze":   "low",
+}
+
+VALID_USER_TYPES = set(USER_TYPE_PRIORITY.keys())
+
+
+# ─── Subprocess → base severity ──────────────────────────────────────────────
+# The subprocess name is selected by the chatbot flow and is the most reliable
+# signal for how urgent a ticket is.  Map every known subprocess to a base
+# severity; keyword scanning then upgrades (never downgrades) from that base.
+#
+# MOBILE
+#   Critical  – nothing at subprocess level (needs query-text signal)
+#   High      – Network/Signal, SIM issues, Call/SMS failures, MNP
+#   Medium    – Billing, Data plan, Roaming
+#   Low       – Others
+#
+# BROADBAND
+#   Critical  – (needs query-text: "no internet at all")
+#   High      – Slow/No Connectivity, Frequent Disconnections, Router/Equipment
+#   Medium    – Billing, New Connection, IP/DNS
+#   Low       – Others
+#
+# DTH
+#   Critical  – (needs query-text: "stb dead", "dish fallen")
+#   High      – Signal/Picture Quality, Set-Top Box Issues
+#   Medium    – Channel Missing, Billing, Package Changes
+#   Low       – Others
+#
+# LANDLINE
+#   Critical  – No Dial Tone / Dead Line
+#   High      – Fault Repair Request
+#   Medium    – Call Quality, Billing, New Connection
+#   Low       – Others
+#
+# ENTERPRISE
+#   Critical  – SLA Breach/Downtime, Leased Line, Cloud/VPN/MPLS
+#   High      – Technical Support Escalation, Bulk/Corporate Issues
+#   Medium    – Others within enterprise
+#   Low       – (nothing — enterprise is never low by default)
+
+SUBPROCESS_BASE_SEVERITY = {
+    # ── Mobile ────────────────────────────────────────────────────────────────
+    "Network / Signal Problems":          "high",
+    "SIM Card & Activation":              "high",
+    "Mobile Number Portability (MNP)":    "high",
+    "Call / SMS Failures":                "high",
+    "Data Plan & Recharge Issues":        "medium",
+    "Billing & Payment Issues":           "medium",
+    "International Roaming":              "medium",
+
+    # ── Broadband ─────────────────────────────────────────────────────────────
+    "Slow Speed / No Connectivity":       "high",
+    "Frequent Disconnections":            "high",
+    "Router / Equipment Problems":        "high",
+    "IP Address / DNS Issues":            "medium",
+    "Billing & Plan Issues":              "medium",
+    "New Connection / Installation":      "medium",
+
+    # ── DTH ───────────────────────────────────────────────────────────────────
+    "Signal / Picture Quality":           "high",
+    "Set-Top Box Issues":                 "high",
+    "Channel Not Working / Missing":      "medium",
+    "Billing & Subscription":             "medium",
+    "Package / Plan Changes":             "low",
+
+    # ── Landline ──────────────────────────────────────────────────────────────
+    "No Dial Tone / Dead Line":           "critical",
+    "Fault Repair Request":               "high",
+    "Call Quality Issues (Noise / Echo)": "medium",
+    "Billing & Charges":                  "medium",
+    "New Connection / Disconnection":     "medium",
+
+    # ── Enterprise ────────────────────────────────────────────────────────────
+    "SLA Breach / Service Downtime":      "critical",
+    "Leased Line / Dedicated Connection": "critical",
+    "Cloud / VPN / MPLS Issues":          "critical",
+    "Technical Support Escalation":       "high",
+    "Bulk / Corporate Plan Issues":       "high",
+}
+
+# ─── Query-text upgrade keywords ─────────────────────────────────────────────
+# These can RAISE severity above the subprocess base but never lower it.
+_UPGRADE_TO_CRITICAL = [
+    "no network", "complete outage", "area outage", "entire area",
+    "no internet at all", "totally down", "stb dead", "box dead",
+    "dish fallen", "dish damaged", "emergency", "urgent", "critical",
+    "fraud", "unauthorized", "sla breach", "business down", "production down",
+    "vpn down", "leased line down", "mpls down",
+]
+_UPGRADE_TO_HIGH = [
+    "not working", "no signal", "dead", "down", "failed", "outage",
+    "cannot call", "no internet", "no service", "unable to connect",
+    "disconnecting", "router dead", "modem dead",
+]
+_UPGRADE_TO_MEDIUM = [
+    "slow", "intermittent", "billing", "wrong charge", "refund",
+    "overcharged", "pixelat", "delay", "quality",
+]
+
+
+def _detect_severity(query_text: str, subprocess_name: str) -> str:
+    """
+    Returns one of: critical / high / medium / low.
+
+    Logic:
+    1. Look up subprocess name in SUBPROCESS_BASE_SEVERITY for a base severity.
+    2. Scan query text for upgrade keywords — severity can only go UP, never down.
+    3. Default base is 'low' if subprocess not found.
+    """
+    base = SUBPROCESS_BASE_SEVERITY.get((subprocess_name or "").strip(), "low")
+    text = (query_text or "").lower()
+
+    # Determine what the query text alone would rate
+    if any(w in text for w in _UPGRADE_TO_CRITICAL):
+        text_sev = "critical"
+    elif any(w in text for w in _UPGRADE_TO_HIGH):
+        text_sev = "high"
+    elif any(w in text for w in _UPGRADE_TO_MEDIUM):
+        text_sev = "medium"
+    else:
+        text_sev = "low"
+
+    # Return whichever is higher
+    return base if PRIORITY_RANK.get(base, 1) >= PRIORITY_RANK.get(text_sev, 1) else text_sev
+
+
+def _compute_final_priority(user_type: str | None, severity: str) -> str:
+    """
+    Final ticket priority = the higher of (user-type floor, issue severity).
+
+    Examples:
+      Platinum user  + medium severity  → critical   (user floor wins)
+      Bronze user    + critical severity → critical   (severity wins)
+      Gold user      + high severity     → high       (both equal)
+      Silver user    + low severity      → medium     (user floor wins)
+    """
+    user_floor = USER_TYPE_PRIORITY.get((user_type or "bronze").lower(), "low")
+    rank_floor = PRIORITY_RANK.get(user_floor, 1)
+    rank_sev   = PRIORITY_RANK.get(severity, 1)
+    return user_floor if rank_floor >= rank_sev else severity
+
+
+# Keep backward-compatible alias so any other callers still work.
 def auto_assign_priority(query_text, subprocess_name):
-    """Simple priority assignment based on keywords."""
-    text = (query_text + " " + subprocess_name).lower()
-    if any(w in text for w in ["urgent", "critical", "emergency", "business down", "sla breach", "escalat"]):
-        return "critical"
-    if any(w in text for w in ["not working", "failed", "no signal", "dead", "down", "outage"]):
-        return "high"
-    if any(w in text for w in ["slow", "intermittent", "billing", "wrong charge", "refund"]):
-        return "medium"
-    return "low"
+    return _detect_severity(query_text, subprocess_name)
 
 
 
@@ -1431,7 +1401,11 @@ def register():
     if User.query.filter_by(email=email).first():
         return jsonify({"error": "Email already registered"}), 409
 
-    user = User(name=name, email=email, phone_number=phone_number, role="customer")  # ← UPDATED
+    user_type = (data.get("user_type") or "bronze").strip().lower()
+    if user_type not in VALID_USER_TYPES:
+        user_type = "bronze"
+
+    user = User(name=name, email=email, phone_number=phone_number, role="customer", user_type=user_type)
     user.set_password(password)
     db.session.add(user)
     db.session.commit()
@@ -1457,10 +1431,11 @@ def login():
 @app.route("/api/auth/me", methods=["GET"])
 @jwt_required()
 def get_me():
-    user = db.session.get(User, int(get_jwt_identity()))
+    user = User.query.get(int(get_jwt_identity()))
     if not user:
         return jsonify({"error": "User not found"}), 404
     return jsonify({"user": user.to_dict()})
+
 
 
 # CHATBOT ROUTES 
@@ -1598,101 +1573,30 @@ def classify_response_route():
 @app.route("/api/chat/session", methods=["POST"])
 @jwt_required()
 def create_chat_session():
-    """Create a new chat session or reuse the latest active one for the user."""
     user_id = int(get_jwt_identity())
-    data = request.json or {}
-    force_new = bool(data.get("force_new"))
-    current_step = data.get("current_step") or "greeting"
-
-    if not force_new:
-        existing = ChatSession.query.filter(
-            ChatSession.user_id == user_id,
-            ChatSession.status.in_(["active", "escalated"])
-        ).order_by(ChatSession.last_message_at.desc()).first()
-        if existing:
-            return jsonify({
-                "session": existing.to_dict(),
-                "messages": [m.to_dict() for m in existing.messages],
-                "reused": True,
-            }), 200
-
-    session = ChatSession(
-        user_id=user_id,
-        status="active",
-        current_step=current_step,
-        last_message_at=datetime.now(timezone.utc),
-    )
+    session = ChatSession(user_id=user_id, status="active")
     db.session.add(session)
     db.session.commit()
-    return jsonify({"session": session.to_dict(), "messages": []}), 201
-
-
-@app.route("/api/chat/session/active", methods=["GET"])
-@jwt_required()
-def get_active_session():
-    """Return the most recent active (or latest) session with full message history."""
-    user_id = int(get_jwt_identity())
-    session = ChatSession.query.filter(
-        ChatSession.user_id == user_id,
-        ChatSession.status.in_(["active", "escalated"])
-    ).order_by(ChatSession.last_message_at.desc()).first()
-
-    if not session:
-        session = ChatSession.query.filter_by(user_id=user_id).order_by(ChatSession.last_message_at.desc()).first()
-
-    if not session:
-        return jsonify({"session": None, "messages": []}), 200
-
-    now_utc = datetime.now(timezone.utc)
-    updated = False
-    for m in session.messages:
-        if m.sender == "agent" and m.delivered_at is None:
-            m.delivered_at = now_utc
-            updated = True
-    if updated:
-        db.session.commit()
-
-    return jsonify({
-        "session": session.to_dict(),
-        "messages": [m.to_dict() for m in session.messages],
-    }), 200
-
-
-@app.route("/api/chat/sessions", methods=["GET"])
-@jwt_required()
-def list_sessions():
-    """List all chat sessions for the logged-in customer (most recent first)."""
-    user_id = int(get_jwt_identity())
-    sessions = ChatSession.query.filter_by(user_id=user_id).order_by(ChatSession.last_message_at.desc()).all()
-    return jsonify({
-        "sessions": [s.to_dict() for s in sessions]
-    })
+    return jsonify({"session": session.to_dict()}), 201
 
 
 @app.route("/api/chat/session/<int:session_id>/message", methods=["POST"])
 @jwt_required()
 def add_chat_message(session_id):
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
-    session = db.session.get(ChatSession, session_id)
+    session = ChatSession.query.get(session_id)
     if not session:
         return jsonify({"error": "Session not found"}), 404
-    if session.user_id != user_id and (not user or user.role != "human_agent"):
-        return jsonify({"error": "Unauthorized"}), 403
 
     data = request.json
-    payload = data.get("payload")
     msg = ChatMessage(
         session_id=session_id,
         sender=data.get("sender", "user"),
-        content=data.get("content", "") or "",
-        content_json=payload if isinstance(payload, dict) else None,
+        content=data.get("content", ""),
     )
     db.session.add(msg)
 
     # Update session metadata
-    if data.get("current_step"):
-        session.current_step = data["current_step"]
     if data.get("sector_name"):
         session.sector_name = data["sector_name"]
     if data.get("subprocess_name"):
@@ -1703,16 +1607,8 @@ def add_chat_message(session_id):
         session.resolution = data["resolution"]
     if data.get("language"):
         session.language = data["language"]
-    session.last_message_at = datetime.now(timezone.utc)
-
-    # Track first response time when an agent replies
-    if msg.sender == "agent" and user and user.role == "human_agent":
-        ticket = Ticket.query.filter_by(chat_session_id=session_id).order_by(Ticket.created_at.desc()).first()
-        if ticket and ticket.assigned_to == user.id and ticket.first_response_at is None:
-            ticket.first_response_at = datetime.now(timezone.utc)
 
     db.session.commit()
-    _emit_session_message(msg)
     return jsonify({"message": msg.to_dict()})
 # ═══════════════════════════════════════════════════════════════════
 # ADD THIS NEW ROUTE to app.py
@@ -1724,7 +1620,7 @@ def add_chat_message(session_id):
 def save_session_location(session_id):
     """Save customer's GPS location for network signal complaints."""
     user_id = int(get_jwt_identity())
-    session = db.session.get(ChatSession, session_id)
+    session = ChatSession.query.get(session_id)
 
     if not session:
         return jsonify({"error": "Session not found"}), 404
@@ -1738,10 +1634,8 @@ def save_session_location(session_id):
     # ── Default coordinates (Gurgaon, Haryana) ────────────────────────────────
     DEFAULT_LATITUDE  = 28.4595
     DEFAULT_LONGITUDE = 77.0266
-
-    # Always use default lat/long regardless of what the client sends
-    session.latitude  = DEFAULT_LATITUDE
-    session.longitude = DEFAULT_LONGITUDE
+    session.latitude  = data.get("latitude")  or DEFAULT_LATITUDE
+    session.longitude = data.get("longitude") or DEFAULT_LONGITUDE
 
     db.session.commit()
 
@@ -1758,19 +1652,15 @@ def save_session_location(session_id):
 def analyze_signal(session_id):
     """Analyze a signal screenshot using Azure OpenAI Vision."""
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
-    session = db.session.get(ChatSession, session_id)
+    session = ChatSession.query.get(session_id)
 
     if not session:
         return jsonify({"error": "Session not found"}), 404
-    if not user:
-        return jsonify({"error": "Unauthorized"}), 401
-    if session.user_id != user_id and user.role != "human_agent":
+    if session.user_id != user_id:
         return jsonify({"error": "Unauthorized"}), 403
 
     data = request.json
     image_base64 = data.get("image")
-    image_data_url = data.get("image_data_url")
 
     if not image_base64:
         return jsonify({"error": "No image provided"}), 400
@@ -1780,16 +1670,6 @@ def analyze_signal(session_id):
         return jsonify({"error": "Image too large. Please upload a smaller screenshot."}), 400
 
     try:
-        # Send customer screenshot to agent view (if any)
-        if not image_data_url:
-            image_data_url = f"data:image/png;base64,{image_base64}"
-        image_msg = ChatMessage(
-            session_id=session_id,
-            sender="customer",
-            content=f"__IMAGE__:{image_data_url}",
-        )
-        db.session.add(image_msg)
-
         result = analyze_signal_screenshot(image_base64)
 
         # If signal is red (Poor), do not include nearest tower sites in user-facing diagnosis
@@ -1811,12 +1691,7 @@ def analyze_signal(session_id):
 
         msg = ChatMessage(session_id=session_id, sender="bot", content=diagnosis_text)
         db.session.add(msg)
-        # Mark that diagnosis has been completed for this session
-        session.diagnosis_ran = True
-        session.last_message_at = datetime.now(timezone.utc)
         db.session.commit()
-        _emit_session_message(image_msg)
-        _emit_session_message(msg)
 
         return jsonify({"diagnosis": result}), 200
     except Exception as e:
@@ -1827,16 +1702,13 @@ def analyze_signal(session_id):
 @jwt_required()
 def resolve_session(session_id):
     user_id = int(get_jwt_identity())
-    session = db.session.get(ChatSession, session_id)
+    session = ChatSession.query.get(session_id)
     if not session:
         return jsonify({"error": "Session not found"}), 404
 
     session.status = "resolved"
     session.resolved_at = datetime.now(timezone.utc)
-    session.current_step = "resolved"
-    session.last_message_at = datetime.now(timezone.utc)
     db.session.commit()
-    _emit_session_update(session)
 
     # Generate summary
     try:
@@ -1848,7 +1720,7 @@ def resolve_session(session_id):
 
     # ← NEW: Send WhatsApp message
     try:
-        user = db.session.get(User, user_id)
+        user = User.query.get(user_id)
         if user and user.phone_number:
             whatsapp_msg = format_chat_summary_for_whatsapp(session, user.name)
             result = send_whatsapp_message(user.phone_number, whatsapp_msg)
@@ -1921,45 +1793,35 @@ def send_ticket_assignment_email(agent, ticket, session):
 @jwt_required()
 def escalate_session(session_id):
     user_id = int(get_jwt_identity())
-    session = db.session.get(ChatSession, session_id)
+    session = ChatSession.query.get(session_id)
     if not session:
         return jsonify({"error": "Session not found"}), 404
 
     session.status = "escalated"
-    session.current_step = "human_handoff"
-    session.last_message_at = datetime.now(timezone.utc)
 
     # Generate summary
     msgs = [{"sender": m.sender, "content": m.content} for m in session.messages]
     session.summary = generate_chat_summary(msgs, session.sector_name, session.subprocess_name)
 
-    # Auto-assign to least-occupied online human agent
-    priority = auto_assign_priority(session.query_text, session.subprocess_name)
+    # Derive ticket domain and customer city
+    ticket_domain = _resolve_ticket_domain(session.sector_name)
+    ticket_city = session.location_description  # may be None
+
+    # --- Priority calculation ---
+    # 1. Issue severity from query keywords
+    severity = _detect_severity(session.query_text, session.subprocess_name)
+    # 2. Customer tier floor (look up the session's owner)
+    customer = db.session.get(User, user_id)
+    customer_type = (customer.user_type or "bronze") if customer else "bronze"
+    # 3. Final priority = max(severity, user-type floor)
+    priority = _compute_final_priority(customer_type, severity)
+
     sla_targets = get_sla_targets()
     sla_h = sla_targets.get(priority, 48)
     now_utc = datetime.now(timezone.utc)
     sla_deadline = now_utc + timedelta(hours=sla_h)
 
-    assigned_agent = None
-    online_agents = User.query.filter_by(role="human_agent", is_online=True).all()
-    if online_agents:
-        # Find least occupied (fewest open tickets)
-        def open_ticket_count(agent):
-            return Ticket.query.filter(
-                Ticket.assigned_to == agent.id,
-                Ticket.status.in_(["pending", "in_progress"])
-            ).count()
-        assigned_agent = min(online_agents, key=open_ticket_count)
-    else:
-        # Fallback: assign to any human_agent with fewest open tickets
-        all_agents = User.query.filter_by(role="human_agent").all()
-        if all_agents:
-            def open_ticket_count_any(agent):
-                return Ticket.query.filter(
-                    Ticket.assigned_to == agent.id,
-                    Ticket.status.in_(["pending", "in_progress"])
-                ).count()
-            assigned_agent = min(all_agents, key=open_ticket_count_any)
+    assigned_agent = _find_best_expert(ticket_domain, ticket_city, priority)
 
     # Create ticket
     ref = generate_ref_number()
@@ -1969,8 +1831,10 @@ def escalate_session(session_id):
         reference_number=ref,
         category=session.sector_name,
         subcategory=session.subprocess_name,
+        domain=ticket_domain,
         description=session.query_text,
         status="pending",
+        severity=severity,
         priority=priority,
         assigned_to=assigned_agent.id if assigned_agent else None,
         sla_hours=sla_h,
@@ -1981,7 +1845,7 @@ def escalate_session(session_id):
 
     # Send WhatsApp message for ticket
     try:
-        user = db.session.get(User, user_id)
+        user = User.query.get(user_id)
         if user and user.phone_number:
             whatsapp_msg = format_ticket_alert_for_whatsapp(ticket, user.name, session)
             result = send_whatsapp_message(user.phone_number, whatsapp_msg)
@@ -2016,11 +1880,11 @@ def escalate_session(session_id):
 def send_summary_email(session_id):
     """Send chat summary to the user's email saved in DB."""
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if not user:
         return jsonify({"error": "User not found"}), 404
 
-    session = db.session.get(ChatSession, session_id)
+    session = ChatSession.query.get(session_id)
     if not session:
         return jsonify({"error": "Session not found"}), 404
 
@@ -2164,61 +2028,17 @@ def get_chat_session(session_id):
         return jsonify({"error": "Session not found"}), 404
     if session.user_id != user_id:
         return jsonify({"error": "Unauthorized"}), 403
-    now_utc = datetime.now(timezone.utc)
-    updated = False
-    for m in session.messages:
-        if m.sender == "agent" and m.delivered_at is None:
-            m.delivered_at = now_utc
-            updated = True
-    if updated:
-        db.session.commit()
     return jsonify({
         "session": session.to_dict(),
         "messages": [m.to_dict() for m in session.messages],
     })
 
 
-@app.route("/api/chat/session/<int:session_id>/seen", methods=["POST"])
-@jwt_required()
-def mark_chat_seen(session_id):
-    user_id = int(get_jwt_identity())
-    session = db.session.get(ChatSession, session_id)
-    if not session:
-        return jsonify({"error": "Session not found"}), 404
-    if session.user_id != user_id:
-        return jsonify({"error": "Unauthorized"}), 403
-
-    data = request.json or {}
-    message_ids = data.get("message_ids") or []
-    if message_ids and not isinstance(message_ids, list):
-        return jsonify({"error": "message_ids must be a list"}), 400
-
-    q = ChatMessage.query.filter(
-        ChatMessage.session_id == session_id,
-        ChatMessage.sender == "agent",
-    )
-    if message_ids:
-        q = q.filter(ChatMessage.id.in_(message_ids))
-
-    now_utc = datetime.now(timezone.utc)
-    updated = 0
-    for m in q.all():
-        if m.seen_at is None:
-            m.seen_at = now_utc
-            if m.delivered_at is None:
-                m.delivered_at = now_utc
-            updated += 1
-    if updated:
-        db.session.commit()
-
-    return jsonify({"updated": updated})
-
-
 @app.route("/api/chat/session/<int:session_id>/status", methods=["GET"])
 @jwt_required()
 def get_session_status(session_id):
     """Lightweight poll endpoint: return session status + latest bot message."""
-    session = db.session.get(ChatSession, session_id)
+    session = ChatSession.query.get(session_id)
     if not session:
         return jsonify({"error": "Session not found"}), 404
     ticket = Ticket.query.filter_by(chat_session_id=session_id).order_by(Ticket.created_at.desc()).first()
@@ -2241,7 +2061,7 @@ def get_session_status(session_id):
 def session_presence(session_id):
     """Update customer presence for a chat session."""
     user_id = int(get_jwt_identity())
-    session = db.session.get(ChatSession, session_id)
+    session = ChatSession.query.get(session_id)
     if not session:
         return jsonify({"error": "Session not found"}), 404
     if session.user_id != user_id:
@@ -2394,7 +2214,7 @@ def submit_feedback():
 @jwt_required()
 def list_feedback():
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if user.role == "customer":
         feedbacks = Feedback.query.filter_by(user_id=user_id).order_by(Feedback.created_at.desc()).all()
     else:
@@ -2410,7 +2230,7 @@ def list_feedback():
 @jwt_required()
 def manager_dashboard():
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if user.role not in ("manager", "cto", "admin"):
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -2434,6 +2254,7 @@ def manager_dashboard():
     in_progress_tickets = ts_map.get("in_progress", 0)
     resolved_tickets = ts_map.get("resolved", 0)
     escalated_tickets = ts_map.get("escalated", 0)
+    manager_escalated_tickets = ts_map.get("manager_escalated", 0)
 
     # Critical/high pending tickets — single query
     urgent_stats = db.session.query(
@@ -2474,6 +2295,7 @@ def manager_dashboard():
             "in_progress_tickets": in_progress_tickets,
             "resolved_tickets": resolved_tickets,
             "escalated_tickets": escalated_tickets,
+            "manager_escalated_tickets": manager_escalated_tickets,
             "critical_tickets": critical_tickets,
             "high_tickets": high_tickets,
             "total_feedback": total_feedback,
@@ -2489,16 +2311,22 @@ def manager_dashboard():
 @jwt_required()
 def manager_tickets():
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if user.role not in ("manager", "cto", "admin"):
         return jsonify({"error": "Unauthorized"}), 403
 
-    status = request.args.get("status")
+    status   = request.args.get("status")
     priority = request.args.get("priority")
     category = request.args.get("category")
-    search = request.args.get("search")
+    search   = request.args.get("search")
 
     query = Ticket.query
+
+    # Managers see only tickets escalated to them.
+    # CTO and Admin retain a full view of all tickets.
+    if user.role == "manager":
+        query = query.filter_by(assigned_to=user_id)
+
     if status:
         query = query.filter_by(status=status)
     if priority:
@@ -2515,7 +2343,13 @@ def manager_tickets():
             )
         )
 
-    tickets = query.order_by(Ticket.created_at.desc()).all()
+    # Sort by priority rank (critical first) then by creation time
+    priority_order = sql_case(
+        {"critical": 1, "high": 2, "medium": 3, "low": 4},
+        value=Ticket.priority,
+        else_=5,
+    )
+    tickets = query.order_by(priority_order, Ticket.created_at.asc()).all()
     return jsonify({"tickets": [t.to_dict() for t in tickets]})
 
 
@@ -2566,36 +2400,278 @@ def manager_review_parameter_change(change_id):
     return jsonify({"change": change.to_dict()})
 
 
-@app.route("/api/manager/tickets/<int:ticket_id>", methods=["PUT"])
+# ═══════════════════════════════════════════════════════════════════════════════
+# CHANGE WORKFLOW (ITIL) — Manager Endpoints
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _cr_auth(user):
+    return user and user.role in ("manager", "cto", "admin")
+
+
+@app.route("/api/manager/change-requests", methods=["GET"])
 @jwt_required()
-def update_ticket(ticket_id):
+def manager_list_change_requests():
+    user_id = int(get_jwt_identity())
+    user    = db.session.get(User, user_id)
+    if not _cr_auth(user):
+        return jsonify({"error": "Unauthorized"}), 403
+
+    status  = request.args.get("status")
+    query   = ChangeRequest.query
+    if status:
+        if status == "needs_action":
+            query = query.filter(ChangeRequest.status.in_(["created", "invalid", "validated", "classified", "implemented", "rolled_back"]))
+        else:
+            query = query.filter_by(status=status)
+
+    crs = query.order_by(ChangeRequest.created_at.desc()).all()
+    all_crs = ChangeRequest.query.all()
+    stats = {
+        "total":        len(all_crs),
+        "needs_action": sum(1 for c in all_crs if c.status in ("created","invalid","validated","classified","implemented","rolled_back")),
+        "approved":     sum(1 for c in all_crs if c.status in ("approved","implementing")),
+        "closed":       sum(1 for c in all_crs if c.status in ("closed","rejected","auto_rejected")),
+    }
+    return jsonify({"change_requests": [c.to_dict() for c in crs], "stats": stats})
+
+
+@app.route("/api/manager/change-requests/<int:cr_id>", methods=["GET"])
+@jwt_required()
+def manager_get_change_request(cr_id):
+    user_id = int(get_jwt_identity())
+    user    = db.session.get(User, user_id)
+    if not _cr_auth(user):
+        return jsonify({"error": "Unauthorized"}), 403
+    cr = db.session.get(ChangeRequest, cr_id)
+    if not cr:
+        return jsonify({"error": "Change request not found"}), 404
+    return jsonify({"cr": cr.to_dict()})
+
+
+@app.route("/api/manager/change-requests/<int:cr_id>/validate", methods=["PUT"])
+@jwt_required()
+def manager_validate_cr(cr_id):
+    """Stage 1: Manager validates whether the CR is acceptable."""
+    user_id = int(get_jwt_identity())
+    user    = db.session.get(User, user_id)
+    if not _cr_auth(user):
+        return jsonify({"error": "Unauthorized"}), 403
+
+    cr = db.session.get(ChangeRequest, cr_id)
+    if not cr:
+        return jsonify({"error": "Change request not found"}), 404
+    if cr.status not in ("created", "invalid"):
+        return jsonify({"error": f"CR cannot be validated in status '{cr.status}'"}), 409
+
+    data     = request.json or {}
+    decision = (data.get("decision") or "").strip()
+    remark   = (data.get("remark")   or "").strip()
+    if decision not in ("valid", "invalid"):
+        return jsonify({"error": "decision must be 'valid' or 'invalid'"}), 400
+
+    now = datetime.now(timezone.utc)
+    cr.validation_remark = remark
+    cr.validated_by      = user_id
+    cr.validated_at      = now
+    cr.updated_at        = now
+
+    if decision == "valid":
+        cr.status = "validated"
+    else:
+        cr.rejection_count += 1
+        if cr.rejection_count >= 2:
+            cr.status = "auto_rejected"
+        else:
+            cr.status = "invalid"
+
+    db.session.commit()
+    return jsonify({"cr": cr.to_dict()})
+
+
+@app.route("/api/manager/change-requests/<int:cr_id>/classify", methods=["PUT"])
+@jwt_required()
+def manager_classify_cr(cr_id):
+    """Stage 2: Manager classifies the change type."""
+    user_id = int(get_jwt_identity())
+    user    = db.session.get(User, user_id)
+    if not _cr_auth(user):
+        return jsonify({"error": "Unauthorized"}), 403
+
+    cr = db.session.get(ChangeRequest, cr_id)
+    if not cr:
+        return jsonify({"error": "Change request not found"}), 404
+    if cr.status != "validated":
+        return jsonify({"error": f"CR must be validated before classification (current: {cr.status})"}), 409
+
+    data        = request.json or {}
+    change_type = (data.get("change_type") or "").strip()
+    note        = (data.get("note")        or "").strip()
+    if change_type not in ("standard", "normal", "emergency"):
+        return jsonify({"error": "change_type must be standard, normal, or emergency"}), 400
+
+    now = datetime.now(timezone.utc)
+    cr.change_type         = change_type
+    cr.classification_note = note
+    cr.classified_by       = user_id
+    cr.classified_at       = now
+    cr.status              = "classified"
+    cr.updated_at          = now
+    db.session.commit()
+    return jsonify({"cr": cr.to_dict()})
+
+
+@app.route("/api/manager/change-requests/<int:cr_id>/approve", methods=["PUT"])
+@jwt_required()
+def manager_approve_cr(cr_id):
+    """Stage 3: Manager approves or rejects the classified CR."""
+    user_id = int(get_jwt_identity())
+    user    = db.session.get(User, user_id)
+    if not _cr_auth(user):
+        return jsonify({"error": "Unauthorized"}), 403
+
+    cr = db.session.get(ChangeRequest, cr_id)
+    if not cr:
+        return jsonify({"error": "Change request not found"}), 404
+    if cr.status != "classified":
+        return jsonify({"error": f"CR must be classified before approval (current: {cr.status})"}), 409
+
+    data     = request.json or {}
+    decision = (data.get("decision") or "").strip()
+    remark   = (data.get("remark")   or "").strip()
+    if decision not in ("approved", "rejected"):
+        return jsonify({"error": "decision must be 'approved' or 'rejected'"}), 400
+
+    now = datetime.now(timezone.utc)
+    cr.approval_remark = remark
+    cr.approved_by     = user_id
+    cr.approved_at     = now
+    cr.status          = decision
+    cr.updated_at      = now
+
+    if cr.parameter_change_id:
+        pc = db.session.get(ParameterChange, cr.parameter_change_id)
+        if pc:
+            pc.status       = "approved" if decision == "approved" else "disapproved"
+            pc.reviewed_by  = user_id
+            pc.reviewed_at  = now
+            pc.manager_note = remark
+
+    db.session.commit()
+    return jsonify({"cr": cr.to_dict()})
+
+
+@app.route("/api/manager/change-requests/<int:cr_id>/close", methods=["PUT"])
+@jwt_required()
+def manager_close_cr(cr_id):
+    """Stage 5: Manager closes the CR after implementation (success or rollback)."""
+    user_id = int(get_jwt_identity())
+    user    = db.session.get(User, user_id)
+    if not _cr_auth(user):
+        return jsonify({"error": "Unauthorized"}), 403
+
+    cr = db.session.get(ChangeRequest, cr_id)
+    if not cr:
+        return jsonify({"error": "Change request not found"}), 404
+    if cr.status not in ("implemented", "rolled_back"):
+        return jsonify({"error": f"CR can only be closed after implementation (current: {cr.status})"}), 409
+
+    data = request.json or {}
+    now  = datetime.now(timezone.utc)
+    cr.closure_notes = (data.get("notes") or "").strip()
+    cr.closed_at     = now
+    cr.status        = "closed"
+    cr.updated_at    = now
+    db.session.commit()
+    return jsonify({"cr": cr.to_dict()})
+
+
+@app.route("/api/agent/change-requests/ticket/<int:ticket_id>", methods=["GET"])
+@jwt_required()
+def agent_get_cr_for_ticket(ticket_id):
+    user_id = int(get_jwt_identity())
+    user    = db.session.get(User, user_id)
+    if not user or user.role != "human_agent":
+        return jsonify({"error": "Unauthorized"}), 403
+    cr = (ChangeRequest.query
+          .filter_by(ticket_id=ticket_id, raised_by=user_id)
+          .order_by(ChangeRequest.created_at.desc())
+          .first())
+    return jsonify({"cr": cr.to_dict() if cr else None})
+
+
+@app.route("/api/manager/tickets/<int:ticket_id>/escalation-review", methods=["PUT"])
+@jwt_required()
+def manager_escalation_review(ticket_id):
+    """Manager approves or rejects an escalated ticket."""
     user_id = int(get_jwt_identity())
     user = db.session.get(User, user_id)
-    if user.role not in ("manager", "cto", "admin"):
+    if not user or user.role != "manager":
         return jsonify({"error": "Unauthorized"}), 403
 
     ticket = db.session.get(Ticket, ticket_id)
     if not ticket:
         return jsonify({"error": "Ticket not found"}), 404
+    if ticket.assigned_to != user_id:
+        return jsonify({"error": "Ticket not assigned to you"}), 403
+    if ticket.status != "manager_escalated":
+        return jsonify({"error": "Ticket is not in escalated state"}), 409
 
     data = request.json or {}
+    decision = (data.get("decision") or "").strip().lower()
+    note = (data.get("note") or "").strip()
+
+    if decision not in ("approved", "rejected"):
+        return jsonify({"error": "decision must be 'approved' or 'rejected'"}), 400
+
+    pending_changes = ParameterChange.query.filter_by(ticket_id=ticket_id, status="pending").all()
+    for pc in pending_changes:
+        pc.status = "approved" if decision == "approved" else "disapproved"
+        pc.manager_note = note
+        pc.reviewed_at = datetime.now(timezone.utc)
+        pc.reviewed_by = user_id
+
+    if decision == "approved":
+        ticket.status = "in_progress"
+        if note:
+            ticket.resolution_notes = note
+    else:
+        if ticket.escalated_by:
+            ticket.assigned_to = ticket.escalated_by
+        ticket.status = "in_progress"
+        if note:
+            ticket.resolution_notes = (
+                f"[Manager rejected escalation: {note}]\n" + (ticket.resolution_notes or "")
+            )
+
+    db.session.commit()
+    return jsonify({"ticket": ticket.to_dict(), "decision": decision})
+
+
+@app.route("/api/manager/tickets/<int:ticket_id>", methods=["PUT"])
+@jwt_required()
+def update_ticket(ticket_id):
+    user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
+    if user.role not in ("manager", "cto", "admin"):
+        return jsonify({"error": "Unauthorized"}), 403
+
+    ticket = Ticket.query.get(ticket_id)
+    if not ticket:
+        return jsonify({"error": "Ticket not found"}), 404
+
+    # Managers can only update tickets assigned to them
+    if user.role == "manager" and ticket.assigned_to != user_id:
+        return jsonify({"error": "Ticket not assigned to you"}), 403
+
+    data = request.json
     if "status" in data:
-        prev_status = ticket.status
-        new_status = data["status"]
-        ticket.status = new_status
-        now_utc = datetime.now(timezone.utc)
-        if new_status == "resolved":
+        ticket.status = data["status"]
+        if data["status"] == "resolved":
             ticket.resolved_at = datetime.now(timezone.utc)
-            if ticket.first_response_at is None:
-                ticket.first_response_at = ticket.resolved_at
-        if prev_status == "resolved" and new_status in ("pending", "in_progress", "escalated"):
-            ticket.reopened_count = (ticket.reopened_count or 0) + 1
-            ticket.last_reopened_at = now_utc
-        if new_status == "in_progress" and ticket.first_response_at is None:
-            ticket.first_response_at = now_utc
     if "priority" in data:
         ticket.priority = data["priority"]
-    if "assigned_to" in data:
+    if "assigned_to" in data and user.role in ("cto", "admin"):
+        # Only CTO/admin can re-assign; managers cannot move tickets between themselves
         ticket.assigned_to = data["assigned_to"]
     if "resolution_notes" in data:
         ticket.resolution_notes = data["resolution_notes"]
@@ -2608,7 +2684,7 @@ def update_ticket(ticket_id):
 @jwt_required()
 def manager_chats():
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if user.role not in ("manager", "cto", "admin"):
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -2625,7 +2701,7 @@ def manager_chats():
 @jwt_required()
 def manager_users():
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if user.role not in ("manager", "cto", "admin"):
         return jsonify({"error": "Unauthorized"}), 403
     managers = User.query.filter(User.role.in_(["manager"])).all()
@@ -2640,7 +2716,7 @@ def manager_users():
 @jwt_required()
 def cto_overview():
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if user.role != "cto":
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -2674,30 +2750,303 @@ def cto_overview():
     })
 
 
-@app.route("/api/cto/duty-roster", methods=["GET"])
+def _require_cto_user():
+    user = User.query.get(int(get_jwt_identity()))
+    if not user or user.role != "cto":
+        return None
+    return user
+
+
+def _latest_site_values_for_kpi(kpi_name):
+    rows = KpiData.query.filter_by(data_level="site", kpi_name=kpi_name).order_by(KpiData.site_id, KpiData.date.desc()).all()
+    latest = {}
+    for row in rows:
+        if row.site_id not in latest and row.value is not None:
+            latest[row.site_id] = {"date": row.date, "value": float(row.value)}
+    return latest
+
+
+def _series_for_kpi_patterns(patterns):
+    rows = KpiData.query.filter(
+        KpiData.data_level == "site",
+        db.or_(*[KpiData.kpi_name.ilike(pattern) for pattern in patterns])
+    ).all()
+
+    grouped = {}
+    for row in rows:
+        if row.value is None:
+            continue
+        key = row.date.isoformat()
+        bucket = grouped.setdefault(key, {"date": key, "total": 0.0, "count": 0})
+        bucket["total"] += float(row.value)
+        bucket["count"] += 1
+
+    series = []
+    for day in sorted(grouped.keys()):
+        bucket = grouped[day]
+        avg = bucket["total"] / bucket["count"] if bucket["count"] else 0
+        series.append({"date": day, "value": round(avg, 2)})
+    return series
+
+
+def _latest_average_for_patterns(patterns):
+    series = _series_for_kpi_patterns(patterns)
+    return round(series[-1]["value"], 2) if series else 0
+
+
+@app.route("/api/cto/map-data", methods=["GET"])
 @jwt_required()
-def cto_duty_roster():
-    user = db.session.get(User, int(get_jwt_identity()))
-    if user.role != "cto":
+def cto_map_data():
+    user = _require_cto_user()
+    if not user:
         return jsonify({"error": "Unauthorized"}), 403
 
-    date_str = request.args.get("date")
-    try:
-        target_date = date.fromisoformat(date_str) if date_str else datetime.now().date()
-    except Exception:
-        return jsonify({"error": "Invalid date format. Use YYYY-MM-DD"}), 400
-
-    roster, err = _build_duty_roster(target_date)
-    if err:
-        return jsonify({"error": err}), 400
+    sites = TelecomSite.query.with_entities(
+        TelecomSite.site_id,
+        TelecomSite.latitude,
+        TelecomSite.longitude,
+        TelecomSite.zone,
+        TelecomSite.site_status,
+        TelecomSite.alarms,
+        TelecomSite.solution,
+    ).all()
 
     return jsonify({
-        "date": target_date.isoformat(),
-        "day": target_date.strftime("%A"),
-        "shift_times": roster["shift_times"],
-        "shifts": roster["shifts"],
-        "teams": roster["teams"],
-        "meta": roster["meta"],
+        "sites": [
+            {
+                "site_id": site.site_id,
+                "lat": site.latitude,
+                "lng": site.longitude,
+                "zone": site.zone or "",
+                "status": (site.site_status or "active").lower(),
+                "alarm": site.alarms or "",
+                "solution": site.solution or "",
+            }
+            for site in sites
+            if (
+                site.latitude is not None and
+                site.longitude is not None and
+                float(site.latitude) != 0 and
+                float(site.longitude) != 0
+            )
+        ]
+    })
+
+
+@app.route("/api/cto/technical-kpi", methods=["GET"])
+@jwt_required()
+def cto_technical_kpi():
+    user = _require_cto_user()
+    if not user:
+        return jsonify({"error": "Unauthorized"}), 403
+
+    kpi_defs = [
+        {
+            "key": "accessibility",
+            "label": "Accessibility",
+            "patterns": [
+                "%availability%",
+                "%rrc setup success rate%",
+                "%call setup success rate%",
+                "%e-rab setup success rate%",
+                "%access success rate%",
+            ],
+        },
+        {
+            "key": "retainability",
+            "label": "Retainability",
+            "patterns": [
+                "%call drop rate%",
+                "%ho success rate%",
+                "%handover success rate%",
+            ],
+        },
+        {
+            "key": "downlink_throughput",
+            "label": "Downlink Throughput",
+            "patterns": [
+                "%dl - cell ave throughput%",
+                "%dl - usr ave throughput%",
+                "%downlink throughput%",
+                "%dl throughput%",
+            ],
+        },
+        {
+            "key": "prb_utilization",
+            "label": "PRB Utilization",
+            "patterns": [
+                "%prb utilization%",
+                "%prb util%",
+            ],
+        },
+        {
+            "key": "downlink_volume",
+            "label": "Downlink Volume",
+            "patterns": [
+                "%dl data total volume%",
+                "%downlink volume%",
+                "%dl volume%",
+            ],
+        },
+        {
+            "key": "uplink_volume",
+            "label": "Uplink Volume",
+            "patterns": [
+                "%ul data total volume%",
+                "%uplink volume%",
+                "%ul volume%",
+            ],
+        },
+    ]
+
+    cards = []
+    chart_series = {}
+    for item in kpi_defs:
+        series = _series_for_kpi_patterns(item["patterns"])
+        cards.append({
+            "key": item["key"],
+            "label": item["label"],
+            "value": round(series[-1]["value"], 2) if series else 0,
+        })
+        chart_series[item["key"]] = series[-30:]
+
+    return jsonify({
+        "cards": cards,
+        "series": chart_series,
+    })
+
+
+@app.route("/api/cto/business-kpi", methods=["GET"])
+@jwt_required()
+def cto_business_kpi():
+    user = _require_cto_user()
+    if not user:
+        return jsonify({"error": "Unauthorized"}), 403
+
+    users_latest = _latest_site_values_for_kpi("Site Users")
+    revenue_latest = _latest_site_values_for_kpi("Site Revenue")
+    prb_latest = _latest_site_values_for_kpi("PRB Utilization")
+
+    users_series = _series_for_kpi_patterns(["Site Users"])
+    revenue_series = _series_for_kpi_patterns(["Site Revenue"])
+
+    all_site_ids = sorted(set(users_latest.keys()) | set(revenue_latest.keys()))
+    site_rows = []
+    for site_id in all_site_ids:
+        user_val = users_latest.get(site_id, {}).get("value", 0.0)
+        revenue_val = revenue_latest.get(site_id, {}).get("value", 0.0)
+        util_val = prb_latest.get(site_id, {}).get("value", 0.0)
+        arpu = (revenue_val / user_val) if user_val else 0.0
+        site_rows.append({
+            "site_id": site_id,
+            "users": round(user_val, 2),
+            "revenue": round(revenue_val, 2),
+            "utilization": round(util_val, 2),
+            "arpu": round(arpu, 2),
+        })
+
+    total_users = round(sum(row["users"] for row in site_rows), 2)
+    avg_users = round(total_users / len(site_rows), 2) if site_rows else 0
+    total_revenue = round(sum(row["revenue"] for row in site_rows), 2)
+    arpu = round(total_revenue / total_users, 2) if total_users else 0
+
+    if len(users_series) >= 2 and users_series[-2]["value"]:
+        growth = round(((users_series[-1]["value"] - users_series[-2]["value"]) / users_series[-2]["value"]) * 100, 2)
+    else:
+        growth = 0
+
+    declining_sites = []
+    overloaded_sites = []
+    revenue_at_risk = 0.0
+
+    for row in site_rows:
+        growth_pct = 0.0
+        if row["users"] and avg_users:
+            growth_pct = round(((row["users"] - avg_users) / avg_users) * 100, 2)
+        item = {**row, "growth": growth_pct}
+        if growth_pct < 0:
+            declining_sites.append(item)
+        if row["utilization"] > 80:
+            overloaded_sites.append(item)
+        if growth_pct < 0 or row["utilization"] > 80:
+            revenue_at_risk += row["users"] * arpu
+
+    top_sites = sorted(site_rows, key=lambda row: (row["revenue"], row["users"]), reverse=True)[:10]
+    declining_sites = sorted(declining_sites, key=lambda row: row["growth"])[:10]
+    overloaded_sites = sorted(overloaded_sites, key=lambda row: row["utilization"], reverse=True)[:10]
+
+    trend = []
+    revenue_by_day = {row["date"]: row["value"] for row in revenue_series}
+    for row in users_series[-30:]:
+        trend.append({
+            "date": row["date"],
+            "users": row["value"],
+            "revenue": revenue_by_day.get(row["date"], 0),
+        })
+
+    return jsonify({
+        "summary": {
+            "total_users": total_users,
+            "avg_users": avg_users,
+            "growth": growth,
+            "arpu": arpu,
+            "revenue_at_risk": round(revenue_at_risk, 2),
+        },
+        "top_sites": top_sites,
+        "declining_sites": declining_sites,
+        "overloaded_sites": overloaded_sites,
+        "trend": trend,
+    })
+
+
+@app.route("/api/cto/operational-kpi", methods=["GET"])
+@jwt_required()
+def cto_operational_kpi():
+    user = _require_cto_user()
+    if not user:
+        return jsonify({"error": "Unauthorized"}), 403
+
+    tickets = Ticket.query.all()
+    total_tickets = len(tickets)
+    resolved_tickets = [t for t in tickets if t.status == "resolved"]
+    sla_breaches = len([t for t in tickets if t.sla_breached])
+    sla_compliance = round(((total_tickets - sla_breaches) / total_tickets) * 100, 1) if total_tickets else 0
+
+    resolution_hours = []
+    for ticket in resolved_tickets:
+        if ticket.created_at and ticket.resolved_at:
+            resolution_hours.append((ticket.resolved_at - ticket.created_at).total_seconds() / 3600)
+    avg_resolution_time = round(sum(resolution_hours) / len(resolution_hours), 2) if resolution_hours else 0
+
+    csat_raw = db.session.query(db.func.avg(Feedback.rating)).filter(Feedback.rating > 0).scalar() or 0
+    csat = round(float(csat_raw), 2)
+
+    status_breakdown = db.session.query(Ticket.status, db.func.count(Ticket.id)).group_by(Ticket.status).all()
+    status_data = [{"name": status or "unknown", "value": count} for status, count in status_breakdown]
+
+    agent_workload = db.session.query(
+        User.name,
+        db.func.count(Ticket.id)
+    ).outerjoin(Ticket, Ticket.assigned_to == User.id).filter(User.role == "human_agent").group_by(User.name).all()
+    workload_data = [{"agent": name or "Unassigned", "tickets": count} for name, count in agent_workload]
+
+    escalated_count = len([t for t in tickets if t.status == "escalated"])
+    escalation_rate = round((escalated_count / total_tickets) * 100, 1) if total_tickets else 0
+
+    breach_alerts = SlaAlert.query.filter_by(recipient_role="cto").count()
+
+    return jsonify({
+        "summary": {
+            "total_tickets": total_tickets,
+            "sla_compliance": sla_compliance,
+            "sla_breaches": sla_breaches,
+            "avg_resolution_time": avg_resolution_time,
+            "csat": csat,
+            "escalation_rate": escalation_rate,
+            "breach_alerts": breach_alerts,
+        },
+        "status_breakdown": status_data,
+        "agent_workload": workload_data,
     })
 
 
@@ -2708,7 +3057,7 @@ def cto_duty_roster():
 @app.route("/api/manager/sla-alerts", methods=["GET"])
 @jwt_required()
 def manager_sla_alerts():
-    user = db.session.get(User, int(get_jwt_identity()))
+    user = User.query.get(int(get_jwt_identity()))
     if user.role not in ("manager", "admin"):
         return jsonify({"error": "Unauthorized"}), 403
     unread_only = request.args.get("unread_only", "false").lower() == "true"
@@ -2722,7 +3071,7 @@ def manager_sla_alerts():
 @app.route("/api/cto/sla-alerts", methods=["GET"])
 @jwt_required()
 def cto_sla_alerts():
-    user = db.session.get(User, int(get_jwt_identity()))
+    user = User.query.get(int(get_jwt_identity()))
     if user.role != "cto":
         return jsonify({"error": "Unauthorized"}), 403
     unread_only = request.args.get("unread_only", "false").lower() == "true"
@@ -2736,10 +3085,10 @@ def cto_sla_alerts():
 @app.route("/api/manager/sla-alerts/<int:alert_id>/read", methods=["PUT"])
 @jwt_required()
 def manager_mark_alert_read(alert_id):
-    user = db.session.get(User, int(get_jwt_identity()))
+    user = User.query.get(int(get_jwt_identity()))
     if user.role not in ("manager", "admin"):
         return jsonify({"error": "Unauthorized"}), 403
-    alert = db.session.get(SlaAlert, alert_id)
+    alert = SlaAlert.query.get(alert_id)
     if not alert or alert.recipient_role != "manager":
         return jsonify({"error": "Alert not found"}), 404
     alert.is_read = True
@@ -2750,10 +3099,10 @@ def manager_mark_alert_read(alert_id):
 @app.route("/api/cto/sla-alerts/<int:alert_id>/read", methods=["PUT"])
 @jwt_required()
 def cto_mark_alert_read(alert_id):
-    user = db.session.get(User, int(get_jwt_identity()))
+    user = User.query.get(int(get_jwt_identity()))
     if user.role != "cto":
         return jsonify({"error": "Unauthorized"}), 403
-    alert = db.session.get(SlaAlert, alert_id)
+    alert = SlaAlert.query.get(alert_id)
     if not alert or alert.recipient_role != "cto":
         return jsonify({"error": "Alert not found"}), 404
     alert.is_read = True
@@ -2764,7 +3113,7 @@ def cto_mark_alert_read(alert_id):
 @app.route("/api/manager/sla-alerts/read-all", methods=["PUT"])
 @jwt_required()
 def manager_mark_all_alerts_read():
-    user = db.session.get(User, int(get_jwt_identity()))
+    user = User.query.get(int(get_jwt_identity()))
     if user.role not in ("manager", "admin"):
         return jsonify({"error": "Unauthorized"}), 403
     SlaAlert.query.filter_by(recipient_role="manager", is_read=False).update({"is_read": True})
@@ -2775,7 +3124,7 @@ def manager_mark_all_alerts_read():
 @app.route("/api/cto/sla-alerts/read-all", methods=["PUT"])
 @jwt_required()
 def cto_mark_all_alerts_read():
-    user = db.session.get(User, int(get_jwt_identity()))
+    user = User.query.get(int(get_jwt_identity()))
     if user.role != "cto":
         return jsonify({"error": "Unauthorized"}), 403
     SlaAlert.query.filter_by(recipient_role="cto", is_read=False).update({"is_read": True})
@@ -2815,7 +3164,7 @@ def generate_employee_id(role):
 @jwt_required()
 def admin_dashboard():
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if user.role != "admin":
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -2896,12 +3245,11 @@ def admin_dashboard():
     })
 
 
-
 @app.route("/api/admin/users", methods=["GET"])
 @jwt_required()
 def admin_list_users():
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if user.role != "admin":
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -2927,7 +3275,7 @@ def admin_list_users():
 @jwt_required()
 def admin_create_user():
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if user.role != "admin":
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -2952,6 +3300,9 @@ def admin_create_user():
     new_user = User(name=name, email=email, role=role, employee_id=emp_id)
     if phone_number:
         new_user.phone_number = phone_number
+    if role == "customer":
+        ut = (data.get("user_type") or "bronze").strip().lower()
+        new_user.user_type = ut if ut in VALID_USER_TYPES else "bronze"
     new_user.set_password(password)
     db.session.add(new_user)
     db.session.commit()
@@ -2962,7 +3313,7 @@ def admin_create_user():
 @jwt_required()
 def admin_upload_users():
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if user.role != "admin":
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -3047,11 +3398,11 @@ def admin_upload_users():
 @jwt_required()
 def admin_update_user(uid):
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if user.role != "admin":
         return jsonify({"error": "Unauthorized"}), 403
 
-    target = db.session.get(User, uid)
+    target = User.query.get(uid)
     if not target:
         return jsonify({"error": "User not found"}), 404
 
@@ -3080,6 +3431,9 @@ def admin_update_user(uid):
         if pw_err:
             return jsonify({"error": pw_err}), 400
         target.set_password(data["password"])
+    if "user_type" in data and target.role == "customer":
+        ut = (data["user_type"] or "bronze").strip().lower()
+        target.user_type = ut if ut in VALID_USER_TYPES else "bronze"
 
     db.session.commit()
     return jsonify({"user": target.to_dict()})
@@ -3089,14 +3443,14 @@ def admin_update_user(uid):
 @jwt_required()
 def admin_delete_user(uid):
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if user.role != "admin":
         return jsonify({"error": "Unauthorized"}), 403
 
     if uid == user_id:
         return jsonify({"error": "Cannot delete your own account"}), 400
 
-    target = db.session.get(User, uid)
+    target = User.query.get(uid)
     if not target:
         return jsonify({"error": "User not found"}), 404
 
@@ -3114,11 +3468,58 @@ def admin_delete_user(uid):
     return jsonify({"message": "User deleted"})
 
 
+@app.route("/api/admin/experts", methods=["GET"])
+@jwt_required()
+def admin_list_experts():
+    """List all domain experts (human_agents) with their domain/location/capacity."""
+    user = db.session.get(User, int(get_jwt_identity()))
+    if not user or user.role != "admin":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    experts = User.query.filter_by(role="human_agent").order_by(User.domain, User.name).all()
+    result = []
+    for e in experts:
+        d = e.to_dict()
+        d["open_tickets"] = _open_ticket_count(e.id)
+        result.append(d)
+    return jsonify({"experts": result})
+
+
+@app.route("/api/admin/experts/<int:uid>", methods=["PUT"])
+@jwt_required()
+def admin_update_expert(uid):
+    """Update domain, location, or bandwidth_capacity of an expert."""
+    user = db.session.get(User, int(get_jwt_identity()))
+    if not user or user.role != "admin":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    expert = db.session.get(User, uid)
+    if not expert or expert.role != "human_agent":
+        return jsonify({"error": "Expert not found"}), 404
+
+    data = request.json or {}
+    if "domain" in data:
+        if data["domain"] not in VALID_EXPERT_DOMAINS:
+            return jsonify({"error": f"Invalid domain. Valid: {sorted(VALID_EXPERT_DOMAINS)}"}), 400
+        expert.domain = data["domain"]
+    if "location" in data:
+        expert.location = (data["location"] or "").strip() or None
+    if "bandwidth_capacity" in data:
+        cap = int(data["bandwidth_capacity"])
+        if cap < 1:
+            return jsonify({"error": "bandwidth_capacity must be >= 1"}), 400
+        expert.bandwidth_capacity = cap
+    db.session.commit()
+    d = expert.to_dict()
+    d["open_tickets"] = _open_ticket_count(expert.id)
+    return jsonify({"expert": d})
+
+
 @app.route("/api/admin/agent-tickets", methods=["GET"])
 @jwt_required()
 def admin_agent_tickets():
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if user.role != "admin":
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -3163,7 +3564,7 @@ def admin_agent_tickets():
 @jwt_required()
 def admin_agent_alerts():
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if user.role != "admin":
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -3260,7 +3661,7 @@ def admin_agent_alerts():
 @jwt_required()
 def admin_feedback():
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if user.role != "admin":
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -3279,42 +3680,15 @@ def admin_feedback():
 # SITE & KPI DATA UPLOAD (Admin)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-haversine = _haversine  # alias — keep backward compat
-
-# In-memory upload progress store: {job_id: {status, total, processed, created, updated, skipped, error}}
-import threading as _threading
-_upload_jobs = {}
-_upload_jobs_lock = _threading.Lock()
-
-
-def _new_upload_job():
-    import uuid
-    job_id = str(uuid.uuid4())
-    with _upload_jobs_lock:
-        _upload_jobs[job_id] = {
-            "status": "processing",
-            "total": 0,
-            "processed": 0,
-            "created": 0,
-            "updated": 0,
-            "skipped": [],
-            "error": None,
-        }
-    return job_id
-
-
-@app.route("/api/admin/upload-jobs/<job_id>", methods=["GET"])
-@jwt_required()
-def admin_upload_job_status(job_id):
-    """Poll progress of an async site upload job."""
-    user = db.session.get(User, int(get_jwt_identity()))
-    if not user or user.role != "admin":
-        return jsonify({"error": "Unauthorized"}), 403
-    with _upload_jobs_lock:
-        job = _upload_jobs.get(job_id)
-    if not job:
-        return jsonify({"error": "Job not found"}), 404
-    return jsonify(job)
+def haversine(lat1, lon1, lat2, lon2):
+    """Calculate distance in km between two lat/lng points."""
+    R = 6371
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = (math.sin(dlat / 2) ** 2 +
+         math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) *
+         math.sin(dlon / 2) ** 2)
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
 def _validate_ooxml_excel_upload(file_storage):
@@ -3341,12 +3715,53 @@ def _validate_ooxml_excel_upload(file_storage):
     return True, None
 
 
+def _normalize_excel_header(value):
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
+
+
+def _find_site_id_column(headers):
+    """Find a site identifier column across multiple workbook formats."""
+    for i, header in enumerate(headers):
+        normalized = _normalize_excel_header(header)
+        if normalized in {"siteid", "homesitecode", "cellsiteid"}:
+            return i
+        if "site" in normalized and "id" in normalized:
+            return i
+    return None
+
+
+def _extract_excel_date_columns(headers, skip_indices=None):
+    """Return (column_index, date) for headers that can be parsed as dates."""
+    skip_indices = set(skip_indices or [])
+    date_columns = []
+    for col_idx, header in enumerate(headers):
+        if col_idx in skip_indices or header is None:
+            continue
+        try:
+            if isinstance(header, datetime):
+                date_columns.append((col_idx, header.date()))
+            elif isinstance(header, str):
+                for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d", "%d-%b-%y", "%d-%b-%Y"):
+                    try:
+                        date_columns.append((col_idx, datetime.strptime(header.strip(), fmt).date()))
+                        break
+                    except ValueError:
+                        continue
+            elif hasattr(header, "date"):
+                date_columns.append((col_idx, header.date()))
+        except Exception:
+            continue
+    return date_columns
+
+
+SHARED_WORKBOOK_KPI_NAMES = ("Site Users", "Site Revenue")
+
+
 @app.route("/api/admin/upload-sites", methods=["POST"])
 @jwt_required()
 def admin_upload_sites():
-    """Upload site data Excel — processes in background chunks for large files.
-    Returns a job_id immediately. Poll /api/admin/upload-jobs/<job_id> for progress."""
-    user = db.session.get(User, int(get_jwt_identity()))
+    """Upload site data Excel (site_id, latitude, longitude, zone)."""
+    user = User.query.get(int(get_jwt_identity()))
     if not user or user.role != "admin":
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -3360,238 +3775,83 @@ def admin_upload_sites():
     if not ok:
         return jsonify({"error": err}), 400
 
-    import tempfile
-    fd, tmp_path = tempfile.mkstemp(suffix=".xlsx")
-    with os.fdopen(fd, "wb") as tmp:
-        file.save(tmp)
+    import openpyxl
+    wb = openpyxl.load_workbook(file, data_only=True)
+    ws = wb.active
 
-    job_id = _new_upload_job()
+    headers = [str(c.value).strip().lower() if c.value else "" for c in ws[1]]
+    col_map = {}
+    for i, h in enumerate(headers):
+        if ("site" in h and "id" in h) or h in ("site name", "sitename", "site"):
+            col_map["site_id"] = i
+        elif "lat" in h:
+            col_map["latitude"] = i
+        elif "lon" in h:
+            col_map["longitude"] = i
+        elif "zone" in h:
+            col_map["zone"] = i
+        elif h == "status" or "site status" in h:
+            col_map["site_status"] = i
+        elif "alarm" in h:
+            col_map["alarms"] = i
+        elif h in ("solution", "standard solution step", "standard solution"):
+            col_map["solution"] = i
 
-    def _run_upload(path, jid):
-        import openpyxl as _openpyxl
+    required = ["site_id", "latitude", "longitude"]
+    missing = [k for k in required if k not in col_map]
+    if missing:
+        return jsonify({"error": f"Missing columns: {', '.join(missing)}. Found headers: {headers}"}), 400
 
-        def _norm_header(val):
-            return re.sub(r"[^a-z0-9]+", " ", (val or "").strip().lower()).strip()
-
-        def _parse_float(v):
-            if v is None:
-                return None
-            try:
-                s = str(v).strip()
-                return float(s) if s else None
-            except Exception:
-                return None
-
-        def _parse_str(v):
-            return "" if v is None else str(v).strip()
-
-        def _normalize_status(v):
-            s = _parse_str(v).lower()
-            if not s:
-                return "on_air"
-            if any(x in s for x in ["off", "down", "out", "inactive", "shutdown"]):
-                return "off_air"
-            return "on_air"
-
-        def _apply_batch(batch):
-            c_count = u_count = 0
-            deduped = {}
-            for b in batch:
-                key = (b.get("site_id"), b.get("cell_id"))
-                deduped[key] = b
-            site_ids = list({k[0] for k in deduped.keys()})
-            existing_rows = TelecomSite.query.filter(TelecomSite.site_id.in_(site_ids)).all()
-            existing_map = {(s.site_id, s.cell_id): s for s in existing_rows}
-            for b in deduped.values():
-                key = (b.get("site_id"), b.get("cell_id"))
-                site = existing_map.get(key)
-                if site:
-                    for field, val in b.items():
-                        if field != "site_id" and val is not None:
-                            setattr(site, field, val)
-                    u_count += 1
-                else:
-                    db.session.add(TelecomSite(**b))
-                    c_count += 1
-            db.session.commit()
-            return c_count, u_count
-
+    created = 0
+    updated = 0
+    skipped = []
+    for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
         try:
-            wb = _openpyxl.load_workbook(path, data_only=True, read_only=True)
-            ws = wb.active
-
-            _fs = {
-                "site_id": ["site id", "site_id", "siteid", "site code"],
-                "site_name": ["site name", "sitename", "name"],
-                "cell_id": ["cell id", "cell_id", "cellid", "cell"],
-                "latitude": ["latitude", "lat"],
-                "longitude": ["longitude", "long", "lon", "lng"],
-                "zone": ["zone", "circle", "region", "area"],
-                "site_status": ["status", "site status", "site_status", "operational status"],
-                "alarms": ["alarm", "alarms", "alarm text", "active alarm"],
-                "standard_solution_step": ["standard solution step", "solution step", "standard solution", "standard_solution_step"],
-                "solution": ["solution", "resolution", "action", "recommended action"],
-                "bandwidth_mhz": ["bandwidth (mhz)", "bandwidth mhz", "bandwidth", "bw", "bandwidth(mhz)", "bw (mhz)"],
-                "antenna_gain_dbi": ["antenna gain (dbi)", "antenna gain", "gain dbi", "antenna gain(dbi)", "gain (dbi)"],
-                "rf_power_eirp_dbm": ["rf power (eirp) [dbm]", "rf power eirp", "eirp dbm", "eirp", "rf power", "rf power(eirp)[dbm]", "eirp [dbm]", "rf power eirp dbm"],
-                "antenna_height_agl_m": ["antenna height (above ground level) (m)", "antenna height (above ground level)(m)", "antenna height", "above ground", "agl", "antenna height agl", "height (m)", "height(m)", "antenna height (agl) (m)", "antenna height(above ground level)(m)"],
-                "e_tilt_degree": ["e-tilt (degree)", "e tilt", "e-tilt", "etilt", "electrical tilt", "tilt", "e tilt (degree)", "e-tilt(degree)"],
-                "crs_gain": ["crs gain", "crs", "crs_gain"],
-            }
-
-            headers = [str(c.value).strip() if c.value else "" for c in ws[1]]
-            norm_headers = [_norm_header(h) for h in headers]
-            col_map = {}
-            for i, nh in enumerate(norm_headers):
-                for field, synonyms in _fs.items():
-                    if field in col_map:
-                        continue
-                    if any(s in nh for s in synonyms):
-                        col_map[field] = i
-                        break
-            # Heuristic fallback
-            for i, nh in enumerate(norm_headers):
-                if "latitude" not in col_map and "lat" in nh:
-                    col_map["latitude"] = i
-                if "longitude" not in col_map and any(x in nh for x in ["lon", "lng", "long"]):
-                    col_map["longitude"] = i
-                if "site_id" not in col_map and "site" in nh and "id" in nh:
-                    col_map["site_id"] = i
-                if "site_name" not in col_map and "site" in nh and "name" in nh:
-                    col_map["site_name"] = i
-                if "cell_id" not in col_map and "cell" in nh and "id" in nh:
-                    col_map["cell_id"] = i
-                if "zone" not in col_map and "zone" in nh:
-                    col_map["zone"] = i
-                if "site_status" not in col_map and "status" in nh:
-                    col_map["site_status"] = i
-                if "alarms" not in col_map and "alarm" in nh:
-                    col_map["alarms"] = i
-                if "solution" not in col_map and "solution" in nh:
-                    col_map["solution"] = i
-                if "standard_solution_step" not in col_map and "standard" in nh and "solution" in nh:
-                    col_map["standard_solution_step"] = i
-                if "bandwidth_mhz" not in col_map and "bandwidth" in nh:
-                    col_map["bandwidth_mhz"] = i
-                if "antenna_gain_dbi" not in col_map and "antenna" in nh and "gain" in nh:
-                    col_map["antenna_gain_dbi"] = i
-                if "rf_power_eirp_dbm" not in col_map and ("eirp" in nh or ("rf" in nh and "power" in nh)):
-                    col_map["rf_power_eirp_dbm"] = i
-                if "antenna_height_agl_m" not in col_map and "antenna" in nh and "height" in nh:
-                    col_map["antenna_height_agl_m"] = i
-                if "e_tilt_degree" not in col_map and "tilt" in nh:
-                    col_map["e_tilt_degree"] = i
-                if "crs_gain" not in col_map and "crs" in nh:
-                    col_map["crs_gain"] = i
-
-            required = ["latitude", "longitude"]
-            if "site_id" not in col_map and "site_name" not in col_map:
-                required.append("site_id")
-            missing = [k for k in required if k not in col_map]
-            if missing:
-                with _upload_jobs_lock:
-                    _upload_jobs[jid]["status"] = "failed"
-                    _upload_jobs[jid]["error"] = f"Missing columns: {', '.join(missing)}. Found headers: {headers}"
-                return
-
-            all_rows = list(ws.iter_rows(min_row=2, values_only=True))
-            total_rows = len(all_rows)
-            with _upload_jobs_lock:
-                _upload_jobs[jid]["total"] = total_rows
-
-            created = updated = 0
-            skipped = []
-            batch = []
-            BATCH_SIZE = 500
-
-            with app.app_context():
-                for row_idx, row in enumerate(all_rows, start=2):
-                    try:
-                        raw_site_id = row[col_map["site_id"]] if "site_id" in col_map else None
-                        raw_site_name = row[col_map["site_name"]] if "site_name" in col_map else None
-                        sid = _parse_str(raw_site_id or raw_site_name)
-                        if not sid:
-                            raise ValueError("Missing site identifier")
-                        lat = _parse_float(row[col_map["latitude"]]) if "latitude" in col_map else None
-                        lon = _parse_float(row[col_map["longitude"]]) if "longitude" in col_map else None
-                        if lat is None or lon is None:
-                            raise ValueError("Missing latitude/longitude")
-                        zone = _parse_str(row[col_map["zone"]]) if "zone" in col_map else ""
-                        status = _normalize_status(row[col_map["site_status"]]) if "site_status" in col_map else "on_air"
-                        alarms = _parse_str(row[col_map["alarms"]]) if "alarms" in col_map else ""
-                        solution = _parse_str(row[col_map["solution"]]) if "solution" in col_map else ""
-                        std_solution = _parse_str(row[col_map["standard_solution_step"]]) if "standard_solution_step" in col_map else ""
-                        if not solution and std_solution:
-                            solution = std_solution
-                        cell_id_val = _parse_str(row[col_map["cell_id"]]) if "cell_id" in col_map else ""
-                        if not cell_id_val:
-                            cell_id_val = None
-                        entry = {
-                            "site_id": sid,
-                            "site_name": _parse_str(raw_site_name) if raw_site_name is not None else sid,
-                            "cell_id": cell_id_val,
-                            "latitude": lat,
-                            "longitude": lon,
-                            "zone": zone,
-                            "site_status": status,
-                            "alarms": alarms,
-                            "solution": solution,
-                            "standard_solution_step": std_solution,
-                            "bandwidth_mhz": _parse_float(row[col_map["bandwidth_mhz"]]) if "bandwidth_mhz" in col_map else None,
-                            "antenna_gain_dbi": _parse_float(row[col_map["antenna_gain_dbi"]]) if "antenna_gain_dbi" in col_map else None,
-                            "rf_power_eirp_dbm": _parse_float(row[col_map["rf_power_eirp_dbm"]]) if "rf_power_eirp_dbm" in col_map else None,
-                            "antenna_height_agl_m": _parse_float(row[col_map["antenna_height_agl_m"]]) if "antenna_height_agl_m" in col_map else None,
-                            "e_tilt_degree": _parse_float(row[col_map["e_tilt_degree"]]) if "e_tilt_degree" in col_map else None,
-                            "crs_gain": _parse_float(row[col_map["crs_gain"]]) if "crs_gain" in col_map else None,
-                        }
-                        batch.append(entry)
-                    except Exception as e:
-                        skipped.append(f"Row {row_idx}: {e}")
-                        continue
-
-                    if len(batch) >= BATCH_SIZE:
-                        c, u = _apply_batch(batch)
-                        created += c
-                        updated += u
-                        batch = []
-                        with _upload_jobs_lock:
-                            _upload_jobs[jid]["processed"] = row_idx - 1
-                            _upload_jobs[jid]["created"] = created
-                            _upload_jobs[jid]["updated"] = updated
-                            _upload_jobs[jid]["skipped"] = skipped[-20:]
-
-                if batch:
-                    c, u = _apply_batch(batch)
-                    created += c
-                    updated += u
-
-            with _upload_jobs_lock:
-                _upload_jobs[jid]["status"] = "done"
-                _upload_jobs[jid]["processed"] = total_rows
-                _upload_jobs[jid]["created"] = created
-                _upload_jobs[jid]["updated"] = updated
-                _upload_jobs[jid]["skipped"] = skipped
-                _upload_jobs[jid]["total"] = created + updated
-
-            wb.close()
-
+            sid = str(row[col_map["site_id"]]).strip()
+            lat = float(row[col_map["latitude"]])
+            lon = float(row[col_map["longitude"]])
+            zone = str(row[col_map.get("zone", -1)]).strip() if col_map.get("zone") is not None and col_map.get("zone") < len(row) and row[col_map.get("zone")] else ""
+            raw_status = str(row[col_map.get("site_status", -1)]).strip().lower() if col_map.get("site_status") is not None and col_map.get("site_status") < len(row) and row[col_map.get("site_status")] else "on_air"
+            alarms = str(row[col_map.get("alarms", -1)]).strip() if col_map.get("alarms") is not None and col_map.get("alarms") < len(row) and row[col_map.get("alarms")] else ""
+            solution = str(row[col_map.get("solution", -1)]).strip() if col_map.get("solution") is not None and col_map.get("solution") < len(row) and row[col_map.get("solution")] else ""
         except Exception as e:
-            with _upload_jobs_lock:
-                _upload_jobs[jid]["status"] = "failed"
-                _upload_jobs[jid]["error"] = str(e)
-        finally:
-            try:
-                os.remove(path)
-            except Exception:
-                pass
+            skipped.append(f"Row {row_idx}: {e}")
+            continue
 
-    t = _threading.Thread(target=_run_upload, args=(tmp_path, job_id), daemon=True)
-    t.start()
+        status_map = {
+            "active": "on_air",
+            "on_air": "on_air",
+            "on air": "on_air",
+            "down": "off_air",
+            "off_air": "off_air",
+            "off air": "off_air",
+            "alarm": "off_air",
+        }
+        site_status = status_map.get(raw_status, raw_status or "on_air")
 
-    return jsonify({
-        "job_id": job_id,
-        "message": "Upload started. Poll /api/admin/upload-jobs/<job_id> for progress.",
-    }), 202
+        existing = TelecomSite.query.filter_by(site_id=sid).first()
+        if existing:
+            existing.latitude = lat
+            existing.longitude = lon
+            existing.zone = zone
+            existing.site_status = site_status
+            existing.alarms = alarms
+            existing.solution = solution
+            updated += 1
+        else:
+            db.session.add(TelecomSite(
+                site_id=sid,
+                latitude=lat,
+                longitude=lon,
+                zone=zone,
+                site_status=site_status,
+                alarms=alarms,
+                solution=solution,
+            ))
+            created += 1
+
+    db.session.commit()
+    return jsonify({"created": created, "updated": updated, "skipped": skipped, "total": created + updated})
 
 
 @app.route("/api/admin/upload-kpi-site-level", methods=["POST"])
@@ -3599,9 +3859,7 @@ def admin_upload_sites():
 def admin_upload_kpi_site_level():
     """Upload site-level KPI workbook (27 sheets, sheet name = KPI name).
     Each sheet: Site_ID column, then date columns with values."""
-    user = db.session.get(User, int(get_jwt_identity()))
-
-    user = db.session.get(User, int(get_jwt_identity()))
+    user = User.query.get(int(get_jwt_identity()))
     if not user or user.role != "admin":
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -3609,161 +3867,236 @@ def admin_upload_kpi_site_level():
         return jsonify({"error": "No file provided"}), 400
 
     file = request.files["file"]
-    if not file.filename.endswith((".xlsx", ".xls")):
-        return jsonify({"error": "Only .xlsx or .xls files accepted"}), 400
+    if not file.filename.lower().endswith((".xlsx", ".xlsm")):
+        return jsonify({"error": "Only .xlsx or .xlsm files are supported (.xls is not supported)."}), 400
+    ok, err = _validate_ooxml_excel_upload(file)
+    if not ok:
+        return jsonify({"error": err}), 400
 
-    import openpyxl, tempfile, io, csv
-    from sqlalchemy import text as sa_text
+    import openpyxl
+    wb = openpyxl.load_workbook(file, data_only=True)
 
-    fd, path = tempfile.mkstemp(suffix=".xlsx")
-    wb = None
+    # Clear old site-level KPI data
+    KpiData.query.filter_by(data_level="site").delete()
+    db.session.flush()
 
-    try:
-        with os.fdopen(fd, 'wb') as tmp:
-            file.save(tmp)
+    total_inserted = 0
+    kpi_summary = []
+    errors = []
 
-        wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+    for ws in wb.worksheets:
+        kpi_name = ws.title.strip()
+        if not kpi_name:
+            continue
 
-        KPI_INDEXES = [
-            "idx_kpi_site_name_date",
-            "idx_kpi_data_level",
-            "ix_kpi_data_site_id",
-            "ix_kpi_data_kpi_name",
-        ]
+        headers = [c.value for c in ws[1]]
+        if not headers or len(headers) < 2:
+            errors.append(f"Sheet '{kpi_name}': insufficient columns")
+            continue
 
-        COPY_SQL = """COPY kpi_data
-        (site_id, kpi_name, date, hour, value, data_level)
-        FROM STDIN WITH (FORMAT CSV, NULL '')"""
+        # First column is Site_ID, remaining columns are dates
+        date_columns = []
+        for col_idx in range(1, len(headers)):
+            h = headers[col_idx]
+            if h is None:
+                continue
+            try:
+                if isinstance(h, datetime):
+                    date_columns.append((col_idx, h.date()))
+                elif isinstance(h, str):
+                    for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%d-%m-%Y", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d"):
+                        try:
+                            date_columns.append((col_idx, datetime.strptime(h.strip(), fmt).date()))
+                            break
+                        except ValueError:
+                            continue
+                elif hasattr(h, 'date'):
+                    date_columns.append((col_idx, h.date()))
+            except Exception:
+                continue
 
-        FLUSH_AT = 1_000_000
+        if not date_columns:
+            errors.append(f"Sheet '{kpi_name}': no valid date columns found")
+            continue
 
-        raw_conn = db.engine.raw_connection()
-        cur = raw_conn.cursor()
+        sheet_inserted = 0
+        batch = []
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            site_id = str(row[0]).strip() if row[0] else None
+            if not site_id or site_id == "None":
+                continue
 
-        cur.execute("SET synchronous_commit TO OFF")
-
-        try:
-            for idx in KPI_INDEXES:
-                cur.execute(f"DROP INDEX IF EXISTS {idx}")
-            raw_conn.commit()
-
-            buf = io.StringIO()
-            writer = csv.writer(buf)
-
-            row_count = 0
-            total_inserted = 0
-
-            for sheet_name in wb.sheetnames:
-
-                ws = wb[sheet_name]
-                rows_iter = ws.iter_rows(values_only=True)
-
-                headers = next(rows_iter, None)
-                if not headers:
-                    continue
-
-                kpi_name = sheet_name.strip()
-
-                date_map = []
-
-                for i in range(1, len(headers)):
-                    h = headers[i]
-                    if h is None:
+            for col_idx, date_val in date_columns:
+                if col_idx < len(row) and row[col_idx] is not None:
+                    try:
+                        val = float(row[col_idx])
+                    except (ValueError, TypeError):
                         continue
+                    batch.append(KpiData(
+                        site_id=site_id, kpi_name=kpi_name, date=date_val,
+                        hour=0, value=val, data_level="site"
+                    ))
+                    sheet_inserted += 1
 
-                    parsed_date = None
+                    if len(batch) >= 2000:
+                        db.session.bulk_save_objects(batch)
+                        batch = []
 
-                    if isinstance(h, datetime):
-                        parsed_date = h.date()
-                    elif isinstance(h, date):
-                        parsed_date = h
-                    else:
-                        for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d"):
-                            try:
-                                parsed_date = datetime.strptime(str(h).strip(), fmt).date()
-                                break
-                            except:
-                                pass
+        if batch:
+            db.session.bulk_save_objects(batch)
 
-                    if parsed_date is None:
-                        parsed_date = datetime.now().date()
+        total_inserted += sheet_inserted
+        kpi_summary.append({"name": kpi_name, "rows": sheet_inserted})
 
-                    date_map.append((i, parsed_date))
+    db.session.commit()
+    return jsonify({
+        "inserted": total_inserted,
+        "kpis_processed": len(kpi_summary),
+        "kpi_summary": kpi_summary,
+        "errors": errors,
+    })
 
-                if not date_map:
-                    continue
 
-                for row in rows_iter:
+@app.route("/api/admin/upload-shared-site-workbook", methods=["POST"])
+@jwt_required()
+def admin_upload_shared_site_workbook():
+    """Upload the shared telecom_site_dataset workbook format as site-level KPI data."""
+    user = User.query.get(int(get_jwt_identity()))
+    if not user or user.role != "admin":
+        return jsonify({"error": "Unauthorized"}), 403
 
-                    if not row or row[0] is None:
+    if "file" not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+
+    file = request.files["file"]
+    if not file.filename.lower().endswith((".xlsx", ".xlsm")):
+        return jsonify({"error": "Only .xlsx or .xlsm files are supported (.xls is not supported)."}), 400
+    ok, err = _validate_ooxml_excel_upload(file)
+    if not ok:
+        return jsonify({"error": err}), 400
+
+    import openpyxl
+    wb = openpyxl.load_workbook(file, data_only=True)
+
+    KpiData.query.filter(
+        KpiData.data_level == "site",
+        KpiData.kpi_name.in_(SHARED_WORKBOOK_KPI_NAMES)
+    ).delete(synchronize_session=False)
+    db.session.flush()
+
+    total_inserted = 0
+    kpi_summary = []
+    errors = []
+
+    for ws in wb.worksheets:
+        kpi_name = ws.title.strip()
+        if not kpi_name:
+            continue
+
+        headers = [c.value for c in ws[1]]
+        if not headers:
+            errors.append(f"Sheet '{kpi_name}': missing header row")
+            continue
+
+        site_id_col = _find_site_id_column(headers)
+        if site_id_col is None:
+            errors.append(f"Sheet '{kpi_name}': no HomeSitecode/site ID column found")
+            continue
+
+        date_columns = _extract_excel_date_columns(headers, skip_indices={site_id_col})
+        if not date_columns:
+            errors.append(f"Sheet '{kpi_name}': no valid date columns found")
+            continue
+
+        sheet_inserted = 0
+        batch = []
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            site_id = str(row[site_id_col]).strip() if site_id_col < len(row) and row[site_id_col] else None
+            if not site_id or site_id == "None":
+                continue
+
+            for col_idx, date_val in date_columns:
+                if col_idx < len(row) and row[col_idx] is not None:
+                    try:
+                        val = float(row[col_idx])
+                    except (ValueError, TypeError):
                         continue
+                    batch.append(KpiData(
+                        site_id=site_id, kpi_name=kpi_name, date=date_val,
+                        hour=0, value=val, data_level="site"
+                    ))
+                    sheet_inserted += 1
 
-                    site_id = row[0]
+                    if len(batch) >= 2000:
+                        db.session.bulk_save_objects(batch)
+                        batch = []
 
-                    row_len = len(row)
+        if batch:
+            db.session.bulk_save_objects(batch)
 
-                    for col_idx, col_date in date_map:
+        total_inserted += sheet_inserted
+        kpi_summary.append({"name": kpi_name, "rows": sheet_inserted})
 
-                        if col_idx < row_len and row[col_idx] is not None:
+    db.session.commit()
+    return jsonify({
+        "message": f"Shared workbook data added to database: {total_inserted} records inserted across {len(kpi_summary)} sheets.",
+        "inserted": total_inserted,
+        "kpis_processed": len(kpi_summary),
+        "kpi_summary": kpi_summary,
+        "errors": errors,
+    })
 
-                            try:
-                                writer.writerow((site_id, kpi_name, col_date, 0, float(row[col_idx]), "site"))
-                                row_count += 1
-                            except:
-                                continue
 
-                    if row_count >= FLUSH_AT:
+@app.route("/api/admin/shared-site-workbook-summary", methods=["GET"])
+@jwt_required()
+def admin_shared_site_workbook_summary():
+    """Return summary for shared workbook KPI data only."""
+    user = User.query.get(int(get_jwt_identity()))
+    if not user or user.role != "admin":
+        return jsonify({"error": "Unauthorized"}), 403
 
-                        buf.seek(0)
-                        cur.copy_expert(COPY_SQL, buf)
+    total_records = db.session.query(db.func.count(KpiData.id)).filter(
+        KpiData.data_level == "site",
+        KpiData.kpi_name.in_(SHARED_WORKBOOK_KPI_NAMES)
+    ).scalar() or 0
 
-                        total_inserted += row_count
-                        raw_conn.commit()
+    total_sites = db.session.query(db.func.count(db.distinct(KpiData.site_id))).filter(
+        KpiData.data_level == "site",
+        KpiData.kpi_name.in_(SHARED_WORKBOOK_KPI_NAMES)
+    ).scalar() or 0
 
-                        buf.truncate(0)
-                        buf.seek(0)
+    return jsonify({
+        "total_sites": total_sites,
+        "total_records": total_records,
+    })
 
-                        row_count = 0
 
-            if row_count > 0:
-                buf.seek(0)
-                cur.copy_expert(COPY_SQL, buf)
-                total_inserted += row_count
-                raw_conn.commit()
+@app.route("/api/admin/delete-shared-site-workbook", methods=["DELETE"])
+@jwt_required()
+def admin_delete_shared_site_workbook():
+    """Delete all shared workbook KPI data only."""
+    user = User.query.get(int(get_jwt_identity()))
+    if not user or user.role != "admin":
+        return jsonify({"error": "Unauthorized"}), 403
 
-        finally:
+    count = KpiData.query.filter(
+        KpiData.data_level == "site",
+        KpiData.kpi_name.in_(SHARED_WORKBOOK_KPI_NAMES)
+    ).count()
+    KpiData.query.filter(
+        KpiData.data_level == "site",
+        KpiData.kpi_name.in_(SHARED_WORKBOOK_KPI_NAMES)
+    ).delete(synchronize_session=False)
+    db.session.commit()
+    return jsonify({"deleted": count})
 
-            for stmt in [
-                "CREATE INDEX IF NOT EXISTS idx_kpi_site_name_date ON kpi_data (site_id, kpi_name, date)",
-                "CREATE INDEX IF NOT EXISTS idx_kpi_data_level ON kpi_data (data_level, kpi_name)",
-                "CREATE INDEX IF NOT EXISTS ix_kpi_data_site_id ON kpi_data (site_id)",
-                "CREATE INDEX IF NOT EXISTS ix_kpi_data_kpi_name ON kpi_data (kpi_name)",
-            ]:
-                try:
-                    cur.execute(stmt)
-                except:
-                    pass
-
-            raw_conn.commit()
-            cur.close()
-            raw_conn.close()
-
-        return jsonify({"message": f"Successfully uploaded {total_inserted} site-level KPI records."}), 200
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-    finally:
-        if wb:
-            wb.close()
-        if os.path.exists(path):
-            os.remove(path)
 
 @app.route("/api/admin/upload-kpi-cell-level", methods=["POST"])
 @jwt_required()
 def admin_upload_kpi_cell_level():
-
-    user = db.session.get(User, int(get_jwt_identity()))
+    """Upload cell-level KPI workbook (27 sheets, sheet name = KPI name).
+    Each sheet: Site_ID, Cell_ID, Cell_Site_ID columns, then date columns with values."""
+    user = User.query.get(int(get_jwt_identity()))
     if not user or user.role != "admin":
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -3771,165 +4104,104 @@ def admin_upload_kpi_cell_level():
         return jsonify({"error": "No file provided"}), 400
 
     file = request.files["file"]
+    if not file.filename.lower().endswith((".xlsx", ".xlsm")):
+        return jsonify({"error": "Only .xlsx or .xlsm files are supported (.xls is not supported)."}), 400
+    ok, err = _validate_ooxml_excel_upload(file)
+    if not ok:
+        return jsonify({"error": err}), 400
 
-    if not file.filename.lower().endswith(('.xlsx', '.xlsm')):
-        return jsonify({"error": "Invalid file format."}), 400
+    import openpyxl
+    wb = openpyxl.load_workbook(file, data_only=True)
 
-    import openpyxl, tempfile, io, csv
-    from sqlalchemy import text as sa_text
+    # Clear old cell-level KPI data
+    KpiData.query.filter_by(data_level="cell").delete()
+    db.session.flush()
 
-    fd, path = tempfile.mkstemp(suffix=".xlsx")
-    wb = None
+    total_inserted = 0
+    kpi_summary = []
+    errors = []
 
-    try:
-        with os.fdopen(fd, 'wb') as tmp:
-            file.save(tmp)
+    for ws in wb.worksheets:
+        kpi_name = ws.title.strip()
+        if not kpi_name:
+            continue
 
-        wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+        headers = [c.value for c in ws[1]]
+        if not headers or len(headers) < 4:
+            errors.append(f"Sheet '{kpi_name}': insufficient columns (need Site_ID, Cell_ID, Cell_Site_ID + dates)")
+            continue
 
-        KPI_INDEXES = [
-            "idx_kpi_site_name_date",
-            "idx_kpi_data_level",
-            "ix_kpi_data_site_id",
-            "ix_kpi_data_kpi_name",
-        ]
+        # First 3 columns: Site_ID, Cell_ID, Cell_Site_ID; remaining are dates
+        date_columns = []
+        for col_idx in range(3, len(headers)):
+            h = headers[col_idx]
+            if h is None:
+                continue
+            try:
+                if isinstance(h, datetime):
+                    date_columns.append((col_idx, h.date()))
+                elif isinstance(h, str):
+                    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d"):
+                        try:
+                            date_columns.append((col_idx, datetime.strptime(h.strip(), fmt).date()))
+                            break
+                        except ValueError:
+                            continue
+                elif hasattr(h, 'date'):
+                    date_columns.append((col_idx, h.date()))
+            except Exception:
+                continue
 
-        COPY_SQL = """COPY kpi_data
-        (site_id, cell_id, cell_site_id, kpi_name, date, hour, value, data_level)
-        FROM STDIN WITH (FORMAT CSV, NULL '')"""
+        if not date_columns:
+            errors.append(f"Sheet '{kpi_name}': no valid date columns found")
+            continue
 
-        FLUSH_AT = 1_000_000
+        sheet_inserted = 0
+        batch = []
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            site_id = str(row[0]).strip() if row[0] else None
+            cell_id = str(row[1]).strip() if row[1] else None
+            cell_site_id = str(row[2]).strip() if row[2] else None
+            if not site_id or site_id == "None":
+                continue
 
-        raw_conn = db.engine.raw_connection()
-        cur = raw_conn.cursor()
-
-        cur.execute("SET synchronous_commit TO OFF")
-
-        try:
-            for idx in KPI_INDEXES:
-                cur.execute(f"DROP INDEX IF EXISTS {idx}")
-            raw_conn.commit()
-
-            buf = io.StringIO()
-            writer = csv.writer(buf)
-
-            row_count = 0
-            total_inserted = 0
-
-            for sheet_name in wb.sheetnames:
-
-                ws = wb[sheet_name]
-                rows_iter = ws.iter_rows(values_only=True)
-
-                headers = next(rows_iter, None)
-                if not headers:
-                    continue
-
-                kpi_name = sheet_name.strip()
-
-                date_map = []
-
-                for i in range(3, len(headers)):
-
-                    h = headers[i]
-                    if h is None:
+            for col_idx, date_val in date_columns:
+                if col_idx < len(row) and row[col_idx] is not None:
+                    try:
+                        val = float(row[col_idx])
+                    except (ValueError, TypeError):
                         continue
+                    batch.append(KpiData(
+                        site_id=site_id, kpi_name=kpi_name, date=date_val,
+                        hour=0, value=val, data_level="cell",
+                        cell_id=cell_id, cell_site_id=cell_site_id
+                    ))
+                    sheet_inserted += 1
 
-                    parsed_date = None
+                    if len(batch) >= 2000:
+                        db.session.bulk_save_objects(batch)
+                        batch = []
 
-                    if isinstance(h, datetime):
-                        parsed_date = h.date()
-                    elif isinstance(h, date):
-                        parsed_date = h
-                    else:
-                        for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d"):
-                            try:
-                                parsed_date = datetime.strptime(str(h).strip(), fmt).date()
-                                break
-                            except:
-                                pass
+        if batch:
+            db.session.bulk_save_objects(batch)
 
-                    if parsed_date is None:
-                        parsed_date = datetime.now().date()
+        total_inserted += sheet_inserted
+        kpi_summary.append({"name": kpi_name, "rows": sheet_inserted})
 
-                    date_map.append((i, parsed_date))
+    db.session.commit()
+    return jsonify({
+        "inserted": total_inserted,
+        "kpis_processed": len(kpi_summary),
+        "kpi_summary": kpi_summary,
+        "errors": errors,
+    })
 
-                if not date_map:
-                    continue
-
-                for row in rows_iter:
-
-                    if not row or not row[0]:
-                        continue
-
-                    site_id = row[0]
-                    cell_id = row[1] if len(row) > 1 else None
-                    cell_site_id = row[2] if len(row) > 2 else None
-
-                    row_len = len(row)
-
-                    for col_idx, col_date in date_map:
-
-                        if col_idx < row_len and row[col_idx] is not None:
-
-                            try:
-                                writer.writerow((site_id, cell_id, cell_site_id, kpi_name, col_date, 0, float(row[col_idx]), "cell"))
-                                row_count += 1
-                            except:
-                                continue
-
-                    if row_count >= FLUSH_AT:
-
-                        buf.seek(0)
-                        cur.copy_expert(COPY_SQL, buf)
-
-                        total_inserted += row_count
-                        raw_conn.commit()
-
-                        buf.truncate(0)
-                        buf.seek(0)
-
-                        row_count = 0
-
-            if row_count > 0:
-                buf.seek(0)
-                cur.copy_expert(COPY_SQL, buf)
-                total_inserted += row_count
-                raw_conn.commit()
-
-        finally:
-
-            for stmt in [
-                "CREATE INDEX IF NOT EXISTS idx_kpi_site_name_date ON kpi_data (site_id, kpi_name, date)",
-                "CREATE INDEX IF NOT EXISTS idx_kpi_data_level ON kpi_data (data_level, kpi_name)",
-                "CREATE INDEX IF NOT EXISTS ix_kpi_data_site_id ON kpi_data (site_id)",
-                "CREATE INDEX IF NOT EXISTS ix_kpi_data_kpi_name ON kpi_data (kpi_name)",
-            ]:
-                try:
-                    cur.execute(stmt)
-                except:
-                    pass
-
-            raw_conn.commit()
-            cur.close()
-            raw_conn.close()
-
-        return jsonify({"message": f"Successfully uploaded {total_inserted} cell-level KPI records."}), 200
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-    finally:
-        if wb:
-            wb.close()
-        if os.path.exists(path):
-            os.remove(path)
 
 @app.route("/api/admin/delete-sites", methods=["DELETE"])
 @jwt_required()
 def admin_delete_sites():
     """Delete all telecom site data."""
-    user = db.session.get(User, int(get_jwt_identity()))
+    user = User.query.get(int(get_jwt_identity()))
     if not user or user.role != "admin":
         return jsonify({"error": "Unauthorized"}), 403
     count = TelecomSite.query.count()
@@ -3942,7 +4214,7 @@ def admin_delete_sites():
 @jwt_required()
 def admin_delete_kpi_site_level():
     """Delete all site-level KPI data."""
-    user = db.session.get(User, int(get_jwt_identity()))
+    user = User.query.get(int(get_jwt_identity()))
     if not user or user.role != "admin":
         return jsonify({"error": "Unauthorized"}), 403
     count = KpiData.query.filter_by(data_level="site").count()
@@ -3955,7 +4227,7 @@ def admin_delete_kpi_site_level():
 @jwt_required()
 def admin_delete_kpi_cell_level():
     """Delete all cell-level KPI data."""
-    user = db.session.get(User, int(get_jwt_identity()))
+    user = User.query.get(int(get_jwt_identity()))
     if not user or user.role != "admin":
         return jsonify({"error": "Unauthorized"}), 403
     count = KpiData.query.filter_by(data_level="cell").count()
@@ -3968,13 +4240,16 @@ def admin_delete_kpi_cell_level():
 @jwt_required()
 def admin_uploaded_kpis():
     """Return list of uploaded KPI names with row counts, split by data level."""
-    user = db.session.get(User, int(get_jwt_identity()))
+    user = User.query.get(int(get_jwt_identity()))
     if not user or user.role != "admin":
         return jsonify({"error": "Unauthorized"}), 403
 
     site_kpis = db.session.query(
         KpiData.kpi_name, db.func.count(KpiData.id)
-    ).filter_by(data_level="site").group_by(KpiData.kpi_name).order_by(KpiData.kpi_name).all()
+    ).filter(
+        KpiData.data_level == "site",
+        ~KpiData.kpi_name.in_(SHARED_WORKBOOK_KPI_NAMES)
+    ).group_by(KpiData.kpi_name).order_by(KpiData.kpi_name).all()
 
     cell_kpis = db.session.query(
         KpiData.kpi_name, db.func.count(KpiData.id)
@@ -4043,7 +4318,7 @@ def calc_trend(current, previous):
 @jwt_required()
 def reports_overview():
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if user.role not in ("manager", "admin"):
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -4196,7 +4471,7 @@ def reports_overview():
 @jwt_required()
 def reports_agents():
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if user.role not in ("manager", "admin"):
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -4271,7 +4546,7 @@ def reports_agents():
 @jwt_required()
 def reports_csat():
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if user.role not in ("manager", "admin"):
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -4348,7 +4623,7 @@ def reports_csat():
 @jwt_required()
 def reports_sla():
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if user.role not in ("manager", "admin"):
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -4484,7 +4759,7 @@ def reports_sla():
 @jwt_required()
 def reports_export():
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if user.role not in ("manager", "admin"):
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -4558,24 +4833,8 @@ def reports_export():
 def agent_toggle_status():
     """Toggle human agent online/offline status."""
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if not user or user.role != "human_agent":
-        return jsonify({"error": "Unauthorized"}), 403
-    data = request.json or {}
-    if "is_online" in data:
-        user.is_online = bool(data["is_online"])
-    else:
-        user.is_online = not user.is_online
-    db.session.commit()
-    return jsonify({"is_online": user.is_online, "message": f"Status set to {'online' if user.is_online else 'offline'}"})
-
-
-@app.route("/api/manager/status", methods=["PUT"])
-@jwt_required()
-def manager_toggle_status():
-    user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
-    if not user or user.role != "manager":
         return jsonify({"error": "Unauthorized"}), 403
     data = request.json or {}
     if "is_online" in data:
@@ -4591,7 +4850,7 @@ def manager_toggle_status():
 def agent_dashboard():
     """Return KPIs for the human agent."""
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if not user or user.role != "human_agent":
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -4641,8 +4900,7 @@ def agent_dashboard():
     csat_pct = round((len([f for f in feedbacks if f.rating >= 4]) / max(len(feedbacks), 1)) * 100, 1)
 
     # Reopen Rate (approximation: tickets re-opened after resolution – not tracked separately, show 0 for now)
-    reopened_tickets = [t for t in my_tickets if (t.reopened_count or 0) > 0]
-    reopen_rate = round((len(reopened_tickets) / max(resolved_count, 1)) * 100, 1)
+    reopen_rate = 0.0
 
     # High Severity Incident Resolution Time (avg hours for critical/high resolved tickets)
     hs_times = []
@@ -4655,14 +4913,7 @@ def agent_dashboard():
     hs_resolution_time = round(sum(hs_times) / len(hs_times), 2) if hs_times else 0
 
     # High Severity Response Time (time from creation to status change from pending, approximation = 0 since not tracked)
-    hs_response_times = []
-    for t in my_tickets:
-        if t.priority in ("critical", "high"):
-            ra = _utc(t.first_response_at)
-            ca = _utc(t.created_at)
-            if ra and ca:
-                hs_response_times.append((ra - ca).total_seconds() / 3600)
-    hs_response_time = round(sum(hs_response_times) / len(hs_response_times), 2) if hs_response_times else 0
+    hs_response_time = round(hs_resolution_time * 0.15, 2) if hs_resolution_time else 0
 
     # Complaint Resolution Time (avg hours for ALL priority tickets)
     complaint_resolution_time = mttr
@@ -4742,10 +4993,14 @@ def agent_dashboard():
 def agent_tickets():
     """Return tickets assigned to the current human agent."""
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if not user or user.role != "human_agent":
         return jsonify({"error": "Unauthorized"}), 403
-    tickets = Ticket.query.filter_by(assigned_to=user_id).order_by(Ticket.created_at.desc()).all()
+    from sqlalchemy import or_
+    tickets = (Ticket.query
+               .filter(or_(Ticket.assigned_to == user_id, Ticket.escalated_by == user_id))
+               .order_by(Ticket.created_at.desc())
+               .all())
     return jsonify({"tickets": [t.to_dict() for t in tickets]})
 
 
@@ -4754,10 +5009,10 @@ def agent_tickets():
 def agent_resolve_ticket(ticket_id):
     """Mark a ticket as resolved by the agent."""
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if not user or user.role != "human_agent":
         return jsonify({"error": "Unauthorized"}), 403
-    ticket = db.session.get(Ticket, ticket_id)
+    ticket = Ticket.query.get(ticket_id)
     if not ticket:
         return jsonify({"error": "Ticket not found"}), 404
     if ticket.assigned_to != user_id:
@@ -4766,8 +5021,6 @@ def agent_resolve_ticket(ticket_id):
     data = request.json or {}
     ticket.status = "resolved"
     ticket.resolved_at = datetime.now(timezone.utc)
-    if ticket.first_response_at is None:
-        ticket.first_response_at = ticket.resolved_at
     resolution_notes = data.get("resolution_notes", "")
     if resolution_notes:
         ticket.resolution_notes = resolution_notes
@@ -4781,7 +5034,7 @@ def agent_resolve_ticket(ticket_id):
     # ── Add a bot message to the chat session so the customer sees it ──
     chat_session = None
     if ticket.chat_session_id:
-        chat_session = db.session.get(ChatSession, ticket.chat_session_id)
+        chat_session = ChatSession.query.get(ticket.chat_session_id)
         if chat_session:
             resolve_text = (
                 f"Great news! Your support ticket ({ticket.reference_number}) has been resolved by "
@@ -4804,7 +5057,7 @@ def agent_resolve_ticket(ticket_id):
     db.session.commit()
 
     # ── Notify customer via Email ──
-    customer_user = db.session.get(User, ticket.user_id)
+    customer_user = User.query.get(ticket.user_id)
     if customer_user and customer_user.email:
         try:
             notes_row = f"<tr><td style='padding:8px 0;color:#64748b;width:140px;'>Resolution</td><td style='padding:8px 0;color:#1e293b;'>{resolution_notes}</td></tr>" if resolution_notes else ""
@@ -4896,10 +5149,24 @@ def agent_get_parameter_change(ticket_id):
     return jsonify({"change": change.to_dict() if change else None})
 
 
+def _generate_cr_number():
+    """Generate a unique CR number: CR-YYYYMMDD-XXXX."""
+    today = datetime.now(timezone.utc).strftime("%Y%m%d")
+    suffix = ''.join(random.choices(string.ascii_uppercase + string.digits, k=4))
+    candidate = f"CR-{today}-{suffix}"
+    while ChangeRequest.query.filter_by(cr_number=candidate).first():
+        suffix = ''.join(random.choices(string.ascii_uppercase + string.digits, k=4))
+        candidate = f"CR-{today}-{suffix}"
+    return candidate
+
+
 @app.route("/api/agent/tickets/<int:ticket_id>/parameter-change", methods=["POST"])
 @jwt_required()
 def agent_create_parameter_change(ticket_id):
-    """Create a parameter change request for manager approval."""
+    """
+    Create a parameter-change request AND escalate the ticket to a manager.
+    Also creates a ChangeRequest (CR) for the full ITIL Change Workflow.
+    """
     user_id = int(get_jwt_identity())
     user = db.session.get(User, user_id)
     if not user or user.role != "human_agent":
@@ -4910,9 +5177,13 @@ def agent_create_parameter_change(ticket_id):
         return jsonify({"error": "Ticket not found"}), 404
     if ticket.assigned_to != user_id:
         return jsonify({"error": "Ticket not assigned to you"}), 403
+    if ticket.status == "manager_escalated":
+        return jsonify({"error": "Ticket is already escalated to a manager"}), 409
 
     data = request.json or {}
-    proposed = (data.get("proposed_change") or "").strip()
+    proposed = (data.get("proposed_change")   or "").strip()
+    impact   = (data.get("impact_assessment") or "").strip()
+    rollback = (data.get("rollback_plan")     or "").strip()
     if not proposed:
         return jsonify({"error": "Proposed change is required"}), 400
 
@@ -4923,6 +5194,8 @@ def agent_create_parameter_change(ticket_id):
     if existing_pending:
         return jsonify({"error": "A pending change request already exists"}), 409
 
+    manager = _find_best_manager(ticket.priority)
+
     change = ParameterChange(
         ticket_id=ticket_id,
         agent_id=user_id,
@@ -4930,9 +5203,127 @@ def agent_create_parameter_change(ticket_id):
         status="pending",
     )
     db.session.add(change)
+    db.session.flush()
+
+    cr_title = f"Parameter Change: {ticket.category or 'General'} — {ticket.reference_number}"
+    cr = ChangeRequest(
+        cr_number           = _generate_cr_number(),
+        ticket_id           = ticket_id,
+        parameter_change_id = change.id,
+        raised_by           = user_id,
+        title               = cr_title,
+        description         = proposed,
+        impact_assessment   = impact,
+        rollback_plan       = rollback,
+        status              = "created",
+    )
+    db.session.add(cr)
+
+    now_utc = datetime.now(timezone.utc)
+    ticket.status          = "manager_escalated"
+    ticket.escalated_by    = user_id
+    ticket.escalated_at    = now_utc
+    ticket.escalation_note = proposed
+    if manager:
+        ticket.assigned_to = manager.id
+
     db.session.commit()
 
-    return jsonify(change.to_dict()), 201
+    return jsonify({
+        "change":           change.to_dict(),
+        "cr":               cr.to_dict(),
+        "ticket":           ticket.to_dict(),
+        "assigned_manager": {"id": manager.id, "name": manager.name, "email": manager.email} if manager else None,
+    }), 201
+
+
+@app.route("/api/agent/change-requests/<int:cr_id>/resubmit", methods=["PUT"])
+@jwt_required()
+def agent_resubmit_cr(cr_id):
+    user_id = int(get_jwt_identity())
+    user    = db.session.get(User, user_id)
+    if not user or user.role != "human_agent":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    cr = db.session.get(ChangeRequest, cr_id)
+    if not cr:
+        return jsonify({"error": "Change request not found"}), 404
+    if cr.raised_by != user_id:
+        return jsonify({"error": "Not your change request"}), 403
+    if cr.status != "invalid":
+        return jsonify({"error": "Only invalid CRs can be resubmitted"}), 409
+    if cr.rejection_count >= 2:
+        return jsonify({"error": "Maximum rejections reached. CR is permanently closed."}), 409
+
+    data        = request.json or {}
+    description = (data.get("description")      or "").strip()
+    impact      = (data.get("impact_assessment") or "").strip()
+    rollback    = (data.get("rollback_plan")     or "").strip()
+    if not description:
+        return jsonify({"error": "Description is required"}), 400
+
+    cr.description       = description
+    cr.impact_assessment = impact
+    cr.rollback_plan     = rollback
+    cr.status            = "created"
+    cr.updated_at        = datetime.now(timezone.utc)
+    db.session.commit()
+    return jsonify({"cr": cr.to_dict()})
+
+
+@app.route("/api/agent/change-requests/<int:cr_id>/implement", methods=["PUT"])
+@jwt_required()
+def agent_implement_cr(cr_id):
+    user_id = int(get_jwt_identity())
+    user    = db.session.get(User, user_id)
+    if not user or user.role != "human_agent":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    cr = db.session.get(ChangeRequest, cr_id)
+    if not cr:
+        return jsonify({"error": "Change request not found"}), 404
+    if cr.raised_by != user_id:
+        return jsonify({"error": "Not your change request"}), 403
+    if cr.status not in ("approved", "implementing"):
+        return jsonify({"error": "CR is not in approved state"}), 409
+
+    data   = request.json or {}
+    result = (data.get("result") or "").strip()
+    notes  = (data.get("notes")  or "").strip()
+    if result not in ("success", "failed"):
+        return jsonify({"error": "result must be 'success' or 'failed'"}), 400
+
+    now = datetime.now(timezone.utc)
+    cr.status               = "implemented" if result == "success" else "failed"
+    cr.implementation_notes = notes
+    cr.implemented_by       = user_id
+    cr.implemented_at       = now
+    cr.updated_at           = now
+    db.session.commit()
+    return jsonify({"cr": cr.to_dict()})
+
+
+@app.route("/api/agent/change-requests/<int:cr_id>/rollback", methods=["PUT"])
+@jwt_required()
+def agent_rollback_cr(cr_id):
+    user_id = int(get_jwt_identity())
+    user    = db.session.get(User, user_id)
+    if not user or user.role != "human_agent":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    cr = db.session.get(ChangeRequest, cr_id)
+    if not cr or cr.raised_by != user_id:
+        return jsonify({"error": "Not found or unauthorized"}), 404
+    if cr.status != "failed":
+        return jsonify({"error": "CR is not in failed state"}), 409
+
+    data = request.json or {}
+    cr.status         = "rolled_back"
+    cr.rollback_notes = (data.get("notes") or "").strip()
+    cr.rollback_at    = datetime.now(timezone.utc)
+    cr.updated_at     = datetime.now(timezone.utc)
+    db.session.commit()
+    return jsonify({"cr": cr.to_dict()})
 
 
 @app.route("/api/agent/tickets/<int:ticket_id>/diagnose", methods=["POST"])
@@ -4940,15 +5331,17 @@ def agent_create_parameter_change(ticket_id):
 def agent_diagnose_ticket(ticket_id):
     """Use AI to generate a diagnosis/recommendation for resolving this ticket."""
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if not user or user.role != "human_agent":
         return jsonify({"error": "Unauthorized"}), 403
 
-    ticket = db.session.get(Ticket, ticket_id)
+    ticket = Ticket.query.get(ticket_id)
     if not ticket:
         return jsonify({"error": "Ticket not found"}), 404
+    if ticket.assigned_to != user_id:
+        return jsonify({"error": "Ticket not assigned to you"}), 403
 
-    session = db.session.get(ChatSession, ticket.chat_session_id) if ticket.chat_session_id else None
+    session = ChatSession.query.get(ticket.chat_session_id) if ticket.chat_session_id else None
     chat_history = ""
     if session:
         msgs = session.messages[:20]  # Last 20 messages for context
@@ -4995,15 +5388,17 @@ Keep your response concise and actionable."""
 @jwt_required()
 def agent_nearest_sites(ticket_id):
     """Find 3 nearest telecom sites to customer's location."""
-    user = db.session.get(User, int(get_jwt_identity()))
+    user = User.query.get(int(get_jwt_identity()))
     if not user or user.role != "human_agent":
         return jsonify({"error": "Unauthorized"}), 403
 
-    ticket = db.session.get(Ticket, ticket_id)
+    ticket = Ticket.query.get(ticket_id)
     if not ticket:
         return jsonify({"error": "Ticket not found"}), 404
+    if ticket.assigned_to != user.id:
+        return jsonify({"error": "Ticket not assigned to you"}), 403
 
-    session = db.session.get(ChatSession, ticket.chat_session_id) if ticket.chat_session_id else None
+    session = ChatSession.query.get(ticket.chat_session_id) if ticket.chat_session_id else None
     if not session or not session.latitude or not session.longitude:
         return jsonify({"error": "Customer location not available"}), 400
 
@@ -5018,64 +5413,12 @@ def agent_nearest_sites(ticket_id):
     })
 
 
-def _detect_significant_drops(trend_data: list, drop_threshold_pct: float = 15.0):
-    """
-    Detect significant drops (or spikes) in a KPI trend list.
-    Returns a list of {label, value, drop_pct, type} for highlighted points.
-    A 'significant drop' is where the avg falls >=threshold% below the rolling baseline
-    (mean of all previous points). Also detects spikes (sharp increases) for metrics
-    like latency/packet_loss where a spike is bad.
-    """
-    if len(trend_data) < 3:
-        return []
-
-    drops = []
-    all_avgs = [p["avg"] for p in trend_data if p["avg"] is not None]
-    if not all_avgs:
-        return []
-
-    overall_mean = sum(all_avgs) / len(all_avgs)
-    if overall_mean == 0:
-        return []
-
-    for i, point in enumerate(trend_data):
-        val = point.get("avg")
-        if val is None:
-            continue
-        # Build baseline from preceding points (at least 2)
-        if i < 2:
-            continue
-        prev_vals = [trend_data[j]["avg"] for j in range(i) if trend_data[j]["avg"] is not None]
-        if not prev_vals:
-            continue
-        baseline = sum(prev_vals) / len(prev_vals)
-        if baseline == 0:
-            continue
-        pct_change = (val - baseline) / baseline * 100
-        if pct_change <= -drop_threshold_pct:
-            drops.append({
-                "label": point["label"],
-                "value": val,
-                "drop_pct": round(pct_change, 1),
-                "type": "drop",
-            })
-        elif pct_change >= drop_threshold_pct * 2:
-            # Spikes are reported for latency-like KPIs (positive = bad)
-            drops.append({
-                "label": point["label"],
-                "value": val,
-                "drop_pct": round(pct_change, 1),
-                "type": "spike",
-            })
-    return drops
-
-
 @app.route("/api/agent/sites/<site_id>/kpi-trends", methods=["GET"])
 @jwt_required()
 def agent_kpi_trends(site_id):
     """Get KPI trend data for a site, aggregated by period (month/week/day/hour).
     Supports data_level filter: 'site' or 'cell'."""
-    user = db.session.get(User, int(get_jwt_identity()))
+    user = User.query.get(int(get_jwt_identity()))
     if not user or user.role != "human_agent":
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -5108,7 +5451,6 @@ def agent_kpi_trends(site_id):
         if not rows:
             continue
         agg = defaultdict(list)
-        has_hour_variation = any((r.hour or 0) != 0 for r in rows)
         for r in rows:
             if r.value is None:
                 continue
@@ -5117,8 +5459,7 @@ def agent_kpi_trends(site_id):
             elif period == "week":
                 key = f"{r.date.isocalendar()[0]}-W{r.date.isocalendar()[1]:02d}"
             elif period == "hour":
-                # If no true hourly data exists, fall back to daily key so chart still renders.
-                key = f"{r.hour:02d}:00" if has_hour_variation else r.date.strftime("%Y-%m-%d")
+                key = f"{r.hour:02d}:00"
             else:  # day
                 key = r.date.strftime("%Y-%m-%d")
             agg[key].append(r.value)
@@ -5135,13 +5476,6 @@ def agent_kpi_trends(site_id):
         if trend:
             result[kpi_name] = trend
 
-    # Build significant_drops map separately — trends keeps flat array format for frontend compat
-    drops_map = {}
-    for kpi_name, trend_data in result.items():
-        drops = _detect_significant_drops(trend_data)
-        if drops:
-            drops_map[kpi_name] = drops
-
     return jsonify({
         "site_id": site_id,
         "period": period,
@@ -5149,7 +5483,6 @@ def agent_kpi_trends(site_id):
         "problem_type": _problem_type_label(problem_type),
         "selected_kpis": selected_kpis,
         "trends": result,
-        "significant_drops": drops_map,
     })
 
 
@@ -5157,15 +5490,17 @@ def agent_kpi_trends(site_id):
 @jwt_required()
 def agent_root_cause(ticket_id):
     """AI root cause analysis using both site-level and cell-level KPI trends of the nearest site."""
-    user = db.session.get(User, int(get_jwt_identity()))
+    user = User.query.get(int(get_jwt_identity()))
     if not user or user.role != "human_agent":
         return jsonify({"error": "Unauthorized"}), 403
 
-    ticket = db.session.get(Ticket, ticket_id)
+    ticket = Ticket.query.get(ticket_id)
     if not ticket:
         return jsonify({"error": "Ticket not found"}), 404
+    if ticket.assigned_to != user.id:
+        return jsonify({"error": "Ticket not assigned to you"}), 403
 
-    session = db.session.get(ChatSession, ticket.chat_session_id) if ticket.chat_session_id else None
+    session = ChatSession.query.get(ticket.chat_session_id) if ticket.chat_session_id else None
     if not session or not session.latitude or not session.longitude:
         return jsonify({"error": "Customer location not available"}), 400
 
@@ -5177,18 +5512,9 @@ def agent_root_cause(ticket_id):
     nearest_site_id = nearest["site_id"]
     nearest_zone = nearest.get("zone")
     dist_km = nearest["distance_km"]
-    site_status = (nearest.get("site_status") or nearest.get("status") or "on_air").lower()
-    alarms_text = nearest.get("alarms") or nearest.get("alarm") or "None"
-    solution_text = nearest.get("solution") or "No action required"
-    std_solution_text = nearest.get("standard_solution_step") or ""
-    site_params_text = "\n".join([
-        f"- Bandwidth (MHz): {nearest.get('bandwidth_mhz')}",
-        f"- Antenna Gain (dBi): {nearest.get('antenna_gain_dbi')}",
-        f"- RF Power (EIRP) [dBm]: {nearest.get('rf_power_eirp_dbm')}",
-        f"- Antenna height (AGL) (M): {nearest.get('antenna_height_agl_m')}",
-        f"- E-tilt (Degree): {nearest.get('e_tilt_degree')}",
-        f"- CRS Gain: {nearest.get('crs_gain')}",
-    ])
+    site_status = nearest.get("status", "on_air")  # Get status from nearest site
+    alarms_text = nearest.get("alarm", "None")  # Get alarms from nearest site
+    solution_text = nearest.get("solution", "No action required")  # Get solution from nearest site
 
     problem_type = _detect_network_problem_type(ticket)
     problem_type_label = _problem_type_label(problem_type)
@@ -5202,18 +5528,15 @@ def agent_root_cause(ticket_id):
     cell_kpi_text = _build_kpi_summary_text(cell_rows, selected_kpis, "cell-level")
 
     if site_status == "off_air":
-        prompt = f"""You are a senior telecom network engineer performing root cause analysis.
+        prompt = f"""You are an expert telecom network engineer performing root cause analysis.
 
-TICKET: {ticket.reference_number} — {ticket.category} / {ticket.subcategory}
-CUSTOMER REPORTED ISSUE: {ticket.description}
+TICKET: {ticket.reference_number} - {ticket.category} / {ticket.subcategory}
+CUSTOMER ISSUE: {ticket.description}
 PROBLEM TYPE: {problem_type_label}
 NEAREST SITE: {nearest_site_id} (Zone: {nearest_zone}, Distance: {dist_km} km from customer)
 
-=== SITE STATUS: OFF AIR ===
-This site is currently down. Root cause analysis must integrate:
-(1) The active alarms that caused/indicate the outage.
-(2) The standard solution steps.
-(3) Trend evidence from the KPIs most directly related to {problem_type_label} — use actual values.
+SITE STATUS: OFF AIR. This site is currently down.
+Use only these KPI families relevant to {problem_type_label}: {", ".join(selected_kpis) if selected_kpis else "No matched KPI names"}.
 
 ACTIVE ALARMS:
 {alarms_text if alarms_text else 'No alarm data available.'}
@@ -5221,62 +5544,43 @@ ACTIVE ALARMS:
 KNOWN SOLUTION:
 {solution_text if solution_text else 'No solution data available.'}
 
-STANDARD SOLUTION STEP:
-{std_solution_text if std_solution_text else 'No standard solution steps available.'}
-
-SITE RF PARAMETERS (NEAREST SITE):
-{site_params_text}
-
-SITE-LEVEL KPI TREND DATA (only {problem_type_label}-related KPIs: {", ".join(selected_kpis) if selected_kpis else "none matched"}):
+SITE-LEVEL KPI TREND DATA:
+SITE-LEVEL KPI SUMMARY FOR SITE {nearest_site_id}:
 {site_kpi_text if site_kpi_text else 'No site-level KPI data available.'}
 
-CELL-LEVEL KPI TREND DATA:
+CELL-LEVEL KPI SUMMARY FOR SITE {nearest_site_id}:
 {cell_kpi_text if cell_kpi_text else 'No cell-level KPI data available.'}
 
-INSTRUCTIONS:
-- Write exactly 4–5 numbered points.
-- Format: **Concise Title**: One or two sentences with specific technical evidence.
-- Each point must be about a DIFFERENT aspect of the root cause.
-- Point 1: State the primary root cause linking the alarm to the {problem_type_label} degradation with a specific KPI value.
-- Point 2: Describe what the KPI trend shows just before/during the outage and the magnitude of the drop.
-- Point 3: Explain the RF/parameter context (use actual values from site parameters) and how they contribute.
-- Point 4: Link the alarm's standard solution step to the expected KPI recovery.
-- Point 5 (if needed): Describe secondary impact on adjacent cells/sectors visible in cell-level KPI trends.
-- Use actual numbers from the KPI data. Do NOT use vague language.
-- Do not add headings, summaries, or extra sections."""
+Respond with exactly 4 to 5 numbered points.
+Format each point as: **Brief Title**: One or two sentences of precise explanation with KPI evidence.
+Each point must be self-contained, technically accurate, and directly relevant.
+Do not add headings, summaries, or extra sections."""
     else:
-        prompt = f"""You are a senior telecom network engineer performing root cause analysis.
+        prompt = f"""You are an expert telecom network engineer performing root cause analysis.
 
-TICKET: {ticket.reference_number} — {ticket.category} / {ticket.subcategory}
-CUSTOMER REPORTED ISSUE: {ticket.description}
+TICKET: {ticket.reference_number} - {ticket.category} / {ticket.subcategory}
+CUSTOMER ISSUE: {ticket.description}
 PROBLEM TYPE: {problem_type_label}
 NEAREST SITE: {nearest_site_id} (Zone: {nearest_zone}, Distance: {dist_km} km from customer)
 
-=== SITE STATUS: ON AIR ===
-Perform root cause analysis based entirely on KPI trend evidence.
-You MUST use the actual KPI values (avg, min, max, period) provided below to explain what is happening.
-Focus only on the KPI families directly relevant to {problem_type_label}: {", ".join(selected_kpis) if selected_kpis else "none matched"}.
+SITE STATUS: ON AIR. Analysis must be based on KPI trends only.
+Use only these KPI families relevant to {problem_type_label}: {", ".join(selected_kpis) if selected_kpis else "No matched KPI names"}.
 
-SITE RF PARAMETERS (NEAREST SITE):
-{site_params_text}
-
-SITE-LEVEL KPI TREND DATA:
+SITE-LEVEL KPI SUMMARY:
 {site_kpi_text if site_kpi_text else 'No site-level KPI data available.'}
 
-CELL-LEVEL KPI TREND DATA:
+CELL-LEVEL KPI SUMMARY:
 {cell_kpi_text if cell_kpi_text else 'No cell-level KPI data available.'}
 
-INSTRUCTIONS:
-- Write exactly 4–5 numbered points.
-- Format: **Concise Title**: One or two sentences with specific technical evidence.
-- Each point must be about a DIFFERENT degradation factor contributing to the {problem_type_label} problem.
-- Point 1: Identify the PRIMARY degraded KPI, state its recent value vs. baseline (use actual numbers), and explain what network condition this reflects.
-- Point 2: Identify the SECONDARY degraded KPI, state values, and explain the chain of impact to the customer's {problem_type_label} problem.
-- Point 3: Analyze the RF parameter context (bandwidth, E-tilt, EIRP, antenna height, CRS gain) and how the current values may be amplifying the KPI degradation.
-- Point 4: Describe the temporal pattern (when did the degradation start, is it continuous or intermittent, peak hours vs. off-peak) using the trend data.
-- Point 5 (if needed): Note any cell-level vs. site-level discrepancy that narrows the fault to a specific cell or sector.
-- Be precise: use actual KPI values from the data. Do NOT write generic statements.
-- Do not add headings, summaries, or extra sections."""
+Analyze ALL the KPI data above (both site-level and cell-level) and provide:
+1. **Site-Level KPI Assessment** - Which site KPIs are performing well and which show degradation?
+2. **Cell-Level KPI Assessment** - Which cells show poor performance? Are specific cells causing issues?
+3. **Anomaly Detection** - Any unusual patterns or outliers at site or cell level?
+4. **Root Cause Identification** - What is the most likely root cause of the network/signal issue?
+5. **Impact Assessment** - How severe is the issue and what is the scope of impact?
+6. **Correlation Analysis** - Are there related KPI degradations across site and cell levels that point to a common cause?
+
+Be specific and reference actual KPI values in your analysis."""
 
     try:
         response = client.chat.completions.create(
@@ -5286,50 +5590,33 @@ INSTRUCTIONS:
             max_tokens=1500,
         )
         analysis_raw = response.choices[0].message.content.strip()
-        cleaned_lines = _filter_rca_lines(_normalize_ai_lines(analysis_raw))
-        fallback_rca = []
+        fallback_rca = [
+            f"**Site Status**: Nearest site {nearest_site_id} ({site_status.replace('_', ' ').upper()}) is the primary impact domain for this complaint.",
+            f"**Problem Classification**: Problem type is {problem_type_label}; only related KPI groups were considered for causality and trend correlation.",
+            "**Trend Evidence**: Daily/hourly trend shift confirms a recent degradation window; weekly/monthly baseline indicates this is not normal behavior.",
+            "**Cell-Site Correlation**: Cell-level variance aligns with site-level degradation, indicating a network-origin issue rather than isolated handset behavior.",
+            "**Action Required**: Immediate technical validation on the identified degraded KPI path is required to close the fault and stabilize service.",
+        ]
         if site_status == "off_air":
-            fallback_rca.append(
-                f"**Site Outage**: Nearest site {nearest_site_id} is OFF AIR; alarms indicate outage as the primary cause."
-            )
-        fallback_rca += _kpi_degradation_points(site_rows + cell_rows, selected_kpis, max_points=3)
-        # Ensure at least 4 fallback points so UI always shows full analysis
-        if len(fallback_rca) < 4:
-            fallback_rca += [
-                f"**KPI Evidence**: Trend shifts across {problem_type_label}-related KPIs indicate measurable degradation during the reported window.",
-                "**Correlation**: Site-level and cell-level KPI movement aligns with the customer's symptom timeline.",
-                "**Impact Scope**: Degradation appears localized to the nearest site/cells based on trend evidence.",
-                "**Next Check**: Validate alarms and RF parameters for contributing factors if KPI evidence is weak.",
-            ]
-            fallback_rca = fallback_rca[:4]
-        if not fallback_rca:
-            fallback_rca = [
-                f"**KPI Evidence**: KPI shifts around the degradation window indicate network-side impact on {problem_type_label}.",
-                "**Correlation**: Site and cell KPI movement align with the customer’s symptom window.",
-                "**Impact Scope**: The degradation is localized to the nearest site/cells based on trend evidence.",
-                "**Actionable Cause**: Prioritize the KPI paths with the largest deviation from baseline.",
-            ]
-        analysis_text = "\n".join(cleaned_lines) if cleaned_lines else ""
+            fallback_rca[0] = f"**Site Outage**: Nearest site {nearest_site_id} is OFF AIR and alarm state is the primary root trigger for outage impact."
+            fallback_rca[4] = "**Resolution Path**: Execute alarm-linked restoration steps first, then validate KPI recovery trend to confirm full service normalization."
         analysis = _force_numbered_points(
-            analysis_text,
+            analysis_raw,
             min_points=4,
             max_points=5,
             fallback_points=fallback_rca,
         )
     except Exception as e:
-        fallback_rca = _kpi_degradation_points(site_rows + cell_rows, selected_kpis, max_points=4)
-        if not fallback_rca:
-            fallback_rca = [
-                f"**Model Error**: Root cause analysis could not be generated automatically: {str(e)}.",
-                f"**KPI Evidence**: Review KPI shifts for {problem_type_label} and isolate the largest deviations.",
-                "**Correlation**: Correlate degraded cell indicators with site KPIs to confirm the fault domain.",
-                "**Next Check**: Validate alarms and site status if KPI evidence is weak.",
-            ]
         analysis = _force_numbered_points(
-            "\n".join(fallback_rca),
+            "",
             min_points=4,
             max_points=5,
-            fallback_points=fallback_rca,
+            fallback_points=[
+                f"**Model Error**: Root cause analysis could not be generated automatically: {str(e)}.",
+                f"**Focus Area**: Nearest site {nearest_site_id} and problem type {problem_type_label} remain the active technical focus.",
+                "**Trend Review**: Review daily/hourly KPI movement against weekly/monthly baseline to isolate degradation start time.",
+                "**Fault Domain**: Correlate degraded cell-level indicators with site-level KPI shifts to validate fault domain.",
+            ],
         )
 
     # Generate PDF-friendly version (plain text, no markdown)
@@ -5351,66 +5638,37 @@ INSTRUCTIONS:
 @jwt_required()
 def agent_recommendation(ticket_id):
     """AI recommendation based on root cause analysis and full trend analysis."""
-    user = db.session.get(User, int(get_jwt_identity()))
+    user = User.query.get(int(get_jwt_identity()))
     if not user or user.role != "human_agent":
         return jsonify({"error": "Unauthorized"}), 403
 
-    ticket = db.session.get(Ticket, ticket_id)
+    ticket = Ticket.query.get(ticket_id)
     if not ticket:
         return jsonify({"error": "Ticket not found"}), 404
-
-    session = db.session.get(ChatSession, ticket.chat_session_id) if ticket.chat_session_id else None
-    nearest = None
-    if session and session.latitude and session.longitude:
-        nearest_list = find_nearest_sites(session.latitude, session.longitude, n=1)
-        if nearest_list:
-            nearest = nearest_list[0]
+    if ticket.assigned_to != user.id:
+        return jsonify({"error": "Ticket not assigned to you"}), 403
 
     root_cause = request.json.get("root_cause", "") if request.json else ""
     trend_summary = request.json.get("trend_summary", "") if request.json else ""
     problem_type = _problem_type_label(_detect_network_problem_type(ticket))
 
-    site_context = "Nearest site data not available."
-    if nearest:
-        site_context = "\n".join([
-            f"NEAREST SITE: {nearest.get('site_id')} (Zone: {nearest.get('zone')}, Distance: {nearest.get('distance_km')} km)",
-            f"SITE STATUS: {(nearest.get('site_status') or 'on_air')}",
-            "SITE PARAMETERS:",
-            f"- Bandwidth (MHz): {nearest.get('bandwidth_mhz')}",
-            f"- Antenna Gain (dBi): {nearest.get('antenna_gain_dbi')}",
-            f"- RF Power (EIRP) [dBm]: {nearest.get('rf_power_eirp_dbm')}",
-            f"- Antenna height (AGL) (M): {nearest.get('antenna_height_agl_m')}",
-            f"- E-tilt (Degree): {nearest.get('e_tilt_degree')}",
-            f"- CRS Gain: {nearest.get('crs_gain')}",
-        ])
+    prompt = f"""You are an expert telecom network engineer providing actionable recommendations.
 
-    prompt = f"""You are a senior telecom network optimization engineer providing precise, actionable field recommendations.
-
-TICKET: {ticket.reference_number} — {ticket.category} / {ticket.subcategory}
-CUSTOMER REPORTED ISSUE: {ticket.description}
+TICKET: {ticket.reference_number} - {ticket.category} / {ticket.subcategory}
+CUSTOMER ISSUE: {ticket.description}
 PRIORITY: {ticket.priority.upper()}
 PROBLEM TYPE: {problem_type}
 
-{site_context}
-
-=== TREND ANALYSIS EVIDENCE ===
+TREND ANALYSIS SUMMARY:
 {trend_summary if trend_summary else 'No trend analysis summary available.'}
 
-=== ROOT CAUSE ANALYSIS FINDINGS ===
+ROOT CAUSE ANALYSIS:
 {root_cause if root_cause else 'No root cause analysis available.'}
 
-=== INSTRUCTIONS ===
-Generate exactly 4–5 numbered recommendations. Format: **Action Title**: 2–3 sentences.
-
-Rules:
-1. Each recommendation must directly address a specific finding from the Root Cause Analysis.
-2. At least 3 recommendations MUST use the exact current site parameter values above and propose a CONCRETE target value (e.g., "Increase E-tilt from 3° to 5°", "Raise EIRP from 42 dBm to 44 dBm").
-3. One recommendation may leverage broader telecom best-practices or OpenAI knowledge (e.g., neighbor cell optimization, scheduler tuning, load balancing) beyond the listed parameters.
-4. State the EXPECTED OUTCOME for each recommendation (which KPI will improve, by how much approximately).
-5. Prioritize recommendations by impact — most impactful first.
-6. Be precise: do not say "consider adjusting" — say "adjust X from Y to Z to achieve W".
-7. Do not repeat the root cause. Focus only on the fix and its expected outcome.
-8. Do not add headings, summaries, preambles, or extra sections."""
+Respond with exactly 3 to 4 numbered points.
+Format each point as: **Brief Action Title**: One or two sentences describing the specific action, expected outcome, and timeline.
+Each recommendation must be directly actionable by a network engineer.
+Do not add headings, summaries, or extra sections."""
 
     try:
         response = client.chat.completions.create(
@@ -5420,32 +5678,27 @@ Rules:
             max_tokens=1500,
         )
         recommendation_raw = response.choices[0].message.content.strip()
-
-        # Always use the AI response directly if it contains meaningful content.
-        # Only fall back to parameter-based builder if AI returns empty/garbage.
-        if recommendation_raw and len(recommendation_raw) > 80:
-            recommendation = _force_numbered_points(
-                recommendation_raw,
-                min_points=4,
-                max_points=5,
-                fallback_points=_build_parameter_recommendations(problem_type, root_cause, trend_summary, nearest or {}),
-            )
-        else:
-            fallback_points = _build_parameter_recommendations(problem_type, root_cause, trend_summary, nearest or {})
-            recommendation = _force_numbered_points(
-                "\n".join(fallback_points),
-                min_points=4,
-                max_points=5,
-                fallback_points=fallback_points,
-            )
-    except Exception as e:
-        fallback_points = _build_parameter_recommendations(problem_type, root_cause, trend_summary, nearest or {})
-        fallback_points.insert(0, f"**Model Error**: Recommendation generation failed: {str(e)}; proceeding with RCA-linked parameter actions.")
         recommendation = _force_numbered_points(
-            "\n".join(fallback_points),
-            min_points=4,
-            max_points=5,
-            fallback_points=fallback_points,
+            recommendation_raw,
+            min_points=3,
+            max_points=4,
+            fallback_points=[
+                "**Immediate Action**: Apply corrective action on the top degraded KPI path and confirm hourly improvement at site and cell levels.",
+                "**Parameter Validation**: Run targeted parameter/hardware validation on affected cells and verify trend slope returns to weekly baseline.",
+                "**Escalation Criteria**: If recovery is partial, escalate to NOC/optimization with alarm evidence, KPI snapshots, and precise impact window.",
+                "**Customer Closure**: Communicate to customer with clear ETA after confirming stable daily trend and no recurring degradation.",
+            ],
+        )
+    except Exception as e:
+        recommendation = _force_numbered_points(
+            "",
+            min_points=3,
+            max_points=4,
+            fallback_points=[
+                f"**Model Error**: Recommendation generation failed: {str(e)}; proceed with technical triage on related KPI path.",
+                "**KPI Recovery**: Validate daily/hourly KPI recovery after corrective action before closure.",
+                "**Escalation**: Escalate with KPI and alarm evidence if stability is not achieved within the defined SLA window.",
+            ],
         )
 
     # Generate PDF-friendly version (plain text, no markdown)
@@ -5461,13 +5714,20 @@ Rules:
 def agent_customer360(customer_user_id):
     """Return 360-degree customer view: plan, billing history, past complaints, location, loyalty."""
     user_id = int(get_jwt_identity())
-    agent = db.session.get(User, user_id)
+    agent = User.query.get(user_id)
     if not agent or agent.role != "human_agent":
         return jsonify({"error": "Unauthorized"}), 403
 
-    customer = db.session.get(User, customer_user_id)
+    customer = User.query.get(customer_user_id)
     if not customer:
         return jsonify({"error": "Customer not found"}), 404
+
+    # Verify this agent has at least one ticket assigned for this customer
+    has_access = Ticket.query.filter_by(
+        assigned_to=user_id, user_id=customer_user_id
+    ).first()
+    if not has_access:
+        return jsonify({"error": "No assigned ticket for this customer"}), 403
 
     # Past complaints / chat sessions
     sessions = ChatSession.query.filter_by(user_id=customer_user_id).order_by(ChatSession.created_at.desc()).limit(20).all()
@@ -5542,12 +5802,18 @@ def agent_customer360(customer_user_id):
 def agent_view_chat(session_id):
     """Allow human agent to view full chat history of a session."""
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if not user or user.role != "human_agent":
         return jsonify({"error": "Unauthorized"}), 403
-    session = db.session.get(ChatSession, session_id)
+    session = ChatSession.query.get(session_id)
     if not session:
         return jsonify({"error": "Session not found"}), 404
+    # Verify the agent has an assigned ticket for this session
+    assigned_ticket = Ticket.query.filter_by(
+        chat_session_id=session_id, assigned_to=user_id
+    ).first()
+    if not assigned_ticket:
+        return jsonify({"error": "Access denied: no assigned ticket for this session"}), 403
     return jsonify({
         "session": session.to_dict(),
         "messages": [m.to_dict() for m in session.messages],
@@ -5564,12 +5830,17 @@ def agent_view_chat(session_id):
 def agent_send_message(session_id):
     """Human agent sends a message into a customer chat session."""
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if not user or user.role != "human_agent":
         return jsonify({"error": "Unauthorized"}), 403
-    session = db.session.get(ChatSession, session_id)
+    session = ChatSession.query.get(session_id)
     if not session:
         return jsonify({"error": "Session not found"}), 404
+    assigned_ticket = Ticket.query.filter_by(
+        chat_session_id=session_id, assigned_to=user_id
+    ).first()
+    if not assigned_ticket:
+        return jsonify({"error": "Access denied: no assigned ticket for this session"}), 403
 
     data = request.json or {}
     content = data.get("content", "").strip()
@@ -5583,33 +5854,6 @@ def agent_send_message(session_id):
     )
     db.session.add(msg)
     db.session.commit()
-    _emit_session_message(msg)
-    return jsonify({"message": msg.to_dict()}), 201
-
-
-@app.route("/api/agent/chat/<int:session_id>/request-diagnosis", methods=["POST"])
-@jwt_required()
-def agent_request_diagnosis(session_id):
-    """Agent requests the customer to run a signal diagnosis."""
-    user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
-    if not user or user.role != "human_agent":
-        return jsonify({"error": "Unauthorized"}), 403
-    session = db.session.get(ChatSession, session_id)
-    if not session:
-        return jsonify({"error": "Session not found"}), 404
-    if session.diagnosis_ran:
-        return jsonify({"error": "Diagnosis already completed for this session"}), 400
-
-    # Insert a special system-trigger message the customer's chat will detect
-    msg = ChatMessage(
-        session_id=session_id,
-        sender="agent",
-        content="__AGENT_REQUEST_DIAGNOSIS__",
-    )
-    db.session.add(msg)
-    db.session.commit()
-    _emit_session_message(msg)
     return jsonify({"message": msg.to_dict()}), 201
 
 
@@ -5798,109 +6042,6 @@ with app.app_context():
     # Migrate: add new columns to kpi_data if they don't exist
     from sqlalchemy import inspect as sa_inspect, text as sa_text
     insp = sa_inspect(db.engine)
-    if insp.has_table("chat_sessions"):
-        existing_cols = [c["name"] for c in insp.get_columns("chat_sessions")]
-        with db.engine.connect() as conn:
-            if "customer_present" not in existing_cols:
-                conn.execute(sa_text("ALTER TABLE chat_sessions ADD COLUMN customer_present BOOLEAN NOT NULL DEFAULT FALSE"))
-                conn.commit()
-                print(">>> Added customer_present column to chat_sessions")
-    if insp.has_table("telecom_sites"):
-        existing_cols = [c["name"] for c in insp.get_columns("telecom_sites")]
-        with db.engine.connect() as conn:
-            # Drop legacy unique constraint on site_id if present
-            try:
-                conn.execute(sa_text("ALTER TABLE telecom_sites DROP CONSTRAINT IF EXISTS telecom_sites_site_id_key"))
-                conn.commit()
-            except Exception:
-                pass
-            # Add composite unique constraint (site_id, cell_id)
-            try:
-                conn.execute(sa_text(
-                    "DO $$ BEGIN "
-                    "IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'uq_telecom_sites_site_cell') THEN "
-                    "ALTER TABLE telecom_sites ADD CONSTRAINT uq_telecom_sites_site_cell UNIQUE (site_id, cell_id); "
-                    "END IF; "
-                    "END $$;"
-                ))
-                conn.commit()
-            except Exception:
-                pass
-            if "site_name" not in existing_cols:
-                conn.execute(sa_text("ALTER TABLE telecom_sites ADD COLUMN site_name VARCHAR(100)"))
-                conn.commit()
-                print(">>> Added site_name column to telecom_sites")
-            if "cell_id" not in existing_cols:
-                conn.execute(sa_text("ALTER TABLE telecom_sites ADD COLUMN cell_id VARCHAR(100)"))
-                conn.commit()
-                print(">>> Added cell_id column to telecom_sites")
-            if "standard_solution_step" not in existing_cols:
-                conn.execute(sa_text("ALTER TABLE telecom_sites ADD COLUMN standard_solution_step TEXT"))
-                conn.commit()
-                print(">>> Added standard_solution_step column to telecom_sites")
-            if "bandwidth_mhz" not in existing_cols:
-                conn.execute(sa_text("ALTER TABLE telecom_sites ADD COLUMN bandwidth_mhz DOUBLE PRECISION"))
-                conn.commit()
-                print(">>> Added bandwidth_mhz column to telecom_sites")
-            if "antenna_gain_dbi" not in existing_cols:
-                conn.execute(sa_text("ALTER TABLE telecom_sites ADD COLUMN antenna_gain_dbi DOUBLE PRECISION"))
-                conn.commit()
-                print(">>> Added antenna_gain_dbi column to telecom_sites")
-            if "rf_power_eirp_dbm" not in existing_cols:
-                conn.execute(sa_text("ALTER TABLE telecom_sites ADD COLUMN rf_power_eirp_dbm DOUBLE PRECISION"))
-                conn.commit()
-                print(">>> Added rf_power_eirp_dbm column to telecom_sites")
-            if "antenna_height_agl_m" not in existing_cols:
-                conn.execute(sa_text("ALTER TABLE telecom_sites ADD COLUMN antenna_height_agl_m DOUBLE PRECISION"))
-                conn.commit()
-                print(">>> Added antenna_height_agl_m column to telecom_sites")
-            if "e_tilt_degree" not in existing_cols:
-                conn.execute(sa_text("ALTER TABLE telecom_sites ADD COLUMN e_tilt_degree DOUBLE PRECISION"))
-                conn.commit()
-                print(">>> Added e_tilt_degree column to telecom_sites")
-            if "crs_gain" not in existing_cols:
-                conn.execute(sa_text("ALTER TABLE telecom_sites ADD COLUMN crs_gain DOUBLE PRECISION"))
-                conn.commit()
-                print(">>> Added crs_gain column to telecom_sites")
-    if insp.has_table("tickets"):
-        existing_cols = [c["name"] for c in insp.get_columns("tickets")]
-        with db.engine.connect() as conn:
-            if "first_response_at" not in existing_cols:
-                conn.execute(sa_text("ALTER TABLE tickets ADD COLUMN first_response_at TIMESTAMP"))
-                conn.commit()
-                print(">>> Added first_response_at column to tickets")
-            if "reopened_count" not in existing_cols:
-                conn.execute(sa_text("ALTER TABLE tickets ADD COLUMN reopened_count INTEGER NOT NULL DEFAULT 0"))
-                conn.commit()
-                print(">>> Added reopened_count column to tickets")
-            if "last_reopened_at" not in existing_cols:
-                conn.execute(sa_text("ALTER TABLE tickets ADD COLUMN last_reopened_at TIMESTAMP"))
-                conn.commit()
-                print(">>> Added last_reopened_at column to tickets")
-
-    # Backfill first_response_at for existing tickets (agent first message or resolved_at)
-    try:
-        to_backfill = Ticket.query.filter(Ticket.first_response_at.is_(None)).all()
-        updated = 0
-        for t in to_backfill:
-            ts = None
-            if t.chat_session_id:
-                first_agent_msg = (ChatMessage.query
-                                   .filter_by(session_id=t.chat_session_id, sender="agent")
-                                   .order_by(ChatMessage.created_at.asc())
-                                   .first())
-                if first_agent_msg and first_agent_msg.created_at:
-                    ts = first_agent_msg.created_at
-            if not ts and t.resolved_at:
-                ts = t.resolved_at
-            if ts:
-                t.first_response_at = ts
-                updated += 1
-        if updated:
-            db.session.commit()
-            print(f">>> Backfilled first_response_at for {updated} tickets")
-    except Exception as e:
-        print(f">>> Backfill first_response_at failed: {e}")
     if insp.has_table("kpi_data"):
         existing_cols = [c["name"] for c in insp.get_columns("kpi_data")]
         with db.engine.connect() as conn:
@@ -5916,40 +6057,22 @@ with app.app_context():
                 conn.execute(sa_text("ALTER TABLE kpi_data ADD COLUMN cell_site_id VARCHAR(100)"))
                 conn.commit()
                 print(">>> Added cell_site_id column to kpi_data")
-    if insp.has_table("chat_messages"):
-        existing_cols = [c["name"] for c in insp.get_columns("chat_messages")]
+
+    if insp.has_table("telecom_sites"):
+        existing_cols = [c["name"] for c in insp.get_columns("telecom_sites")]
         with db.engine.connect() as conn:
-            if "delivered_at" not in existing_cols:
-                conn.execute(sa_text("ALTER TABLE chat_messages ADD COLUMN delivered_at TIMESTAMP"))
+            if "site_status" not in existing_cols:
+                conn.execute(text("ALTER TABLE telecom_sites ADD COLUMN site_status VARCHAR(20) DEFAULT 'on_air'"))
                 conn.commit()
-                print(">>> Added delivered_at column to chat_messages")
-            if "seen_at" not in existing_cols:
-                conn.execute(sa_text("ALTER TABLE chat_messages ADD COLUMN seen_at TIMESTAMP"))
+                print(">>> Added site_status column to telecom_sites")
+            if "alarms" not in existing_cols:
+                conn.execute(text("ALTER TABLE telecom_sites ADD COLUMN alarms TEXT DEFAULT ''"))
                 conn.commit()
-                print(">>> Added seen_at column to chat_messages")
-            if "content_json" not in existing_cols:
-                conn.execute(sa_text("ALTER TABLE chat_messages ADD COLUMN content_json JSON"))
+                print(">>> Added alarms column to telecom_sites")
+            if "solution" not in existing_cols:
+                conn.execute(text("ALTER TABLE telecom_sites ADD COLUMN solution TEXT DEFAULT ''"))
                 conn.commit()
-                print(">>> Added content_json column to chat_messages")
-    if insp.has_table("chat_sessions"):
-        existing_cols = [c["name"] for c in insp.get_columns("chat_sessions")]
-        with db.engine.connect() as conn:
-            if "diagnosis_ran" not in existing_cols:
-                conn.execute(sa_text("ALTER TABLE chat_sessions ADD COLUMN diagnosis_ran BOOLEAN NOT NULL DEFAULT FALSE"))
-                conn.commit()
-                print(">>> Added diagnosis_ran column to chat_sessions")
-            if "current_step" not in existing_cols:
-                conn.execute(sa_text("ALTER TABLE chat_sessions ADD COLUMN current_step VARCHAR(50) NOT NULL DEFAULT 'greeting'"))
-                conn.commit()
-                print(">>> Added current_step column to chat_sessions")
-            if "last_message_at" not in existing_cols:
-                conn.execute(sa_text("ALTER TABLE chat_sessions ADD COLUMN last_message_at TIMESTAMP DEFAULT NOW()"))
-                conn.commit()
-                print(">>> Added last_message_at column to chat_sessions")
-            if "customer_present" not in existing_cols:
-                conn.execute(sa_text("ALTER TABLE chat_sessions ADD COLUMN customer_present BOOLEAN NOT NULL DEFAULT FALSE"))
-                conn.commit()
-                print(">>> Added customer_present column to chat_sessions")
+                print(">>> Added solution column to telecom_sites")
 
     # Seed default admin if none exists
     if not User.query.filter_by(role="admin").first():
@@ -5981,25 +6104,9 @@ with app.app_context():
     db.session.commit()
 
 
-
-# ── Serve React build (production) ───────────────────────────────────────────
-# When Flask serves the built frontend, all non-API routes must return index.html
-# so that React Router can handle client-side navigation without 404s on refresh.
-BUILD_DIR = os.path.join(os.path.dirname(__file__), '..', 'frontend', 'build')
-
-@app.route('/', defaults={'path': ''})
-@app.route('/<path:path>')
-def serve_react(path):
-    # Never intercept API routes
-    if path.startswith('api/'):
-        from flask import abort
-        abort(404)
-    full_path = os.path.join(BUILD_DIR, path)
-    if path and os.path.exists(full_path):
-        return send_from_directory(BUILD_DIR, path)
-    return send_from_directory(BUILD_DIR, 'index.html')
-
 if __name__ == "__main__":
     run_sla_checks()
-    socketio.run(app, debug=True, host="0.0.0.0", port=5500, use_reloader=False)
+    app.run(debug=True, host="0.0.0.0", port=5500, use_reloader=False)
 
+
+    app.run(debug=True, port=5500, use_reloader=False)

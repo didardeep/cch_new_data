@@ -14,9 +14,14 @@ import ActiveTickets from './pages/manager/ActiveTickets';
 import IssueTracking from './pages/manager/IssueTracking';
 import ChatDetail from './pages/manager/ChatDetail';
 import ManagerAlertBox from './pages/manager/ManagerAlertBox';
+import ManagerApprovals from './pages/manager/ManagerApprovals';
+import ManagerChangeWorkflow from './pages/manager/ManagerChangeWorkflow';
 import CTOLayout from './pages/cto/CTOLayout';
 import CTODashboard from './pages/cto/CTODashboard';
 import CTOAlertBox from './pages/cto/CTOAlertBox';
+import TechnicalKPI from './pages/cto/TechnicalKPI';
+import BusinessKPI from './pages/cto/BusinessKPI';
+import OperationalKPI from './pages/cto/OperationalKPI';
 import CTODutyRoster from './pages/cto/CTODutyRoster';
 import AdminLayout from './pages/admin/AdminLayout';
 import AdminDashboard from './pages/admin/AdminDashboard';
@@ -74,11 +79,16 @@ export default function App() {
         <Route path="chat-detail/:id" element={<ChatDetail />} />
         <Route path="reports" element={<ReportsPage />} />
         <Route path="alerts" element={<ManagerAlertBox />} />
+        <Route path="approvals" element={<ManagerApprovals />} />
+        <Route path="change-workflow" element={<ManagerChangeWorkflow />} />
       </Route>
 
       {/* CTO Routes */}
       <Route path="/cto" element={<ProtectedRoute roles={['cto']}><CTOLayout /></ProtectedRoute>}>
         <Route path="dashboard" element={<CTODashboard />} />
+        <Route path="technical" element={<TechnicalKPI />} />
+        <Route path="business" element={<BusinessKPI />} />
+        <Route path="operational" element={<OperationalKPI />} />
         <Route path="tickets" element={<ActiveTickets />} />
         <Route path="tracking" element={<IssueTracking />} />
         <Route path="chat-detail/:id" element={<ChatDetail />} />
