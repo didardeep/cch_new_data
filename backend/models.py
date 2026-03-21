@@ -139,6 +139,10 @@ class Ticket(db.Model):
     resolution_notes = db.Column(db.Text, default="")
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
     resolved_at = db.Column(db.DateTime, nullable=True)
+    # Response/reopen tracking
+    first_response_at = db.Column(db.DateTime, nullable=True)
+    reopened_count = db.Column(db.Integer, default=0)
+    last_reopened_at = db.Column(db.DateTime, nullable=True)
     # SLA fields
     sla_hours = db.Column(db.Float, nullable=True)        # SLA time assigned at ticket creation (hours)
     sla_deadline = db.Column(db.DateTime, nullable=True)  # Absolute deadline = created_at + sla_hours
@@ -355,4 +359,70 @@ class KpiData(db.Model):
     __table_args__ = (
         db.Index("idx_kpi_site_name_date", "site_id", "kpi_name", "date"),
         db.Index("idx_kpi_data_level", "data_level", "kpi_name"),
+    )
+
+
+class FlexibleKpiUpload(db.Model):
+    """
+    Schema-flexible EAV storage for Core KPI and Revenue KPI files uploaded by admin.
+    Only site_id is mandatory. Every other column the admin uploads is stored as a
+    key→value pair so the DB schema never needs migration when columns change.
+
+    kpi_type   : 'core' | 'revenue'
+    column_name: normalised column name (e.g. 'auth_success_rate', 'revenue_jan')
+    column_type: auto-detected  'numeric' | 'text' | 'date'
+    num_value  : populated when column_type == 'numeric'
+    str_value  : populated when column_type == 'text' | 'date'
+    upload_batch: UUID string grouping all rows from one upload
+    """
+    __tablename__ = "flexible_kpi_uploads"
+
+    id           = db.Column(db.Integer, primary_key=True)
+    kpi_type     = db.Column(db.String(20), nullable=False, index=True)
+    upload_batch = db.Column(db.String(40), nullable=False, index=True)
+    site_id      = db.Column(db.String(100), nullable=False, index=True)
+    column_name  = db.Column(db.String(120), nullable=False, index=True)
+    column_type  = db.Column(db.String(10), nullable=False, default='numeric')
+    num_value    = db.Column(db.Float, nullable=True)
+    str_value    = db.Column(db.String(500), nullable=True)
+    row_date     = db.Column(db.Date, nullable=True)
+    uploaded_at  = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (
+        db.Index("idx_flex_type_site_col", "kpi_type", "site_id", "column_name"),
+    )
+
+    def to_dict(self):
+        return {
+            "id":           self.id,
+            "kpi_type":     self.kpi_type,
+            "upload_batch": self.upload_batch,
+            "site_id":      self.site_id,
+            "column_name":  self.column_name,
+            "column_type":  self.column_type,
+            "value":        self.num_value if self.column_type == 'numeric' else self.str_value,
+            "row_date":     self.row_date.isoformat() if self.row_date else None,
+        }
+
+
+class FlexibleKpiMeta(db.Model):
+    """
+    Stores schema metadata for each upload batch so the dashboard knows
+    what columns are available, their labels, units and types.
+    """
+    __tablename__ = "flexible_kpi_meta"
+
+    id           = db.Column(db.Integer, primary_key=True)
+    kpi_type     = db.Column(db.String(20), nullable=False, index=True)
+    upload_batch = db.Column(db.String(40), nullable=False)
+    column_name  = db.Column(db.String(120), nullable=False)
+    column_label = db.Column(db.String(200), nullable=True)
+    column_type  = db.Column(db.String(10), nullable=False, default='numeric')
+    unit         = db.Column(db.String(30), nullable=True)
+    is_active    = db.Column(db.Boolean, default=True)
+    uploaded_at  = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (
+        db.UniqueConstraint("kpi_type", "upload_batch", "column_name",
+                            name="uq_flex_meta_type_batch_col"),
     )

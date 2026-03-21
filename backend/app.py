@@ -34,6 +34,7 @@ from sqlalchemy.orm import joinedload
 from models import db, bcrypt, User, ChatSession, ChatMessage, Ticket, Feedback, SystemSetting, SlaAlert, TelecomSite, KpiData, ParameterChange
 # Add this import after other imports
 from whatsapp_integration import send_whatsapp_message, format_chat_summary_for_whatsapp, format_ticket_alert_for_whatsapp
+from network_analytics import network_bp   # ← Predictive Network Analytics module
 load_dotenv()
 
 # ─── App Setup ────────────────────────────────────────────────────────────────
@@ -54,6 +55,13 @@ app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get(
     "postgresql://postgres:postgres@localhost:5432/telecom_complaints"
 )
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
+    "pool_size": 20,        # base connections kept open (was 5)
+    "max_overflow": 40,     # extra connections allowed under load (was 10)
+    "pool_timeout": 30,     # seconds to wait for a free connection
+    "pool_recycle": 1800,   # recycle connections after 30 min to avoid stale sockets
+    "pool_pre_ping": True,  # verify connection is alive before using it
+}
 app.config["JWT_SECRET_KEY"] = _get_jwt_secret()
 app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(hours=24)
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16MB max for image uploads
@@ -83,6 +91,9 @@ CORS(
     resources={r"/api/*": {"origins": _cors_origins}},
     supports_credentials=True,
 )
+
+# ── Register blueprints ───────────────────────────────────────────────────────
+app.register_blueprint(network_bp)   # Predictive Network Analytics
 
 from openai import OpenAI
 # ─── Google Gemini Configuration (OpenAI-compatible endpoint) ────────────────
@@ -730,11 +741,11 @@ def on_join_session(data):
     except Exception:
         emit("error", {"error": "invalid token"})
         return
-    session = ChatSession.query.get(session_id)
+    session = db.session.get(ChatSession, session_id)
     if not session:
         emit("error", {"error": "session not found"})
         return
-    user = User.query.get(user_id)
+    user = db.session.get(User, user_id)
     if not user:
         emit("error", {"error": "user not found"})
         return
@@ -1452,7 +1463,6 @@ def get_me():
     return jsonify({"user": user.to_dict()})
 
 
-
 # CHATBOT ROUTES 
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1663,8 +1673,8 @@ def list_sessions():
 @jwt_required()
 def add_chat_message(session_id):
     user_id = int(get_jwt_identity())
-    user = User.query.get(user_id)
-    session = ChatSession.query.get(session_id)
+    user = db.session.get(User, user_id)
+    session = db.session.get(ChatSession, session_id)
     if not session:
         return jsonify({"error": "Session not found"}), 404
     if session.user_id != user_id and (not user or user.role != "human_agent"):
@@ -1694,6 +1704,12 @@ def add_chat_message(session_id):
     if data.get("language"):
         session.language = data["language"]
     session.last_message_at = datetime.now(timezone.utc)
+
+    # Track first response time when an agent replies
+    if msg.sender == "agent" and user and user.role == "human_agent":
+        ticket = Ticket.query.filter_by(chat_session_id=session_id).order_by(Ticket.created_at.desc()).first()
+        if ticket and ticket.assigned_to == user.id and ticket.first_response_at is None:
+            ticket.first_response_at = datetime.now(timezone.utc)
 
     db.session.commit()
     _emit_session_message(msg)
@@ -1742,8 +1758,8 @@ def save_session_location(session_id):
 def analyze_signal(session_id):
     """Analyze a signal screenshot using Azure OpenAI Vision."""
     user_id = int(get_jwt_identity())
-    user = User.query.get(user_id)
-    session = ChatSession.query.get(session_id)
+    user = db.session.get(User, user_id)
+    session = db.session.get(ChatSession, session_id)
 
     if not session:
         return jsonify({"error": "Session not found"}), 404
@@ -2166,7 +2182,7 @@ def get_chat_session(session_id):
 @jwt_required()
 def mark_chat_seen(session_id):
     user_id = int(get_jwt_identity())
-    session = ChatSession.query.get(session_id)
+    session = db.session.get(ChatSession, session_id)
     if not session:
         return jsonify({"error": "Session not found"}), 404
     if session.user_id != user_id:
@@ -2562,11 +2578,21 @@ def update_ticket(ticket_id):
     if not ticket:
         return jsonify({"error": "Ticket not found"}), 404
 
-    data = request.json
+    data = request.json or {}
     if "status" in data:
-        ticket.status = data["status"]
-        if data["status"] == "resolved":
+        prev_status = ticket.status
+        new_status = data["status"]
+        ticket.status = new_status
+        now_utc = datetime.now(timezone.utc)
+        if new_status == "resolved":
             ticket.resolved_at = datetime.now(timezone.utc)
+            if ticket.first_response_at is None:
+                ticket.first_response_at = ticket.resolved_at
+        if prev_status == "resolved" and new_status in ("pending", "in_progress", "escalated"):
+            ticket.reopened_count = (ticket.reopened_count or 0) + 1
+            ticket.last_reopened_at = now_utc
+        if new_status == "in_progress" and ticket.first_response_at is None:
+            ticket.first_response_at = now_utc
     if "priority" in data:
         ticket.priority = data["priority"]
     if "assigned_to" in data:
@@ -4615,7 +4641,8 @@ def agent_dashboard():
     csat_pct = round((len([f for f in feedbacks if f.rating >= 4]) / max(len(feedbacks), 1)) * 100, 1)
 
     # Reopen Rate (approximation: tickets re-opened after resolution – not tracked separately, show 0 for now)
-    reopen_rate = 0.0
+    reopened_tickets = [t for t in my_tickets if (t.reopened_count or 0) > 0]
+    reopen_rate = round((len(reopened_tickets) / max(resolved_count, 1)) * 100, 1)
 
     # High Severity Incident Resolution Time (avg hours for critical/high resolved tickets)
     hs_times = []
@@ -4628,7 +4655,14 @@ def agent_dashboard():
     hs_resolution_time = round(sum(hs_times) / len(hs_times), 2) if hs_times else 0
 
     # High Severity Response Time (time from creation to status change from pending, approximation = 0 since not tracked)
-    hs_response_time = round(hs_resolution_time * 0.15, 2) if hs_resolution_time else 0
+    hs_response_times = []
+    for t in my_tickets:
+        if t.priority in ("critical", "high"):
+            ra = _utc(t.first_response_at)
+            ca = _utc(t.created_at)
+            if ra and ca:
+                hs_response_times.append((ra - ca).total_seconds() / 3600)
+    hs_response_time = round(sum(hs_response_times) / len(hs_response_times), 2) if hs_response_times else 0
 
     # Complaint Resolution Time (avg hours for ALL priority tickets)
     complaint_resolution_time = mttr
@@ -4732,6 +4766,8 @@ def agent_resolve_ticket(ticket_id):
     data = request.json or {}
     ticket.status = "resolved"
     ticket.resolved_at = datetime.now(timezone.utc)
+    if ticket.first_response_at is None:
+        ticket.first_response_at = ticket.resolved_at
     resolution_notes = data.get("resolution_notes", "")
     if resolution_notes:
         ticket.resolution_notes = resolution_notes
@@ -5556,10 +5592,10 @@ def agent_send_message(session_id):
 def agent_request_diagnosis(session_id):
     """Agent requests the customer to run a signal diagnosis."""
     user_id = int(get_jwt_identity())
-    user = User.query.get(user_id)
+    user = db.session.get(User, user_id)
     if not user or user.role != "human_agent":
         return jsonify({"error": "Unauthorized"}), 403
-    session = ChatSession.query.get(session_id)
+    session = db.session.get(ChatSession, session_id)
     if not session:
         return jsonify({"error": "Session not found"}), 404
     if session.diagnosis_ran:
@@ -5826,6 +5862,45 @@ with app.app_context():
                 conn.execute(sa_text("ALTER TABLE telecom_sites ADD COLUMN crs_gain DOUBLE PRECISION"))
                 conn.commit()
                 print(">>> Added crs_gain column to telecom_sites")
+    if insp.has_table("tickets"):
+        existing_cols = [c["name"] for c in insp.get_columns("tickets")]
+        with db.engine.connect() as conn:
+            if "first_response_at" not in existing_cols:
+                conn.execute(sa_text("ALTER TABLE tickets ADD COLUMN first_response_at TIMESTAMP"))
+                conn.commit()
+                print(">>> Added first_response_at column to tickets")
+            if "reopened_count" not in existing_cols:
+                conn.execute(sa_text("ALTER TABLE tickets ADD COLUMN reopened_count INTEGER NOT NULL DEFAULT 0"))
+                conn.commit()
+                print(">>> Added reopened_count column to tickets")
+            if "last_reopened_at" not in existing_cols:
+                conn.execute(sa_text("ALTER TABLE tickets ADD COLUMN last_reopened_at TIMESTAMP"))
+                conn.commit()
+                print(">>> Added last_reopened_at column to tickets")
+
+    # Backfill first_response_at for existing tickets (agent first message or resolved_at)
+    try:
+        to_backfill = Ticket.query.filter(Ticket.first_response_at.is_(None)).all()
+        updated = 0
+        for t in to_backfill:
+            ts = None
+            if t.chat_session_id:
+                first_agent_msg = (ChatMessage.query
+                                   .filter_by(session_id=t.chat_session_id, sender="agent")
+                                   .order_by(ChatMessage.created_at.asc())
+                                   .first())
+                if first_agent_msg and first_agent_msg.created_at:
+                    ts = first_agent_msg.created_at
+            if not ts and t.resolved_at:
+                ts = t.resolved_at
+            if ts:
+                t.first_response_at = ts
+                updated += 1
+        if updated:
+            db.session.commit()
+            print(f">>> Backfilled first_response_at for {updated} tickets")
+    except Exception as e:
+        print(f">>> Backfill first_response_at failed: {e}")
     if insp.has_table("kpi_data"):
         existing_cols = [c["name"] for c in insp.get_columns("kpi_data")]
         with db.engine.connect() as conn:
@@ -5926,7 +6001,5 @@ def serve_react(path):
 
 if __name__ == "__main__":
     run_sla_checks()
-    app.run(debug=True, host="0.0.0.0", port=5500, use_reloader=False)
+    socketio.run(app, debug=True, host="0.0.0.0", port=5500, use_reloader=False)
 
-
-    app.run(debug=True, port=5500, use_reloader=False)

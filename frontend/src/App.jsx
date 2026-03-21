@@ -29,6 +29,7 @@ import AgentLayout from './pages/agent/AgentLayout';
 import AgentDashboard from './pages/agent/AgentDashboard';
 import AgentTicketBucket from './pages/agent/AgentTicketBucket';
 import AgentChatView from './pages/agent/AgentChatView';
+import NetworkAnalyticsDashboard from './pages/agent/NetworkAnalyticsDashboard';
 
 function ProtectedRoute({ children, roles }) {
   const { user, loading } = useAuth();
@@ -103,6 +104,7 @@ export default function App() {
         <Route path="dashboard" element={<AgentDashboard />} />
         <Route path="tickets" element={<AgentTicketBucket />} />
         <Route path="chat/:sessionId" element={<AgentChatView />} />
+        <Route path="network" element={<NetworkAnalyticsDashboard />} />
       </Route>
 
       <Route path="*" element={<Navigate to="/" />} />

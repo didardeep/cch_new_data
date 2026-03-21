@@ -393,8 +393,12 @@ export default function ReportsPage() {
   };
 
   const handleExportPDF = async () => {
+    if (!currentData) {
+      alert('Report data is still loading. Please try again in a moment.');
+      return;
+    }
     const { default: jsPDF } = await import('jspdf');
-    await import('jspdf-autotable');
+    const { default: autoTable } = await import('jspdf-autotable');
     const doc = new jsPDF();
     doc.setFontSize(18);
     doc.setTextColor(0, 51, 141);
@@ -404,7 +408,7 @@ export default function ReportsPage() {
     doc.text(`Range: ${RANGES.find(r => r.key === range)?.label} | Generated: ${new Date().toLocaleDateString()}`, 14, 30);
 
     if (tab === 'overview' && currentData) {
-      doc.autoTable({
+      autoTable(doc, {
         startY: 38,
         head: [['Metric', 'Value']],
         body: [
@@ -416,22 +420,22 @@ export default function ReportsPage() {
         headStyles: { fillColor: [0, 51, 141] },
       });
       if (currentData.category_breakdown?.length) {
-        doc.autoTable({
-          startY: doc.lastAutoTable.finalY + 10,
+        autoTable(doc, {
+          startY: doc.lastAutoTable ? doc.lastAutoTable.finalY + 10 : 48,
           head: [['Category', 'Count']],
           body: currentData.category_breakdown.map(c => [c.name, c.count]),
           headStyles: { fillColor: [0, 51, 141] },
         });
       }
     } else if (tab === 'agents' && currentData) {
-      doc.autoTable({
+      autoTable(doc, {
         startY: 38,
         head: [['Agent', 'Resolved', 'Pending', 'Escalated', 'Avg Hours', 'Rating']],
         body: (currentData.agents || []).map(a => [a.name, a.resolved, a.pending, a.escalated, a.avg_resolution_hours, a.avg_rating]),
         headStyles: { fillColor: [0, 51, 141] },
       });
     } else if (tab === 'csat' && currentData) {
-      doc.autoTable({
+      autoTable(doc, {
         startY: 38,
         head: [['Metric', 'Value']],
         body: [
@@ -443,15 +447,15 @@ export default function ReportsPage() {
         headStyles: { fillColor: [0, 51, 141] },
       });
       if (currentData.feedback_distribution?.length) {
-        doc.autoTable({
-          startY: doc.lastAutoTable.finalY + 10,
+        autoTable(doc, {
+          startY: doc.lastAutoTable ? doc.lastAutoTable.finalY + 10 : 48,
           head: [['Stars', 'Count']],
           body: currentData.feedback_distribution.map(d => [`${d.stars} Star`, d.count]),
           headStyles: { fillColor: [0, 51, 141] },
         });
       }
     } else if (tab === 'sla' && currentData) {
-      doc.autoTable({
+      autoTable(doc, {
         startY: 38,
         head: [['Priority', 'Target (h)', 'Actual (h)', 'Status']],
         body: (currentData.sla_targets || []).map(t => [t.priority, t.target_hours, t.actual_hours, t.status]),
