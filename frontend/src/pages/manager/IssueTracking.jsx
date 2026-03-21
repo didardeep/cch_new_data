@@ -47,16 +47,28 @@ export default function IssueTracking() {
           </div>
         ) : (
           <div className="table-scroll">
-            <table className="data-table">
+            <table className="data-table" style={{ tableLayout: 'fixed', width: '100%' }}>
+              <colgroup>
+                <col style={{ width: 80  }} />  {/* Chat ID */}
+                <col style={{ width: 160 }} />  {/* User Name / Email */}
+                <col style={{ width: 150 }} />  {/* Category */}
+                <col style={{ width: 150 }} />  {/* Subcategory */}
+                <col style={{ width: 150 }} />  {/* Handled By */}
+                <col style={{ width: 100 }} />  {/* Status */}
+                <col style={{ width: 130 }} />  {/* Created At */}
+                <col style={{ width: 130 }} />  {/* Resolved At */}
+                <col style={{ width: 200 }} />  {/* Resolution Summary */}
+              </colgroup>
               <thead>
                 <tr>
                   <th>Chat ID</th>
                   <th>User Name / Email</th>
                   <th>Category</th>
                   <th>Subcategory</th>
+                  <th>Handled By</th>
                   <th>Status</th>
-                  <th>Created At</th>
-                  <th>Resolved At</th>
+                  <th style={{ whiteSpace: 'nowrap' }}>Created At</th>
+                  <th style={{ whiteSpace: 'nowrap' }}>Resolved At</th>
                   <th>Resolution Summary</th>
                 </tr>
               </thead>
@@ -72,8 +84,38 @@ export default function IssueTracking() {
                       <div style={{ fontWeight: 500, fontSize: 13 }}>{s.user_name}</div>
                       <div style={{ fontSize: 11, color: '#94a3b8' }}>{s.user_email}</div>
                     </td>
-                    <td style={{ fontSize: 13 }}>{s.sector_name || '—'}</td>
-                    <td style={{ fontSize: 13 }}>{s.subprocess_name || '—'}</td>
+                    <td style={{ overflow: 'hidden' }}>
+                      <div style={{
+                        fontSize: 13, fontWeight: 500, color: '#0f172a',
+                        overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                      }}>
+                        {s.sector_name || '—'}
+                      </div>
+                    </td>
+                    <td style={{ overflow: 'hidden' }}>
+                      <div style={{
+                        fontSize: 13, color: '#475569',
+                        overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                      }}>
+                        {s.subprocess_name || '—'}
+                      </div>
+                    </td>
+                    <td style={{ overflow: 'hidden' }}>
+                      <div style={{
+                        fontSize: 13, fontWeight: 500, color: '#0f172a',
+                        overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                      }}>
+                        {s.assignee_name || '—'}
+                      </div>
+                      {s.assignee_domain && (
+                        <div style={{
+                          fontSize: 11, color: '#94a3b8', textTransform: 'capitalize',
+                          overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                        }}>
+                          {s.assignee_domain}
+                        </div>
+                      )}
+                    </td>
                     <td><span className={`badge badge-${s.status}`}>{s.status}</span></td>
                     <td style={{ fontSize: 12, color: '#94a3b8', whiteSpace: 'nowrap' }}>
                       {s.created_at ? new Date(s.created_at).toLocaleString() : '—'}
@@ -81,8 +123,13 @@ export default function IssueTracking() {
                     <td style={{ fontSize: 12, color: '#94a3b8', whiteSpace: 'nowrap' }}>
                       {s.resolved_at ? new Date(s.resolved_at).toLocaleString() : '—'}
                     </td>
-                    <td style={{ maxWidth: 220, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 13 }}>
-                      {s.summary || '—'}
+                    <td style={{ overflow: 'hidden' }}>
+                      <div style={{
+                        fontSize: 13, color: '#475569',
+                        overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                      }}>
+                        {s.summary || '—'}
+                      </div>
                     </td>
                   </tr>
                 ))}

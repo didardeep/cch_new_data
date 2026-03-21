@@ -3,6 +3,18 @@ import { useNavigate } from 'react-router-dom';
 import { apiGet, apiPut } from '../../api';
 import { useAuth } from '../../AuthContext';
 
+const ESCALATION_BANNER_STYLE = {
+  background: '#fdf4ff',
+  border: '1px solid #e9d5ff',
+  borderRadius: 12,
+  padding: '16px 20px',
+  marginBottom: 24,
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'space-between',
+  gap: 16,
+};
+
 const LEVEL_STYLE = {
   '625': { label: '62.5%', bg: '#fffbeb', border: '#fde68a', text: '#92400e', badge: '#f59e0b' },
   '750': { label: '75%',   bg: '#fff7ed', border: '#fed7aa', text: '#9a3412', badge: '#f97316' },
@@ -20,6 +32,7 @@ const PRIORITY_BADGE = {
 export default function ManagerDashboard() {
   const [data, setData] = useState(null);
   const [alerts, setAlerts] = useState([]);
+  const [pendingEscalations, setPendingEscalations] = useState(0);
   const [loading, setLoading] = useState(true);
   const [alertsExpanded, setAlertsExpanded] = useState(true);
   const { user } = useAuth();
@@ -32,19 +45,28 @@ export default function ManagerDashboard() {
     } catch { /* ignore */ }
   }, []);
 
+  const fetchEscalations = useCallback(async () => {
+    try {
+      const d = await apiGet('/api/manager/parameter-changes?status=pending');
+      setPendingEscalations(d?.changes?.length || 0);
+    } catch { /* ignore */ }
+  }, []);
+
   useEffect(() => {
-    Promise.all([
+    Promise.allSettled([
       apiGet('/api/manager/dashboard'),
       apiGet('/api/manager/sla-alerts'),
-    ]).then(([dash, alertData]) => {
-      setData(dash);
-      if (alertData?.alerts) setAlerts(alertData.alerts);
+      apiGet('/api/manager/parameter-changes?status=pending'),
+    ]).then(([dashRes, alertRes, changesRes]) => {
+      if (dashRes.status === 'fulfilled')  setData(dashRes.value);
+      if (alertRes.status === 'fulfilled' && alertRes.value?.alerts) setAlerts(alertRes.value.alerts);
+      if (changesRes.status === 'fulfilled') setPendingEscalations(changesRes.value?.changes?.length || 0);
       setLoading(false);
     });
-    // Poll alerts every 30s
-    const iv = setInterval(fetchAlerts, 30000);
+    // Poll alerts and escalations every 30s
+    const iv = setInterval(() => { fetchAlerts(); fetchEscalations(); }, 30000);
     return () => clearInterval(iv);
-  }, [fetchAlerts]);
+  }, [fetchAlerts, fetchEscalations]);
 
   const markRead = async (id) => {
     await apiPut(`/api/manager/sla-alerts/${id}/read`);
@@ -69,6 +91,37 @@ export default function ManagerDashboard() {
         <h1>Manager Dashboard</h1>
         <p>Welcome back, {user?.name}. Here's your operational overview.</p>
       </div>
+
+      {/* ── Pending Escalations Banner ──────────────────────────────── */}
+      {pendingEscalations > 0 && (
+        <div style={ESCALATION_BANNER_STYLE}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+            <span style={{
+              width: 36, height: 36, borderRadius: 8, background: '#f3e8ff',
+              display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
+            }}>
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#7e22ce" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/>
+              </svg>
+            </span>
+            <div>
+              <div style={{ fontSize: 14, fontWeight: 700, color: '#3b0764' }}>
+                {pendingEscalations} escalation{pendingEscalations > 1 ? 's' : ''} awaiting your review
+              </div>
+              <div style={{ fontSize: 12, color: '#7e22ce', marginTop: 2 }}>
+                Expert-escalated tickets need your approval to proceed
+              </div>
+            </div>
+          </div>
+          <button
+            className="btn btn-sm"
+            style={{ background: '#7e22ce', color: '#fff', border: 'none', whiteSpace: 'nowrap' }}
+            onClick={() => navigate('/manager/tickets')}
+          >
+            Review Now
+          </button>
+        </div>
+      )}
 
       {/* ── SLA Alerts Section ──────────────────────────────────────── */}
       {unreadAlerts.length > 0 && (
@@ -220,6 +273,12 @@ export default function ManagerDashboard() {
           <div className="stat-card-label">Critical</div>
           <div className="stat-card-value">{s.critical_tickets || 0}</div>
           <div className="stat-card-sub">{s.high_tickets || 0} high priority</div>
+        </div>
+        <div className="stat-card" style={s.manager_escalated_tickets > 0 ? { borderColor: '#e9d5ff', background: '#fdf4ff' } : {}}>
+          <div className="stat-card-header"><div className="stat-card-icon" style={{ background: '#f3e8ff' }}></div></div>
+          <div className="stat-card-label" style={{ color: '#6d28d9' }}>Needs Review</div>
+          <div className="stat-card-value" style={{ color: '#6d28d9' }}>{s.manager_escalated_tickets || 0}</div>
+          <div className="stat-card-sub">escalated by experts</div>
         </div>
       </div>
 
