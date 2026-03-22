@@ -284,95 +284,456 @@ def _haversine(lat1, lon1, lat2, lon2):
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
-# ─── Network diagnosis helpers (delegated to network_diagnosis.py) ───────────
-# All KPI constants, tower lookup, RCA helpers, and text formatting functions
-# now live in network_diagnosis.py. These aliases keep any remaining
-# in-file references working without changes.
-find_nearest_sites          = network_diagnosis.find_nearest_sites
-_detect_network_problem_type = network_diagnosis._detect_network_problem_type
-_problem_type_label          = network_diagnosis._problem_type_label
-_filter_kpi_names_for_problem = network_diagnosis._filter_kpi_names_for_problem
-_build_kpi_summary_text      = network_diagnosis._build_kpi_summary_text
-_build_parameter_recommendations = network_diagnosis._build_parameter_recommendations
-_normalize_ai_lines          = network_diagnosis._normalize_ai_lines
-_force_numbered_points       = network_diagnosis._force_numbered_points
-_format_points_for_pdf       = network_diagnosis._format_points_for_pdf
-_filter_rca_lines            = network_diagnosis._filter_rca_lines
-_kpi_degradation_points      = network_diagnosis._kpi_degradation_points
-_detect_significant_drops    = network_diagnosis._detect_significant_drops
+# ── Strict KPI mapping: exact KPI names from DB for each problem type ──────
+# Only KPIs DIRECTLY related to diagnosing each problem are included.
+PROBLEM_KPI_EXACT = {
+    "internet_signal": [
+        "LTE DL - Usr Ave Throughput",       # Primary: user download speed
+        "DL PRB Utilization (1BH)",           # Congestion indicator
+        "Average Latency Downlink",           # Latency
+        "Ave RRC Connected Ue",               # User load causing congestion
+        "Average NI of Carrier-",             # Interference degrading speed
+        "Availability",                       # Site up/down
+    ],
+    "call_drop": [
+        "E-RAB Call Drop Rate_1",             # Primary: drop rate
+        "LTE Intra-Freq HO Success Rate",     # Handover failures cause drops
+        "DL PRB Utilization (1BH)",           # Congestion causes drops
+        "Ave RRC Connected Ue",               # Overload causes drops
+        "LTE DL - Usr Ave Throughput",        # Degraded service indicator
+        "Availability",                       # Site availability
+    ],
+    "call_failure": [
+        "LTE Call Setup Success Rate",        # Primary: CSSR
+        "LTE RRC Setup Success Rate",         # RRC failures block calls
+        "LTE E-RAB Setup Success Rate",       # E-RAB setup failures
+        "DL PRB Utilization (1BH)",           # Congestion blocks calls
+        "VoLTE Traffic Erlang",               # Voice traffic load
+        "Availability",                       # Site availability
+    ],
+}
 
-# ─── Socket.IO Helpers ───────────────────────────────────────────────────────
-
-def _emit_session_message(msg: ChatMessage):
-    try:
-        socketio.emit("new_message", msg.to_dict(), room=f"session_{msg.session_id}")
-    except Exception:
-        pass
-
-
-def _emit_session_update(session: ChatSession):
-    try:
-        socketio.emit("session_updated", {"session_id": session.id, "status": session.status}, room=f"session_{session.id}")
-    except Exception:
-        pass
+# Legacy keyword-based fallback for matching arbitrary KPI names
+NETWORK_PROBLEM_KPI_KEYWORDS = {
+    "internet_signal": ["throughput", "latency", "prb", "volume", "interference", "availability", "ue", "user"],
+    "call_failure": ["call setup", "rrc setup", "e-rab setup", "csfb", "volte", "availability", "prb"],
+    "call_drop": ["drop", "handover", "ho success", "prb", "ue", "throughput", "availability"],
+}
 
 
-@socketio.on("join_session")
-def on_join_session(data):
-    data = data or {}
-    token = data.get("token")
-    session_id = data.get("session_id")
-    if not token or not session_id:
-        emit("error", {"error": "token and session_id required"})
-        return
-    try:
-        decoded = decode_token(token)
-        user_id = int(decoded.get("sub"))
-    except Exception:
-        emit("error", {"error": "invalid token"})
-        return
-    session = ChatSession.query.get(session_id)
-    if not session:
-        emit("error", {"error": "session not found"})
-        return
-    user = User.query.get(user_id)
-    if not user:
-        emit("error", {"error": "user not found"})
-        return
-    if user.role != "human_agent" and session.user_id != user_id:
-        emit("error", {"error": "unauthorized"})
-        return
-    join_room(f"session_{session_id}")
-    emit("joined", {"session_id": session_id})
+def _normalize_problem_text(ticket: Ticket) -> str:
+    return " ".join([
+        (ticket.category or "").strip().lower(),
+        (ticket.subcategory or "").strip().lower(),
+        (ticket.description or "").strip().lower(),
+    ])
+
+
+def _detect_network_problem_type(ticket: Ticket) -> str:
+    text = _normalize_problem_text(ticket)
+    if any(x in text for x in ["call drop", "calls drop", "dropped call", "call disconnect", "drop rate"]):
+        return "call_drop"
+    if any(x in text for x in ["call failure", "calls fail", "unable to make call", "call not connecting", "call setup"]):
+        return "call_failure"
+    if "call / sms failures" in text:
+        return "call_failure"
+    return "internet_signal"
+
+
+def _problem_type_label(problem_type: str) -> str:
+    labels = {
+        "internet_signal": "Internet Speed",
+        "call_failure": "Call Failure",
+        "call_drop": "Call Drop",
+    }
+    return labels.get(problem_type, "Internet Speed")
+
+
+def _filter_kpi_names_for_problem(kpi_names, problem_type: str):
+    """Select only KPIs strictly related to the problem type.
+    Uses exact name matching first, then keyword fallback."""
+    exact = PROBLEM_KPI_EXACT.get(problem_type, PROBLEM_KPI_EXACT["internet_signal"])
+    # First: exact match against the predefined list
+    available = set(kpi_names)
+    selected = [k for k in exact if k in available]
+    # Fallback: keyword match if exact match found nothing
+    if not selected:
+        keys = NETWORK_PROBLEM_KPI_KEYWORDS.get(problem_type, NETWORK_PROBLEM_KPI_KEYWORDS["internet_signal"])
+        selected = [name for name in sorted(kpi_names) if any(k in (name or "").lower() for k in keys)]
+    if not selected:
+        selected = sorted(kpi_names)[:8]
+    return selected
+
+
+def _period_key_for_row(row: KpiData, period: str, has_hour_data: bool = False) -> str:
+    if period == "month":
+        return row.date.strftime("%Y-%m")
+    if period == "week":
+        iso = row.date.isocalendar()
+        return f"{iso[0]}-W{iso[1]:02d}"
+    if period == "hour":
+        # Only show hourly if actual hour variation exists, otherwise fall back to daily
+        if has_hour_data and (row.hour or 0) != 0:
+            return f"{row.date.strftime('%m/%d')} {row.hour:02d}h"
+        return row.date.strftime("%Y-%m-%d")
+    return row.date.strftime("%Y-%m-%d")
+
+
+def _build_period_stats(rows, period: str):
+    has_hour = any((r.hour or 0) != 0 for r in rows) if rows else False
+    agg = {}
+    for r in rows:
+        if r.value is None:
+            continue
+        key = _period_key_for_row(r, period, has_hour)
+        agg.setdefault(key, []).append(float(r.value))
+    if not agg:
+        return "no data"
+    ordered = sorted(agg.items(), key=lambda kv: kv[0])
+    latest_key, latest_vals = ordered[-1]
+    flat_vals = [v for _, vals in ordered for v in vals]
+    avg_all = round(sum(flat_vals) / len(flat_vals), 4)
+    return f"{latest_key}: avg={round(sum(latest_vals)/len(latest_vals), 4)}, overall_avg={avg_all}, min={round(min(flat_vals), 4)}, max={round(max(flat_vals), 4)}"
+
+
+def _build_kpi_summary_text(rows, selected_kpis, data_level_label: str) -> str:
+    from collections import defaultdict
+    grouped = defaultdict(list)
+    for r in rows:
+        if r.kpi_name in selected_kpis and r.value is not None:
+            grouped[r.kpi_name].append(r)
+    if not grouped:
+        return f"No {data_level_label} KPI data available."
+
+    parts = []
+    for kpi_name in sorted(grouped.keys()):
+        kpi_rows = grouped[kpi_name]
+        monthly = _build_period_stats(kpi_rows, "month")
+        weekly = _build_period_stats(kpi_rows, "week")
+        daily = _build_period_stats(kpi_rows, "day")
+        hourly = _build_period_stats(kpi_rows, "hour")
+        parts.append(
+            f"- {kpi_name}\n"
+            f"  Monthly: {monthly}\n"
+            f"  Weekly: {weekly}\n"
+            f"  Daily: {daily}\n"
+            f"  Hourly: {hourly}"
+        )
+    return "\n".join(parts)
+
+
+# ─── UPDATED: RCA text formatting helpers ────────────────────────────────────
+
+def _normalize_ai_lines(text: str):
+    """
+    Split raw AI text into clean, complete lines.
+    - Strips leading bullet / number markers only
+    - Removes stray 'Crux:' prefix labels (all variants)
+    - Deduplicates while preserving order
+    - Does NOT strip **bold** from mid-line content (titles like **Title**: body are kept)
+    - Does NOT truncate content — full sentences are preserved
+    """
+    lines = []
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        # Remove leading list markers: "1.", "2)", "-", "*", "•"
+        line = re.sub(r"^\s*(?:[-*•]|\d+[.)]\s*)\s*", "", line).strip()
+        # Remove "**Crux:**", "Crux:", "**Crux**:", etc. from the front only
+        line = re.sub(r"^\*{0,2}[Cc]rux\*{0,2}\s*:?\s*", "", line).strip()
+        # Only strip ** if they wrap the ENTIRE line AND there's no colon separator
+        # i.e. "**Some Title**" alone → "Some Title"
+        # but "**Title**: body text" is kept as-is (bold title with body)
+        if re.match(r"^\*\*[^*]+\*\*$", line):
+            line = re.sub(r"^\*\*(.*?)\*\*$", r"\1", line).strip()
+        if not line:
+            continue
+        lines.append(line)
+
+    # Deduplicate while preserving order
+    unique, seen = [], set()
+    for line in lines:
+        key = line.lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(line)
+
+    # Drop the last line if it looks truncated (no closing punctuation).
+    # This happens when the AI response is cut by max_tokens mid-sentence.
+    if unique and not re.search(r'[.!?)>]$', unique[-1].rstrip()):
+        unique = unique[:-1]
+
+    return unique
+
+
+def _force_numbered_points(raw_text: str, min_points: int, max_points: int, prefix: str = "", fallback_points=None):
+    """
+    Parse AI output into clean numbered points.
+    - Full sentences preserved — no character truncation
+    - No 'Crux:' prefix injected (prefix param kept for API compat but defaults to "")
+    - Bold markdown (**Title**: body) preserved as-is for frontend rendering
+    - Picks most technically relevant lines first
+    """
+    lines = _normalize_ai_lines(raw_text)
+
+    # Score lines: prefer those with technical/diagnostic keywords and longer content
+    ranked = sorted(
+        lines,
+        key=lambda l: (
+            1 if re.search(r"\b(root cause|cause|kpi|trend|alarm|site|cell|impact|action|recommend)\b", l, re.IGNORECASE) else 0,
+            len(l),
+        ),
+        reverse=True,
+    )
+    picked = []
+    for line in ranked:
+        if len(line) < 12:
+            continue
+        picked.append(line)  # No truncation — keep full sentence
+        if len(picked) >= max_points:
+            break
+
+    for line in (fallback_points or []):
+        if len(picked) >= min_points:
+            break
+        if line and line not in picked:
+            picked.append(line)
+
+    picked = picked[:max_points]
+    if not picked:
+        picked = ["Analysis could not be generated from available data."]
+
+    # prefix param ignored (was used for "**Crux:** " — removed)
+    return "\n".join(f"{idx + 1}. {line}" for idx, line in enumerate(picked))
+
+
+def _strip_markdown_for_pdf(text: str) -> str:
+    """Remove **bold** and *italic* markdown markers for plain-text PDF output."""
+    text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
+    text = re.sub(r"\*(.*?)\*", r"\1", text)
+    return text
+
+
+def _format_points_for_pdf(raw_text: str) -> str:
+    """
+    Convert numbered markdown points to clean plain-text for PDF sections.
+    Input:  "1. **Site Offline**: The site is off air due to power failure.\n2. ..."
+    Output: "1. Site Offline: The site is off air due to power failure.\n\n2. ..."
+    """
+    lines = _normalize_ai_lines(raw_text)
+    plain_lines = []
+    for i, line in enumerate(lines[:5], 1):
+        plain = _strip_markdown_for_pdf(line)
+        plain_lines.append(f"{i}. {plain}")
+    return "\n\n".join(plain_lines)
+
+def _infer_issue_flags(text: str):
+    t = (text or "").lower()
+    flags = set()
+    if any(k in t for k in ["prb", "utilization", "congestion", "overload", "traffic spike"]):
+        flags.add("congestion")
+    if any(k in t for k in ["sinr", "rsrp", "rsrq", "weak signal", "coverage", "low signal"]):
+        flags.add("coverage")
+    if any(k in t for k in ["interference", "pilot pollution", "overshoot", "over-shoot"]):
+        flags.add("interference")
+    if any(k in t for k in ["latency", "packet loss", "delay", "jitter"]):
+        flags.add("latency")
+    if any(k in t for k in ["handover", "rlf", "drop", "call drop"]):
+        flags.add("handover")
+    if any(k in t for k in ["call setup", "cssr", "paging", "accessibility", "sdcch", "call failure"]):
+        flags.add("access")
+    if "off air" in t or "off_air" in t:
+        flags.add("off_air")
+    return flags
+
+
+def _build_parameter_recommendations(problem_type, root_cause, trend_summary, nearest):
+    """Build concrete RF parameter change recommendations using actual site values."""
+    bw = nearest.get("bandwidth_mhz") if nearest else None
+    gain = nearest.get("antenna_gain_dbi") if nearest else None
+    eirp = nearest.get("rf_power_eirp_dbm") if nearest else None
+    height = nearest.get("antenna_height_agl_m") if nearest else None
+    tilt = nearest.get("e_tilt_degree") if nearest else None
+    crs = nearest.get("crs_gain") if nearest else None
+
+    def _v(val, delta):
+        """Safely adjust a numeric value."""
+        try: return round(float(val) + delta, 1)
+        except: return "N/A"
+
+    recs = []
+
+    # Generate exactly 4 unique parameter recommendations — one per parameter
+    # Each addresses a different aspect of the root cause
+    params = [
+        ("Bandwidth", bw, "MHz",
+         {"Internet Speed": (5 if bw and float(bw)<=10 else 10, "increase PRB capacity, reducing congestion and improving DL throughput by 15-25%"),
+          "Call Drop": (5, "free resources for active bearers, reducing E-RAB drops under load by ~10%"),
+          "Call Failure": (5, "free PRB resources for call setup signaling, improving CSSR by ~5%")}),
+        ("E-tilt", tilt, "°",
+         {"Internet Speed": (-1, "extend coverage footprint, improving RSRP for cell-edge users and increasing throughput by ~10%"),
+          "Call Drop": (1, "reduce overshoot into neighboring cells, minimizing inter-cell interference and reducing drop rate by ~20%"),
+          "Call Failure": (-0.5, "optimize coverage-to-interference ratio, improving RRC Setup Success Rate by ~5%")}),
+        ("EIRP", eirp, "dBm",
+         {"Internet Speed": (2, "boost signal strength at cell edge, reducing latency and improving user throughput by ~12%"),
+          "Call Drop": (-1, "reduce pilot pollution in overlapping zones, improving handover success rate by ~15%"),
+          "Call Failure": (2, "improve signal quality for call setup, increasing E-RAB Setup Success Rate by ~8%")}),
+        ("CRS Gain", crs, "",
+         {"Internet Speed": (3, "improve reference signal quality and channel estimation, boosting throughput by ~8%"),
+          "Call Drop": (3, "strengthen reference signals during mobility, reducing Radio Link Failures by ~12%"),
+          "Call Failure": (3, "improve cell detection and measurement accuracy, enhancing RRC success rate by ~6%")}),
+    ]
+
+    pt = problem_type if problem_type in ("Internet Speed","Call Drop","Call Failure") else "Internet Speed"
+    for name, val, unit, actions in params:
+        if val is not None:
+            delta, effect = actions.get(pt, actions["Internet Speed"])
+            new_val = _v(val, delta)
+            direction = "Increase" if delta > 0 else "Decrease"
+            recs.append(f"**{name} {direction}**: Current {name} is {val}{unit}. {direction} to {new_val}{unit} to {effect}.")
+
+    # Add Antenna Height as 5th option if space and value available
+    if len(recs) < 4 and height is not None:
+        recs.append(f"**Antenna Height Adjustment**: Current height is {height} m. Adjust to {_v(height, -2 if pt=='Call Drop' else 2)} m to {'reduce overshooting and improve HO success' if pt=='Call Drop' else 'improve line-of-sight coverage and signal quality'}.")
+
+    # Add Antenna Gain if still space
+    if len(recs) < 4 and gain is not None:
+        recs.append(f"**Antenna Gain Upgrade**: Current gain is {gain} dBi. Increase to {_v(gain, 1)} dBi to improve signal levels for edge users.")
+
+    if not recs:
+        recs = [
+            "**Bandwidth**: Increase carrier bandwidth by 5-10 MHz to reduce congestion.",
+            "**E-tilt**: Optimize electrical tilt to balance coverage vs interference.",
+            "**EIRP**: Adjust transmit power to improve cell-edge signal quality.",
+        ]
+
+    return recs[:4]
+
+
+def _kpi_degradation_points(rows, selected_kpis, max_points=3):
+    """Build fallback RCA points from KPI trend data by detecting significant shifts."""
+    from collections import defaultdict
+    grouped = defaultdict(list)
+    for r in rows:
+        if r.kpi_name in selected_kpis and r.value is not None:
+            grouped[r.kpi_name].append(r)
+    points = []
+    for kpi_name, kpi_rows in grouped.items():
+        kpi_rows.sort(key=lambda r: (r.date, r.hour))
+        vals = [float(r.value) for r in kpi_rows if r.value is not None]
+        if len(vals) < 2:
+            continue
+        overall = sum(vals) / len(vals)
+        latest_vals = [float(r.value) for r in kpi_rows[-min(8, len(kpi_rows)):] if r.value is not None]
+        latest = sum(latest_vals) / max(len(latest_vals), 1)
+        if overall == 0:
+            continue
+        delta_pct = (latest - overall) / overall * 100
+        if abs(delta_pct) < 20:
+            continue
+        direction = "drop" if delta_pct < 0 else "increase"
+        points.append((
+            abs(delta_pct),
+            f"**KPI Shift**: {kpi_name} shows a {direction} to {round(latest, 3)} vs baseline {round(overall, 3)} ({round(delta_pct, 1)}%)."
+        ))
+    points.sort(key=lambda x: -x[0])
+    return [p for _, p in points[:max_points]]
+
+
+def _recommendation_has_params(text: str):
+    t = (text or "").lower()
+    param_hits = 0
+    for p in ["bandwidth", "antenna gain", "eirp", "rf power", "antenna height", "e-tilt", "tilt", "crs gain"]:
+        if p in t:
+            param_hits += 1
+    has_numbers = bool(re.search(r"\d+(\.\d+)?", t))
+    return param_hits >= 2 and has_numbers
+
+
+def _filter_rca_lines(lines):
+    generic_patterns = [
+        r"\bsite status\b",
+        r"\bproblem classification\b",
+        r"\bproblem type\b",
+        r"\bprimary impact domain\b",
+        r"\bonly related kpi\b",
+        r"\btrend evidence\b",
+        r"\baction required\b",
+        r"\bfocus area\b",
+    ]
+    out = []
+    for line in lines:
+        l = line.lower()
+        if any(re.search(p, l) for p in generic_patterns):
+            continue
+        # Keep lines that mention KPI evidence or alarms/solutions
+        if re.search(r"\b(kpi|throughput|latency|prb|sinr|rsrp|rsrq|cqi|drop|handover|cssr|paging|rlf|alarm|off air|on air)\b", l):
+            out.append(line)
+            continue
+        # Keep lines with concrete numbers/percentages
+        if re.search(r"\d+(\.\d+)?", l):
+            out.append(line)
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def find_nearest_sites(lat, lon, n=3):
-    """Return the n nearest telecom sites to the given coordinates from DB uploads."""
+    """Return the n nearest telecom sites with averaged RF parameters across all cells."""
     if lat is None or lon is None:
         return []
 
-    sites = TelecomSite.query.all()
-    if not sites:
+    try:
+        from sqlalchemy import text as sa_text
+        rows = db.session.execute(sa_text("""
+            SELECT site_id, zone, site_status, alarms, solution, standard_solution_step,
+                   AVG(latitude) AS latitude, AVG(longitude) AS longitude,
+                   ROUND(AVG(bandwidth_mhz)::numeric, 1) AS bandwidth_mhz,
+                   ROUND(AVG(antenna_gain_dbi)::numeric, 1) AS antenna_gain_dbi,
+                   ROUND(AVG(rf_power_eirp_dbm)::numeric, 1) AS rf_power_eirp_dbm,
+                   ROUND(AVG(antenna_height_agl_m)::numeric, 1) AS antenna_height_agl_m,
+                   ROUND(AVG(e_tilt_degree)::numeric, 1) AS e_tilt_degree,
+                   ROUND(AVG(crs_gain)::numeric, 1) AS crs_gain
+            FROM telecom_sites
+            WHERE latitude IS NOT NULL AND longitude IS NOT NULL
+            GROUP BY site_id, zone, site_status, alarms, solution, standard_solution_step
+        """)).fetchall()
+    except Exception:
+        return []
+
+    if not rows:
         return []
 
     scored = []
-    for site in sites:
-        dist = _haversine(lat, lon, site.latitude, site.longitude)
-        scored.append((dist, site))
+    for r in rows:
+        dist = _haversine(lat, lon, float(r.latitude or 0), float(r.longitude or 0))
+        scored.append((dist, r))
 
     scored.sort(key=lambda x: x[0])
     results = []
-    for dist, site in scored[:n]:
-        status = (site.site_status or "on_air").upper()
+    for dist, r in scored[:n]:
+        status = (r.site_status or "on_air").lower()
         results.append({
-            "site_id": site.site_id,
-            "zone": site.zone or "",
-            "latitude": site.latitude,
-            "longitude": site.longitude,
+            "site_id": r.site_id,
+            "zone": r.zone or "",
+            "latitude": float(r.latitude or 0),
+            "longitude": float(r.longitude or 0),
+            "site_status": status,
             "status": status,
-            "alarm": site.alarms or "None",
-            "solution": site.solution or "No action required",
+            "alarms": r.alarms or "None",
+            "alarm": r.alarms or "None",
+            "solution": r.solution or "No action required",
+            "standard_solution_step": r.standard_solution_step or "",
             "distance_km": round(dist, 2),
+            # RF Parameters (averaged across all cells of this site)
+            "bandwidth_mhz": float(r.bandwidth_mhz) if r.bandwidth_mhz else None,
+            "antenna_gain_dbi": float(r.antenna_gain_dbi) if r.antenna_gain_dbi else None,
+            "rf_power_eirp_dbm": float(r.rf_power_eirp_dbm) if r.rf_power_eirp_dbm else None,
+            "antenna_height_agl_m": float(r.antenna_height_agl_m) if r.antenna_height_agl_m else None,
+            "e_tilt_degree": float(r.e_tilt_degree) if r.e_tilt_degree else None,
+            "crs_gain": float(r.crs_gain) if r.crs_gain else None,
         })
     return results
 
@@ -1261,7 +1622,8 @@ def escalate_session(session_id):
     now_utc = datetime.now(timezone.utc)
     sla_deadline = now_utc + timedelta(hours=sla_h)
 
-    assigned_agent = _find_best_expert(ticket_domain, ticket_city, priority)
+    ticket_expertise = _resolve_expertise(session.subprocess_name)
+    assigned_agent = _find_best_expert(ticket_domain, ticket_city, priority, expertise=ticket_expertise)
 
     # Create ticket
     ref = generate_ref_number()
@@ -2874,6 +3236,15 @@ def admin_update_user(uid):
     if "user_type" in data and target.role == "customer":
         ut = (data["user_type"] or "bronze").strip().lower()
         target.user_type = ut if ut in VALID_USER_TYPES else "bronze"
+    # Agent-specific fields (expertise, location, domain)
+    if "domain" in data and target.role == "human_agent":
+        target.domain = (data["domain"] or "").strip()
+    if "location" in data and target.role == "human_agent":
+        target.location = (data["location"] or "").strip()
+    if "expertise" in data and target.role == "human_agent":
+        target.expertise = (data["expertise"] or "").strip()
+    if "specialization" in data and target.role == "human_agent":
+        target.specialization = (data["specialization"] or "").strip()
 
     db.session.commit()
     return jsonify({"user": target.to_dict()})
@@ -3080,7 +3451,7 @@ def admin_agent_alerts():
         Ticket.created_at <= three_days_ago,
     ).order_by(Ticket.created_at.asc()).all()
     for t in overdue:
-        days_old = (datetime.now(timezone.utc) - t.created_at).days if t.created_at else 0
+        days_old = (datetime.utcnow() - t.created_at).days if t.created_at else 0
         alerts.append({
             "type": "overdue",
             "severity": "warning",
@@ -4302,7 +4673,10 @@ def agent_dashboard():
             return None
         return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
 
-    my_tickets = Ticket.query.filter_by(assigned_to=user_id).all()
+    from sqlalchemy import or_
+    my_tickets = Ticket.query.filter(
+        or_(Ticket.assigned_to == user_id, Ticket.escalated_by == user_id)
+    ).all()
     resolved = [t for t in my_tickets if t.status == "resolved"]
     total = len(my_tickets)
     resolved_count = len(resolved)
@@ -4640,12 +5014,25 @@ def agent_create_parameter_change(ticket_id):
 
     manager = _find_best_manager(ticket.priority)
 
+    # Approval deadline = 30% of remaining SLA for the ticket
+    from datetime import timezone as _tz
+    _now = datetime.utcnow()
+    _approval_dl = None
+    if ticket.sla_deadline:
+        _sla_dl = ticket.sla_deadline if ticket.sla_deadline.tzinfo is None else ticket.sla_deadline.replace(tzinfo=None)
+        _remaining = (_sla_dl - _now).total_seconds()
+        _window = max(_remaining * 0.3, 1800)  # at least 30 mins
+        _approval_dl = _now + timedelta(seconds=_window)
+
     change = ParameterChange(
         ticket_id=ticket_id,
         agent_id=user_id,
         proposed_change=proposed,
         status="pending",
     )
+    # Set approval_deadline if column exists
+    try: change.approval_deadline = _approval_dl
+    except: pass
     db.session.add(change)
     db.session.flush()
 
@@ -4678,6 +5065,7 @@ def agent_create_parameter_change(ticket_id):
         "cr":               cr.to_dict(),
         "ticket":           ticket.to_dict(),
         "assigned_manager": {"id": manager.id, "name": manager.name, "email": manager.email} if manager else None,
+        "approval_deadline": _approval_dl.isoformat() if _approval_dl else None,
     }), 201
 
 
@@ -4777,6 +5165,7 @@ def agent_rollback_cr(cr_id):
 # /api/agent/tickets/:id/root-cause
 # /api/agent/tickets/:id/recommendation
 # All registered via network_diagnosis.register_routes(app) at startup.
+
 
 @app.route("/api/agent/customer360/<int:customer_user_id>", methods=["GET"])
 @jwt_required()
@@ -5173,36 +5562,22 @@ with app.app_context():
     db.session.commit()
 
 
+# ─── Register Network Analytics Blueprint ─────────────────────────────────────
+from network_analytics import network_bp
+app.register_blueprint(network_bp)
 
-# ── Serve React build (production) ───────────────────────────────────────────
-# When Flask serves the built frontend, all non-API routes must return index.html
-# so that React Router can handle client-side navigation without 404s on refresh.
-BUILD_DIR = os.path.join(os.path.dirname(__file__), '..', 'frontend', 'build')
+# ─── Register Network Issues Blueprint ─────────────────────────────────────
+from network_issues import network_issues_bp, NetworkIssueTicket, schedule_daily_job
+app.register_blueprint(network_issues_bp)
 
-@app.route("/api/speedtest-widget")
-def serve_speedtest():
-    """Serve the self-hosted speed test page under /api/ so React Router never intercepts it."""
-    return send_from_directory(
-        os.path.join(os.path.dirname(__file__), 'static', 'speedtest'),
-        'index.html'
-    )
+# Create network_issue_tickets table if not exists
+with app.app_context():
+    NetworkIssueTicket.__table__.create(db.engine, checkfirst=True)
 
+# Schedule daily 07:00 AM job for worst cell ticket creation
+schedule_daily_job(app)
 
-@app.route('/', defaults={'path': ''})
-@app.route('/<path:path>')
-def serve_react(path):
-    # Never intercept API routes
-    if path.startswith('api/'):
-        from flask import abort
-        abort(404)
-    full_path = os.path.join(BUILD_DIR, path)
-    if path and os.path.exists(full_path):
-        return send_from_directory(BUILD_DIR, path)
-    return send_from_directory(BUILD_DIR, 'index.html')
 
 if __name__ == "__main__":
     run_sla_checks()
-    app.run(debug=True, host="0.0.0.0", port=5500, use_reloader=False)
-
-
-    app.run(debug=True, port=5500, use_reloader=False)
+    app.run(debug=True, host="0.0.0.0", port=5000, use_reloader=False)

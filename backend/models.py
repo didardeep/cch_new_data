@@ -28,6 +28,8 @@ class User(db.Model):
     # Expert fields (applicable when role == "human_agent")
     domain = db.Column(db.String(50), nullable=True)           # e.g. "mobile", "broadband", "dth", "landline", "enterprise", "fiber"
     location = db.Column(db.String(100), nullable=True)        # City name, e.g. "Gurugram", "Mumbai"
+    expertise = db.Column(db.String(100), nullable=True)       # e.g. "NETWORK_RF", "NETWORK_OPTIMIZATION", "LTE", "5G"
+    specialization = db.Column(db.String(200), nullable=True)  # Additional specialization details
     bandwidth_capacity = db.Column(db.Integer, default=10, nullable=False)  # Max concurrent open tickets
 
     chat_sessions = db.relationship("ChatSession", backref="user", lazy=True)
@@ -52,6 +54,8 @@ class User(db.Model):
             "user_type": self.user_type or "bronze",
             "domain": self.domain,
             "location": self.location,
+            "expertise": getattr(self, 'expertise', None),
+            "specialization": getattr(self, 'specialization', None),
             "bandwidth_capacity": self.bandwidth_capacity,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
@@ -382,8 +386,10 @@ class ParameterChange(db.Model):
     __tablename__ = "parameter_changes"
 
     id = db.Column(db.Integer, primary_key=True)
-    ticket_id = db.Column(db.Integer, db.ForeignKey("tickets.id"), nullable=False)
+    ticket_id = db.Column(db.Integer, db.ForeignKey("tickets.id"), nullable=True)
+    network_issue_id = db.Column(db.Integer, nullable=True)  # links to network_issue_tickets
     agent_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
+    approval_deadline = db.Column(db.DateTime, nullable=True)
     proposed_change = db.Column(db.Text, nullable=False)
     status = db.Column(db.String(20), default="pending")   # 'pending', 'approved', 'disapproved'
     manager_note = db.Column(db.Text, default="")
@@ -423,7 +429,7 @@ class ChangeRequest(db.Model):
 
     id          = db.Column(db.Integer, primary_key=True)
     cr_number   = db.Column(db.String(30), unique=True, nullable=False)          # CR-20260320-A3F7
-    ticket_id   = db.Column(db.Integer, db.ForeignKey("tickets.id"), nullable=False)
+    ticket_id   = db.Column(db.Integer, db.ForeignKey("tickets.id"), nullable=True)
     parameter_change_id = db.Column(db.Integer, db.ForeignKey("parameter_changes.id"), nullable=True)
     raised_by   = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
 

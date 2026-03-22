@@ -80,13 +80,15 @@ function StaffTab() {
 
   const handleEdit = (u) => {
     setEditingId(u.id);
-    setEditData({ name: u.name, email: u.email, role: u.role, password: '' });
+    setEditData({ name: u.name, email: u.email, role: u.role, password: '',
+      domain: u.domain || '', location: u.location || '', expertise: u.expertise || '', specialization: u.specialization || '' });
     setEditError('');
   };
 
   const handleUpdate = async (id) => {
     setEditError('');
-    const payload = { name: editData.name, email: editData.email, role: editData.role };
+    const payload = { name: editData.name, email: editData.email, role: editData.role,
+      domain: editData.domain, location: editData.location, expertise: editData.expertise, specialization: editData.specialization };
     if (editData.password) {
       const pwErr = validatePassword(editData.password);
       if (pwErr) { setEditError(pwErr); return; }
@@ -299,9 +301,28 @@ function StaffTab() {
                   </td>
                   <td>
                     {editingId === u.id ? (
-                      <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
-                        <input type="password" className="form-input" placeholder="New password (optional)"
-                          style={{ padding: '4px 8px', fontSize: 11, width: 140 }}
+                      <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', alignItems: 'center' }}>
+                        {editData.role === 'human_agent' && (
+                          <>
+                            <select className="filter-select" value={editData.domain || ''} style={{padding:'4px 6px',fontSize:10,width:90}}
+                              onChange={e => setEditData(d => ({ ...d, domain: e.target.value }))}>
+                              <option value="">Domain</option>
+                              {['mobile','broadband','dth','landline','enterprise','fiber'].map(v=><option key={v} value={v}>{v}</option>)}
+                            </select>
+                            <select className="filter-select" value={editData.expertise || ''} style={{padding:'4px 6px',fontSize:10,width:110}}
+                              onChange={e => setEditData(d => ({ ...d, expertise: e.target.value }))}>
+                              <option value="">Expertise</option>
+                              {['NETWORK_RF','NETWORK_OPTIMIZATION','LTE','5G','CORE','TRANSPORT','VoLTE','GENERAL'].map(v=><option key={v} value={v}>{v}</option>)}
+                            </select>
+                            <select className="filter-select" value={editData.location || ''} style={{padding:'4px 6px',fontSize:10,width:110}}
+                              onChange={e => setEditData(d => ({ ...d, location: e.target.value }))}>
+                              <option value="">Location</option>
+                              {['Gurgaon','Delhi','Noida','Faridabad','Manesar','Mumbai','Bangalore','Hyderabad','Chennai','Pune'].map(v=><option key={v} value={v}>{v}</option>)}
+                            </select>
+                          </>
+                        )}
+                        <input type="password" className="form-input" placeholder="Password"
+                          style={{ padding: '4px 8px', fontSize: 11, width: 100 }}
                           value={editData.password} onChange={e => setEditData(d => ({ ...d, password: e.target.value }))} />
                         <button className="btn btn-success btn-sm" onClick={() => handleUpdate(u.id)}>Save</button>
                         <button className="btn btn-ghost btn-sm" onClick={() => { setEditingId(null); setEditData({}); setEditError(''); }}>Cancel</button>
