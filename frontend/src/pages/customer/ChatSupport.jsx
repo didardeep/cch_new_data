@@ -1460,7 +1460,14 @@ export default function ChatSupport() {
         // Fallback: if restoreSession failed (e.g. network error), use resumeChat with DB messages.
         try { const data = await apiGet(`/api/chat/session/${resumeId}`); if (data?.session) { resumeChat(data.session, data.messages || []); return; } } catch {}
       }
-      // Direct navigation (no resume param): always show the start gate.
+      // If there's an active session in localStorage, auto-resume it on refresh.
+      const storedId = localStorage.getItem('chat_session_id');
+      if (storedId) {
+        const restored = await restoreSession({ sessionId: storedId });
+        if (restored) return;
+        try { const data = await apiGet(`/api/chat/session/${storedId}`); if (data?.session && data.session.status === 'active') { resumeChat(data.session, data.messages || []); return; } } catch {}
+      }
+      // No active session — show the start gate.
       setInitPhase('start-gate');
     })();
   }, [searchParams, resumeChat, restoreSession]);
