@@ -345,6 +345,8 @@ class TelecomSite(db.Model):
     latitude = db.Column(db.Float, nullable=False)
     longitude = db.Column(db.Float, nullable=False)
     zone = db.Column(db.String(100), default="")
+    city = db.Column(db.String(100), nullable=True)
+    state = db.Column(db.String(100), nullable=True)
     site_status = db.Column(db.String(20), default="on_air")   # 'on_air' or 'off_air'
     alarms = db.Column(db.Text, default="")
     solution = db.Column(db.Text, default="")
@@ -369,6 +371,8 @@ class TelecomSite(db.Model):
             "latitude": self.latitude,
             "longitude": self.longitude,
             "zone": self.zone,
+            "city": self.city,
+            "state": self.state,
             "site_status": self.site_status or "on_air",
             "alarms": self.alarms or "",
             "solution": self.solution or "",

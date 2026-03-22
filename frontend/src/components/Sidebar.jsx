@@ -1,12 +1,30 @@
 import { useState } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { useAuth } from '../AuthContext';
+import { useTheme } from '../ThemeContext';
 import { apiPut } from '../api';
+
+const SunIcon = () => (
+  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <circle cx="12" cy="12" r="5" />
+    <line x1="12" y1="1" x2="12" y2="3" /><line x1="12" y1="21" x2="12" y2="23" />
+    <line x1="4.22" y1="4.22" x2="5.64" y2="5.64" /><line x1="18.36" y1="18.36" x2="19.78" y2="19.78" />
+    <line x1="1" y1="12" x2="3" y2="12" /><line x1="21" y1="12" x2="23" y2="12" />
+    <line x1="4.22" y1="19.78" x2="5.64" y2="18.36" /><line x1="18.36" y1="5.64" x2="19.78" y2="4.22" />
+  </svg>
+);
+
+const MoonIcon = () => (
+  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
+  </svg>
+);
 
 export default function Sidebar({ links, statusToggle }) {
   const navigate = useNavigate();
   const location = useLocation();
   const { user, logout } = useAuth();
+  const { isDark, toggleTheme } = useTheme();
   const [isOnline, setIsOnline] = useState(user?.is_online || false);
   const [toggling, setToggling] = useState(false);
   const showToggle = !!statusToggle?.endpoint;
@@ -123,6 +141,18 @@ export default function Sidebar({ links, statusToggle }) {
           </>
         )}
       </nav>
+
+      <div style={{ padding: '8px 12px' }}>
+        <div className="sidebar-section-label">Appearance</div>
+        <button
+          className="sidebar-link"
+          onClick={toggleTheme}
+          style={{ gap: 10 }}
+        >
+          {isDark ? <SunIcon /> : <MoonIcon />}
+          {isDark ? 'Light Mode' : 'Dark Mode'}
+        </button>
+      </div>
 
       <div className="sidebar-footer">
         <div className="sidebar-user">

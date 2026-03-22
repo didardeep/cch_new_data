@@ -1,9 +1,11 @@
 import { useState, useEffect } from 'react';
 import { useAuth } from '../AuthContext';
+import { useTheme } from '../ThemeContext';
 import { apiPut } from '../api';
 
 export default function SettingsPage() {
   const { user, updateUser } = useAuth();
+  const { isDark } = useTheme();
 
   // Account details state
   const [name, setName] = useState(user?.name || '');
@@ -74,27 +76,27 @@ export default function SettingsPage() {
 
   const inputStyle = {
     width: '100%', padding: '10px 13px', fontSize: 14,
-    border: '1px solid #d1d5db', borderRadius: 8,
-    outline: 'none', background: '#f9fafb', color: '#1e293b',
+    border: `1px solid ${isDark ? '#334155' : '#d1d5db'}`, borderRadius: 8,
+    outline: 'none', background: isDark ? '#1a2536' : '#f9fafb', color: isDark ? '#e2e8f0' : '#1e293b',
     boxSizing: 'border-box', transition: 'border-color 0.15s',
   };
 
   const labelStyle = {
     display: 'block', fontSize: 12.5, fontWeight: 600,
-    color: '#475569', marginBottom: 6, letterSpacing: 0.2,
+    color: isDark ? '#94a3b8' : '#475569', marginBottom: 6, letterSpacing: 0.2,
   };
 
   const cardStyle = {
-    background: '#fff', borderRadius: 12,
-    border: '1px solid #e2e8f0',
-    boxShadow: '0 1px 4px rgba(0,0,0,0.05)',
+    background: isDark ? '#1e293b' : '#fff', borderRadius: 12,
+    border: `1px solid ${isDark ? '#334155' : '#e2e8f0'}`,
+    boxShadow: isDark ? '0 1px 4px rgba(0,0,0,0.3)' : '0 1px 4px rgba(0,0,0,0.05)',
     overflow: 'hidden',
   };
 
   const cardHeaderStyle = {
     padding: '20px 24px 18px',
-    borderBottom: '1px solid #f1f5f9',
-    background: '#fafbfc',
+    borderBottom: `1px solid ${isDark ? '#334155' : '#f1f5f9'}`,
+    background: isDark ? '#152238' : '#fafbfc',
   };
 
   return (
@@ -108,28 +110,28 @@ export default function SettingsPage() {
       {/* Profile info strip */}
       <div style={{
         display: 'flex', alignItems: 'center', gap: 16,
-        background: '#fff', border: '1px solid #e2e8f0',
+        background: isDark ? '#1e293b' : '#fff', border: `1px solid ${isDark ? '#334155' : '#e2e8f0'}`,
         borderRadius: 12, padding: '18px 24px', marginBottom: 28,
-        boxShadow: '0 1px 4px rgba(0,0,0,0.04)',
+        boxShadow: isDark ? '0 1px 4px rgba(0,0,0,0.3)' : '0 1px 4px rgba(0,0,0,0.04)',
       }}>
         <div style={{
           width: 52, height: 52, borderRadius: '50%',
-          background: '#00338d', color: '#fff',
+          background: isDark ? '#2563eb' : '#00338d', color: '#fff',
           display: 'flex', alignItems: 'center', justifyContent: 'center',
           fontSize: 22, fontWeight: 700, flexShrink: 0,
         }}>
           {user?.name?.charAt(0)?.toUpperCase() || 'U'}
         </div>
         <div>
-          <div style={{ fontSize: 16, fontWeight: 700, color: '#0f172a' }}>{user?.name}</div>
-          <div style={{ fontSize: 13, color: '#64748b', marginTop: 2 }}>{user?.email}</div>
+          <div style={{ fontSize: 16, fontWeight: 700, color: isDark ? '#e2e8f0' : '#0f172a' }}>{user?.name}</div>
+          <div style={{ fontSize: 13, color: isDark ? '#94a3b8' : '#64748b', marginTop: 2 }}>{user?.email}</div>
         </div>
         <div style={{ marginLeft: 'auto' }}>
           <span style={{
             display: 'inline-block', padding: '4px 12px',
-            background: '#f0f4ff', color: '#00338d',
+            background: isDark ? 'rgba(77,163,255,0.12)' : '#f0f4ff', color: isDark ? '#60a5fa' : '#00338d',
             borderRadius: 20, fontSize: 12, fontWeight: 600,
-            textTransform: 'capitalize', border: '1px solid #c7d7fa',
+            textTransform: 'capitalize', border: `1px solid ${isDark ? 'rgba(77,163,255,0.3)' : '#c7d7fa'}`,
           }}>
             {user?.role === 'human_agent' ? 'Human Agent' : user?.role}
           </span>
@@ -145,15 +147,15 @@ export default function SettingsPage() {
             <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
               <div style={{
                 width: 34, height: 34, borderRadius: 8,
-                background: '#f0f4ff', border: '1px solid #c7d7fa',
-                display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#00338d',
+                background: isDark ? 'rgba(77,163,255,0.12)' : '#f0f4ff', border: `1px solid ${isDark ? 'rgba(77,163,255,0.3)' : '#c7d7fa'}`,
+                display: 'flex', alignItems: 'center', justifyContent: 'center', color: isDark ? '#60a5fa' : '#00338d',
               }}>
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                   <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>
                 </svg>
               </div>
               <div>
-                <div style={{ fontSize: 15, fontWeight: 700, color: '#0f172a' }}>Account Details</div>
+                <div style={{ fontSize: 15, fontWeight: 700, color: isDark ? '#e2e8f0' : '#0f172a' }}>Account Details</div>
                 <div style={{ fontSize: 12, color: '#94a3b8', marginTop: 1 }}>Update your name, email and phone</div>
               </div>
             </div>
@@ -174,12 +176,12 @@ export default function SettingsPage() {
               </div>
 
               {detailsError && (
-                <div style={{ fontSize: 13, color: '#dc2626', background: '#fef2f2', padding: '10px 14px', borderRadius: 8, border: '1px solid #fecaca' }}>
+                <div style={{ fontSize: 13, color: isDark ? '#f87171' : '#dc2626', background: isDark ? 'rgba(248,113,113,0.1)' : '#fef2f2', padding: '10px 14px', borderRadius: 8, border: `1px solid ${isDark ? 'rgba(248,113,113,0.3)' : '#fecaca'}` }}>
                   {detailsError}
                 </div>
               )}
               {detailsSuccess && (
-                <div style={{ fontSize: 13, color: '#16a34a', background: '#f0fdf4', padding: '10px 14px', borderRadius: 8, border: '1px solid #bbf7d0' }}>
+                <div style={{ fontSize: 13, color: isDark ? '#34d399' : '#16a34a', background: isDark ? 'rgba(52,211,153,0.1)' : '#f0fdf4', padding: '10px 14px', borderRadius: 8, border: `1px solid ${isDark ? 'rgba(52,211,153,0.3)' : '#bbf7d0'}` }}>
                   {detailsSuccess}
                 </div>
               )}
@@ -189,7 +191,7 @@ export default function SettingsPage() {
                 disabled={savingDetails}
                 style={{
                   padding: '10px 0', fontSize: 14, fontWeight: 600,
-                  background: savingDetails ? '#94a3b8' : '#00338d',
+                  background: savingDetails ? '#94a3b8' : isDark ? '#2563eb' : '#00338d',
                   color: '#fff', border: 'none', borderRadius: 8,
                   cursor: savingDetails ? 'not-allowed' : 'pointer',
                   transition: 'background 0.15s', width: '100%',
@@ -207,15 +209,15 @@ export default function SettingsPage() {
             <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
               <div style={{
                 width: 34, height: 34, borderRadius: 8,
-                background: '#fff7ed', border: '1px solid #fed7aa',
-                display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#ea580c',
+                background: isDark ? 'rgba(251,191,36,0.12)' : '#fff7ed', border: `1px solid ${isDark ? 'rgba(251,191,36,0.3)' : '#fed7aa'}`,
+                display: 'flex', alignItems: 'center', justifyContent: 'center', color: isDark ? '#fbbf24' : '#ea580c',
               }}>
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                   <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>
                 </svg>
               </div>
               <div>
-                <div style={{ fontSize: 15, fontWeight: 700, color: '#0f172a' }}>Change Password</div>
+                <div style={{ fontSize: 15, fontWeight: 700, color: isDark ? '#e2e8f0' : '#0f172a' }}>Change Password</div>
                 <div style={{ fontSize: 12, color: '#94a3b8', marginTop: 1 }}>Update your login password</div>
               </div>
             </div>
@@ -236,12 +238,12 @@ export default function SettingsPage() {
               </div>
 
               {pwdError && (
-                <div style={{ fontSize: 13, color: '#dc2626', background: '#fef2f2', padding: '10px 14px', borderRadius: 8, border: '1px solid #fecaca' }}>
+                <div style={{ fontSize: 13, color: isDark ? '#f87171' : '#dc2626', background: isDark ? 'rgba(248,113,113,0.1)' : '#fef2f2', padding: '10px 14px', borderRadius: 8, border: `1px solid ${isDark ? 'rgba(248,113,113,0.3)' : '#fecaca'}` }}>
                   {pwdError}
                 </div>
               )}
               {pwdSuccess && (
-                <div style={{ fontSize: 13, color: '#16a34a', background: '#f0fdf4', padding: '10px 14px', borderRadius: 8, border: '1px solid #bbf7d0' }}>
+                <div style={{ fontSize: 13, color: isDark ? '#34d399' : '#16a34a', background: isDark ? 'rgba(52,211,153,0.1)' : '#f0fdf4', padding: '10px 14px', borderRadius: 8, border: `1px solid ${isDark ? 'rgba(52,211,153,0.3)' : '#bbf7d0'}` }}>
                   {pwdSuccess}
                 </div>
               )}

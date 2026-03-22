@@ -1,8 +1,10 @@
 import { useEffect, useState } from 'react';
 import { Bar, BarChart, CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
 import { apiGet } from '../../api';
+import { useTheme } from '../../ThemeContext';
 
 export default function BusinessKPI() {
+  const { isDark } = useTheme();
   const [data, setData] = useState(null);
 
   useEffect(() => {
@@ -75,7 +77,7 @@ export default function BusinessKPI() {
           <div className="section-card-body">
             <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
               <thead>
-                <tr style={{ textAlign: 'left', color: '#64748b' }}>
+                <tr style={{ textAlign: 'left', color: isDark ? '#94a3b8' : '#64748b' }}>
                   <th style={{ paddingBottom: 10 }}>Site</th>
                   <th style={{ paddingBottom: 10 }}>Users</th>
                   <th style={{ paddingBottom: 10 }}>Growth</th>
@@ -83,7 +85,7 @@ export default function BusinessKPI() {
               </thead>
               <tbody>
                 {(data.declining_sites || []).map((row) => (
-                  <tr key={row.site_id} style={{ borderTop: '1px solid #e2e8f0' }}>
+                  <tr key={row.site_id} style={{ borderTop: `1px solid ${isDark ? '#334155' : '#e2e8f0'}` }}>
                     <td style={{ padding: '10px 0' }}>{row.site_id}</td>
                     <td>{row.users}</td>
                     <td style={{ color: '#dc2626', fontWeight: 700 }}>{row.growth}%</td>
@@ -99,7 +101,7 @@ export default function BusinessKPI() {
           <div className="section-card-body">
             <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
               <thead>
-                <tr style={{ textAlign: 'left', color: '#64748b' }}>
+                <tr style={{ textAlign: 'left', color: isDark ? '#94a3b8' : '#64748b' }}>
                   <th style={{ paddingBottom: 10 }}>Site</th>
                   <th style={{ paddingBottom: 10 }}>Utilization</th>
                   <th style={{ paddingBottom: 10 }}>Revenue</th>
@@ -107,7 +109,7 @@ export default function BusinessKPI() {
               </thead>
               <tbody>
                 {(data.overloaded_sites || []).map((row) => (
-                  <tr key={row.site_id} style={{ borderTop: '1px solid #e2e8f0' }}>
+                  <tr key={row.site_id} style={{ borderTop: `1px solid ${isDark ? '#334155' : '#e2e8f0'}` }}>
                     <td style={{ padding: '10px 0' }}>{row.site_id}</td>
                     <td style={{ color: '#f59e0b', fontWeight: 700 }}>{row.utilization}%</td>
                     <td>{row.revenue}</td>

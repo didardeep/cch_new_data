@@ -31,6 +31,141 @@
   --font: 'DM Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
 }
 
+/* ─── Dark Theme ──────────────────────────────────────────────────────────── */
+[data-theme="dark"] {
+  --primary: #4da3ff;
+  --primary-light: #60a5fa;
+  --primary-dark: #1e3a5f;
+  --primary-glow: rgba(77, 163, 255, 0.12);
+  --primary-glow-md: rgba(77, 163, 255, 0.18);
+  --bg: #0f172a;
+  --bg-white: #1e293b;
+  --bg-card: #1e293b;
+  --border: #334155;
+  --border-light: #1e293b;
+  --text: #e2e8f0;
+  --text-secondary: #94a3b8;
+  --text-muted: #64748b;
+  --success: #34d399;
+  --success-bg: rgba(52, 211, 153, 0.12);
+  --warning: #fbbf24;
+  --warning-bg: rgba(251, 191, 36, 0.12);
+  --danger: #f87171;
+  --danger-bg: rgba(248, 113, 113, 0.12);
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.3);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.4);
+  --shadow-lg: 0 8px 30px rgba(0, 0, 0, 0.5);
+}
+
+[data-theme="dark"] body {
+  background: var(--bg);
+  color: var(--text);
+}
+
+[data-theme="dark"] .sidebar {
+  background: #0c1524;
+}
+
+[data-theme="dark"] .main-content {
+  background: var(--bg);
+}
+
+[data-theme="dark"] .data-table th {
+  background: #1a2332;
+}
+
+[data-theme="dark"] .data-table td {
+  border-bottom: none;
+}
+
+[data-theme="dark"] .data-table tr:hover td {
+  background: rgba(77, 163, 255, 0.04);
+}
+
+[data-theme="dark"] .mini-table thead {
+  background: var(--bg-white);
+}
+
+[data-theme="dark"] .rpt-table tbody tr:nth-child(even) {
+  background: #1a2536;
+}
+
+[data-theme="dark"] .rpt-table tbody tr:hover {
+  background: var(--primary-glow);
+}
+
+[data-theme="dark"] .rpt-sla-target-row {
+  background: #1a2536;
+}
+
+[data-theme="dark"] .filter-select,
+[data-theme="dark"] .filter-input,
+[data-theme="dark"] .form-input,
+[data-theme="dark"] .form-select {
+  background: #1a2536;
+  border-color: var(--border);
+  color: var(--text);
+}
+
+[data-theme="dark"] .feedback-textarea {
+  background: #1a2536;
+  border-color: var(--border);
+  color: var(--text);
+}
+
+[data-theme="dark"] .badge-resolved { background: rgba(52, 211, 153, 0.15); color: #34d399; }
+[data-theme="dark"] .badge-pending { background: rgba(251, 191, 36, 0.15); color: #fbbf24; }
+[data-theme="dark"] .badge-escalated { background: rgba(248, 113, 113, 0.15); color: #f87171; }
+[data-theme="dark"] .badge-manager_escalated { background: rgba(167, 139, 250, 0.15); color: #a78bfa; border-color: rgba(167, 139, 250, 0.3); }
+[data-theme="dark"] .badge-active { background: rgba(77, 163, 255, 0.15); color: #60a5fa; }
+[data-theme="dark"] .badge-in_progress { background: rgba(77, 163, 255, 0.15); color: #60a5fa; }
+[data-theme="dark"] .badge-low { background: rgba(52, 211, 153, 0.15); color: #34d399; }
+[data-theme="dark"] .badge-medium { background: rgba(251, 191, 36, 0.15); color: #fbbf24; }
+[data-theme="dark"] .badge-high { background: rgba(248, 113, 113, 0.15); color: #f87171; }
+[data-theme="dark"] .badge-critical { background: rgba(248, 113, 113, 0.15); color: #f87171; border-color: rgba(248, 113, 113, 0.3); }
+
+[data-theme="dark"] .btn-ghost {
+  border-color: var(--border);
+  color: var(--text-secondary);
+}
+[data-theme="dark"] .btn-ghost:hover {
+  background: #1a2536;
+  color: var(--text);
+}
+
+[data-theme="dark"] .btn-outline {
+  border-color: var(--primary);
+  color: var(--primary);
+}
+
+[data-theme="dark"] .rpt-range-group {
+  background: var(--bg-white);
+  border-color: var(--border);
+}
+[data-theme="dark"] .rpt-range-btn {
+  color: var(--text-secondary);
+}
+[data-theme="dark"] .rpt-range-btn:not(:last-child) {
+  border-right-color: var(--border);
+}
+[data-theme="dark"] .rpt-export-btn {
+  background: var(--bg-white);
+  border-color: var(--border);
+  color: var(--text);
+}
+
+[data-theme="dark"] .form-error {
+  background: rgba(248, 113, 113, 0.1);
+  border-color: rgba(248, 113, 113, 0.3);
+  color: #f87171;
+}
+
+[data-theme="dark"] .toast-success {
+  background: rgba(52, 211, 153, 0.1);
+  border-color: rgba(52, 211, 153, 0.3);
+  color: #34d399;
+}
+
 * { margin: 0; padding: 0; box-sizing: border-box; }
 
 body {

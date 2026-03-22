@@ -1803,7 +1803,7 @@ export default function ChatSupport() {
           <img src="https://upload.wikimedia.org/wikipedia/commons/d/db/KPMG_blue_logo.svg" alt="KPMG" style={{ height: 24 }} />
           <div className="header-info"><h1>Customer Handling</h1><p>AI-powered multilingual support</p></div>
           <div className="status-dot" />
-          {initPhase === 'chat' && <button className="restart-btn" onClick={beginNewChat}>Restart</button>}
+          {initPhase === 'chat' && <button className="restart-btn" onClick={beginNewChat}>Start New Chat</button>}
         </div>
 
         {initPhase === 'loading' && (

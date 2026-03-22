@@ -1,10 +1,12 @@
 import { useState, useEffect, useCallback } from 'react';
 import { apiGet, apiPut } from '../../api';
+import { useTheme } from '../../ThemeContext';
 
 export default function CTOAlertBox() {
   const [alerts, setAlerts] = useState([]);
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState('all'); // 'all' | 'unread'
+  const { isDark } = useTheme();
 
   const fetchAlerts = useCallback(async () => {
     try {
@@ -67,9 +69,9 @@ export default function CTOAlertBox() {
               style={{
                 padding: '6px 14px', borderRadius: 6, fontSize: 12, fontWeight: 600,
                 border: '1px solid', cursor: 'pointer',
-                background: filter === f.key ? '#dc2626' : '#fff',
-                color: filter === f.key ? '#fff' : '#475569',
-                borderColor: filter === f.key ? '#dc2626' : '#e2e8f0',
+                background: filter === f.key ? '#dc2626' : isDark ? '#1e293b' : '#fff',
+                color: filter === f.key ? '#fff' : isDark ? '#94a3b8' : '#475569',
+                borderColor: filter === f.key ? '#dc2626' : isDark ? '#334155' : '#e2e8f0',
               }}
             >
               {f.label}
@@ -96,21 +98,21 @@ export default function CTOAlertBox() {
             <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#94a3b8" strokeWidth="1.5" style={{ marginBottom: 12 }}>
               <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
             </svg>
-            <h4 style={{ color: '#64748b', margin: 0 }}>No breach alerts</h4>
-            <p style={{ color: '#94a3b8', fontSize: 13, margin: '6px 0 0' }}>
+            <h4 style={{ color: isDark ? '#94a3b8' : '#64748b', margin: 0 }}>No breach alerts</h4>
+            <p style={{ color: isDark ? '#64748b' : '#94a3b8', fontSize: 13, margin: '6px 0 0' }}>
               {filter === 'unread' ? 'All breaches have been acknowledged.' : 'No SLA breaches to display.'}
             </p>
           </div>
         </div>
       ) : (
-        <div className="section-card" style={{ overflow: 'hidden', border: '1px solid #fca5a5' }}>
+        <div className="section-card" style={{ overflow: 'hidden', border: `1px solid ${isDark ? '#7f1d1d' : '#fca5a5'}` }}>
           <div className="section-card-body" style={{ padding: 0 }}>
             {filtered.map(a => (
               <div key={a.id} style={{
                 display: 'flex', alignItems: 'flex-start', gap: 14,
                 padding: '16px 20px',
-                borderBottom: '1px solid #fee2e2',
-                background: a.is_read ? '#fff' : '#fef2f2',
+                borderBottom: `1px solid ${isDark ? '#451a1a' : '#fee2e2'}`,
+                background: a.is_read ? (isDark ? '#1e293b' : '#fff') : (isDark ? '#3b1111' : '#fef2f2'),
                 opacity: a.is_read ? 0.65 : 1,
                 transition: 'opacity 0.2s',
               }}>
@@ -163,7 +165,7 @@ export default function CTOAlertBox() {
       )}
 
       {/* Summary */}
-      <div style={{ marginTop: 16, fontSize: 12, color: '#94a3b8', textAlign: 'right' }}>
+      <div style={{ marginTop: 16, fontSize: 12, color: isDark ? '#64748b' : '#94a3b8', textAlign: 'right' }}>
         Showing {filtered.length} of {alerts.length} breaches &middot; Auto-refreshes every 30s
       </div>
     </div>

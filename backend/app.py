@@ -57,7 +57,7 @@ app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get(
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 app.config["JWT_SECRET_KEY"] = os.environ.get("JWT_SECRET", "super-secret-jwt-key-change-in-prod")
 app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(hours=24)
-app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16MB max for image uploads
+app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024  # 200MB max for large Excel uploads
 
 # Flask-Mail Configuration
 app.config["MAIL_SERVER"] = os.environ.get("MAIL_SERVER", "smtp.gmail.com")
@@ -3595,74 +3595,106 @@ def admin_upload_sites():
     for i, h in enumerate(headers):
         if ("site" in h and "id" in h) or h in ("site name", "sitename", "site"):
             col_map["site_id"] = i
+        elif h in ("cell_id", "cell id", "cellid", "cell"):
+            col_map["cell_id"] = i
         elif "lat" in h:
             col_map["latitude"] = i
         elif "lon" in h:
             col_map["longitude"] = i
-        elif "zone" in h:
+        elif "zone" in h or "cluster" in h:
             col_map["zone"] = i
-        elif h == "status" or "site status" in h:
+        elif h in ("city",):
+            col_map["city"] = i
+        elif h in ("state",):
+            col_map["state"] = i
+        elif h == "status" or "site status" in h or "site_status" in h:
             col_map["site_status"] = i
         elif "alarm" in h:
             col_map["alarms"] = i
-        elif h in ("solution", "standard solution step", "standard solution"):
+        elif h in ("solution", "standard solution step", "standard solution", "standard_solution_step"):
             col_map["solution"] = i
+        elif "bandwidth" in h or h == "bandwidth_mhz":
+            col_map["bandwidth_mhz"] = i
+        elif "antenna" in h and "gain" in h or h == "antenna_gain_dbi":
+            col_map["antenna_gain_dbi"] = i
+        elif ("rf" in h and "power" in h) or "eirp" in h or h == "rf_power_eirp_dbm":
+            col_map["rf_power_eirp_dbm"] = i
+        elif ("antenna" in h and "height" in h) or h == "antenna_height_agl_m":
+            col_map["antenna_height_agl_m"] = i
+        elif "tilt" in h or h == "e_tilt_degree":
+            col_map["e_tilt_degree"] = i
+        elif "crs" in h or h == "crs_gain":
+            col_map["crs_gain"] = i
 
     required = ["site_id", "latitude", "longitude"]
     missing = [k for k in required if k not in col_map]
     if missing:
         return jsonify({"error": f"Missing columns: {', '.join(missing)}. Found headers: {headers}"}), 400
 
+    # Helper to read a string cell value
+    def _str_cell(row, key, default=""):
+        idx = col_map.get(key)
+        if idx is None or idx >= len(row) or row[idx] is None:
+            return default
+        return str(row[idx]).strip()
+
+    # Helper to read a float cell value
+    def _float_cell(row, key):
+        idx = col_map.get(key)
+        if idx is None or idx >= len(row) or row[idx] is None:
+            return None
+        try:
+            return float(row[idx])
+        except (ValueError, TypeError):
+            return None
+
+    # Clear existing site data so upload is a full replace
+    TelecomSite.query.delete()
+    db.session.flush()
+
+    status_map = {
+        "active": "on_air", "on_air": "on_air", "on air": "on_air",
+        "down": "off_air", "off_air": "off_air", "off air": "off_air",
+        "alarm": "off_air",
+    }
+
     created = 0
-    updated = 0
     skipped = []
     for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
         try:
             sid = str(row[col_map["site_id"]]).strip()
             lat = float(row[col_map["latitude"]])
             lon = float(row[col_map["longitude"]])
-            zone = str(row[col_map.get("zone", -1)]).strip() if col_map.get("zone") is not None and col_map.get("zone") < len(row) and row[col_map.get("zone")] else ""
-            raw_status = str(row[col_map.get("site_status", -1)]).strip().lower() if col_map.get("site_status") is not None and col_map.get("site_status") < len(row) and row[col_map.get("site_status")] else "on_air"
-            alarms = str(row[col_map.get("alarms", -1)]).strip() if col_map.get("alarms") is not None and col_map.get("alarms") < len(row) and row[col_map.get("alarms")] else ""
-            solution = str(row[col_map.get("solution", -1)]).strip() if col_map.get("solution") is not None and col_map.get("solution") < len(row) and row[col_map.get("solution")] else ""
         except Exception as e:
             skipped.append(f"Row {row_idx}: {e}")
             continue
 
-        status_map = {
-            "active": "on_air",
-            "on_air": "on_air",
-            "on air": "on_air",
-            "down": "off_air",
-            "off_air": "off_air",
-            "off air": "off_air",
-            "alarm": "off_air",
-        }
+        raw_status = _str_cell(row, "site_status", "on_air").lower()
         site_status = status_map.get(raw_status, raw_status or "on_air")
 
-        existing = TelecomSite.query.filter_by(site_id=sid).first()
-        if existing:
-            existing.latitude = lat
-            existing.longitude = lon
-            existing.zone = zone
-            existing.site_status = site_status
-            existing.alarms = alarms
-            existing.solution = solution
-            updated += 1
-        else:
-            db.session.add(TelecomSite(
-                site_id=sid,
-                latitude=lat,
-                longitude=lon,
-                zone=zone,
-                site_status=site_status,
-                alarms=alarms,
-                solution=solution,
-            ))
-            created += 1
+        db.session.add(TelecomSite(
+            site_id=sid,
+            cell_id=_str_cell(row, "cell_id") or None,
+            latitude=lat,
+            longitude=lon,
+            zone=_str_cell(row, "zone"),
+            city=_str_cell(row, "city") or None,
+            state=_str_cell(row, "state") or None,
+            site_status=site_status,
+            alarms=_str_cell(row, "alarms"),
+            solution=_str_cell(row, "solution"),
+            bandwidth_mhz=_float_cell(row, "bandwidth_mhz"),
+            antenna_gain_dbi=_float_cell(row, "antenna_gain_dbi"),
+            rf_power_eirp_dbm=_float_cell(row, "rf_power_eirp_dbm"),
+            antenna_height_agl_m=_float_cell(row, "antenna_height_agl_m"),
+            e_tilt_degree=_float_cell(row, "e_tilt_degree"),
+            crs_gain=_float_cell(row, "crs_gain"),
+        ))
+        created += 1
 
     db.session.commit()
-    return jsonify({"created": created, "updated": updated, "skipped": skipped, "total": created + updated})
+    clear_analytics_cache()
+    return jsonify({"created": created, "skipped": skipped, "total": created})
 
 
 @app.route("/api/admin/upload-kpi-site-level", methods=["POST"])
@@ -3686,10 +3718,6 @@ def admin_upload_kpi_site_level():
 
     import openpyxl
     wb = openpyxl.load_workbook(file, data_only=True)
-
-    # Clear old site-level KPI data
-    KpiData.query.filter_by(data_level="site").delete()
-    db.session.flush()
 
     total_inserted = 0
     kpi_summary = []
@@ -3780,20 +3808,11 @@ def admin_upload_shared_site_workbook():
         return jsonify({"error": "No file provided"}), 400
 
     file = request.files["file"]
-    if not file.filename.lower().endswith((".xlsx", ".xlsm")):
-        return jsonify({"error": "Only .xlsx or .xlsm files are supported (.xls is not supported)."}), 400
-    ok, err = _validate_ooxml_excel_upload(file)
-    if not ok:
-        return jsonify({"error": err}), 400
+    if not file.filename.endswith((".xlsx", ".xls")):
+        return jsonify({"error": "Only .xlsx or .xls files accepted"}), 400
 
     import openpyxl
     wb = openpyxl.load_workbook(file, data_only=True)
-
-    KpiData.query.filter(
-        KpiData.data_level == "site",
-        KpiData.kpi_name.in_(SHARED_WORKBOOK_KPI_NAMES)
-    ).delete(synchronize_session=False)
-    db.session.flush()
 
     total_inserted = 0
     kpi_summary = []
@@ -3924,10 +3943,6 @@ def admin_upload_kpi_cell_level():
     import openpyxl
     wb = openpyxl.load_workbook(file, data_only=True)
 
-    # Clear old cell-level KPI data
-    KpiData.query.filter_by(data_level="cell").delete()
-    db.session.flush()
-
     total_inserted = 0
     kpi_summary = []
     errors = []
@@ -4018,6 +4033,7 @@ def admin_delete_sites():
     count = TelecomSite.query.count()
     TelecomSite.query.delete()
     db.session.commit()
+    clear_analytics_cache()
     return jsonify({"deleted": count})
 
 
@@ -4031,6 +4047,7 @@ def admin_delete_kpi_site_level():
     count = KpiData.query.filter_by(data_level="site").count()
     KpiData.query.filter_by(data_level="site").delete()
     db.session.commit()
+    clear_analytics_cache()
     return jsonify({"deleted": count})
 
 
@@ -4044,6 +4061,7 @@ def admin_delete_kpi_cell_level():
     count = KpiData.query.filter_by(data_level="cell").count()
     KpiData.query.filter_by(data_level="cell").delete()
     db.session.commit()
+    clear_analytics_cache()
     return jsonify({"deleted": count})
 
 
@@ -5531,6 +5549,31 @@ with app.app_context():
                 conn.execute(text("ALTER TABLE telecom_sites ADD COLUMN solution TEXT DEFAULT ''"))
                 conn.commit()
                 print(">>> Added solution column to telecom_sites")
+            if "city" not in existing_cols:
+                conn.execute(sa_text("ALTER TABLE telecom_sites ADD COLUMN city VARCHAR(100)"))
+                conn.commit()
+                print(">>> Added city column to telecom_sites")
+            if "state" not in existing_cols:
+                conn.execute(sa_text("ALTER TABLE telecom_sites ADD COLUMN state VARCHAR(100)"))
+                conn.commit()
+                print(">>> Added state column to telecom_sites")
+
+    # Migrate: add new columns to users if they don't exist
+    if insp.has_table("users"):
+        existing_cols = [c["name"] for c in insp.get_columns("users")]
+        with db.engine.connect() as conn:
+            if "expertise" not in existing_cols:
+                conn.execute(sa_text("ALTER TABLE users ADD COLUMN expertise VARCHAR(100)"))
+                conn.commit()
+                print(">>> Added expertise column to users")
+            if "specialization" not in existing_cols:
+                conn.execute(sa_text("ALTER TABLE users ADD COLUMN specialization VARCHAR(200)"))
+                conn.commit()
+                print(">>> Added specialization column to users")
+            if "bandwidth_capacity" not in existing_cols:
+                conn.execute(sa_text("ALTER TABLE users ADD COLUMN bandwidth_capacity INTEGER NOT NULL DEFAULT 10"))
+                conn.commit()
+                print(">>> Added bandwidth_capacity column to users")
 
     # Seed default admin if none exists
     if not User.query.filter_by(role="admin").first():
@@ -5563,7 +5606,7 @@ with app.app_context():
 
 
 # ─── Register Network Analytics Blueprint ─────────────────────────────────────
-from network_analytics import network_bp
+from network_analytics import network_bp, clear_analytics_cache
 app.register_blueprint(network_bp)
 
 # ─── Register Network Issues Blueprint ─────────────────────────────────────
@@ -5580,4 +5623,4 @@ schedule_daily_job(app)
 
 if __name__ == "__main__":
     run_sla_checks()
-    app.run(debug=True, host="0.0.0.0", port=5000, use_reloader=False)
+    app.run(debug=True, host="0.0.0.0", port=5500, use_reloader=False)

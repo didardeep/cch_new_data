@@ -2,12 +2,14 @@ import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { apiGet, apiPut } from '../../api';
 import { useAuth } from '../../AuthContext';
+import { useTheme } from '../../ThemeContext';
 
 export default function CustomerDashboard() {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const { user } = useAuth();
   const navigate = useNavigate();
+  const { isDark } = useTheme();
 
   const refreshDashboard = () => {
     apiGet('/api/customer/dashboard').then(d => {
@@ -120,7 +122,7 @@ export default function CustomerDashboard() {
                         {s.status === 'active' ? 'Resume' : 'Open'}
                       </span>
                     </td>
-                    <td style={{ fontSize: 12, color: '#94a3b8' }}>
+                    <td style={{ fontSize: 12, color: isDark ? '#64748b' : '#94a3b8' }}>
                       {s.created_at ? new Date(s.created_at).toLocaleDateString() : '—'}
                     </td>
                     <td>
@@ -128,8 +130,8 @@ export default function CustomerDashboard() {
                         <button
                           className="btn btn-sm"
                           style={{
-                            padding: '4px 10px', fontSize: 11, background: '#fef2f2',
-                            color: '#dc2626', border: '1px solid #fecaca', borderRadius: 6,
+                            padding: '4px 10px', fontSize: 11, background: isDark ? '#451a1a' : '#fef2f2',
+                            color: '#dc2626', border: `1px solid ${isDark ? '#7f1d1d' : '#fecaca'}`, borderRadius: 6,
                             cursor: 'pointer', fontFamily: 'inherit', fontWeight: 500,
                           }}
                           onClick={(e) => handleClearChat(e, s.id)}

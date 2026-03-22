@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { apiGet, apiPut } from '../../api';
+import { useTheme } from '../../ThemeContext';
 
 /* ── Style helpers ─────────────────────────────────────────────────────────── */
 const TIER_CFG = {
@@ -62,7 +63,7 @@ function StatusBadge({ status }) {
 }
 
 /* ── Review Dialog ─────────────────────────────────────────────────────────── */
-function ReviewDialog({ dialog, note, setNote, msg, loading, onClose, onSubmit }) {
+function ReviewDialog({ dialog, note, setNote, msg, loading, onClose, onSubmit, isDark }) {
   if (!dialog.open) return null;
   const isApprove = dialog.decision === 'approved';
 
@@ -78,8 +79,8 @@ function ReviewDialog({ dialog, note, setNote, msg, loading, onClose, onSubmit }
       <div
         onClick={e => e.stopPropagation()}
         style={{
-          width: '100%', maxWidth: 520, background: '#fff', borderRadius: 14,
-          boxShadow: '0 24px 48px rgba(15,23,42,0.2)', border: '1px solid #e2e8f0', padding: 28,
+          width: '100%', maxWidth: 520, background: isDark ? '#1e293b' : '#fff', borderRadius: 14,
+          boxShadow: isDark ? '0 24px 48px rgba(0,0,0,0.4)' : '0 24px 48px rgba(15,23,42,0.2)', border: `1px solid ${isDark ? '#334155' : '#e2e8f0'}`, padding: 28,
         }}
       >
         {/* Icon + title */}
@@ -94,18 +95,18 @@ function ReviewDialog({ dialog, note, setNote, msg, loading, onClose, onSubmit }
             {isApprove ? '✓' : '✕'}
           </div>
           <div>
-            <h3 style={{ margin: 0, fontSize: 16, fontWeight: 700, color: '#0f172a' }}>
+            <h3 style={{ margin: 0, fontSize: 16, fontWeight: 700, color: isDark ? '#e2e8f0' : '#0f172a' }}>
               {isApprove ? 'Approve Request' : 'Reject Request'}
             </h3>
             {dialog.changeRef && (
-              <span style={{ fontSize: 11, color: '#64748b', fontFamily: 'monospace' }}>
+              <span style={{ fontSize: 11, color: isDark ? '#94a3b8' : '#64748b', fontFamily: 'monospace' }}>
                 {dialog.changeRef}
               </span>
             )}
           </div>
         </div>
 
-        <p style={{ fontSize: 13, color: '#64748b', margin: '0 0 16px', lineHeight: 1.55 }}>
+        <p style={{ fontSize: 13, color: isDark ? '#94a3b8' : '#64748b', margin: '0 0 16px', lineHeight: 1.55 }}>
           {isApprove
             ? 'Approving this request will notify the expert and log your decision.'
             : 'Rejecting will notify the expert with your reason.'}
@@ -114,13 +115,13 @@ function ReviewDialog({ dialog, note, setNote, msg, loading, onClose, onSubmit }
         {/* Proposed change preview */}
         {dialog.proposedChange && (
           <div style={{
-            background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 8,
+            background: isDark ? '#152238' : '#f8fafc', border: `1px solid ${isDark ? '#334155' : '#e2e8f0'}`, borderRadius: 8,
             padding: '10px 14px', marginBottom: 16, lineHeight: 1.5,
           }}>
-            <div style={{ fontSize: 10, fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 4 }}>
+            <div style={{ fontSize: 10, fontWeight: 700, color: isDark ? '#64748b' : '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 4 }}>
               Proposed Change
             </div>
-            <div style={{ fontSize: 13, color: '#0f172a' }}>{dialog.proposedChange}</div>
+            <div style={{ fontSize: 13, color: isDark ? '#e2e8f0' : '#0f172a' }}>{dialog.proposedChange}</div>
           </div>
         )}
 
@@ -130,8 +131,9 @@ function ReviewDialog({ dialog, note, setNote, msg, loading, onClose, onSubmit }
           placeholder={isApprove ? 'Optional approval note for the expert...' : 'Reason for rejection (recommended)...'}
           rows={3}
           style={{
-            width: '100%', borderRadius: 8, border: '1px solid #e2e8f0',
-            padding: '10px 12px', fontSize: 13, color: '#0f172a',
+            width: '100%', borderRadius: 8, border: `1px solid ${isDark ? '#334155' : '#e2e8f0'}`,
+            padding: '10px 12px', fontSize: 13, color: isDark ? '#e2e8f0' : '#0f172a',
+            background: isDark ? '#0f172a' : '#fff',
             resize: 'vertical', outline: 'none', boxSizing: 'border-box',
             fontFamily: 'inherit',
           }}
@@ -148,7 +150,7 @@ function ReviewDialog({ dialog, note, setNote, msg, loading, onClose, onSubmit }
             disabled={loading}
             style={{
               padding: '8px 18px', borderRadius: 7, fontSize: 13, fontWeight: 600,
-              background: '#f8fafc', color: '#475569', border: '1px solid #e2e8f0', cursor: 'pointer',
+              background: isDark ? '#152238' : '#f8fafc', color: isDark ? '#94a3b8' : '#475569', border: `1px solid ${isDark ? '#334155' : '#e2e8f0'}`, cursor: 'pointer',
             }}
           >
             Cancel
@@ -158,7 +160,7 @@ function ReviewDialog({ dialog, note, setNote, msg, loading, onClose, onSubmit }
             disabled={loading}
             style={{
               padding: '8px 22px', borderRadius: 7, fontSize: 13, fontWeight: 700,
-              background: isApprove ? '#16a34a' : '#fff',
+              background: isApprove ? '#16a34a' : (isDark ? '#1e293b' : '#fff'),
               color: isApprove ? '#fff' : '#dc2626',
               border: isApprove ? 'none' : '1px solid #fca5a5',
               cursor: loading ? 'not-allowed' : 'pointer',
@@ -174,15 +176,15 @@ function ReviewDialog({ dialog, note, setNote, msg, loading, onClose, onSubmit }
 }
 
 /* ── Approval Card ─────────────────────────────────────────────────────────── */
-function ApprovalCard({ change, onAction }) {
+function ApprovalCard({ change, onAction, isDark }) {
   const t = change.ticket || {};
   const priority = t.priority || 'medium';
   const p = PRIORITY_STYLE[priority] || PRIORITY_STYLE.medium;
 
   return (
     <div style={{
-      background: '#fff', borderRadius: 12, border: '1px solid #e2e8f0',
-      boxShadow: '0 1px 4px rgba(15,23,42,0.06)',
+      background: isDark ? '#1e293b' : '#fff', borderRadius: 12, border: `1px solid ${isDark ? '#334155' : '#e2e8f0'}`,
+      boxShadow: isDark ? '0 1px 4px rgba(0,0,0,0.2)' : '0 1px 4px rgba(15,23,42,0.06)',
       overflow: 'hidden', marginBottom: 12,
     }}>
       {/* Top accent bar based on priority */}
@@ -194,7 +196,7 @@ function ApprovalCard({ change, onAction }) {
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
             <span style={{
               fontFamily: "'JetBrains Mono', monospace", fontSize: 13,
-              fontWeight: 700, color: '#00338D',
+              fontWeight: 700, color: isDark ? '#4da3ff' : '#00338D',
             }}>
               {t.reference_number || `#${change.ticket_id}`}
             </span>
@@ -210,7 +212,7 @@ function ApprovalCard({ change, onAction }) {
             )}
             <TierBadge userType={t.user_type} />
           </div>
-          <span style={{ fontSize: 11, color: '#94a3b8', whiteSpace: 'nowrap' }}>
+          <span style={{ fontSize: 11, color: isDark ? '#64748b' : '#94a3b8', whiteSpace: 'nowrap' }}>
             {change.created_at ? new Date(change.created_at).toLocaleString([], {
               month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
             }) : ''}
@@ -219,16 +221,16 @@ function ApprovalCard({ change, onAction }) {
 
         {/* Row 2: customer + category */}
         <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, marginBottom: 4, flexWrap: 'wrap' }}>
-          <span style={{ fontSize: 14, fontWeight: 600, color: '#0f172a' }}>{t.user_name || 'Customer'}</span>
-          <span style={{ fontSize: 12, color: '#94a3b8' }}>
+          <span style={{ fontSize: 14, fontWeight: 600, color: isDark ? '#e2e8f0' : '#0f172a' }}>{t.user_name || 'Customer'}</span>
+          <span style={{ fontSize: 12, color: isDark ? '#64748b' : '#94a3b8' }}>
             {t.category || 'General'}{t.subcategory ? ` › ${t.subcategory}` : ''}
           </span>
         </div>
 
         {/* Row 3: submitted by */}
-        <div style={{ fontSize: 12, color: '#64748b', marginBottom: 12 }}>
+        <div style={{ fontSize: 12, color: isDark ? '#94a3b8' : '#64748b', marginBottom: 12 }}>
           Submitted by{' '}
-          <strong style={{ color: '#374151' }}>{change.agent_name || 'Expert'}</strong>
+          <strong style={{ color: isDark ? '#cbd5e1' : '#374151' }}>{change.agent_name || 'Expert'}</strong>
         </div>
 
         {/* Proposed change box */}
@@ -266,7 +268,7 @@ function ApprovalCard({ change, onAction }) {
             onClick={() => onAction(change, 'disapproved')}
             style={{
               flex: 1, padding: '9px 0', borderRadius: 8, fontSize: 13, fontWeight: 700,
-              background: '#fff', color: '#dc2626',
+              background: isDark ? '#1e293b' : '#fff', color: '#dc2626',
               border: '1px solid #fca5a5', cursor: 'pointer',
               display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6,
             }}
@@ -280,47 +282,47 @@ function ApprovalCard({ change, onAction }) {
 }
 
 /* ── History Row ───────────────────────────────────────────────────────────── */
-function HistoryRow({ change }) {
+function HistoryRow({ change, isDark }) {
   const t = change.ticket || {};
   return (
-    <tr style={{ borderBottom: '1px solid #f1f5f9' }}>
+    <tr style={{ borderBottom: `1px solid ${isDark ? '#1e293b' : '#f1f5f9'}` }}>
       <td style={{ padding: '10px 16px' }}>
         <span style={{
           fontFamily: "'JetBrains Mono', monospace",
-          fontSize: 12, color: '#00338D', fontWeight: 600,
+          fontSize: 12, color: isDark ? '#4da3ff' : '#00338D', fontWeight: 600,
         }}>
           {t.reference_number || `#${change.ticket_id}`}
         </span>
       </td>
       <td style={{ padding: '10px 16px' }}>
-        <div style={{ fontSize: 13, fontWeight: 500, color: '#0f172a' }}>{t.user_name || '—'}</div>
+        <div style={{ fontSize: 13, fontWeight: 500, color: isDark ? '#e2e8f0' : '#0f172a' }}>{t.user_name || '—'}</div>
         <TierBadge userType={t.user_type} />
       </td>
-      <td style={{ padding: '10px 16px', fontSize: 12, color: '#475569' }}>
+      <td style={{ padding: '10px 16px', fontSize: 12, color: isDark ? '#94a3b8' : '#475569' }}>
         <PriorityBadge priority={t.priority} />
       </td>
       <td style={{
-        padding: '10px 16px', fontSize: 13, color: '#374151',
+        padding: '10px 16px', fontSize: 13, color: isDark ? '#cbd5e1' : '#374151',
         maxWidth: 240, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
       }}>
         {change.proposed_change}
       </td>
-      <td style={{ padding: '10px 16px', fontSize: 12, color: '#475569' }}>
+      <td style={{ padding: '10px 16px', fontSize: 12, color: isDark ? '#94a3b8' : '#475569' }}>
         {change.agent_name || '—'}
       </td>
       <td style={{ padding: '10px 16px' }}>
         <StatusBadge status={change.status} />
       </td>
-      <td style={{ padding: '10px 16px', fontSize: 12, color: '#94a3b8', whiteSpace: 'nowrap' }}>
+      <td style={{ padding: '10px 16px', fontSize: 12, color: isDark ? '#64748b' : '#94a3b8', whiteSpace: 'nowrap' }}>
         {change.reviewed_at
           ? new Date(change.reviewed_at).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
           : '—'}
       </td>
-      <td style={{ padding: '10px 16px', fontSize: 12, color: '#64748b' }}>
+      <td style={{ padding: '10px 16px', fontSize: 12, color: isDark ? '#94a3b8' : '#64748b' }}>
         {change.reviewer_name || '—'}
       </td>
       <td style={{
-        padding: '10px 16px', fontSize: 12, color: '#475569',
+        padding: '10px 16px', fontSize: 12, color: isDark ? '#94a3b8' : '#475569',
         maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
       }}>
         {change.manager_note || '—'}
@@ -331,6 +333,7 @@ function HistoryRow({ change }) {
 
 /* ── Main Component ─────────────────────────────────────────────────────────── */
 export default function ManagerApprovals() {
+  const { isDark } = useTheme();
   const [pending, setPending]   = useState([]);
   const [history, setHistory]   = useState([]);
   const [loading, setLoading]   = useState(true);
@@ -429,48 +432,49 @@ export default function ManagerApprovals() {
         loading={reviewLoading}
         onClose={closeDialog}
         onSubmit={submitReview}
+        isDark={isDark}
       />
 
       {/* Summary stat cards */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 14, marginBottom: 24 }}>
         {/* Pending */}
         <div style={{
-          background: '#fff', borderRadius: 12, border: '1px solid #e2e8f0',
-          padding: '16px 20px', boxShadow: '0 1px 3px rgba(0,0,0,0.05)',
+          background: isDark ? '#1e293b' : '#fff', borderRadius: 12, border: `1px solid ${isDark ? '#334155' : '#e2e8f0'}`,
+          padding: '16px 20px', boxShadow: isDark ? '0 1px 3px rgba(0,0,0,0.2)' : '0 1px 3px rgba(0,0,0,0.05)',
         }}>
-          <div style={{ fontSize: 11, fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 6 }}>
+          <div style={{ fontSize: 11, fontWeight: 700, color: isDark ? '#64748b' : '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 6 }}>
             Pending
           </div>
-          <div style={{ fontSize: 28, fontWeight: 800, color: pendingCount > 0 ? '#dc2626' : '#0f172a' }}>
+          <div style={{ fontSize: 28, fontWeight: 800, color: pendingCount > 0 ? '#dc2626' : (isDark ? '#e2e8f0' : '#0f172a') }}>
             {pendingCount}
           </div>
-          <div style={{ fontSize: 12, color: '#64748b', marginTop: 2 }}>Awaiting your review</div>
+          <div style={{ fontSize: 12, color: isDark ? '#94a3b8' : '#64748b', marginTop: 2 }}>Awaiting your review</div>
         </div>
         {/* Approved */}
         <div style={{
-          background: '#fff', borderRadius: 12, border: '1px solid #e2e8f0',
-          padding: '16px 20px', boxShadow: '0 1px 3px rgba(0,0,0,0.05)',
+          background: isDark ? '#1e293b' : '#fff', borderRadius: 12, border: `1px solid ${isDark ? '#334155' : '#e2e8f0'}`,
+          padding: '16px 20px', boxShadow: isDark ? '0 1px 3px rgba(0,0,0,0.2)' : '0 1px 3px rgba(0,0,0,0.05)',
         }}>
-          <div style={{ fontSize: 11, fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 6 }}>
+          <div style={{ fontSize: 11, fontWeight: 700, color: isDark ? '#64748b' : '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 6 }}>
             Approved
           </div>
           <div style={{ fontSize: 28, fontWeight: 800, color: '#16a34a' }}>
             {history.filter(c => c.status === 'approved').length}
           </div>
-          <div style={{ fontSize: 12, color: '#64748b', marginTop: 2 }}>Total approved</div>
+          <div style={{ fontSize: 12, color: isDark ? '#94a3b8' : '#64748b', marginTop: 2 }}>Total approved</div>
         </div>
         {/* Rejected */}
         <div style={{
-          background: '#fff', borderRadius: 12, border: '1px solid #e2e8f0',
-          padding: '16px 20px', boxShadow: '0 1px 3px rgba(0,0,0,0.05)',
+          background: isDark ? '#1e293b' : '#fff', borderRadius: 12, border: `1px solid ${isDark ? '#334155' : '#e2e8f0'}`,
+          padding: '16px 20px', boxShadow: isDark ? '0 1px 3px rgba(0,0,0,0.2)' : '0 1px 3px rgba(0,0,0,0.05)',
         }}>
-          <div style={{ fontSize: 11, fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 6 }}>
+          <div style={{ fontSize: 11, fontWeight: 700, color: isDark ? '#64748b' : '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 6 }}>
             Rejected
           </div>
           <div style={{ fontSize: 28, fontWeight: 800, color: '#ea580c' }}>
             {history.filter(c => c.status === 'disapproved').length}
           </div>
-          <div style={{ fontSize: 12, color: '#64748b', marginTop: 2 }}>Total rejected</div>
+          <div style={{ fontSize: 12, color: isDark ? '#94a3b8' : '#64748b', marginTop: 2 }}>Total rejected</div>
         </div>
       </div>
 
@@ -486,9 +490,9 @@ export default function ManagerApprovals() {
             style={{
               padding: '8px 20px', borderRadius: 8, fontSize: 13, fontWeight: 600,
               border: '1px solid',
-              background: tab === t.key ? '#00338D' : '#fff',
-              color: tab === t.key ? '#fff' : '#475569',
-              borderColor: tab === t.key ? '#00338D' : '#e2e8f0',
+              background: tab === t.key ? (isDark ? '#4da3ff' : '#00338D') : (isDark ? '#1e293b' : '#fff'),
+              color: tab === t.key ? '#fff' : (isDark ? '#94a3b8' : '#475569'),
+              borderColor: tab === t.key ? (isDark ? '#4da3ff' : '#00338D') : (isDark ? '#334155' : '#e2e8f0'),
               cursor: 'pointer',
             }}
           >
@@ -504,19 +508,19 @@ export default function ManagerApprovals() {
         /* ── Pending tab ── */
         pendingCount === 0 ? (
           <div style={{
-            background: '#fff', borderRadius: 12, border: '1px solid #e2e8f0',
+            background: isDark ? '#1e293b' : '#fff', borderRadius: 12, border: `1px solid ${isDark ? '#334155' : '#e2e8f0'}`,
             padding: '60px 20px', textAlign: 'center',
           }}>
             <div style={{ fontSize: 48, marginBottom: 12 }}>✅</div>
             <h4 style={{ color: '#16a34a', margin: '0 0 6px', fontSize: 16 }}>All caught up!</h4>
-            <p style={{ color: '#64748b', fontSize: 13, margin: 0 }}>
+            <p style={{ color: isDark ? '#94a3b8' : '#64748b', fontSize: 13, margin: 0 }}>
               There are no pending approval requests from experts.
             </p>
           </div>
         ) : (
           <div>
             {pending.map(change => (
-              <ApprovalCard key={change.id} change={change} onAction={openDialog} />
+              <ApprovalCard key={change.id} change={change} onAction={openDialog} isDark={isDark} />
             ))}
           </div>
         )
@@ -524,29 +528,29 @@ export default function ManagerApprovals() {
         /* ── History tab ── */
         history.length === 0 ? (
           <div style={{
-            background: '#fff', borderRadius: 12, border: '1px solid #e2e8f0',
+            background: isDark ? '#1e293b' : '#fff', borderRadius: 12, border: `1px solid ${isDark ? '#334155' : '#e2e8f0'}`,
             padding: '60px 20px', textAlign: 'center',
           }}>
             <div style={{ fontSize: 48, marginBottom: 12 }}>📋</div>
-            <h4 style={{ color: '#64748b', margin: '0 0 6px', fontSize: 16 }}>No history yet</h4>
-            <p style={{ color: '#94a3b8', fontSize: 13, margin: 0 }}>
+            <h4 style={{ color: isDark ? '#94a3b8' : '#64748b', margin: '0 0 6px', fontSize: 16 }}>No history yet</h4>
+            <p style={{ color: isDark ? '#64748b' : '#94a3b8', fontSize: 13, margin: 0 }}>
               Reviewed approvals will appear here.
             </p>
           </div>
         ) : (
           <div style={{
-            background: '#fff', borderRadius: 12, border: '1px solid #e2e8f0',
-            overflow: 'hidden', boxShadow: '0 1px 3px rgba(0,0,0,0.05)',
+            background: isDark ? '#1e293b' : '#fff', borderRadius: 12, border: `1px solid ${isDark ? '#334155' : '#e2e8f0'}`,
+            overflow: 'hidden', boxShadow: isDark ? '0 1px 3px rgba(0,0,0,0.2)' : '0 1px 3px rgba(0,0,0,0.05)',
           }}>
             <div style={{ overflowX: 'auto' }}>
               <table style={{ width: '100%', borderCollapse: 'collapse' }}>
                 <thead>
-                  <tr style={{ background: '#f8fafc' }}>
+                  <tr style={{ background: isDark ? '#152238' : '#f8fafc' }}>
                     {['Ticket Ref', 'Customer', 'Priority', 'Proposed Change', 'Submitted By', 'Decision', 'Reviewed At', 'Reviewed By', 'Manager Note'].map(h => (
                       <th key={h} style={{
                         padding: '10px 16px', textAlign: 'left', fontSize: 11,
-                        fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase',
-                        letterSpacing: '0.06em', borderBottom: '1px solid #e2e8f0',
+                        fontWeight: 700, color: isDark ? '#64748b' : '#94a3b8', textTransform: 'uppercase',
+                        letterSpacing: '0.06em', borderBottom: `1px solid ${isDark ? '#334155' : '#e2e8f0'}`,
                         whiteSpace: 'nowrap',
                       }}>
                         {h}
@@ -556,7 +560,7 @@ export default function ManagerApprovals() {
                 </thead>
                 <tbody>
                   {history.map(change => (
-                    <HistoryRow key={change.id} change={change} />
+                    <HistoryRow key={change.id} change={change} isDark={isDark} />
                   ))}
                 </tbody>
               </table>
@@ -565,7 +569,7 @@ export default function ManagerApprovals() {
         )
       )}
 
-      <div style={{ marginTop: 14, fontSize: 12, color: '#94a3b8', textAlign: 'right' }}>
+      <div style={{ marginTop: 14, fontSize: 12, color: isDark ? '#64748b' : '#94a3b8', textAlign: 'right' }}>
         Auto-refreshes every 30s
       </div>
     </div>

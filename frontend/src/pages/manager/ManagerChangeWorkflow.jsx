@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { apiGet, apiPut } from '../../api';
+import { useTheme } from '../../ThemeContext';
 
 /* ── Constants ─────────────────────────────────────────────────────────────── */
 const PRIORITY_STYLE = {
@@ -96,7 +97,7 @@ function Pipeline({ status }) {
 }
 
 /* ── Action Modal ───────────────────────────────────────────────────────────── */
-function ActionModal({ cr, onClose, onDone }) {
+function ActionModal({ cr, onClose, onDone, isDark }) {
   const [step,     setStep]     = useState('');     // validate|classify|approve|close
   const [typeVal,  setTypeVal]  = useState('standard');
   const [remark,   setRemark]   = useState('');
@@ -157,36 +158,36 @@ function ActionModal({ cr, onClose, onDone }) {
       zIndex: 1000, padding: 16,
     }} onClick={onClose}>
       <div onClick={e => e.stopPropagation()} style={{
-        width: '100%', maxWidth: 540, background: '#fff', borderRadius: 14,
-        boxShadow: '0 24px 48px rgba(15,23,42,0.2)', padding: 28,
+        width: '100%', maxWidth: 540, background: isDark ? '#1e293b' : '#fff', borderRadius: 14,
+        boxShadow: isDark ? '0 24px 48px rgba(0,0,0,0.4)' : '0 24px 48px rgba(15,23,42,0.2)', padding: 28,
       }}>
         {/* Header */}
         <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 18 }}>
           <div>
-            <h3 style={{ margin: '0 0 4px', fontSize: 16, fontWeight: 700, color: '#0f172a' }}>
+            <h3 style={{ margin: '0 0 4px', fontSize: 16, fontWeight: 700, color: isDark ? '#e2e8f0' : '#0f172a' }}>
               {STEP_TITLES[step]}
             </h3>
             <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-              <span style={{ fontSize: 12, fontFamily: 'monospace', color: '#00338D', fontWeight: 700 }}>
+              <span style={{ fontSize: 12, fontFamily: 'monospace', color: isDark ? '#4da3ff' : '#00338D', fontWeight: 700 }}>
                 {cr.cr_number}
               </span>
-              <span style={{ fontSize: 11, color: '#94a3b8' }}>·</span>
-              <span style={{ fontSize: 12, color: '#64748b' }}>{cr.ticket_ref}</span>
+              <span style={{ fontSize: 11, color: isDark ? '#64748b' : '#94a3b8' }}>·</span>
+              <span style={{ fontSize: 12, color: isDark ? '#94a3b8' : '#64748b' }}>{cr.ticket_ref}</span>
             </div>
           </div>
           <button onClick={onClose} style={{
-            border: 'none', background: '#f1f5f9', borderRadius: 6, width: 28, height: 28,
-            cursor: 'pointer', fontSize: 14, color: '#64748b', flexShrink: 0,
+            border: 'none', background: isDark ? '#334155' : '#f1f5f9', borderRadius: 6, width: 28, height: 28,
+            cursor: 'pointer', fontSize: 14, color: isDark ? '#94a3b8' : '#64748b', flexShrink: 0,
           }}>✕</button>
         </div>
 
         {/* CR summary box */}
         <div style={{
-          background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 8,
+          background: isDark ? '#152238' : '#f8fafc', border: `1px solid ${isDark ? '#334155' : '#e2e8f0'}`, borderRadius: 8,
           padding: '10px 14px', marginBottom: 18,
         }}>
-          <div style={{ fontSize: 13, fontWeight: 600, color: '#0f172a', marginBottom: 4 }}>{cr.title}</div>
-          <div style={{ fontSize: 12, color: '#64748b', lineHeight: 1.5 }}>{cr.description}</div>
+          <div style={{ fontSize: 13, fontWeight: 600, color: isDark ? '#e2e8f0' : '#0f172a', marginBottom: 4 }}>{cr.title}</div>
+          <div style={{ fontSize: 12, color: isDark ? '#94a3b8' : '#64748b', lineHeight: 1.5 }}>{cr.description}</div>
           {cr.rejection_count > 0 && (
             <div style={{
               marginTop: 8, fontSize: 11, fontWeight: 700, color: '#dc2626',
@@ -201,20 +202,20 @@ function ActionModal({ cr, onClose, onDone }) {
         {/* Step-specific inputs */}
         {step === 'validate' && (
           <div>
-            <label style={{ fontSize: 12, fontWeight: 600, color: '#374151', display: 'block', marginBottom: 6 }}>
+            <label style={{ fontSize: 12, fontWeight: 600, color: isDark ? '#cbd5e1' : '#374151', display: 'block', marginBottom: 6 }}>
               Validation Remark (required if rejecting)
             </label>
             <textarea value={remark} onChange={e => setRemark(e.target.value)}
               rows={3} placeholder="Provide your validation comments..."
-              style={{ width: '100%', borderRadius: 8, border: '1px solid #e2e8f0', padding: '8px 12px', fontSize: 13, resize: 'vertical', boxSizing: 'border-box', fontFamily: 'inherit' }}
+              style={{ width: '100%', borderRadius: 8, border: `1px solid ${isDark ? '#334155' : '#e2e8f0'}`, padding: '8px 12px', fontSize: 13, resize: 'vertical', boxSizing: 'border-box', fontFamily: 'inherit', background: isDark ? '#0f172a' : '#fff', color: isDark ? '#e2e8f0' : '#0f172a' }}
             />
             {errMsg && <p style={{ margin: '6px 0 0', fontSize: 12, color: '#dc2626' }}>{errMsg}</p>}
             <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 16 }}>
-              <button onClick={onClose} disabled={loading} style={btnStyle('ghost')}>Cancel</button>
-              <button onClick={() => submit('invalid')} disabled={loading} style={btnStyle('danger')}>
+              <button onClick={onClose} disabled={loading} style={btnStyle('ghost', isDark)}>Cancel</button>
+              <button onClick={() => submit('invalid')} disabled={loading} style={btnStyle('danger', isDark)}>
                 {loading ? '…' : `Reject (${cr.rejection_count + 1}/2)`}
               </button>
-              <button onClick={() => submit('valid')} disabled={loading} style={btnStyle('success')}>
+              <button onClick={() => submit('valid')} disabled={loading} style={btnStyle('success', isDark)}>
                 {loading ? '…' : 'Mark Valid ✓'}
               </button>
             </div>
@@ -223,7 +224,7 @@ function ActionModal({ cr, onClose, onDone }) {
 
         {step === 'classify' && (
           <div>
-            <label style={{ fontSize: 12, fontWeight: 600, color: '#374151', display: 'block', marginBottom: 8 }}>
+            <label style={{ fontSize: 12, fontWeight: 600, color: isDark ? '#cbd5e1' : '#374151', display: 'block', marginBottom: 8 }}>
               Change Classification
             </label>
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 10, marginBottom: 14 }}>
@@ -233,9 +234,9 @@ function ActionModal({ cr, onClose, onDone }) {
                 return (
                   <button key={t} onClick={() => setTypeVal(t)} style={{
                     padding: '10px 6px', borderRadius: 8, cursor: 'pointer', textAlign: 'center',
-                    background: sel ? ts.bg : '#f8fafc',
-                    border: `2px solid ${sel ? ts.border : '#e2e8f0'}`,
-                    color: sel ? ts.color : '#64748b',
+                    background: sel ? ts.bg : (isDark ? '#152238' : '#f8fafc'),
+                    border: `2px solid ${sel ? ts.border : (isDark ? '#334155' : '#e2e8f0')}`,
+                    color: sel ? ts.color : (isDark ? '#94a3b8' : '#64748b'),
                     fontWeight: sel ? 700 : 500, fontSize: 13,
                     transition: 'all 0.15s',
                   }}>
@@ -249,12 +250,12 @@ function ActionModal({ cr, onClose, onDone }) {
             </div>
             <textarea value={remark} onChange={e => setRemark(e.target.value)}
               rows={2} placeholder="Optional classification note..."
-              style={{ width: '100%', borderRadius: 8, border: '1px solid #e2e8f0', padding: '8px 12px', fontSize: 13, resize: 'none', boxSizing: 'border-box', fontFamily: 'inherit' }}
+              style={{ width: '100%', borderRadius: 8, border: `1px solid ${isDark ? '#334155' : '#e2e8f0'}`, padding: '8px 12px', fontSize: 13, resize: 'none', boxSizing: 'border-box', fontFamily: 'inherit', background: isDark ? '#0f172a' : '#fff', color: isDark ? '#e2e8f0' : '#0f172a' }}
             />
             {errMsg && <p style={{ margin: '6px 0 0', fontSize: 12, color: '#dc2626' }}>{errMsg}</p>}
             <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 16 }}>
-              <button onClick={onClose} disabled={loading} style={btnStyle('ghost')}>Cancel</button>
-              <button onClick={() => submit()} disabled={loading} style={btnStyle('primary')}>
+              <button onClick={onClose} disabled={loading} style={btnStyle('ghost', isDark)}>Cancel</button>
+              <button onClick={() => submit()} disabled={loading} style={btnStyle('primary', isDark)}>
                 {loading ? '…' : 'Classify & Continue →'}
               </button>
             </div>
@@ -263,20 +264,20 @@ function ActionModal({ cr, onClose, onDone }) {
 
         {step === 'approve' && (
           <div>
-            <label style={{ fontSize: 12, fontWeight: 600, color: '#374151', display: 'block', marginBottom: 6 }}>
+            <label style={{ fontSize: 12, fontWeight: 600, color: isDark ? '#cbd5e1' : '#374151', display: 'block', marginBottom: 6 }}>
               Approval Remark
             </label>
             <textarea value={remark} onChange={e => setRemark(e.target.value)}
               rows={3} placeholder="Optional note for the expert..."
-              style={{ width: '100%', borderRadius: 8, border: '1px solid #e2e8f0', padding: '8px 12px', fontSize: 13, resize: 'vertical', boxSizing: 'border-box', fontFamily: 'inherit' }}
+              style={{ width: '100%', borderRadius: 8, border: `1px solid ${isDark ? '#334155' : '#e2e8f0'}`, padding: '8px 12px', fontSize: 13, resize: 'vertical', boxSizing: 'border-box', fontFamily: 'inherit', background: isDark ? '#0f172a' : '#fff', color: isDark ? '#e2e8f0' : '#0f172a' }}
             />
             {errMsg && <p style={{ margin: '6px 0 0', fontSize: 12, color: '#dc2626' }}>{errMsg}</p>}
             <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 16 }}>
-              <button onClick={onClose} disabled={loading} style={btnStyle('ghost')}>Cancel</button>
-              <button onClick={() => submit('rejected')} disabled={loading} style={btnStyle('danger')}>
+              <button onClick={onClose} disabled={loading} style={btnStyle('ghost', isDark)}>Cancel</button>
+              <button onClick={() => submit('rejected')} disabled={loading} style={btnStyle('danger', isDark)}>
                 {loading ? '…' : 'Reject ✕'}
               </button>
-              <button onClick={() => submit('approved')} disabled={loading} style={btnStyle('success')}>
+              <button onClick={() => submit('approved')} disabled={loading} style={btnStyle('success', isDark)}>
                 {loading ? '…' : 'Approve ✓'}
               </button>
             </div>
@@ -297,12 +298,12 @@ function ActionModal({ cr, onClose, onDone }) {
             </div>
             <textarea value={remark} onChange={e => setRemark(e.target.value)}
               rows={3} placeholder="Closure notes / lessons learned..."
-              style={{ width: '100%', borderRadius: 8, border: '1px solid #e2e8f0', padding: '8px 12px', fontSize: 13, resize: 'vertical', boxSizing: 'border-box', fontFamily: 'inherit' }}
+              style={{ width: '100%', borderRadius: 8, border: `1px solid ${isDark ? '#334155' : '#e2e8f0'}`, padding: '8px 12px', fontSize: 13, resize: 'vertical', boxSizing: 'border-box', fontFamily: 'inherit', background: isDark ? '#0f172a' : '#fff', color: isDark ? '#e2e8f0' : '#0f172a' }}
             />
             {errMsg && <p style={{ margin: '6px 0 0', fontSize: 12, color: '#dc2626' }}>{errMsg}</p>}
             <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 16 }}>
-              <button onClick={onClose} disabled={loading} style={btnStyle('ghost')}>Cancel</button>
-              <button onClick={() => submit()} disabled={loading} style={btnStyle('primary')}>
+              <button onClick={onClose} disabled={loading} style={btnStyle('ghost', isDark)}>Cancel</button>
+              <button onClick={() => submit()} disabled={loading} style={btnStyle('primary', isDark)}>
                 {loading ? '…' : 'Close Change Request'}
               </button>
             </div>
@@ -310,7 +311,7 @@ function ActionModal({ cr, onClose, onDone }) {
         )}
 
         {!step && (
-          <div style={{ textAlign: 'center', padding: '12px 0', color: '#94a3b8', fontSize: 13 }}>
+          <div style={{ textAlign: 'center', padding: '12px 0', color: isDark ? '#64748b' : '#94a3b8', fontSize: 13 }}>
             No action available for this CR in its current state.
           </div>
         )}
@@ -320,12 +321,12 @@ function ActionModal({ cr, onClose, onDone }) {
 }
 
 /* ── Detail Drawer ──────────────────────────────────────────────────────────── */
-function DetailDrawer({ cr, onClose }) {
+function DetailDrawer({ cr, onClose, isDark }) {
   if (!cr) return null;
   const Row = ({ label, value, mono }) => value ? (
-    <div style={{ display: 'grid', gridTemplateColumns: '130px 1fr', gap: 8, padding: '7px 0', borderBottom: '1px solid #f1f5f9' }}>
-      <span style={{ fontSize: 11, fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.05em', paddingTop: 1 }}>{label}</span>
-      <span style={{ fontSize: 13, color: '#0f172a', fontFamily: mono ? 'monospace' : 'inherit' }}>{value}</span>
+    <div style={{ display: 'grid', gridTemplateColumns: '130px 1fr', gap: 8, padding: '7px 0', borderBottom: `1px solid ${isDark ? '#1e293b' : '#f1f5f9'}` }}>
+      <span style={{ fontSize: 11, fontWeight: 700, color: isDark ? '#64748b' : '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.05em', paddingTop: 1 }}>{label}</span>
+      <span style={{ fontSize: 13, color: isDark ? '#e2e8f0' : '#0f172a', fontFamily: mono ? 'monospace' : 'inherit' }}>{value}</span>
     </div>
   ) : null;
 
@@ -349,22 +350,22 @@ function DetailDrawer({ cr, onClose }) {
       zIndex: 1000,
     }} onClick={onClose}>
       <div onClick={e => e.stopPropagation()} style={{
-        width: 480, height: '100vh', background: '#fff', overflowY: 'auto',
-        boxShadow: '-8px 0 24px rgba(15,23,42,0.15)', padding: 28,
+        width: 480, height: '100vh', background: isDark ? '#1e293b' : '#fff', overflowY: 'auto',
+        boxShadow: isDark ? '-8px 0 24px rgba(0,0,0,0.3)' : '-8px 0 24px rgba(15,23,42,0.15)', padding: 28,
       }}>
         {/* Header */}
         <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 20 }}>
           <div>
-            <div style={{ fontSize: 11, fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 4 }}>
+            <div style={{ fontSize: 11, fontWeight: 700, color: isDark ? '#64748b' : '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 4 }}>
               Change Request
             </div>
-            <div style={{ fontSize: 18, fontWeight: 800, color: '#00338D', fontFamily: 'monospace' }}>
+            <div style={{ fontSize: 18, fontWeight: 800, color: isDark ? '#4da3ff' : '#00338D', fontFamily: 'monospace' }}>
               {cr.cr_number}
             </div>
           </div>
           <button onClick={onClose} style={{
-            border: 'none', background: '#f1f5f9', borderRadius: 8, width: 32, height: 32,
-            cursor: 'pointer', fontSize: 16, color: '#64748b',
+            border: 'none', background: isDark ? '#334155' : '#f1f5f9', borderRadius: 8, width: 32, height: 32,
+            cursor: 'pointer', fontSize: 16, color: isDark ? '#94a3b8' : '#64748b',
           }}>✕</button>
         </div>
 
@@ -390,7 +391,7 @@ function DetailDrawer({ cr, onClose }) {
 
         {/* Details */}
         <div style={{ marginBottom: 20 }}>
-          <div style={{ fontSize: 14, fontWeight: 700, color: '#0f172a', marginBottom: 12 }}>Change Details</div>
+          <div style={{ fontSize: 14, fontWeight: 700, color: isDark ? '#e2e8f0' : '#0f172a', marginBottom: 12 }}>Change Details</div>
           <Row label="Title"      value={cr.title} />
           <Row label="Ticket"     value={cr.ticket_ref} mono />
           <Row label="Customer"   value={cr.ticket_user_name} />
@@ -402,17 +403,17 @@ function DetailDrawer({ cr, onClose }) {
 
         {/* Description */}
         <div style={{ marginBottom: 16 }}>
-          <div style={{ fontSize: 12, fontWeight: 700, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 6 }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: isDark ? '#94a3b8' : '#64748b', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 6 }}>
             Description
           </div>
-          <div style={{ background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 8, padding: '10px 14px', fontSize: 13, color: '#0f172a', lineHeight: 1.6 }}>
+          <div style={{ background: isDark ? '#152238' : '#f8fafc', border: `1px solid ${isDark ? '#334155' : '#e2e8f0'}`, borderRadius: 8, padding: '10px 14px', fontSize: 13, color: isDark ? '#e2e8f0' : '#0f172a', lineHeight: 1.6 }}>
             {cr.description}
           </div>
         </div>
 
         {cr.impact_assessment && (
           <div style={{ marginBottom: 16 }}>
-            <div style={{ fontSize: 12, fontWeight: 700, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 6 }}>
+            <div style={{ fontSize: 12, fontWeight: 700, color: isDark ? '#94a3b8' : '#64748b', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 6 }}>
               Impact Assessment
             </div>
             <div style={{ background: '#fffbeb', border: '1px solid #fde68a', borderRadius: 8, padding: '10px 14px', fontSize: 13, color: '#0f172a', lineHeight: 1.6 }}>
@@ -423,7 +424,7 @@ function DetailDrawer({ cr, onClose }) {
 
         {cr.rollback_plan && (
           <div style={{ marginBottom: 16 }}>
-            <div style={{ fontSize: 12, fontWeight: 700, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 6 }}>
+            <div style={{ fontSize: 12, fontWeight: 700, color: isDark ? '#94a3b8' : '#64748b', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 6 }}>
               Rollback Plan
             </div>
             <div style={{ background: '#fef2f2', border: '1px solid #fecaca', borderRadius: 8, padding: '10px 14px', fontSize: 13, color: '#0f172a', lineHeight: 1.6 }}>
@@ -434,25 +435,25 @@ function DetailDrawer({ cr, onClose }) {
 
         {/* Audit timeline */}
         <div>
-          <div style={{ fontSize: 14, fontWeight: 700, color: '#0f172a', marginBottom: 12 }}>Audit Trail</div>
+          <div style={{ fontSize: 14, fontWeight: 700, color: isDark ? '#e2e8f0' : '#0f172a', marginBottom: 12 }}>Audit Trail</div>
           <div style={{ position: 'relative', paddingLeft: 20 }}>
-            <div style={{ position: 'absolute', left: 7, top: 6, bottom: 0, width: 2, background: '#e2e8f0' }} />
+            <div style={{ position: 'absolute', left: 7, top: 6, bottom: 0, width: 2, background: isDark ? '#334155' : '#e2e8f0' }} />
             {timeline.map((ev, i) => (
               <div key={i} style={{ position: 'relative', paddingBottom: 16 }}>
                 <div style={{
                   position: 'absolute', left: -20, top: 4,
                   width: 10, height: 10, borderRadius: '50%',
-                  background: '#00338D', border: '2px solid #fff',
-                  boxShadow: '0 0 0 2px #00338D',
+                  background: isDark ? '#4da3ff' : '#00338D', border: `2px solid ${isDark ? '#1e293b' : '#fff'}`,
+                  boxShadow: `0 0 0 2px ${isDark ? '#4da3ff' : '#00338D'}`,
                 }} />
-                <div style={{ fontSize: 11, fontWeight: 700, color: '#00338D', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+                <div style={{ fontSize: 11, fontWeight: 700, color: isDark ? '#4da3ff' : '#00338D', textTransform: 'uppercase', letterSpacing: '0.04em' }}>
                   {ev.label} {ev.by ? `— ${ev.by}` : ''}
                 </div>
-                <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: ev.note ? 4 : 0 }}>
+                <div style={{ fontSize: 11, color: isDark ? '#64748b' : '#94a3b8', marginBottom: ev.note ? 4 : 0 }}>
                   {ev.time ? new Date(ev.time).toLocaleString() : ''}
                 </div>
                 {ev.note && (
-                  <div style={{ fontSize: 12, color: '#475569', background: '#f8fafc', borderRadius: 6, padding: '6px 10px', lineHeight: 1.5 }}>
+                  <div style={{ fontSize: 12, color: isDark ? '#94a3b8' : '#475569', background: isDark ? '#152238' : '#f8fafc', borderRadius: 6, padding: '6px 10px', lineHeight: 1.5 }}>
                     {ev.note}
                   </div>
                 )}
@@ -466,16 +467,16 @@ function DetailDrawer({ cr, onClose }) {
 }
 
 /* ── Helpers ────────────────────────────────────────────────────────────────── */
-function btnStyle(type) {
+function btnStyle(type, isDark) {
   const base = { padding: '8px 18px', borderRadius: 7, fontSize: 13, fontWeight: 600, cursor: 'pointer', border: '1px solid' };
-  if (type === 'primary') return { ...base, background: '#00338D', color: '#fff', borderColor: '#00338D' };
+  if (type === 'primary') return { ...base, background: isDark ? '#4da3ff' : '#00338D', color: '#fff', borderColor: isDark ? '#4da3ff' : '#00338D' };
   if (type === 'success') return { ...base, background: '#16a34a', color: '#fff', borderColor: '#16a34a' };
-  if (type === 'danger')  return { ...base, background: '#fff', color: '#dc2626', borderColor: '#fca5a5' };
-  return { ...base, background: '#f8fafc', color: '#475569', borderColor: '#e2e8f0' };
+  if (type === 'danger')  return { ...base, background: isDark ? '#1e293b' : '#fff', color: '#dc2626', borderColor: '#fca5a5' };
+  return { ...base, background: isDark ? '#152238' : '#f8fafc', color: isDark ? '#94a3b8' : '#475569', borderColor: isDark ? '#334155' : '#e2e8f0' };
 }
 
 /* ── CR Card ────────────────────────────────────────────────────────────────── */
-function CRCard({ cr, onAction, onDetail }) {
+function CRCard({ cr, onAction, onDetail, isDark }) {
   const meta   = STATUS_META[cr.status] || STATUS_META.created;
   const p      = PRIORITY_STYLE[cr.ticket_priority] || PRIORITY_STYLE.medium;
   const ts     = TYPE_STYLE[cr.change_type];
@@ -483,8 +484,8 @@ function CRCard({ cr, onAction, onDetail }) {
 
   return (
     <div style={{
-      background: '#fff', borderRadius: 12, border: '1px solid #e2e8f0',
-      boxShadow: needsAction ? '0 2px 8px rgba(0,51,141,0.08)' : '0 1px 3px rgba(0,0,0,0.04)',
+      background: isDark ? '#1e293b' : '#fff', borderRadius: 12, border: `1px solid ${isDark ? '#334155' : '#e2e8f0'}`,
+      boxShadow: needsAction ? (isDark ? '0 2px 8px rgba(0,0,0,0.2)' : '0 2px 8px rgba(0,51,141,0.08)') : (isDark ? '0 1px 3px rgba(0,0,0,0.2)' : '0 1px 3px rgba(0,0,0,0.04)'),
       overflow: 'hidden', marginBottom: 12,
       borderLeft: `4px solid ${meta.color}`,
     }}>
@@ -492,11 +493,11 @@ function CRCard({ cr, onAction, onDetail }) {
         {/* Row 1: CR# + Ticket + Badges + Time */}
         <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 8, gap: 12 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-            <span style={{ fontFamily: 'monospace', fontSize: 13, fontWeight: 800, color: '#00338D' }}>
+            <span style={{ fontFamily: 'monospace', fontSize: 13, fontWeight: 800, color: isDark ? '#4da3ff' : '#00338D' }}>
               {cr.cr_number}
             </span>
-            <span style={{ fontSize: 11, color: '#94a3b8' }}>·</span>
-            <span style={{ fontFamily: 'monospace', fontSize: 11, color: '#64748b' }}>{cr.ticket_ref}</span>
+            <span style={{ fontSize: 11, color: isDark ? '#64748b' : '#94a3b8' }}>·</span>
+            <span style={{ fontFamily: 'monospace', fontSize: 11, color: isDark ? '#94a3b8' : '#64748b' }}>{cr.ticket_ref}</span>
             <span style={{ fontSize: 10, fontWeight: 700, padding: '2px 7px', borderRadius: 4, background: p.bg, color: p.color, border: `1px solid ${p.border}`, textTransform: 'uppercase' }}>
               {cr.ticket_priority}
             </span>
@@ -509,27 +510,27 @@ function CRCard({ cr, onAction, onDetail }) {
               {meta.label}
             </span>
           </div>
-          <span style={{ fontSize: 11, color: '#94a3b8', whiteSpace: 'nowrap', flexShrink: 0 }}>
+          <span style={{ fontSize: 11, color: isDark ? '#64748b' : '#94a3b8', whiteSpace: 'nowrap', flexShrink: 0 }}>
             {cr.created_at ? new Date(cr.created_at).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : ''}
           </span>
         </div>
 
         {/* Title */}
-        <div style={{ fontSize: 14, fontWeight: 600, color: '#0f172a', marginBottom: 4, lineHeight: 1.4 }}>
+        <div style={{ fontSize: 14, fontWeight: 600, color: isDark ? '#e2e8f0' : '#0f172a', marginBottom: 4, lineHeight: 1.4 }}>
           {cr.title}
         </div>
 
         {/* Meta: raised by + customer */}
-        <div style={{ fontSize: 12, color: '#64748b', marginBottom: 10 }}>
-          Raised by <strong style={{ color: '#374151' }}>{cr.raised_by_name}</strong>
-          {cr.ticket_user_name && <> · Customer: <strong style={{ color: '#374151' }}>{cr.ticket_user_name}</strong></>}
+        <div style={{ fontSize: 12, color: isDark ? '#94a3b8' : '#64748b', marginBottom: 10 }}>
+          Raised by <strong style={{ color: isDark ? '#cbd5e1' : '#374151' }}>{cr.raised_by_name}</strong>
+          {cr.ticket_user_name && <> · Customer: <strong style={{ color: isDark ? '#cbd5e1' : '#374151' }}>{cr.ticket_user_name}</strong></>}
           {cr.ticket_domain && <> · <span style={{ textTransform: 'capitalize' }}>{cr.ticket_domain}</span></>}
         </div>
 
         {/* Description excerpt */}
         <div style={{
-          background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 7,
-          padding: '8px 12px', fontSize: 12, color: '#475569',
+          background: isDark ? '#152238' : '#f8fafc', border: `1px solid ${isDark ? '#334155' : '#e2e8f0'}`, borderRadius: 7,
+          padding: '8px 12px', fontSize: 12, color: isDark ? '#94a3b8' : '#475569',
           lineHeight: 1.5, marginBottom: 12,
           overflow: 'hidden', display: '-webkit-box', WebkitLineClamp: 2,
           WebkitBoxOrient: 'vertical',
@@ -553,12 +554,12 @@ function CRCard({ cr, onAction, onDetail }) {
 
         {/* Actions */}
         <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 4 }}>
-          <button onClick={() => onDetail(cr)} style={btnStyle('ghost')}>
+          <button onClick={() => onDetail(cr)} style={btnStyle('ghost', isDark)}>
             View Details
           </button>
           {needsAction && (
             <button onClick={() => onAction(cr)} style={{
-              ...btnStyle('primary'),
+              ...btnStyle('primary', isDark),
               background: 'linear-gradient(135deg, #00338D, #0047c9)',
             }}>
               {cr.status === 'created' || cr.status === 'invalid'     ? 'Validate →'
@@ -585,6 +586,7 @@ const FILTER_TABS = [
 ];
 
 export default function ManagerChangeWorkflow() {
+  const { isDark } = useTheme();
   const [crs,     setCrs]     = useState([]);
   const [stats,   setStats]   = useState({ total: 0, needs_action: 0, approved: 0, closed: 0 });
   const [loading, setLoading] = useState(true);
@@ -635,21 +637,21 @@ export default function ManagerChangeWorkflow() {
 
       {/* Modals */}
       {actionCR && (
-        <ActionModal cr={actionCR} onClose={() => setActionCR(null)} onDone={fetchCRs} />
+        <ActionModal cr={actionCR} onClose={() => setActionCR(null)} onDone={fetchCRs} isDark={isDark} />
       )}
       {detailCR && (
-        <DetailDrawer cr={detailCR} onClose={() => setDetailCR(null)} />
+        <DetailDrawer cr={detailCR} onClose={() => setDetailCR(null)} isDark={isDark} />
       )}
 
       {/* Stats row */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 14, marginBottom: 24 }}>
         {STAT_CARDS.map(s => (
           <div key={s.label} style={{
-            background: '#fff', borderRadius: 12, border: `1px solid ${s.highlight ? '#fecaca' : '#e2e8f0'}`,
-            padding: '16px 20px', boxShadow: s.highlight ? '0 2px 8px rgba(220,38,38,0.1)' : '0 1px 3px rgba(0,0,0,0.05)',
+            background: isDark ? '#1e293b' : '#fff', borderRadius: 12, border: `1px solid ${s.highlight ? '#fecaca' : (isDark ? '#334155' : '#e2e8f0')}`,
+            padding: '16px 20px', boxShadow: s.highlight ? '0 2px 8px rgba(220,38,38,0.1)' : (isDark ? '0 1px 3px rgba(0,0,0,0.2)' : '0 1px 3px rgba(0,0,0,0.05)'),
           }}>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
-              <div style={{ fontSize: 11, fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.06em' }}>
+              <div style={{ fontSize: 11, fontWeight: 700, color: isDark ? '#64748b' : '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.06em' }}>
                 {s.label}
               </div>
               <span style={{ fontSize: 18 }}>{s.icon}</span>
@@ -683,9 +685,9 @@ export default function ManagerChangeWorkflow() {
           <button key={t.key} onClick={() => setFilter(t.key)} style={{
             padding: '7px 16px', borderRadius: 7, fontSize: 13, fontWeight: 600,
             border: '1px solid', cursor: 'pointer',
-            background: filter === t.key ? '#00338D' : '#fff',
-            color: filter === t.key ? '#fff' : '#475569',
-            borderColor: filter === t.key ? '#00338D' : '#e2e8f0',
+            background: filter === t.key ? (isDark ? '#4da3ff' : '#00338D') : (isDark ? '#1e293b' : '#fff'),
+            color: filter === t.key ? '#fff' : (isDark ? '#94a3b8' : '#475569'),
+            borderColor: filter === t.key ? (isDark ? '#4da3ff' : '#00338D') : (isDark ? '#334155' : '#e2e8f0'),
           }}>
             {t.label}
             {t.key === 'needs_action' && stats.needs_action > 0 && (
@@ -705,12 +707,12 @@ export default function ManagerChangeWorkflow() {
         <div className="page-loader" style={{ minHeight: 200 }}><div className="spinner" /></div>
       ) : crs.length === 0 ? (
         <div style={{
-          background: '#fff', borderRadius: 12, border: '1px solid #e2e8f0',
+          background: isDark ? '#1e293b' : '#fff', borderRadius: 12, border: `1px solid ${isDark ? '#334155' : '#e2e8f0'}`,
           padding: '60px 20px', textAlign: 'center',
         }}>
           <div style={{ fontSize: 48, marginBottom: 12 }}>📋</div>
-          <h4 style={{ color: '#64748b', margin: '0 0 6px', fontSize: 16 }}>No Change Requests</h4>
-          <p style={{ color: '#94a3b8', fontSize: 13, margin: 0 }}>
+          <h4 style={{ color: isDark ? '#94a3b8' : '#64748b', margin: '0 0 6px', fontSize: 16 }}>No Change Requests</h4>
+          <p style={{ color: isDark ? '#64748b' : '#94a3b8', fontSize: 13, margin: 0 }}>
             {filter ? 'No CRs match this filter.' : 'Change requests raised by experts will appear here.'}
           </p>
         </div>
@@ -722,12 +724,13 @@ export default function ManagerChangeWorkflow() {
               cr={cr}
               onAction={setActionCR}
               onDetail={setDetailCR}
+              isDark={isDark}
             />
           ))}
         </div>
       )}
 
-      <div style={{ marginTop: 14, fontSize: 12, color: '#94a3b8', textAlign: 'right' }}>
+      <div style={{ marginTop: 14, fontSize: 12, color: isDark ? '#64748b' : '#94a3b8', textAlign: 'right' }}>
         {crs.length} change request{crs.length !== 1 ? 's' : ''} · Auto-refreshes every 30s
       </div>
     </div>
