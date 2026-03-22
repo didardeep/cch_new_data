@@ -1,24 +1,29 @@
 import { useState, useEffect, useCallback } from 'react';
 import { apiGet, apiPut } from '../../api';
+import { useTheme } from '../../ThemeContext';
 
-const LEVEL_STYLE = {
-  '625': { label: '62.5%', bg: '#fffbeb', border: '#fde68a', text: '#92400e', badge: '#f59e0b' },
-  '750': { label: '75%',   bg: '#fff7ed', border: '#fed7aa', text: '#9a3412', badge: '#f97316' },
-  '875': { label: '87.5%', bg: '#fef2f2', border: '#fecaca', text: '#991b1b', badge: '#ef4444' },
-  breach: { label: 'BREACH', bg: '#fef2f2', border: '#fca5a5', text: '#7f1d1d', badge: '#dc2626' },
-};
+const getLevelStyle = (isDark) => ({
+  '625': { label: '62.5%', bg: isDark ? '#422006' : '#fffbeb', border: isDark ? '#854d0e' : '#fde68a', text: isDark ? '#fbbf24' : '#92400e', badge: '#f59e0b' },
+  '750': { label: '75%',   bg: isDark ? '#431407' : '#fff7ed', border: isDark ? '#9a3412' : '#fed7aa', text: isDark ? '#fb923c' : '#9a3412', badge: '#f97316' },
+  '875': { label: '87.5%', bg: isDark ? '#450a0a' : '#fef2f2', border: isDark ? '#991b1b' : '#fecaca', text: isDark ? '#fca5a5' : '#991b1b', badge: '#ef4444' },
+  breach: { label: 'BREACH', bg: isDark ? '#450a0a' : '#fef2f2', border: isDark ? '#991b1b' : '#fca5a5', text: isDark ? '#fca5a5' : '#7f1d1d', badge: '#dc2626' },
+});
 
-const PRIORITY_BADGE = {
-  critical: { bg: '#fef2f2', color: '#dc2626', border: '#fecaca' },
-  high:     { bg: '#fff7ed', color: '#ea580c', border: '#fed7aa' },
-  medium:   { bg: '#fffbeb', color: '#d97706', border: '#fde68a' },
-  low:      { bg: '#f0fdf4', color: '#16a34a', border: '#bbf7d0' },
-};
+const getPriorityBadge = (isDark) => ({
+  critical: { bg: isDark ? '#450a0a' : '#fef2f2', color: isDark ? '#fca5a5' : '#dc2626', border: isDark ? '#991b1b' : '#fecaca' },
+  high:     { bg: isDark ? '#431407' : '#fff7ed', color: isDark ? '#fb923c' : '#ea580c', border: isDark ? '#9a3412' : '#fed7aa' },
+  medium:   { bg: isDark ? '#422006' : '#fffbeb', color: isDark ? '#fbbf24' : '#d97706', border: isDark ? '#854d0e' : '#fde68a' },
+  low:      { bg: isDark ? '#052e16' : '#f0fdf4', color: isDark ? '#4ade80' : '#16a34a', border: isDark ? '#166534' : '#bbf7d0' },
+});
 
 export default function ManagerAlertBox() {
+  const { isDark } = useTheme();
   const [alerts, setAlerts] = useState([]);
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState('all'); // 'all' | 'unread' | '625' | '750' | '875'
+
+  const LEVEL_STYLE = getLevelStyle(isDark);
+  const PRIORITY_BADGE = getPriorityBadge(isDark);
 
   const fetchAlerts = useCallback(async () => {
     try {
@@ -89,9 +94,9 @@ export default function ManagerAlertBox() {
               style={{
                 padding: '6px 14px', borderRadius: 6, fontSize: 12, fontWeight: 600,
                 border: '1px solid', cursor: 'pointer',
-                background: filter === f.key ? '#00338D' : '#fff',
-                color: filter === f.key ? '#fff' : '#475569',
-                borderColor: filter === f.key ? '#00338D' : '#e2e8f0',
+                background: filter === f.key ? '#00338D' : (isDark ? '#1e293b' : '#fff'),
+                color: filter === f.key ? '#fff' : (isDark ? '#94a3b8' : '#475569'),
+                borderColor: filter === f.key ? '#00338D' : (isDark ? '#334155' : '#e2e8f0'),
               }}
             >
               {f.label}
@@ -118,8 +123,8 @@ export default function ManagerAlertBox() {
             <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#94a3b8" strokeWidth="1.5" style={{ marginBottom: 12 }}>
               <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
             </svg>
-            <h4 style={{ color: '#64748b', margin: 0 }}>No alerts found</h4>
-            <p style={{ color: '#94a3b8', fontSize: 13, margin: '6px 0 0' }}>
+            <h4 style={{ color: isDark ? '#94a3b8' : '#64748b', margin: 0 }}>No alerts found</h4>
+            <p style={{ color: isDark ? '#64748b' : '#94a3b8', fontSize: 13, margin: '6px 0 0' }}>
               {filter === 'unread' ? 'All alerts have been read.' : 'No SLA alerts to display.'}
             </p>
           </div>
@@ -143,8 +148,8 @@ export default function ManagerAlertBox() {
                 <div key={a.id} style={{
                   display: 'flex', alignItems: 'flex-start', gap: 14,
                   padding: '16px 20px',
-                  borderBottom: '1px solid #f1f5f9',
-                  background: a.is_read ? '#fff' : ls.bg,
+                  borderBottom: isDark ? '1px solid #334155' : '1px solid #f1f5f9',
+                  background: a.is_read ? (isDark ? '#1e293b' : '#fff') : ls.bg,
                   opacity: a.is_read ? 0.65 : 1,
                   transition: 'opacity 0.2s',
                 }}>
@@ -160,7 +165,7 @@ export default function ManagerAlertBox() {
                   {/* Details */}
                   <div style={{ flex: 1, minWidth: 0 }}>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 5 }}>
-                      <span style={{ fontSize: 14, fontWeight: 700, color: '#0f172a' }}>{a.reference_number}</span>
+                      <span style={{ fontSize: 14, fontWeight: 700, color: isDark ? '#e2e8f0' : '#0f172a' }}>{a.reference_number}</span>
                       <span style={{
                         fontSize: 10, fontWeight: 700, padding: '2px 7px', borderRadius: 4,
                         background: pb.bg, color: pb.color, border: `1px solid ${pb.border}`,
@@ -177,13 +182,13 @@ export default function ManagerAlertBox() {
                         </span>
                       )}
                     </div>
-                    <p style={{ fontSize: 13, color: '#334155', margin: '0 0 6px', lineHeight: 1.45 }}>
+                    <p style={{ fontSize: 13, color: isDark ? '#cbd5e1' : '#334155', margin: '0 0 6px', lineHeight: 1.45 }}>
                       {a.message}
                     </p>
-                    <div style={{ display: 'flex', gap: 16, fontSize: 11, color: '#94a3b8', flexWrap: 'wrap' }}>
+                    <div style={{ display: 'flex', gap: 16, fontSize: 11, color: isDark ? '#64748b' : '#94a3b8', flexWrap: 'wrap' }}>
                       <span>{a.category}{a.subcategory ? ` / ${a.subcategory}` : ''}</span>
-                      <span>Agent: <strong style={{ color: '#475569' }}>{a.assignee_name}</strong></span>
-                      <span>SLA: <strong style={{ color: '#475569' }}>{a.sla_hours}h</strong></span>
+                      <span>Agent: <strong style={{ color: isDark ? '#94a3b8' : '#475569' }}>{a.assignee_name}</strong></span>
+                      <span>SLA: <strong style={{ color: isDark ? '#94a3b8' : '#475569' }}>{a.sla_hours}h</strong></span>
                       <span>{a.created_at ? new Date(a.created_at).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : ''}</span>
                     </div>
                   </div>
@@ -210,7 +215,7 @@ export default function ManagerAlertBox() {
       )}
 
       {/* Summary */}
-      <div style={{ marginTop: 16, fontSize: 12, color: '#94a3b8', textAlign: 'right' }}>
+      <div style={{ marginTop: 16, fontSize: 12, color: isDark ? '#64748b' : '#94a3b8', textAlign: 'right' }}>
         Showing {filtered.length} of {alerts.length} alerts &middot; Auto-refreshes every 30s
       </div>
     </div>

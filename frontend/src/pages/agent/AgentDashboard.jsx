@@ -6,6 +6,7 @@ import {
 } from 'recharts';
 import { apiGet } from '../../api';
 import { useAuth } from '../../AuthContext';
+import { useTheme } from '../../ThemeContext';
 
 /* ── Themes ──────────────────────────────────────────────────────────────── */
 const T_LIGHT = {
@@ -195,7 +196,7 @@ export default function AgentDashboard() {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [lastUpdated, setLastUpdated] = useState(null);
-  const [dark, setDark] = useState(false);
+  const { isDark: dark } = useTheme();
   const T = dark ? T_DARK : T_LIGHT;
 
   const fetchDashboard = useCallback(async (silent = false) => {
@@ -225,6 +226,9 @@ export default function AgentDashboard() {
   const monthly = data?.monthly_trend    || [];
   const pChart  = data?.priority_chart   || [];
   const sChart  = data?.sla_priority_chart || [];
+
+  const nn = (v) => Math.max(0, v ?? 0); // clamp: never display negative
+  const nh = (v) => +Math.max(0, v ?? 0).toFixed(1); // clamp + 1 decimal for hour values
 
   const kpiRows = [
     { label:'MTTR',                      value: kpis.mttr ?? 0,                          unit:'hrs', icon: IC.clock,  sub:'Mean Time To Resolve' },
@@ -273,13 +277,6 @@ export default function AgentDashboard() {
                 {lastUpdated.toLocaleTimeString([], { hour:'2-digit', minute:'2-digit' })}
               </span>
             )}
-            <button onClick={() => setDark(d => !d)}
-              style={{ padding:'5px 12px', borderRadius:18, fontSize:10.5, fontWeight:600,
-                background: dark ? '#F59E0B22' : 'rgba(255,255,255,0.15)',
-                border:`1px solid ${dark ? '#F59E0B44' : 'rgba(255,255,255,0.25)'}`,
-                color: dark ? '#F59E0B' : '#fff', cursor:'pointer' }}>
-              {dark ? '☀️ Light' : '🌙 Dark'}
-            </button>
             <button onClick={() => fetchDashboard(false)} disabled={refreshing}
               style={{ display:'flex', alignItems:'center', gap:5, padding:'5px 14px',
                 borderRadius:18, fontSize:10.5, fontWeight:600,

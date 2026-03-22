@@ -7,6 +7,7 @@ import {
   ScatterChart, Scatter, ZAxis,
 } from 'recharts';
 import { apiGet } from '../../api';
+import { useTheme } from '../../ThemeContext';
 
 // ── Themes ─────────────────────────────────────────────────────────────────
 const T_LIGHT = {
@@ -1842,7 +1843,7 @@ function KPIFilterPage({T,kpiFilter,data,mapSites:_mapSites}) {
 
 // ── MAIN COMPONENT ─────────────────────────────────────────────────────────────
 export default function NetworkAnalyticsDashboard() {
-  const [dark,setDark]=useState(false);
+  const { isDark: dark, toggleTheme } = useTheme();
   const T=dark?T_DARK:T_LIGHT;
 
   // Data
@@ -2028,8 +2029,9 @@ export default function NetworkAnalyticsDashboard() {
               {(opts.states||[]).map(v=><option key={v} value={v}>{v}</option>)}
             </select>
             <MultiSel T={T} label="All City" options={opts.cities||[]} value={filters.city} onChange={v=>setFilters(p=>({...p,city:v}))}/>
-            <button onClick={()=>setDark(d=>!d)} style={{padding:'5px 10px',borderRadius:18,fontSize:10.5,fontWeight:600,background:dark?'#F59E0B22':'#00338D10',border:`1px solid ${dark?'#F59E0B44':T.border}`,color:dark?'#F59E0B':T.kpmgBlue,cursor:'pointer'}}>
-              {dark?'':''}
+            <button onClick={toggleTheme} style={{padding:'5px 10px',borderRadius:18,fontSize:10.5,fontWeight:600,background:dark?'#F59E0B22':'#00338D10',border:`1px solid ${dark?'#F59E0B44':T.border}`,color:dark?'#F59E0B':T.kpmgBlue,cursor:'pointer',display:'flex',alignItems:'center',gap:4}}>
+              {dark?(<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>):(<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>)}
+              {dark?'Light':'Dark'}
             </button>
             <button onClick={()=>setChatOpen(o=>!o)} style={{padding:'5px 11px',borderRadius:18,fontSize:11,fontWeight:700,background:`linear-gradient(135deg,${T.kpmgBlue},${T.blue3})`,border:'none',color:'#fff',cursor:'pointer'}}> AI</button>
             {aiView&&<button onClick={()=>{setAiView(null);setPage('overview');}} style={{padding:'5px 10px',borderRadius:18,fontSize:10.5,fontWeight:700,background:'transparent',border:`1px solid ${T.red}`,color:T.red,cursor:'pointer'}}> AI</button>}

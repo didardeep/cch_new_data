@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Speed Test</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0f172a; color: #e2e8f0; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; }
+  .card { background: #1e293b; border-radius: 16px; padding: 28px 32px; width: 340px; text-align: center; box-shadow: 0 20px 60px rgba(0,0,0,0.4); }
+  h2 { font-size: 16px; font-weight: 600; color: #94a3b8; letter-spacing: 0.1em; text-transform: uppercase; margin-bottom: 24px; }
+  .gauge { position: relative; width: 160px; height: 80px; margin: 0 auto 20px; overflow: hidden; }
+  .gauge svg { width: 160px; height: 160px; }
+  .gauge-val { position: absolute; bottom: 0; left: 50%; transform: translateX(-50%); font-size: 32px; font-weight: 800; color: #fff; line-height: 1; }
+  .gauge-unit { font-size: 12px; color: #64748b; margin-top: 2px; }
+  .metrics { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; margin: 20px 0; }
+  .metric { background: #0f172a; border-radius: 10px; padding: 10px 8px; }
+  .metric-label { font-size: 10px; color: #64748b; text-transform: uppercase; letter-spacing: 0.08em; }
+  .metric-val { font-size: 20px; font-weight: 700; color: #fff; margin: 4px 0 2px; }
+  .metric-unit { font-size: 10px; color: #475569; }
+  .status { font-size: 13px; color: #64748b; margin: 8px 0 16px; min-height: 20px; }
+  .progress-track { background: #0f172a; border-radius: 99px; height: 6px; margin-bottom: 20px; overflow: hidden; }
+  .progress-fill { height: 100%; border-radius: 99px; background: linear-gradient(90deg, #3b82f6, #06b6d4); transition: width 0.5s ease; }
+  .btn { background: linear-gradient(135deg, #3b82f6, #06b6d4); color: #fff; border: none; border-radius: 10px; padding: 12px 32px; font-size: 14px; font-weight: 700; font-family: inherit; cursor: pointer; width: 100%; transition: opacity 0.2s; }
+  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .btn:hover:not(:disabled) { opacity: 0.9; }
+  .attr { font-size: 10px; color: #334155; margin-top: 16px; }
+  .attr a { color: #475569; }
+  .result-banner { background: #052e16; border: 1px solid #14532d; border-radius: 10px; padding: 12px; margin-bottom: 14px; display: none; }
+  .result-banner.show { display: block; }
+  .result-banner p { font-size: 12px; color: #4ade80; font-weight: 600; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h2>Speed Test</h2>
+
+  <div class="gauge">
+    <svg viewBox="0 0 160 160">
+      <path d="M20,140 A80,80 0 1,1 140,140" fill="none" stroke="#1e3a5f" stroke-width="14" stroke-linecap="round"/>
+      <path id="gauge-arc" d="M20,140 A80,80 0 1,1 140,140" fill="none" stroke="#3b82f6" stroke-width="14" stroke-linecap="round" stroke-dasharray="0 251"/>
+    </svg>
+    <div class="gauge-val" id="gauge-num">—</div>
+  </div>
+  <div class="gauge-unit">Mbps download</div>
+
+  <div class="metrics">
+    <div class="metric"><div class="metric-label">Ping</div><div class="metric-val" id="val-ping">—</div><div class="metric-unit">ms</div></div>
+    <div class="metric"><div class="metric-label">Download</div><div class="metric-val" id="val-dl">—</div><div class="metric-unit">Mbps</div></div>
+    <div class="metric"><div class="metric-label">Upload</div><div class="metric-val" id="val-ul">—</div><div class="metric-unit">Mbps</div></div>
+  </div>
+
+  <div class="progress-track"><div class="progress-fill" id="prog" style="width:0%"></div></div>
+  <div class="status" id="status-text">Ready to test your connection</div>
+
+  <div class="result-banner" id="result-banner">
+    <p id="result-text"></p>
+  </div>
+
+  <button class="btn" id="start-btn" onclick="startTest()">Run Speed Test</button>
+  <div class="attr">Powered by <a href="https://openspeedtest.com" target="_blank">OpenSpeedTest™</a></div>
+</div>
+
+<script>
+// ── State ────────────────────────────────────────────────────────────
+let running = false;
+let results = { ping: null, download: null, upload: null };
+
+function setStatus(t) { document.getElementById('status-text').textContent = t; }
+function setProgress(p) { document.getElementById('prog').style.width = p + '%'; }
+function setGauge(mbps) {
+  const pct = Math.min(mbps / 200, 1);
+  const arc = 251 * pct;
+  document.getElementById('gauge-arc').setAttribute('stroke-dasharray', arc + ' 251');
+  document.getElementById('gauge-num').textContent = mbps > 0 ? mbps : '—';
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────
+async function fetchWithTimeout(url, opts, ms=8000) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), ms);
+  try { return await fetch(url, { ...opts, signal: ctrl.signal }); }
+  finally { clearTimeout(t); }
+}
+
+// ── Ping ──────────────────────────────────────────────────────────────
+async function measurePing() {
+  const times = [];
+  for (let i = 0; i < 10; i++) {
+    try {
+      const t0 = performance.now();
+      const r = await fetchWithTimeout('/api/broadband/ping?_=' + Date.now(), {
+        headers: { Authorization: 'Bearer ' + (window._token || '') },
+        cache: 'no-store'
+      }, 4000);
+      if (r.ok) { await r.json(); times.push(performance.now() - t0); }
+    } catch {}
+    await new Promise(r => setTimeout(r, 30));
+  }
+  if (!times.length) return null;
+  const avg = times.reduce((a,b)=>a+b)/times.length;
+  return Math.round(avg * 10) / 10;
+}
+
+// ── Download ──────────────────────────────────────────────────────────
+async function downloadOne() {
+  const t0 = performance.now();
+  const r = await fetchWithTimeout('/api/broadband/speedtest-file?_=' + Date.now(), {
+    headers: { Authorization: 'Bearer ' + (window._token || '') },
+    cache: 'no-store'
+  }, 30000);
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  let bytes = 0;
+  if (r.body?.getReader) {
+    const rdr = r.body.getReader();
+    while (true) { const {done, value} = await rdr.read(); if (done) break; bytes += value?.length || 0; }
+  } else { bytes = (await r.arrayBuffer()).byteLength; }
+  const secs = (performance.now() - t0) / 1000;
+  return (bytes * 8) / (secs * 1e6);
+}
+
+// ── Upload ────────────────────────────────────────────────────────────
+async function uploadOne() {
+  const body = crypto.getRandomValues(new Uint8Array(4 * 1024 * 1024));
+  const t0 = performance.now();
+  const r = await fetchWithTimeout('/api/broadband/speedtest-upload', {
+    method: 'POST',
+    headers: { Authorization: 'Bearer ' + (window._token || ''), 'Content-Type': 'application/octet-stream' },
+    body, cache: 'no-store'
+  }, 30000);
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  const secs = (performance.now() - t0) / 1000;
+  return (body.byteLength * 8) / (secs * 1e6);
+}
+
+// ── Main test ─────────────────────────────────────────────────────────
+async function startTest() {
+  if (running) return;
+  running = true;
+  results = { ping: null, download: null, upload: null };
+  document.getElementById('start-btn').disabled = true;
+  document.getElementById('result-banner').classList.remove('show');
+  document.getElementById('val-ping').textContent = '…';
+  document.getElementById('val-dl').textContent = '…';
+  document.getElementById('val-ul').textContent = '…';
+  setGauge(0); setProgress(3);
+
+  try {
+    // 1. Ping
+    setStatus('Measuring ping…');
+    const ping = await measurePing();
+    results.ping = ping;
+    document.getElementById('val-ping').textContent = ping !== null ? ping : '—';
+    setProgress(18);
+
+    // 2. Warmup
+    setStatus('Warming up…');
+    try { await downloadOne(); } catch {}
+    setProgress(22);
+
+    // 3. Download — 4 parallel × 2 rounds
+    setStatus('Measuring download speed…');
+    const dlSamples = [];
+    for (let round = 0; round < 2; round++) {
+      const res = await Promise.allSettled(Array.from({length:4}, downloadOne));
+      res.forEach(r => { if (r.status==='fulfilled') dlSamples.push(r.value); });
+      if (dlSamples.length) {
+        const avg = dlSamples.reduce((a,b)=>a+b)/dlSamples.length;
+        const disp = Math.round(avg*100)/100;
+        document.getElementById('val-dl').textContent = disp;
+        setGauge(disp);
+      }
+      setProgress(22 + (round+1)*20);
+    }
+    dlSamples.sort((a,b)=>a-b);
+    const dlTrim = dlSamples.slice(0, Math.max(1, Math.floor(dlSamples.length*0.9)));
+    const finalDl = Math.round((dlTrim.reduce((a,b)=>a+b)/dlTrim.length)*100)/100;
+    results.download = finalDl;
+    document.getElementById('val-dl').textContent = finalDl;
+    setGauge(finalDl);
+    setProgress(65);
+
+    // 4. Upload — 4 parallel × 2 rounds
+    setStatus('Measuring upload speed…');
+    const ulSamples = [];
+    for (let round = 0; round < 2; round++) {
+      const res = await Promise.allSettled(Array.from({length:4}, uploadOne));
+      res.forEach(r => { if (r.status==='fulfilled') ulSamples.push(r.value); });
+      if (ulSamples.length) {
+        const avg = ulSamples.reduce((a,b)=>a+b)/ulSamples.length;
+        document.getElementById('val-ul').textContent = Math.round(avg*100)/100;
+      }
+      setProgress(65 + (round+1)*15);
+    }
+    ulSamples.sort((a,b)=>a-b);
+    const ulTrim = ulSamples.slice(0, Math.max(1, Math.floor(ulSamples.length*0.9)));
+    const finalUl = Math.round((ulTrim.reduce((a,b)=>a+b)/ulTrim.length)*100)/100;
+    results.upload = finalUl;
+    document.getElementById('val-ul').textContent = finalUl;
+    setProgress(100);
+
+    setStatus('Test complete ✓');
+    document.getElementById('result-text').textContent =
+      'Download: ' + finalDl + ' Mbps  |  Upload: ' + finalUl + ' Mbps  |  Ping: ' + (ping !== null ? ping + ' ms' : 'N/A');
+    document.getElementById('result-banner').classList.add('show');
+
+    // ── postMessage results to parent ────────────────────────────────
+    const payload = { type: 'speedtest-results', download: finalDl, upload: finalUl, ping: results.ping };
+    window.parent.postMessage(payload, '*');
+
+  } catch(e) {
+    setStatus('Test failed: ' + e.message);
+  }
+
+  running = false;
+  document.getElementById('start-btn').disabled = false;
+  document.getElementById('start-btn').textContent = 'Re-run Test';
+}
+
+// Accept token from parent
+window.addEventListener('message', function(e) {
+  if (e.data && e.data.type === 'set-token') {
+    window._token = e.data.token;
+  }
+});
+
+// Auto-start if ?Run in URL
+if (location.search.includes('Run')) {
+  window.addEventListener('load', () => setTimeout(startTest, 500));
+}
+</script>
+</body>
+</html>

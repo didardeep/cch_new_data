@@ -1,12 +1,14 @@
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { apiGet } from '../../api';
+import { useTheme } from '../../ThemeContext';
 
 export default function IssueTracking() {
   const [sessions, setSessions] = useState([]);
   const [loading, setLoading] = useState(true);
   const [statusFilter, setStatusFilter] = useState('');
   const navigate = useNavigate();
+  const { isDark } = useTheme();
 
   const basePath = window.location.pathname.startsWith('/cto') ? '/cto' : window.location.pathname.startsWith('/admin') ? '/admin' : '/manager';
 
@@ -82,11 +84,11 @@ export default function IssueTracking() {
                     </td>
                     <td>
                       <div style={{ fontWeight: 500, fontSize: 13 }}>{s.user_name}</div>
-                      <div style={{ fontSize: 11, color: '#94a3b8' }}>{s.user_email}</div>
+                      <div style={{ fontSize: 11, color: isDark ? '#64748b' : '#94a3b8' }}>{s.user_email}</div>
                     </td>
                     <td style={{ overflow: 'hidden' }}>
                       <div style={{
-                        fontSize: 13, fontWeight: 500, color: '#0f172a',
+                        fontSize: 13, fontWeight: 500, color: isDark ? '#e2e8f0' : '#0f172a',
                         overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
                       }}>
                         {s.sector_name || '—'}
@@ -94,7 +96,7 @@ export default function IssueTracking() {
                     </td>
                     <td style={{ overflow: 'hidden' }}>
                       <div style={{
-                        fontSize: 13, color: '#475569',
+                        fontSize: 13, color: isDark ? '#94a3b8' : '#475569',
                         overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
                       }}>
                         {s.subprocess_name || '—'}
@@ -102,14 +104,14 @@ export default function IssueTracking() {
                     </td>
                     <td style={{ overflow: 'hidden' }}>
                       <div style={{
-                        fontSize: 13, fontWeight: 500, color: '#0f172a',
+                        fontSize: 13, fontWeight: 500, color: isDark ? '#e2e8f0' : '#0f172a',
                         overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
                       }}>
                         {s.assignee_name || '—'}
                       </div>
                       {s.assignee_domain && (
                         <div style={{
-                          fontSize: 11, color: '#94a3b8', textTransform: 'capitalize',
+                          fontSize: 11, color: isDark ? '#64748b' : '#94a3b8', textTransform: 'capitalize',
                           overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
                         }}>
                           {s.assignee_domain}
@@ -117,15 +119,15 @@ export default function IssueTracking() {
                       )}
                     </td>
                     <td><span className={`badge badge-${s.status}`}>{s.status}</span></td>
-                    <td style={{ fontSize: 12, color: '#94a3b8', whiteSpace: 'nowrap' }}>
+                    <td style={{ fontSize: 12, color: isDark ? '#64748b' : '#94a3b8', whiteSpace: 'nowrap' }}>
                       {s.created_at ? new Date(s.created_at).toLocaleString() : '—'}
                     </td>
-                    <td style={{ fontSize: 12, color: '#94a3b8', whiteSpace: 'nowrap' }}>
+                    <td style={{ fontSize: 12, color: isDark ? '#64748b' : '#94a3b8', whiteSpace: 'nowrap' }}>
                       {s.resolved_at ? new Date(s.resolved_at).toLocaleString() : '—'}
                     </td>
                     <td style={{ overflow: 'hidden' }}>
                       <div style={{
-                        fontSize: 13, color: '#475569',
+                        fontSize: 13, color: isDark ? '#94a3b8' : '#475569',
                         overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
                       }}>
                         {s.summary || '—'}

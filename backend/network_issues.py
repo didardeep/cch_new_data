@@ -386,6 +386,106 @@ def update_network_issue_status(ticket_id):
     return jsonify({"success": True, "status": new_status})
 
 
+@network_issues_bp.route("/api/network-issues/<int:ticket_id>/pdf-data", methods=["GET"])
+@jwt_required()
+def network_issue_pdf_data(ticket_id):
+    """Return comprehensive data for PDF report: site/cell info, location, KPIs."""
+    from models import TelecomSite
+    t = db.session.get(NetworkIssueTicket, ticket_id)
+    if not t:
+        return jsonify({"error": "Not found"}), 404
+
+    # Site info from telecom_sites
+    site_rows = TelecomSite.query.filter_by(site_id=t.site_id).all()
+    site_info = None
+    cells_info = []
+    if site_rows:
+        first = site_rows[0]
+        site_info = {
+            "site_id": first.site_id,
+            "latitude": first.latitude,
+            "longitude": first.longitude,
+            "zone": first.zone or "",
+            "city": getattr(first, "city", "") or "",
+            "state": getattr(first, "state", "") or "",
+            "site_status": first.site_status or "on_air",
+            "alarms": first.alarms or "",
+            "bandwidth_mhz": first.bandwidth_mhz,
+            "antenna_gain_dbi": first.antenna_gain_dbi,
+            "rf_power_eirp_dbm": first.rf_power_eirp_dbm,
+            "antenna_height_agl_m": first.antenna_height_agl_m,
+            "e_tilt_degree": first.e_tilt_degree,
+            "crs_gain": first.crs_gain,
+        }
+        for sr in site_rows:
+            if sr.cell_id:
+                cells_info.append({
+                    "cell_id": sr.cell_id,
+                    "latitude": sr.latitude,
+                    "longitude": sr.longitude,
+                    "zone": sr.zone or "",
+                    "site_status": sr.site_status or "on_air",
+                    "alarms": sr.alarms or "",
+                    "bandwidth_mhz": sr.bandwidth_mhz,
+                    "antenna_gain_dbi": sr.antenna_gain_dbi,
+                    "rf_power_eirp_dbm": sr.rf_power_eirp_dbm,
+                    "antenna_height_agl_m": sr.antenna_height_agl_m,
+                    "e_tilt_degree": sr.e_tilt_degree,
+                    "crs_gain": sr.crs_gain,
+                })
+
+    # KPI snapshot per cell from kpi_data (latest date, affected cells only)
+    cell_ids = t.cells_affected.split(",") if t.cells_affected else []
+    cell_kpis = []
+    if cell_ids:
+        try:
+            placeholders = ",".join([f":c{i}" for i in range(len(cell_ids))])
+            params = {f"c{i}": c.strip() for i, c in enumerate(cell_ids)}
+            params["sid"] = t.site_id
+            rows = _sql(f"""
+                SELECT k.cell_id,
+                       AVG(CASE WHEN k.kpi_name='E-RAB Call Drop Rate_1' THEN k.value END) AS drop_rate,
+                       AVG(CASE WHEN k.kpi_name='LTE Call Setup Success Rate' THEN k.value END) AS cssr,
+                       AVG(CASE WHEN k.kpi_name='LTE DL - Usr Ave Throughput' THEN k.value END) AS tput,
+                       AVG(CASE WHEN k.kpi_name='Ave RRC Connected Ue' THEN k.value END) AS rrc
+                FROM kpi_data k
+                WHERE k.site_id = :sid AND k.cell_id IN ({placeholders})
+                  AND k.data_level = 'cell' AND k.value IS NOT NULL
+                  AND k.date >= CURRENT_DATE - INTERVAL '7 days'
+                GROUP BY k.cell_id
+            """, params)
+            for r in rows:
+                cell_kpis.append({
+                    "cell_id": r["cell_id"],
+                    "drop_rate": round(float(r["drop_rate"] or 0), 2),
+                    "cssr": round(float(r["cssr"] or 0), 1),
+                    "tput": round(float(r["tput"] or 0), 1),
+                    "rrc": round(float(r["rrc"] or 0), 0),
+                })
+        except Exception as e:
+            _LOG.error("pdf-data cell_kpis: %s", e)
+
+    return jsonify({
+        "ticket": {
+            "id": t.id, "site_id": t.site_id, "category": t.category,
+            "priority": t.priority, "priority_score": t.priority_score,
+            "status": t.status, "zone": t.zone, "location": t.location,
+            "avg_drop_rate": t.avg_drop_rate, "avg_cssr": t.avg_cssr,
+            "avg_tput": t.avg_tput, "avg_rrc": t.avg_rrc, "max_rrc": t.max_rrc,
+            "revenue_total": t.revenue_total, "violations": t.violations,
+            "sla_hours": t.sla_hours,
+            "cells_affected": t.cells_affected,
+            "cell_site_ids": t.cell_site_ids,
+            "root_cause": t.root_cause or "",
+            "recommendation": t.recommendation or "",
+            "created_at": t.created_at.isoformat() if t.created_at else None,
+        },
+        "site_info": site_info,
+        "cells_info": cells_info,
+        "cell_kpis": cell_kpis,
+    })
+
+
 @network_issues_bp.route("/api/network-issues/<int:ticket_id>/trends", methods=["GET"])
 @jwt_required()
 def network_issue_trends(ticket_id):

@@ -35,6 +35,7 @@ import AgentDashboard from './pages/agent/AgentDashboard';
 import AgentTicketBucket from './pages/agent/AgentTicketBucket';
 import AgentChatView from './pages/agent/AgentChatView';
 import NetworkAnalyticsDashboard from './pages/agent/NetworkAnalyticsDashboard';
+import SettingsPage from './pages/SettingsPage';
 import NetworkIssues from './pages/agent/NetworkIssues';
 
 function ProtectedRoute({ children, roles }) {
@@ -61,7 +62,7 @@ export default function App() {
   return (
     <Routes>
       <Route path="/" element={<HomePage />} />
-      <Route path="/login" element={<LoginPage />} />
+      <Route path="/login" element={user ? <Navigate to={getDashboardPath()} /> : <LoginPage />} />
       <Route path="/register" element={user ? <Navigate to={getDashboardPath()} /> : <RegisterPage />} />
 
       {/* Customer Routes */}
@@ -69,6 +70,7 @@ export default function App() {
         <Route path="dashboard" element={<CustomerDashboard />} />
         <Route path="chat" element={<ChatSupport />} />
         <Route path="feedback" element={<FeedbackPage />} />
+        <Route path="settings" element={<SettingsPage />} />
       </Route>
 
       {/* Manager Routes */}
@@ -95,6 +97,7 @@ export default function App() {
         <Route path="chat-detail/:id" element={<ChatDetail />} />
         <Route path="alerts" element={<CTOAlertBox />} />
         <Route path="roster" element={<CTODutyRoster />} />
+        <Route path="settings" element={<SettingsPage />} />
       </Route>
 
       {/* Admin Routes */}
@@ -108,6 +111,7 @@ export default function App() {
         <Route path="feedback" element={<AdminFeedback />} />
         <Route path="reports" element={<ReportsPage />} />
         <Route path="data-upload" element={<DataUpload />} />
+        <Route path="settings" element={<SettingsPage />} />
       </Route>
 
       {/* Human Agent Routes */}
@@ -116,6 +120,7 @@ export default function App() {
         <Route path="tickets" element={<AgentTicketBucket />} />
         <Route path="chat/:sessionId" element={<AgentChatView />} />
         <Route path="network" element={<NetworkAnalyticsDashboard />} />
+        <Route path="settings" element={<SettingsPage />} />
         <Route path="network-issues" element={<NetworkIssues />} />
       </Route>
 
