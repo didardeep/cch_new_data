@@ -3716,95 +3716,68 @@ def admin_upload_kpi_site_level():
     if not ok:
         return jsonify({"error": err}), 400
 
-    import openpyxl
-    wb = openpyxl.load_workbook(file, data_only=True, read_only=True)
+    import io, openpyxl
+    from bulk_insert import bulk_insert_from_sheet_site
+
+    # Read file into memory so openpyxl can read it reliably
+    raw_bytes = file.read()
+    wb = openpyxl.load_workbook(io.BytesIO(raw_bytes), data_only=True, read_only=True)
 
     total_inserted = 0
     kpi_summary = []
     errors = []
-    CHUNK = 3000
 
-    for ws in wb.worksheets:
-        kpi_name = ws.title.strip()
-        if not kpi_name:
-            continue
-
-        rows_iter = ws.iter_rows(values_only=True)
-        try:
-            headers = next(rows_iter)
-        except StopIteration:
-            errors.append(f"Sheet '{kpi_name}': empty sheet")
-            continue
-
-        if not headers or len(headers) < 2:
-            errors.append(f"Sheet '{kpi_name}': insufficient columns")
-            continue
-
-        # First column is Site_ID, remaining columns are dates
-        date_columns = []
-        for col_idx in range(1, len(headers)):
-            h = headers[col_idx]
-            if h is None:
+    try:
+        for ws in wb.worksheets:
+            kpi_name = ws.title.strip()
+            if not kpi_name:
                 continue
+
+            rows_iter = ws.iter_rows(values_only=True)
             try:
-                if isinstance(h, datetime):
-                    date_columns.append((col_idx, h.date()))
-                elif isinstance(h, str):
-                    for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%d-%m-%Y", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d"):
-                        try:
-                            date_columns.append((col_idx, datetime.strptime(h.strip(), fmt).date()))
-                            break
-                        except ValueError:
-                            continue
-                elif hasattr(h, 'date'):
-                    date_columns.append((col_idx, h.date()))
-            except Exception:
+                headers = next(rows_iter)
+            except StopIteration:
+                errors.append(f"Sheet '{kpi_name}': empty sheet")
                 continue
 
-        if not date_columns:
-            errors.append(f"Sheet '{kpi_name}': no valid date columns found")
-            continue
-
-        sheet_inserted = 0
-        batch = []
-        for row in rows_iter:
-            site_id = str(row[0]).strip() if row[0] else None
-            if not site_id or site_id == "None":
+            if not headers or len(headers) < 2:
+                errors.append(f"Sheet '{kpi_name}': insufficient columns")
                 continue
 
-            for col_idx, date_val in date_columns:
-                if col_idx < len(row) and row[col_idx] is not None:
-                    try:
-                        val = float(row[col_idx])
-                    except (ValueError, TypeError):
-                        continue
-                    batch.append({
-                        "site_id": site_id, "kpi_name": kpi_name,
-                        "date": date_val, "hour": 0, "value": val,
-                        "data_level": "site", "cell_id": None, "cell_site_id": None,
-                    })
-                    sheet_inserted += 1
+            date_columns = []
+            for col_idx in range(1, len(headers)):
+                h = headers[col_idx]
+                if h is None:
+                    continue
+                try:
+                    if isinstance(h, datetime):
+                        date_columns.append((col_idx, h.date()))
+                    elif isinstance(h, str):
+                        for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%d-%m-%Y", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d"):
+                            try:
+                                date_columns.append((col_idx, datetime.strptime(h.strip(), fmt).date()))
+                                break
+                            except ValueError:
+                                continue
+                    elif hasattr(h, 'date'):
+                        date_columns.append((col_idx, h.date()))
+                except Exception:
+                    continue
 
-                    if len(batch) >= CHUNK:
-                        db.session.execute(
-                            text("INSERT INTO kpi_data (site_id,kpi_name,date,hour,value,data_level,cell_id,cell_site_id) VALUES (:site_id,:kpi_name,:date,:hour,:value,:data_level,:cell_id,:cell_site_id)"),
-                            batch,
-                        )
-                        db.session.commit()
-                        batch = []
+            if not date_columns:
+                errors.append(f"Sheet '{kpi_name}': no valid date columns found")
+                continue
 
-        if batch:
-            db.session.execute(
-                text("INSERT INTO kpi_data (site_id,kpi_name,date,hour,value,data_level,cell_id,cell_site_id) VALUES (:site_id,:kpi_name,:date,:hour,:value,:data_level,:cell_id,:cell_site_id)"),
-                batch,
-            )
-            db.session.commit()
+            sheet_inserted = bulk_insert_from_sheet_site(db, rows_iter, kpi_name, date_columns)
+            total_inserted += sheet_inserted
+            kpi_summary.append({"name": kpi_name, "rows": sheet_inserted})
+            app.logger.info(f"Site-level upload: sheet '{kpi_name}' done — {sheet_inserted} rows")
+    except Exception as e:
+        app.logger.error(f"Site-level upload error: {e}")
+        return jsonify({"error": f"Upload failed: {e}"}), 500
+    finally:
+        wb.close()
 
-        total_inserted += sheet_inserted
-        kpi_summary.append({"name": kpi_name, "rows": sheet_inserted})
-        app.logger.info(f"Site-level upload: sheet '{kpi_name}' done — {sheet_inserted} rows")
-
-    wb.close()
     clear_analytics_cache()
     return jsonify({
         "inserted": total_inserted,
@@ -3958,97 +3931,67 @@ def admin_upload_kpi_cell_level():
     if not ok:
         return jsonify({"error": err}), 400
 
-    import openpyxl
-    wb = openpyxl.load_workbook(file, data_only=True, read_only=True)
+    import io, openpyxl
+    from bulk_insert import bulk_insert_from_sheet_cell
+
+    raw_bytes = file.read()
+    wb = openpyxl.load_workbook(io.BytesIO(raw_bytes), data_only=True, read_only=True)
 
     total_inserted = 0
     kpi_summary = []
     errors = []
-    CHUNK = 3000
 
-    for ws in wb.worksheets:
-        kpi_name = ws.title.strip()
-        if not kpi_name:
-            continue
-
-        rows_iter = ws.iter_rows(values_only=True)
-        try:
-            headers = next(rows_iter)
-        except StopIteration:
-            errors.append(f"Sheet '{kpi_name}': empty sheet")
-            continue
-
-        if not headers or len(headers) < 4:
-            errors.append(f"Sheet '{kpi_name}': insufficient columns (need Site_ID, Cell_ID, Cell_Site_ID + dates)")
-            continue
-
-        # First 3 columns: Site_ID, Cell_ID, Cell_Site_ID; remaining are dates
-        date_columns = []
-        for col_idx in range(3, len(headers)):
-            h = headers[col_idx]
-            if h is None:
+    try:
+        for ws in wb.worksheets:
+            kpi_name = ws.title.strip()
+            if not kpi_name:
                 continue
+
+            rows_iter = ws.iter_rows(values_only=True)
             try:
-                if isinstance(h, datetime):
-                    date_columns.append((col_idx, h.date()))
-                elif isinstance(h, str):
-                    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d"):
-                        try:
-                            date_columns.append((col_idx, datetime.strptime(h.strip(), fmt).date()))
-                            break
-                        except ValueError:
-                            continue
-                elif hasattr(h, 'date'):
-                    date_columns.append((col_idx, h.date()))
-            except Exception:
+                headers = next(rows_iter)
+            except StopIteration:
+                errors.append(f"Sheet '{kpi_name}': empty sheet")
                 continue
 
-        if not date_columns:
-            errors.append(f"Sheet '{kpi_name}': no valid date columns found")
-            continue
-
-        sheet_inserted = 0
-        batch = []
-        for row in rows_iter:
-            site_id = str(row[0]).strip() if row[0] else None
-            cell_id = str(row[1]).strip() if row[1] else None
-            cell_site_id = str(row[2]).strip() if row[2] else None
-            if not site_id or site_id == "None":
+            if not headers or len(headers) < 4:
+                errors.append(f"Sheet '{kpi_name}': insufficient columns (need Site_ID, Cell_ID, Cell_Site_ID + dates)")
                 continue
 
-            for col_idx, date_val in date_columns:
-                if col_idx < len(row) and row[col_idx] is not None:
-                    try:
-                        val = float(row[col_idx])
-                    except (ValueError, TypeError):
-                        continue
-                    batch.append({
-                        "site_id": site_id, "kpi_name": kpi_name,
-                        "date": date_val, "hour": 0, "value": val,
-                        "data_level": "cell", "cell_id": cell_id, "cell_site_id": cell_site_id,
-                    })
-                    sheet_inserted += 1
+            date_columns = []
+            for col_idx in range(3, len(headers)):
+                h = headers[col_idx]
+                if h is None:
+                    continue
+                try:
+                    if isinstance(h, datetime):
+                        date_columns.append((col_idx, h.date()))
+                    elif isinstance(h, str):
+                        for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d"):
+                            try:
+                                date_columns.append((col_idx, datetime.strptime(h.strip(), fmt).date()))
+                                break
+                            except ValueError:
+                                continue
+                    elif hasattr(h, 'date'):
+                        date_columns.append((col_idx, h.date()))
+                except Exception:
+                    continue
 
-                    if len(batch) >= CHUNK:
-                        db.session.execute(
-                            text("INSERT INTO kpi_data (site_id,kpi_name,date,hour,value,data_level,cell_id,cell_site_id) VALUES (:site_id,:kpi_name,:date,:hour,:value,:data_level,:cell_id,:cell_site_id)"),
-                            batch,
-                        )
-                        db.session.commit()
-                        batch = []
+            if not date_columns:
+                errors.append(f"Sheet '{kpi_name}': no valid date columns found")
+                continue
 
-        if batch:
-            db.session.execute(
-                text("INSERT INTO kpi_data (site_id,kpi_name,date,hour,value,data_level,cell_id,cell_site_id) VALUES (:site_id,:kpi_name,:date,:hour,:value,:data_level,:cell_id,:cell_site_id)"),
-                batch,
-            )
-            db.session.commit()
+            sheet_inserted = bulk_insert_from_sheet_cell(db, rows_iter, kpi_name, date_columns)
+            total_inserted += sheet_inserted
+            kpi_summary.append({"name": kpi_name, "rows": sheet_inserted})
+            app.logger.info(f"Cell-level upload: sheet '{kpi_name}' done — {sheet_inserted} rows")
+    except Exception as e:
+        app.logger.error(f"Cell-level upload error: {e}")
+        return jsonify({"error": f"Upload failed: {e}"}), 500
+    finally:
+        wb.close()
 
-        total_inserted += sheet_inserted
-        kpi_summary.append({"name": kpi_name, "rows": sheet_inserted})
-        app.logger.info(f"Cell-level upload: sheet '{kpi_name}' done — {sheet_inserted} rows")
-
-    wb.close()
     clear_analytics_cache()
     return jsonify({
         "inserted": total_inserted,
