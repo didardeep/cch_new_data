@@ -3316,6 +3316,7 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text):
                     ],
                     temperature=0.1,
                     max_tokens=2000,
+                    response_format={"type": "json_object"},
                 )
                 raw_content = az_resp.choices[0].message.content
                 if raw_content:
@@ -5043,7 +5044,9 @@ def overview_stats():
     Optimised: uses targeted CASE WHEN SQL — never loads all 40K rows into Python.
     """
     filters = _get_filters()
-    ck = _cache_key("overview_v18", filters)
+    # Include today's date in cache key so worst cells update daily
+    from datetime import date as _date_type
+    ck = _cache_key(f"overview_v19_{_date_type.today().isoformat()}", filters)
     cached = _from_cache(ck)
     if cached:
         return jsonify(cached)
@@ -5160,10 +5163,15 @@ def overview_stats():
     except Exception as e:
         _LOG.error("overview zone_perf: %s", e)
 
-    # ── 3. Worst sites — last 7 days, sites violating any of 3 thresholds ────
-    #   Drop Rate > 1.5%  |  CSSR < 98.5%  |  User Throughput < 8 Mbps
+    # ── 3. Worst sites — ALWAYS last 7 days from CURRENT_DATE ────────────────
+    #   AVG of last 7 days: Drop Rate > 1.5% | CSSR < 98.5% | Usr Tput < 8 Mbps
+    #   Updates daily. Time dropdown does NOT affect this — always 7-day window.
+    #   Only geo filters (zone/city/tech) apply.
+    _geo_only = dict(filters or {})
+    _geo_only["time_range"] = "all"  # remove time filter for worst cells
+    _wfw, _wfp, _w_needs_ts = _kpi_filter_clause(_geo_only, "k", "ts")
     worst_sites = []
-    _worst_params = {**_fp, "drop": _DROP, "cssr": _CSSR, "usr_tput": _USR_TPUT}
+    _worst_params = {**_wfp, "drop": _DROP, "cssr": _CSSR, "usr_tput": _USR_TPUT}
     try:
         wrows = _sql(f"""
             SELECT k.site_id, ts.zone,
@@ -5175,7 +5183,8 @@ def overview_stats():
             JOIN telecom_sites ts ON k.site_id = ts.site_id
             WHERE k.value IS NOT NULL AND k.data_level = 'site'
               AND k.kpi_name IN (:drop, :cssr, :usr_tput)
-              AND k.date >= CURRENT_DATE - INTERVAL '7 days' {_fw}
+              AND k.date >= CURRENT_DATE - INTERVAL '7 days'
+              AND k.date <= CURRENT_DATE {_wfw}
             GROUP BY k.site_id, ts.zone
             HAVING AVG(CASE WHEN k.kpi_name=:drop     THEN k.value END) > 1.5
                 OR AVG(CASE WHEN k.kpi_name=:cssr     THEN k.value END) < 98.5
@@ -5202,6 +5211,7 @@ def overview_stats():
         _LOG.error("overview worst_sites: %s", e)
 
     # ── 3b. Worst cells — same 3-factor logic, cell-level, last 7 days ─────
+    #   ALWAYS 7-day window from CURRENT_DATE — time dropdown ignored
     worst_cells = []
     try:
         wcrows = _sql(f"""
@@ -5214,7 +5224,8 @@ def overview_stats():
             JOIN telecom_sites ts ON k.site_id = ts.site_id
             WHERE k.value IS NOT NULL AND k.data_level = 'cell'
               AND k.kpi_name IN (:drop, :cssr, :usr_tput)
-              AND k.date >= CURRENT_DATE - INTERVAL '7 days' {_fw}
+              AND k.date >= CURRENT_DATE - INTERVAL '7 days'
+              AND k.date <= CURRENT_DATE {_wfw}
             GROUP BY k.site_id, k.cell_id, ts.zone
             HAVING AVG(CASE WHEN k.kpi_name=:drop     THEN k.value END) > 1.5
                 OR AVG(CASE WHEN k.kpi_name=:cssr     THEN k.value END) < 98.5

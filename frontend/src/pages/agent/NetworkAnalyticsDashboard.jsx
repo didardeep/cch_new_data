@@ -35,20 +35,20 @@ const card = T => ({ background:T.surface, border:`1px solid ${T.border}`, borde
 const sel  = T => ({ padding:'5px 9px', borderRadius:7, border:`1px solid ${T.border}`, fontSize:11, color:T.text, background:T.surface, cursor:'pointer', outline:'none', fontFamily:'inherit' });
 
 const KPI_FILTERS = [
-  { key:'low_access',    label:'Low Accessibility Sites',      icon:'🔴', desc:'RRC/E-RAB SR < 90%' },
-  { key:'high_latency',  label:'High Latency Cells',           icon:'⏱', desc:'DL Latency > 60ms' },
-  { key:'volte_fail',    label:'VoLTE Failure Cells',          icon:'🔊', desc:'Low VoLTE & high drop' },
-  { key:'interference',  label:'Interference Zones',           icon:'📡', desc:'SINR < 5dB' },
-  { key:'overloaded',    label:'Overloaded Sites',             icon:'🔥', desc:'PRB > 85%' },
-  { key:'underutilized', label:'Underutilized Sites',          icon:'💤', desc:'PRB < 20%' },
-  { key:'rev_leakage',   label:'Revenue Leakage Sites',        icon:'💸', desc:'High util, low revenue' },
-  { key:'low_margin',    label:'Low Margin Sites',             icon:'📉', desc:'EBITDA < 25%' },
-  { key:'high_rev_util', label:'High Revenue High Util Sites', icon:'⭐', desc:'Top performers' },
-  { key:'low_tput',      label:'< 5 Mbps Cells',              icon:'🐌', desc:'DL tput < 5 Mbps' },
-  { key:'worst_drop',    label:'Worst Call Drop Offenders',    icon:'📵', desc:'E-RAB drop > 2%' },
-  { key:'worst_ho',      label:'Worst Handover Offenders',     icon:'🔄', desc:'HO SR < 90%' },
-  { key:'worst_tput',    label:'Worst Throughput Offenders',   icon:'🐢', desc:'Bottom 10% DL' },
-  { key:'critical_avail',label:'Low Availability Sites',       icon:'⚠️', desc:'Avail < 95%' },
+  { key:'low_access',    label:'Low Accessibility Sites',      icon:'', desc:'RRC/E-RAB SR < 90%' },
+  { key:'high_latency',  label:'High Latency Cells',           icon:'', desc:'DL Latency > 60ms' },
+  { key:'volte_fail',    label:'VoLTE Failure Cells',          icon:'', desc:'Low VoLTE & high drop' },
+  { key:'interference',  label:'Interference Zones',           icon:'', desc:'SINR < 5dB' },
+  { key:'overloaded',    label:'Overloaded Sites',             icon:'', desc:'PRB > 85%' },
+  { key:'underutilized', label:'Underutilized Sites',          icon:'', desc:'PRB < 20%' },
+  { key:'rev_leakage',   label:'Revenue Leakage Sites',        icon:'', desc:'High util, low revenue' },
+  { key:'low_margin',    label:'Low Margin Sites',             icon:'', desc:'EBITDA < 25%' },
+  { key:'high_rev_util', label:'High Revenue High Util Sites', icon:'', desc:'Top performers' },
+  { key:'low_tput',      label:'< 5 Mbps Cells',              icon:'', desc:'DL tput < 5 Mbps' },
+  { key:'worst_drop',    label:'Worst Call Drop Offenders',    icon:'', desc:'E-RAB drop > 2%' },
+  { key:'worst_ho',      label:'Worst Handover Offenders',     icon:'', desc:'HO SR < 90%' },
+  { key:'worst_tput',    label:'Worst Throughput Offenders',   icon:'', desc:'Bottom 10% DL' },
+  { key:'critical_avail',label:'Low Availability Sites',       icon:'', desc:'Avail < 95%' },
 ];
 
 // ── CSS ────────────────────────────────────────────────────────────────────
@@ -64,6 +64,7 @@ const CSS = `
 .kc:hover{transform:translateY(-2px);box-shadow:0 8px 24px rgba(0,51,141,.15)!important;}
 .nav-btn:hover{opacity:.85;}
 .dd-item:hover{background:rgba(0,51,141,.07);}
+
 `;
 
 // ── Multi-select dropdown (checkbox style) ────────────────────────────────
@@ -90,7 +91,7 @@ function MultiSel({T,label,options=[],value,onChange}) {
       {open&&(
         <div style={{position:'absolute',top:'100%',left:0,marginTop:4,background:T.surface,border:`1px solid ${T.border}`,borderRadius:8,boxShadow:'0 8px 24px rgba(0,0,0,.15)',zIndex:50,minWidth:140,maxHeight:220,overflowY:'auto',padding:'4px 0'}}>
           {selected.length>0&&(
-            <div onClick={()=>{onChange('');setOpen(false);}} style={{padding:'5px 10px',fontSize:10,color:T.red,cursor:'pointer',borderBottom:`1px solid ${T.border}`,fontWeight:600}}>✕ Clear all</div>
+            <div onClick={()=>{onChange('');setOpen(false);}} style={{padding:'5px 10px',fontSize:10,color:T.red,cursor:'pointer',borderBottom:`1px solid ${T.border}`,fontWeight:600}}> Clear all</div>
           )}
           {options.map(v=>(
             <label key={v} style={{display:'flex',alignItems:'center',gap:6,padding:'4px 10px',cursor:'pointer',fontSize:10.5,color:T.text}}
@@ -111,7 +112,7 @@ function Bdg({color,children,sm}) {
 }
 function SL({T,children}) { return <div style={{fontSize:9.5,fontWeight:700,color:T.muted,textTransform:'uppercase',letterSpacing:'0.1em',marginBottom:8}}>{children}</div>; }
 function CT({T,children,mb=10}) { return <div style={{fontSize:11,fontWeight:700,color:T.kpmgBlue,textTransform:'uppercase',letterSpacing:'0.05em',marginBottom:mb}}>{children}</div>; }
-function Empty({T,h=100}) { return <div style={{height:h,display:'flex',alignItems:'center',justifyContent:'center',fontSize:12,color:T.muted,flexDirection:'column',gap:6}}><span style={{fontSize:28}}>📭</span>No data</div>; }
+function Empty({T,h=100}) { return <div style={{height:h,display:'flex',alignItems:'center',justifyContent:'center',fontSize:12,color:T.muted,flexDirection:'column',gap:6}}><span style={{fontSize:28}}></span>No data</div>; }
 function Spin({T}) { return <div style={{height:80,display:'flex',alignItems:'center',justifyContent:'center'}}><div style={{width:24,height:24,border:`3px solid ${T.border}`,borderTopColor:T.kpmgBlue,borderRadius:'50%',animation:'spin .7s linear infinite'}}/></div>; }
 
 function CC({T,title,children,col,action,p='14px 16px'}) {
@@ -226,7 +227,7 @@ function LeafletMap({sites=[],highlight=[],T,height=300}) {
           `<div style="font-family:system-ui;padding:2px;min-width:190px">
             <div style="display:flex;align-items:center;gap:6px;margin-bottom:8px">
               <span style="width:10px;height:10px;border-radius:50%;background:${color};display:inline-block"></span>
-              <span style="font-weight:800;color:#00338D;font-size:12px">📡 ${sid}</span>
+              <span style="font-weight:800;color:#00338D;font-size:12px"> ${sid}</span>
               <span style="margin-left:auto;font-size:9px;padding:1px 6px;border-radius:10px;background:${color}22;color:${color};font-weight:700">${status.toUpperCase()}</span>
             </div>
             <div style="font-size:9px;color:#64748B;margin-bottom:6px;font-weight:600">Health Score: ${typeof healthScore==='number'?healthScore.toFixed(1):healthScore}/100</div>
@@ -296,8 +297,8 @@ function SiteSearch({T,layer,onSelect,placeholder='Search site ID…',filters:se
           placeholder={placeholder}
           style={{...sel(T),width:'100%',padding:'7px 32px 7px 10px',fontSize:12,borderRadius:8}}/>
         {loading
-          ? <span style={{position:'absolute',right:9,top:'50%',transform:'translateY(-50%)',fontSize:10,color:T.muted,animation:'spin .7s linear infinite',display:'inline-block'}}>⟳</span>
-          : q&&<span onClick={()=>{setQ('');setResults([]);setOpen(false);}} style={{position:'absolute',right:9,top:'50%',transform:'translateY(-50%)',cursor:'pointer',fontSize:12,color:T.muted}}>✕</span>
+          ? <span style={{position:'absolute',right:9,top:'50%',transform:'translateY(-50%)',fontSize:10,color:T.muted,animation:'spin .7s linear infinite',display:'inline-block'}}></span>
+          : q&&<span onClick={()=>{setQ('');setResults([]);setOpen(false);}} style={{position:'absolute',right:9,top:'50%',transform:'translateY(-50%)',cursor:'pointer',fontSize:12,color:T.muted}}></span>
         }
       </div>
       {open&&results.length>0&&(
@@ -305,7 +306,7 @@ function SiteSearch({T,layer,onSelect,placeholder='Search site ID…',filters:se
           {results.map(sid=>(
             <div key={sid} className="dd-item" onClick={()=>{setQ(sid);setOpen(false);onSelect(sid);}}
               style={{padding:'7px 12px',cursor:'pointer',fontSize:11.5,color:T.text,borderBottom:`1px solid ${T.border}40`,fontFamily:"'IBM Plex Mono',monospace"}}>
-              📡 {sid}
+               {sid}
             </div>
           ))}
         </div>
@@ -337,14 +338,14 @@ function AIChat({T,open,onClose,summary,filters,onResult}) {
       });
       const result=await resp.json();
       if(result.error){
-        setMsgs(p=>[...p,{role:'ai',text:`⚠️ ${result.error}. Try: "Show worst sites by PRB" or "Compare zones"`}]);
+        setMsgs(p=>[...p,{role:'ai',text:` ${result.error}. Try: "Show worst sites by PRB" or "Compare zones"`}]);
       } else {
         onResult(result);
         const rows=result.row_count||0;
-        setMsgs(p=>[...p,{role:'ai',text:`✦ ${result.response||'Here are the results.'}`,rows}]);
+        setMsgs(p=>[...p,{role:'ai',text:` ${result.response||'Here are the results.'}`,rows}]);
       }
     }catch(e){
-      setMsgs(p=>[...p,{role:'ai',text:'⚠️ Could not reach the server. Check your connection and try again.'}]);
+      setMsgs(p=>[...p,{role:'ai',text:' Could not reach the server. Check your connection and try again.'}]);
     }finally{setLoading(false);}
   };
 
@@ -353,24 +354,24 @@ function AIChat({T,open,onClose,summary,filters,onResult}) {
     <div style={{position:'fixed',bottom:24,right:24,width:350,maxHeight:500,background:T.surface,border:`1px solid ${T.border}`,borderRadius:16,boxShadow:'0 20px 60px rgba(0,0,0,.25)',display:'flex',flexDirection:'column',zIndex:1000,animation:'fadeIn .25s ease'}}>
       <div style={{padding:'12px 14px',borderBottom:`1px solid ${T.border}`,background:T.kpmgBlue,borderRadius:'16px 16px 0 0',display:'flex',alignItems:'center',justifyContent:'space-between'}}>
         <div style={{display:'flex',alignItems:'center',gap:8}}>
-          <div style={{width:26,height:26,borderRadius:'50%',background:'rgba(255,255,255,.2)',display:'flex',alignItems:'center',justifyContent:'center',fontSize:13}}>✦</div>
+          <div style={{width:26,height:26,borderRadius:'50%',background:'rgba(255,255,255,.2)',display:'flex',alignItems:'center',justifyContent:'center',fontSize:13}}></div>
           <div>
             <div style={{fontWeight:700,color:'#fff',fontSize:11.5}}>Network AI Assistant</div>
             <div style={{fontSize:9,color:'rgba(255,255,255,.6)'}}>Ask anything about your network</div>
           </div>
         </div>
-        <button onClick={onClose} style={{background:'none',border:'none',color:'rgba(255,255,255,.7)',cursor:'pointer',fontSize:15}}>✕</button>
+        <button onClick={onClose} style={{background:'none',border:'none',color:'rgba(255,255,255,.7)',cursor:'pointer',fontSize:15}}></button>
       </div>
       <div style={{flex:1,overflowY:'auto',padding:'10px 12px',display:'flex',flexDirection:'column',gap:8}}>
         {msgs.length===0&&(
           <div style={{textAlign:'center',padding:'18px 0',color:T.muted,fontSize:11}}>
-            <div style={{fontSize:28,marginBottom:8}}>✦</div>
+            <div style={{fontSize:28,marginBottom:8}}></div>
             Try: "Show worst 5 cells by PRB" · "Compare zones" · "High latency sites"
           </div>
         )}
         {msgs.map((m,i)=>(
           <div key={i} style={{display:'flex',flexDirection:m.role==='user'?'row-reverse':'row',gap:6}}>
-            <div style={{width:24,height:24,borderRadius:'50%',background:m.role==='user'?T.blue3:T.kpmgBlue,display:'flex',alignItems:'center',justifyContent:'center',fontSize:10,color:'#fff',flexShrink:0}}>{m.role==='user'?'U':'✦'}</div>
+            <div style={{width:24,height:24,borderRadius:'50%',background:m.role==='user'?T.blue3:T.kpmgBlue,display:'flex',alignItems:'center',justifyContent:'center',fontSize:10,color:'#fff',flexShrink:0}}>{m.role==='user'?'U':''}</div>
             <div style={{maxWidth:'80%',padding:'7px 10px',borderRadius:m.role==='user'?'12px 12px 4px 12px':'12px 12px 12px 4px',background:m.role==='user'?T.blue3:T.surface2,color:m.role==='user'?'#fff':T.text,fontSize:11.5,lineHeight:1.5}}>
               {m.text}
               {m.rows!=null&&<div style={{fontSize:9.5,opacity:.7,marginTop:3}}>{m.rows} records found</div>}
@@ -378,7 +379,7 @@ function AIChat({T,open,onClose,summary,filters,onResult}) {
           </div>
         ))}
         {loading&&<div style={{display:'flex',gap:6,alignItems:'center'}}>
-          <div style={{width:24,height:24,borderRadius:'50%',background:T.kpmgBlue,display:'flex',alignItems:'center',justifyContent:'center',fontSize:10,color:'#fff'}}>✦</div>
+          <div style={{width:24,height:24,borderRadius:'50%',background:T.kpmgBlue,display:'flex',alignItems:'center',justifyContent:'center',fontSize:10,color:'#fff'}}></div>
           <div style={{padding:'7px 10px',borderRadius:'12px 12px 12px 4px',background:T.surface2}}>
             {[0,1,2].map(i=><span key={i} style={{display:'inline-block',width:5,height:5,borderRadius:'50%',background:T.kpmgBlue,margin:'0 2px',animation:`bounce 1s ${i*.15}s infinite`}}/>)}
           </div>
@@ -488,12 +489,15 @@ function AIView({result,T,onClose}) {
     // COMPOSED — bar + line overlay (e.g. PRB bar + tput line)
     if(ctype==='composed'&&yKeys.length>=2){
       const barKey=yKeys[0], lineKey=yKeys[1];
+      const cTickInterval=data.length>15?Math.ceil(data.length/10):0;
       return(
-        <ResponsiveContainer width="100%" height={h}>
-          <ComposedChart data={data} margin={{top:5,right:20,left:0,bottom:5}}>
+        <ResponsiveContainer width="100%" height={h+30}>
+          <ComposedChart data={data} margin={{top:5,right:20,left:0,bottom:35}}>
             <defs><linearGradient id="cga" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor={PAL[0]} stopOpacity={.4}/><stop offset="100%" stopColor={PAL[0]} stopOpacity={.03}/></linearGradient></defs>
             <CartesianGrid strokeDasharray="3 3" stroke={T.border} vertical={false}/>
-            <XAxis dataKey={xKey} tick={{fontSize:9,fill:T.muted}} axisLine={false} tickLine={false} tickFormatter={shortLbl}/>
+            <XAxis dataKey={xKey} tick={{fontSize:8,fill:T.muted}} axisLine={false} tickLine={false}
+              interval={cTickInterval} angle={-35} textAnchor="end" height={45}
+              tickFormatter={v=>{if(typeof v!=='string')return v;if(v.length>10)return v.slice(5,10);return v;}}/>
             <YAxis yAxisId="l" tick={{fontSize:9,fill:T.muted}} axisLine={false} width={35}/>
             <YAxis yAxisId="r" orientation="right" tick={{fontSize:9,fill:T.muted}} axisLine={false} width={35}/>
             <Tooltip content={<TipC/>}/>
@@ -508,13 +512,16 @@ function AIView({result,T,onClose}) {
 
     // LINE / AREA — time series
     if(ctype==='line'||(ctype==='area')||isTimeSeries){
+      const tickInterval=data.length>20?Math.ceil(data.length/8):data.length>10?2:0;
       return(
-        <ResponsiveContainer width="100%" height={h}>
-          <AreaChart data={data} margin={{top:5,right:10,left:0,bottom:5}}>
+        <ResponsiveContainer width="100%" height={h+40}>
+          <AreaChart data={data} margin={{top:5,right:30,left:5,bottom:45}}>
             <defs>{yKeys.map((k,i)=><linearGradient key={k} id={`aig${i}`} x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor={PAL[i%10]} stopOpacity={.35}/><stop offset="100%" stopColor={PAL[i%10]} stopOpacity={.02}/></linearGradient>)}</defs>
             <CartesianGrid strokeDasharray="3 3" stroke={T.border} vertical={false}/>
-            <XAxis dataKey={xKey} tick={{fontSize:9,fill:T.muted}} axisLine={false} tickLine={false} tickFormatter={v=>typeof v==='string'?v.slice(0,10):v}/>
-            <YAxis tick={{fontSize:9,fill:T.muted}} axisLine={false} tickLine={false} width={38}/>
+            <XAxis dataKey={xKey} tick={{fontSize:8,fill:T.muted}} axisLine={false} tickLine={false}
+              interval={tickInterval} angle={-40} textAnchor="end" height={55}
+              tickFormatter={v=>{if(typeof v!=='string')return v;return v.replace(/^20\d{2}-/,'').slice(0,5);}}/>
+            <YAxis tick={{fontSize:9,fill:T.muted}} axisLine={false} tickLine={false} width={42}/>
             <Tooltip content={<TipC/>}/>
             {threshold!=null&&<ReferenceLine y={threshold} stroke={T.amber} strokeDasharray="4 2" label={{value:`${threshold}`,fontSize:9,fill:T.amber}}/>}
             {yKeys.map((k,i)=><Area key={k} type="monotone" dataKey={k} stroke={PAL[i%10]} fill={`url(#aig${i})`} strokeWidth={2} dot={data.length<=30?{r:2.5}:false} name={k.replace(/_/g,' ')}/>)}
@@ -564,25 +571,25 @@ function AIView({result,T,onClose}) {
     );
   };
 
-  const chartIcon={'bar':'📊','line':'📈','area':'📈','pie':'🥧','scatter':'⬡','composed':'📊','radar':'🕸','heatmap':'🌡'}[ctype]||'📊';
+  const chartIcon={'bar':'','line':'','area':'','pie':'','scatter':'⬡','composed':'','radar':'','heatmap':''}[ctype]||'';
 
   return(
     <div style={{animation:'fadeIn .3s ease'}}>
       {/* Header */}
       <div style={{display:'flex',alignItems:'flex-start',justifyContent:'space-between',marginBottom:14}}>
         <div>
-          <div style={{fontSize:17,fontWeight:800,color:T.text,marginBottom:3}}>✦ {title}</div>
+          <div style={{fontSize:17,fontWeight:800,color:T.text,marginBottom:3}}> {title}</div>
           <div style={{fontSize:11.5,color:T.muted,lineHeight:1.6}}>{response}</div>
           <div style={{display:'flex',gap:6,marginTop:5,flexWrap:'wrap'}}>
             <Bdg color={T.kpmgBlue}>{row_count} records</Bdg>
             <Bdg color={T.purple}>{chartIcon} {ctype}</Bdg>
-            {provider&&<Bdg color={T.teal}>🤖 {provider}</Bdg>}
+            {provider&&<Bdg color={T.teal}> {provider}</Bdg>}
             {threshold!=null&&<Bdg color={T.amber}>SLA: {threshold}</Bdg>}
           </div>
         </div>
         <div style={{display:'flex',gap:8,alignItems:'center'}}>
           <button onClick={()=>setShowTable(t=>!t)} style={{padding:'5px 12px',borderRadius:16,fontSize:10.5,fontWeight:700,background:showTable?T.kpmgBlue:'transparent',color:showTable?'#fff':T.textSub,border:`1.5px solid ${showTable?T.kpmgBlue:T.border}`,cursor:'pointer'}}>
-            {showTable?'📊 Chart':'📋 Table'}
+            {showTable?' Chart':' Table'}
           </button>
           <button onClick={onClose} style={{padding:'5px 12px',borderRadius:16,fontSize:10.5,fontWeight:700,background:'transparent',border:`1.5px solid ${T.border}`,color:T.textSub,cursor:'pointer'}}>← Back</button>
         </div>
@@ -606,7 +613,7 @@ function AIView({result,T,onClose}) {
 
       {showTable?(
         /* Data Table */
-        <CC T={T} title="📋 Query Results">
+        <CC T={T} title=" Query Results">
           <div style={{overflowX:'auto',maxHeight:420,overflowY:'auto'}}>
             <table style={{width:'100%',borderCollapse:'collapse',fontSize:10.5}}>
               <thead style={{position:'sticky',top:0,zIndex:1}}>
@@ -631,7 +638,7 @@ function AIView({result,T,onClose}) {
             {data.length>0?renderChart():<Empty T={T}/>}
           </CC>
           {hasGeo&&(
-            <CC T={T} title="🗺 Geographic View">
+            <CC T={T} title=" Geographic View">
               <LeafletMap sites={data} highlight={data} T={T} height={280}/>
             </CC>
           )}
@@ -641,7 +648,7 @@ function AIView({result,T,onClose}) {
       {/* SQL disclosure */}
       {sql&&(
         <details style={{marginTop:10}}>
-          <summary style={{fontSize:9.5,color:T.muted,cursor:'pointer',fontWeight:600}}>🔍 View generated SQL</summary>
+          <summary style={{fontSize:9.5,color:T.muted,cursor:'pointer',fontWeight:600}}> View generated SQL</summary>
           <pre style={{background:T.surface2,border:`1px solid ${T.border}`,borderRadius:8,padding:'10px 12px',fontSize:9.5,color:T.textSub,overflow:'auto',marginTop:6,lineHeight:1.6}}>{sql}</pre>
         </details>
       )}
@@ -656,15 +663,15 @@ function OverviewPage({T,data,mapSites}) {
   const hs=Math.round(d.network_health_score||0);
 
   const kpis=[
-    {label:'Total Sites',    value:f(d.total_sites,0),    icon:'🏗', color:T.kpmgBlue},
-    {label:'Active Cells',   value:f(d.total_cells,0),    icon:'📡', color:T.blue3},
-    {label:'Congested Sites',value:f(d.congested_sites,0),icon:'⚠️', color:d.congested_sites>0?T.red:T.green, badge:d.congested_sites>0?{color:T.red,text:'PRB>85%'}:null},
-    {label:'Avg DL Tput',    value:f(d.avg_dl_tput),      unit:'Mbps',icon:'⚡', color:T.teal},
-    {label:'Call Drop Rate', value:f(d.avg_drop_rate,2),  unit:'%',  icon:'📉', color:d.avg_drop_rate>2?T.red:T.green, badge:d.avg_drop_rate>2?{color:T.red,text:'High'}:null},
-    {label:'Avg PRB Util',   value:f(d.avg_prb),          unit:'%',  icon:'📊', color:d.avg_prb>80?T.red:d.avg_prb>60?T.amber:T.green},
-    {label:'Avg DL Volume',  value:f(d.avg_dl_vol,1),     unit:'GB', icon:'💾', color:T.blue2},
-    {label:'Avg RRC Users',  value:f(d.avg_rrc_ue,0),     icon:'📱', color:T.purple},
-    {label:'Packet Loss',    value:f(d.avg_packet_loss,2), unit:'%', icon:'📦', color:T.blue2, badge:d.avg_packet_loss>3?{color:T.red,text:'Alert'}:null},
+    {label:'Total Sites',    value:f(d.total_sites,0),    icon:'', color:T.kpmgBlue},
+    {label:'Active Cells',   value:f(d.total_cells,0),    icon:'', color:T.blue3},
+    {label:'Congested Sites',value:f(d.congested_sites,0),icon:'', color:d.congested_sites>0?T.red:T.green, badge:d.congested_sites>0?{color:T.red,text:'PRB>85%'}:null},
+    {label:'Avg DL Tput',    value:f(d.avg_dl_tput),      unit:'Mbps',icon:'', color:T.teal},
+    {label:'Call Drop Rate', value:f(d.avg_drop_rate,2),  unit:'%',  icon:'', color:d.avg_drop_rate>2?T.red:T.green, badge:d.avg_drop_rate>2?{color:T.red,text:'High'}:null},
+    {label:'Avg PRB Util',   value:f(d.avg_prb),          unit:'%',  icon:'', color:d.avg_prb>80?T.red:d.avg_prb>60?T.amber:T.green},
+    {label:'Avg DL Volume',  value:f(d.avg_dl_vol,1),     unit:'GB', icon:'', color:T.blue2},
+    {label:'Avg RRC Users',  value:f(d.avg_rrc_ue,0),     icon:'', color:T.purple},
+    {label:'Packet Loss',    value:f(d.avg_packet_loss,2), unit:'%', icon:'', color:T.blue2, badge:d.avg_packet_loss>3?{color:T.red,text:'Alert'}:null},
   ];
 
   const coreStat=[
@@ -703,7 +710,7 @@ function OverviewPage({T,data,mapSites}) {
 
       {/* Map + problems */}
       <div style={{display:'grid',gridTemplateColumns:'1fr 280px',gap:11,marginBottom:11}}>
-        <CC T={T} title="🗺 Interactive Network Map — Site Health">
+        <CC T={T} title=" Interactive Network Map — Site Health">
           <div style={{display:'flex',gap:10,marginBottom:8,flexWrap:'wrap'}}>
             {[['#22c55e','Healthy (0 issues)'],['#EAB308','Warning (1 issue)'],['#F97316','Degraded (2 issues)'],['#DC2626','Critical (3+ issues)']].map(([c,l])=>(
               <span key={l} style={{display:'flex',alignItems:'center',gap:4,fontSize:9.5,color:T.muted}}>
@@ -716,12 +723,12 @@ function OverviewPage({T,data,mapSites}) {
         </CC>
         <div style={{display:'flex',flexDirection:'column',gap:9}}>
           {/* Network problems */}
-          <CC T={T} title="🚨 Network Issues">
+          <CC T={T} title=" Network Issues">
             {[
-              {icon:'🔥',text:`${d.congested_sites||0} sites congested (PRB > 85%)`,color:T.red},
-              {icon:'📉',text:`Call drop rate ${f(d.avg_drop_rate,2)}%`,color:d.avg_drop_rate>2?T.red:T.green},
-              {icon:'⚡',text:`Avg DL throughput ${f(d.avg_dl_tput)} Mbps`,color:T.teal},
-              {icon:'📶',text:`Core Auth SR ${f(d.avg_auth_sr)}%`,color:d.avg_auth_sr>95?T.green:T.amber},
+              {icon:'',text:`${d.congested_sites||0} sites congested (PRB > 85%)`,color:T.red},
+              {icon:'',text:`Call drop rate ${f(d.avg_drop_rate,2)}%`,color:d.avg_drop_rate>2?T.red:T.green},
+              {icon:'',text:`Avg DL throughput ${f(d.avg_dl_tput)} Mbps`,color:T.teal},
+              {icon:'',text:`Core Auth SR ${f(d.avg_auth_sr)}%`,color:d.avg_auth_sr>95?T.green:T.amber},
             ].map((p,i)=>(
               <div key={i} style={{display:'flex',gap:7,padding:'5px 7px',borderRadius:7,background:p.color+'10',marginBottom:5}}>
                 <span style={{fontSize:11}}>{p.icon}</span>
@@ -730,7 +737,7 @@ function OverviewPage({T,data,mapSites}) {
             ))}
           </CC>
           {/* Revenue */}
-          <CC T={T} title="💰 Revenue Q1">
+          <CC T={T} title=" Revenue Q1">
             <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:7}}>
               {[
                 {label:'Revenue',value:`₹${f(d.total_q1_revenue)} L`,color:T.green},
@@ -749,7 +756,7 @@ function OverviewPage({T,data,mapSites}) {
 
       {/* Charts row */}
       <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:10,marginBottom:10}}>
-        <CC T={T} title="🏙 Zone PRB Performance">
+        <CC T={T} title=" Zone PRB Performance">
           {zone.length>0?(
             <ResponsiveContainer width="100%" height={190}>
               <BarChart data={zone}>
@@ -764,7 +771,7 @@ function OverviewPage({T,data,mapSites}) {
             </ResponsiveContainer>
           ):<Empty T={T}/>}
         </CC>
-        <CC T={T} title="⚡ DL Throughput Trend">
+        <CC T={T} title=" DL Throughput Trend">
           {trend.length>0?(
             <ResponsiveContainer width="100%" height={190}>
               <AreaChart data={trend}>
@@ -780,7 +787,7 @@ function OverviewPage({T,data,mapSites}) {
             </ResponsiveContainer>
           ):<Empty T={T}/>}
         </CC>
-        <CC T={T} title="🖥 Cross-Layer Health">
+        <CC T={T} title=" Cross-Layer Health">
           <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:6}}>
             {[...coreStat,...trStat].map((s,i)=>(
               <div key={i} style={{background:T.surface2,borderRadius:7,padding:'7px 9px',border:`1px solid ${T.border}`}}>
@@ -794,7 +801,7 @@ function OverviewPage({T,data,mapSites}) {
 
       {/* Worst Cells / Best / Low Margin */}
       <div style={{marginBottom:10}}>
-        <CC T={T} title="🔴 Worst Cells (Last 7 Days)">
+        <CC T={T} title=" Worst Cells (Last 7 Days)">
           {worstCells.length>0?(
             <div style={{maxHeight:220,overflowY:'auto'}}>
               <table style={{width:'100%',borderCollapse:'collapse',fontSize:10.5}}>
@@ -820,7 +827,7 @@ function OverviewPage({T,data,mapSites}) {
         </CC>
       </div>
       <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,alignItems:'start'}}>
-        <CC T={T} title="🟢 Best Sites (Throughput)">
+        <CC T={T} title=" Best Sites (Throughput)">
           {best.length>0?(
             <ResponsiveContainer width="100%" height={Math.max(170, best.length*22+40)}>
               <BarChart data={best} layout="vertical" margin={{left:4,right:12,top:4,bottom:4}}>
@@ -847,7 +854,7 @@ function OverviewPage({T,data,mapSites}) {
             </ResponsiveContainer>
           ):<Empty T={T}/>}
         </CC>
-        <CC T={T} title="📉 Low Margin Sites">
+        <CC T={T} title=" Low Margin Sites">
           {lowMargin.length>0?(
             <div style={{maxHeight:Math.max(170, best.length*22+40),overflowY:'auto'}}>
               <table style={{width:'100%',borderCollapse:'collapse',fontSize:10.5}}>
@@ -860,7 +867,7 @@ function OverviewPage({T,data,mapSites}) {
                       <td style={{padding:'4px 6px',fontWeight:700,color:T.kpmgBlue,fontSize:9.5,fontFamily:"'IBM Plex Mono',monospace"}}>{s.site_id}</td>
                       <td style={{padding:'4px 6px',fontFamily:"'IBM Plex Mono',monospace",fontSize:9.5}}>{f(s.q1_rev)}</td>
                       <td style={{padding:'4px 6px',fontFamily:"'IBM Plex Mono',monospace",fontSize:9.5}}>{f(s.q1_opex)}</td>
-                      <td style={{padding:'4px 6px',fontFamily:"'IBM Plex Mono',monospace",fontSize:9.5,color:diff<0?T.red:T.green,fontWeight:700}}>{f(diff)}</td>
+                      <td style={{padding:'4px 6px',fontFamily:"'IBM Plex Mono',monospace",fontSize:9.5,color:diff<0?T.red:T.green,fontWeight:700}}>{diff<0?`(${f(Math.abs(diff))})`:`${f(diff)}`}</td>
                     </tr>
                   )})}
                 </tbody>
@@ -904,26 +911,26 @@ function RANPage({T,data,mapSites,filters,opts}) {
 
   // 6 key RAN KPI cards
   const summary6=[
-    {label:'Call Drop Rate',   value:f(d.erab_drop_rate,2),unit:'%',  icon:'📉', color:fn(d.erab_drop_rate)>2?T.red:T.green,   badge:fn(d.erab_drop_rate)>2?{color:T.red,text:'High'}:null},
-    {label:'Call Failure Rate',value:f(100-fn(d.lte_call_setup_sr),2),unit:'%',icon:'📵',color:T.red},
-    {label:'DL Throughput',    value:f(d.dl_cell_tput),    unit:'Mbps',icon:'⚡', color:T.teal},
-    {label:'RRC Attached UEs', value:f(d.avg_rrc_ue,0),    icon:'📱',  color:T.purple},
-    {label:'DL PRB Util',      value:f(d.dl_prb_util),     unit:'%',   icon:'📊', color:fn(d.dl_prb_util)>80?T.red:T.amber},
-    {label:'DL Traffic Volume',value:f(d.dl_data_vol),     unit:'GB',  icon:'💾', color:T.blue3},
+    {label:'Call Drop Rate',   value:f(d.erab_drop_rate,2),unit:'%',  icon:'', color:fn(d.erab_drop_rate)>2?T.red:T.green,   badge:fn(d.erab_drop_rate)>2?{color:T.red,text:'High'}:null},
+    {label:'Call Failure Rate',value:f(100-fn(d.lte_call_setup_sr),2),unit:'%',icon:'',color:T.red},
+    {label:'DL Throughput',    value:f(d.dl_cell_tput),    unit:'Mbps',icon:'', color:T.teal},
+    {label:'RRC Attached UEs', value:f(d.avg_rrc_ue,0),    icon:'',  color:T.purple},
+    {label:'DL PRB Util',      value:f(d.dl_prb_util),     unit:'%',   icon:'', color:fn(d.dl_prb_util)>80?T.red:T.amber},
+    {label:'DL Traffic Volume',value:f(d.dl_data_vol),     unit:'GB',  icon:'', color:T.blue3},
   ];
 
   return (
     <div style={{animation:'fadeIn .3s ease'}}>
       <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:13}}>
         <div>
-          <div style={{fontSize:17,fontWeight:800,color:T.text,display:'flex',alignItems:'center',gap:8}}>📡 RAN Network Performance</div>
+          <div style={{fontSize:17,fontWeight:800,color:T.text,display:'flex',alignItems:'center',gap:8}}> RAN Network Performance</div>
           <div style={{fontSize:11,color:T.muted,marginTop:2}}>Radio Access Network · Call Drop · Throughput · PRB · RRC Users · DL Traffic</div>
         </div>
         <div style={{display:'flex',gap:7,alignItems:'center'}}>
           {['network','sitewise'].map(m=>(
             <button key={m} onClick={()=>{setViewMode(m);if(m==='network')setSelectedSite(null);}}
               style={{padding:'5px 13px',borderRadius:18,fontSize:11,fontWeight:700,background:viewMode===m?T.kpmgBlue:'transparent',color:viewMode===m?'#fff':T.textSub,border:`1.5px solid ${viewMode===m?T.kpmgBlue:T.border}`,cursor:'pointer',transition:'all .2s'}}>
-              {m==='network'?'🌐 Network':'🏗 Site-wise'}
+              {m==='network'?' Network':' Site-wise'}
             </button>
           ))}
         </div>
@@ -938,7 +945,7 @@ function RANPage({T,data,mapSites,filters,opts}) {
         <>
           <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:10,marginBottom:10}}>
             {/* Call Drop Trend */}
-            <CC T={T} title="📉 Call Drop Rate Trend">
+            <CC T={T} title=" Call Drop Rate Trend">
               {callDrop.length>0?(
                 <ResponsiveContainer width="100%" height={185}>
                   <AreaChart data={callDrop}>
@@ -954,7 +961,7 @@ function RANPage({T,data,mapSites,filters,opts}) {
               ):<Empty T={T}/>}
             </CC>
             {/* PRB Distribution */}
-            <CC T={T} title="📊 PRB Utilization Distribution">
+            <CC T={T} title=" PRB Utilization Distribution">
               {prbDist.length>0?(
                 <ResponsiveContainer width="100%" height={185}>
                   <BarChart data={prbDist}>
@@ -970,7 +977,7 @@ function RANPage({T,data,mapSites,filters,opts}) {
               ):<Empty T={T}/>}
             </CC>
             {/* Hourly DL Traffic */}
-            <CC T={T} title="💾 Hourly DL Traffic Volume">
+            <CC T={T} title=" Hourly DL Traffic Volume">
               {hourlyDL.length>0?(
                 <ResponsiveContainer width="100%" height={185}>
                   <ComposedChart data={hourlyDL}>
@@ -989,7 +996,7 @@ function RANPage({T,data,mapSites,filters,opts}) {
           </div>
           <div style={{display:'grid',gridTemplateColumns:'1fr 1.4fr 1fr',gap:10}}>
             {/* Zone Radar */}
-            <CC T={T} title="🗺 Zone Performance Radar">
+            <CC T={T} title=" Zone Performance Radar">
               <ResponsiveContainer width="100%" height={210}>
                 <RadarChart data={zonePerf.length>0?zonePerf:[{zone:'No data',avg_prb:0,avg_tput:0}]} cx="50%" cy="50%" outerRadius={75}>
                   <PolarGrid stroke={T.border}/>
@@ -1002,7 +1009,7 @@ function RANPage({T,data,mapSites,filters,opts}) {
               </ResponsiveContainer>
             </CC>
             {/* Map */}
-            <CC T={T} title="🗺 Network Site Map — 4-Factor Health">
+            <CC T={T} title=" Network Site Map — 4-Factor Health">
               <div style={{display:'flex',gap:8,marginBottom:6,flexWrap:'wrap'}}>
                 {[['#22c55e','Healthy'],['#EAB308','Warning'],['#F97316','Degraded'],['#DC2626','Critical']].map(([c,l])=>(
                   <span key={l} style={{display:'flex',alignItems:'center',gap:3,fontSize:9,color:T.muted}}>
@@ -1013,7 +1020,7 @@ function RANPage({T,data,mapSites,filters,opts}) {
               <LeafletMap sites={sites} T={T} height={200}/>
             </CC>
             {/* Top issues */}
-            <CC T={T} title="🔴 Top Issue Sites">
+            <CC T={T} title=" Top Issue Sites">
               <div style={{maxHeight:210,overflowY:'auto'}}>
                 {topIssues.length===0?<Empty T={T}/>:topIssues.slice(0,10).map((s,i)=>(
                   <div key={i} style={{display:'flex',alignItems:'center',gap:7,padding:'5px 0',borderBottom:`1px solid ${T.border}`}}>
@@ -1035,7 +1042,7 @@ function RANPage({T,data,mapSites,filters,opts}) {
           <div style={{display:'flex',alignItems:'center',gap:10,marginBottom:12}}>
             <SiteSearch T={T} layer="ran" onSelect={fetchSite} placeholder="Type site ID to see detailed KPIs…" filters={filters}/>
             {selectedSite&&<span style={{fontSize:11,color:T.muted}}>Showing: <strong style={{color:T.kpmgBlue}}>{selectedSite}</strong></span>}
-            {selectedSite&&<button onClick={()=>{setSelectedSite(null);setSiteData(null);}} style={{padding:'4px 10px',borderRadius:8,fontSize:10,border:`1px solid ${T.border}`,background:T.surface2,color:T.textSub,cursor:'pointer'}}>✕ Clear</button>}
+            {selectedSite&&<button onClick={()=>{setSelectedSite(null);setSiteData(null);}} style={{padding:'4px 10px',borderRadius:8,fontSize:10,border:`1px solid ${T.border}`,background:T.surface2,color:T.textSub,cursor:'pointer'}}> Clear</button>}
           </div>
 
           {selectedSite&&(
@@ -1045,15 +1052,15 @@ function RANPage({T,data,mapSites,filters,opts}) {
                 <div style={{display:'grid',gridTemplateColumns:'1fr 280px',gap:10,marginBottom:11}}>
                   <div style={{display:'grid',gridTemplateColumns:'repeat(3,1fr)',gap:8,alignContent:'start'}}>
                     {[
-                      {label:'Call Drop Rate',  value:f(siteData.summary?.call_drop_rate,2),unit:'%',icon:'📉',color:fn(siteData.summary?.call_drop_rate)>2?T.red:T.green},
-                      {label:'Call Failure',    value:f(siteData.summary?.call_failure_rate,2),unit:'%',icon:'📵',color:T.red},
-                      {label:'DL Throughput',   value:f(siteData.summary?.dl_throughput),unit:'Mbps',icon:'⚡',color:T.teal},
-                      {label:'RRC Users (Avg)', value:f(siteData.summary?.rrc_users,0),icon:'📱',color:T.purple},
-                      {label:'DL PRB Util',     value:f(siteData.summary?.dl_prb_util),unit:'%',icon:'📊',color:fn(siteData.summary?.dl_prb_util)>80?T.red:T.amber},
-                      {label:'DL Traffic Vol',  value:f(siteData.summary?.dl_traffic_vol),unit:'GB',icon:'💾',color:T.blue3},
+                      {label:'Call Drop Rate',  value:f(siteData.summary?.call_drop_rate,2),unit:'%',icon:'',color:fn(siteData.summary?.call_drop_rate)>2?T.red:T.green},
+                      {label:'Call Failure',    value:f(siteData.summary?.call_failure_rate,2),unit:'%',icon:'',color:T.red},
+                      {label:'DL Throughput',   value:f(siteData.summary?.dl_throughput),unit:'Mbps',icon:'',color:T.teal},
+                      {label:'RRC Users (Avg)', value:f(siteData.summary?.rrc_users,0),icon:'',color:T.purple},
+                      {label:'DL PRB Util',     value:f(siteData.summary?.dl_prb_util),unit:'%',icon:'',color:fn(siteData.summary?.dl_prb_util)>80?T.red:T.amber},
+                      {label:'DL Traffic Vol',  value:f(siteData.summary?.dl_traffic_vol),unit:'GB',icon:'',color:T.blue3},
                     ].map((k,i)=><KpiCard key={i} T={T} {...k}/>)}
                   </div>
-                  <CC T={T} title={`📍 ${selectedSite} Location`}>
+                  <CC T={T} title={` ${selectedSite} Location`}>
                     {siteData.meta?.latitude&&siteData.meta?.longitude?(
                       <LeafletMap sites={[{site_id:selectedSite,lat:siteData.meta.latitude,lng:siteData.meta.longitude,cluster:siteData.meta.zone||'',dl_prb_util:siteData.summary?.dl_prb_util||0,call_drop_rate:siteData.summary?.call_drop_rate||0,dl_tput:siteData.summary?.dl_throughput||0}]} highlight={[{site_id:selectedSite,lat:siteData.meta.latitude,lng:siteData.meta.longitude,cluster:siteData.meta.zone||'',dl_prb_util:siteData.summary?.dl_prb_util||0,call_drop_rate:siteData.summary?.call_drop_rate||0,dl_tput:siteData.summary?.dl_throughput||0}]} T={T} height={180}/>
                     ):<div style={{padding:20,textAlign:'center',color:T.muted,fontSize:11}}>No location data</div>}
@@ -1061,7 +1068,7 @@ function RANPage({T,data,mapSites,filters,opts}) {
                 </div>
                 {/* Trend charts */}
                 <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginBottom:10}}>
-                  <CC T={T} title={`📉 Call Drop & Failure Trend — ${selectedSite}`}>
+                  <CC T={T} title={` Call Drop & Failure Trend — ${selectedSite}`}>
                     {siteData.daily_trend?.length>0?(
                       <ResponsiveContainer width="100%" height={195}>
                         <ComposedChart data={siteData.daily_trend}>
@@ -1077,7 +1084,7 @@ function RANPage({T,data,mapSites,filters,opts}) {
                       </ResponsiveContainer>
                     ):<Empty T={T}/>}
                   </CC>
-                  <CC T={T} title={`⚡ Throughput & PRB — ${selectedSite}`}>
+                  <CC T={T} title={` Throughput & PRB — ${selectedSite}`}>
                     {siteData.daily_trend?.length>0?(
                       <ResponsiveContainer width="100%" height={195}>
                         <ComposedChart data={siteData.daily_trend}>
@@ -1094,7 +1101,7 @@ function RANPage({T,data,mapSites,filters,opts}) {
                       </ResponsiveContainer>
                     ):<Empty T={T}/>}
                   </CC>
-                  <CC T={T} title={`📱 RRC Attached Users — ${selectedSite}`}>
+                  <CC T={T} title={` RRC Attached Users — ${selectedSite}`}>
                     {siteData.daily_trend?.length>0?(
                       <ResponsiveContainer width="100%" height={185}>
                         <BarChart data={siteData.daily_trend}>
@@ -1107,7 +1114,7 @@ function RANPage({T,data,mapSites,filters,opts}) {
                       </ResponsiveContainer>
                     ):<Empty T={T}/>}
                   </CC>
-                  <CC T={T} title={`💾 DL Traffic Volume — ${selectedSite}`}>
+                  <CC T={T} title={` DL Traffic Volume — ${selectedSite}`}>
                     {siteData.daily_trend?.length>0?(
                       <ResponsiveContainer width="100%" height={185}>
                         <BarChart data={siteData.daily_trend}>
@@ -1125,7 +1132,7 @@ function RANPage({T,data,mapSites,filters,opts}) {
                 </div>
                 {/* Cell table */}
                 {siteData.cells?.length>0&&(
-                  <CC T={T} title={`📋 Cell-level Breakdown — ${selectedSite}`}>
+                  <CC T={T} title={` Cell-level Breakdown — ${selectedSite}`}>
                     <table style={{width:'100%',borderCollapse:'collapse',fontSize:10.5}}>
                       <thead>
                         <tr style={{background:T.surface2}}>{['Cell ID','PRB %','DL Tput (Mbps)','Call Drop %','RRC Users'].map(h=><th key={h} style={{padding:'6px 9px',textAlign:'center',borderBottom:`2px solid ${T.border}`,color:T.muted,fontWeight:700,fontSize:9,textTransform:'uppercase'}}>{h}</th>)}</tr>
@@ -1149,7 +1156,7 @@ function RANPage({T,data,mapSites,filters,opts}) {
           )}
 
           {!selectedSite&&(
-            <CC T={T} title="📋 Site-wise RAN KPI Table (All Sites)">
+            <CC T={T} title=" Site-wise RAN KPI Table (All Sites)">
               <div style={{overflowX:'auto'}}>
                 <table style={{width:'100%',borderCollapse:'collapse',fontSize:10}}>
                   <thead>
@@ -1244,20 +1251,20 @@ function CorePage({T,data,filters}) {
   useEffect(()=>{if(selectedSite)fetchSite(selectedSite);},[filters]);// eslint-disable-line
 
   const kpis=[
-    {label:'Auth Success Rate', value:f(d.avg_auth_sr),  unit:'%',icon:'🔐',color:fn(d.avg_auth_sr)<95?T.red:T.green,  badge:fn(d.avg_auth_sr)<95?{color:T.red,text:'Below SLA'}:null},
-    {label:'CPU Utilization',   value:f(d.avg_cpu),      unit:'%',icon:'🖥', color:fn(d.avg_cpu)>80?T.red:T.amber,     badge:fn(d.avg_cpu)>80?{color:T.red,text:'High'}:null},
-    {label:'Attach Success Rate',value:f(d.avg_attach_sr),unit:'%',icon:'🔗',color:fn(d.avg_attach_sr)<95?T.red:T.green},
-    {label:'PDP Bearer SR',     value:f(d.avg_pdp_sr),   unit:'%',icon:'📦',color:fn(d.avg_pdp_sr)<95?T.red:T.teal},
+    {label:'Auth Success Rate', value:f(d.avg_auth_sr),  unit:'%',icon:'',color:fn(d.avg_auth_sr)<95?T.red:T.green,  badge:fn(d.avg_auth_sr)<95?{color:T.red,text:'Below SLA'}:null},
+    {label:'CPU Utilization',   value:f(d.avg_cpu),      unit:'%',icon:'', color:fn(d.avg_cpu)>80?T.red:T.amber,     badge:fn(d.avg_cpu)>80?{color:T.red,text:'High'}:null},
+    {label:'Attach Success Rate',value:f(d.avg_attach_sr),unit:'%',icon:'',color:fn(d.avg_attach_sr)<95?T.red:T.green},
+    {label:'PDP Bearer SR',     value:f(d.avg_pdp_sr),   unit:'%',icon:'',color:fn(d.avg_pdp_sr)<95?T.red:T.teal},
   ];
 
   const siteSummary=d.site_summary||[];
 
   // Shared chart config for network & site level
   const CORE_CHARTS=[
-    {title:'🔐 Authentication SR Trend', key:'auth_sr',  color:'#2B4DCC', sla:95, slaLabel:'SLA 95%'},
-    {title:'🖥 CPU Utilization Trend',   key:'cpu_util', color:'#E91E8C', sla:80, slaLabel:'Alert 80%'},
-    {title:'🔗 Attach Success Rate',     key:'attach_sr',color:'#00BCD4', sla:95},
-    {title:'📦 PDP Bearer SR',           key:'pdp_sr',   color:'#7B1FA2', sla:95},
+    {title:' Authentication SR Trend', key:'auth_sr',  color:'#2B4DCC', sla:95, slaLabel:'SLA 95%'},
+    {title:' CPU Utilization Trend',   key:'cpu_util', color:'#E91E8C', sla:80, slaLabel:'Alert 80%'},
+    {title:' Attach Success Rate',     key:'attach_sr',color:'#00BCD4', sla:95},
+    {title:' PDP Bearer SR',           key:'pdp_sr',   color:'#7B1FA2', sla:95},
   ];
 
   // Map key → network trend array
@@ -1268,7 +1275,7 @@ function CorePage({T,data,filters}) {
   return (
     <div style={{animation:'fadeIn .3s ease'}}>
       <div style={{marginBottom:13}}>
-        <div style={{fontSize:17,fontWeight:800,color:T.text,marginBottom:3}}>🖥 Core Network Performance</div>
+        <div style={{fontSize:17,fontWeight:800,color:T.text,marginBottom:3}}> Core Network Performance</div>
         <div style={{fontSize:11,color:T.muted}}>EPC / 5GC · Authentication · Attach · PDP Bearer · CPU Utilization</div>
       </div>
       <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:9,marginBottom:12}}>
@@ -1285,10 +1292,10 @@ function CorePage({T,data,filters}) {
       </div>
 
       {/* Site search + site-level */}
-      <CC T={T} title="🏗 Site-level Core KPI Analysis">
+      <CC T={T} title=" Site-level Core KPI Analysis">
         <div style={{display:'flex',gap:10,marginBottom:12,alignItems:'center'}}>
           <SiteSearch T={T} layer="core" onSelect={fetchSite} placeholder="Search core site ID…" filters={filters}/>
-          {selectedSite&&<button onClick={()=>{setSelectedSite(null);setSiteData(null);}} style={{padding:'4px 10px',borderRadius:8,fontSize:10,border:`1px solid ${T.border}`,background:T.surface2,color:T.textSub,cursor:'pointer'}}>✕ Clear</button>}
+          {selectedSite&&<button onClick={()=>{setSelectedSite(null);setSiteData(null);}} style={{padding:'4px 10px',borderRadius:8,fontSize:10,border:`1px solid ${T.border}`,background:T.surface2,color:T.textSub,cursor:'pointer'}}> Clear</button>}
         </div>
 
         {selectedSite&&(
@@ -1298,13 +1305,13 @@ function CorePage({T,data,filters}) {
               <div style={{display:'grid',gridTemplateColumns:'1fr 280px',gap:10,marginBottom:12}}>
                 <div style={{display:'grid',gridTemplateColumns:'repeat(2,1fr)',gap:8,alignContent:'start'}}>
                   {[
-                    {label:'Auth SR',   value:f(siteData.summary?.auth_sr),  unit:'%',icon:'🔐',color:fn(siteData.summary?.auth_sr)<95?T.red:T.green},
-                    {label:'CPU Util',  value:f(siteData.summary?.cpu_util), unit:'%',icon:'🖥', color:fn(siteData.summary?.cpu_util)>80?T.red:T.amber},
-                    {label:'Attach SR', value:f(siteData.summary?.attach_sr),unit:'%',icon:'🔗',color:T.blue3},
-                    {label:'PDP SR',    value:f(siteData.summary?.pdp_sr),   unit:'%',icon:'📦',color:T.teal},
+                    {label:'Auth SR',   value:f(siteData.summary?.auth_sr),  unit:'%',icon:'',color:fn(siteData.summary?.auth_sr)<95?T.red:T.green},
+                    {label:'CPU Util',  value:f(siteData.summary?.cpu_util), unit:'%',icon:'', color:fn(siteData.summary?.cpu_util)>80?T.red:T.amber},
+                    {label:'Attach SR', value:f(siteData.summary?.attach_sr),unit:'%',icon:'',color:T.blue3},
+                    {label:'PDP SR',    value:f(siteData.summary?.pdp_sr),   unit:'%',icon:'',color:T.teal},
                   ].map((k,i)=><KpiCard key={i} T={T} {...k}/>)}
                 </div>
-                <CC T={T} title={`📍 ${selectedSite} Location`}>
+                <CC T={T} title={` ${selectedSite} Location`}>
                   {siteData.meta?.latitude&&siteData.meta?.longitude?(
                     <LeafletMap sites={[{site_id:selectedSite,lat:siteData.meta.latitude,lng:siteData.meta.longitude,cluster:siteData.meta.zone||''}]} highlight={[{site_id:selectedSite,lat:siteData.meta.latitude,lng:siteData.meta.longitude,cluster:siteData.meta.zone||''}]} T={T} height={160}/>
                   ):<div style={{padding:20,textAlign:'center',color:T.muted,fontSize:11}}>No location data</div>}
@@ -1376,12 +1383,12 @@ function TransportPage({T,data,filters}) {
   useEffect(()=>{if(selectedSite)fetchSite(selectedSite);},[filters]);// eslint-disable-line
 
   const kpis=[
-    {label:'Avg Link Util',      value:f(d.avg_util),            unit:'%', icon:'📶',color:T.kpmgBlue},
-    {label:'Avg Packet Loss',    value:f(d.avg_packet_loss,3),   unit:'%', icon:'📉',color:T.red},
-    {label:'Avg Latency',        value:f(d.avg_latency),         unit:'ms',icon:'⏱', color:T.amber},
-    {label:'Avg Jitter',         value:f(d.avg_jitter),          unit:'ms',icon:'〰️',color:T.purple},
-    {label:'Link Availability',  value:f(d.avg_availability),    unit:'%', icon:'✅',color:T.green},
-    {label:'Throughput Efficiency',value:f(d.avg_tput_efficiency),unit:'%',icon:'⚡',color:T.teal},
+    {label:'Avg Link Util',      value:f(d.avg_util),            unit:'%', icon:'',color:T.kpmgBlue},
+    {label:'Avg Packet Loss',    value:f(d.avg_packet_loss,3),   unit:'%', icon:'',color:T.red},
+    {label:'Avg Latency',        value:f(d.avg_latency),         unit:'ms',icon:'', color:T.amber},
+    {label:'Avg Jitter',         value:f(d.avg_jitter),          unit:'ms',icon:'',color:T.purple},
+    {label:'Link Availability',  value:f(d.avg_availability),    unit:'%', icon:'',color:T.green},
+    {label:'Throughput Efficiency',value:f(d.avg_tput_efficiency),unit:'%',icon:'',color:T.teal},
   ];
   const sites=d.sites||[];
   const zoneUtil=d.zone_util||[];
@@ -1390,7 +1397,7 @@ function TransportPage({T,data,filters}) {
   return (
     <div style={{animation:'fadeIn .3s ease'}}>
       <div style={{marginBottom:13}}>
-        <div style={{fontSize:17,fontWeight:800,color:T.text,marginBottom:3}}>🔌 Transport Network Performance</div>
+        <div style={{fontSize:17,fontWeight:800,color:T.text,marginBottom:3}}> Transport Network Performance</div>
         <div style={{fontSize:11,color:T.muted}}>Backhaul · Latency · Packet Loss · Link Utilization · Jitter</div>
       </div>
       <div style={{display:'grid',gridTemplateColumns:'repeat(6,1fr)',gap:9,marginBottom:12}}>
@@ -1398,7 +1405,7 @@ function TransportPage({T,data,filters}) {
       </div>
 
       <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:10,marginBottom:12}}>
-        <CC T={T} title="📶 Link Utilization Trend">
+        <CC T={T} title=" Link Utilization Trend">
           {(d.link_util_trend||[]).length>0?(
             <ResponsiveContainer width="100%" height={185}>
               <AreaChart data={d.link_util_trend}>
@@ -1413,7 +1420,7 @@ function TransportPage({T,data,filters}) {
             </ResponsiveContainer>
           ):<Empty T={T}/>}
         </CC>
-        <CC T={T} title="⏱ Latency & Jitter Trend">
+        <CC T={T} title=" Latency & Jitter Trend">
           {(d.latency_trend||[]).length>0?(
             <ResponsiveContainer width="100%" height={185}>
               <LineChart data={d.latency_trend}>
@@ -1428,7 +1435,7 @@ function TransportPage({T,data,filters}) {
             </ResponsiveContainer>
           ):<Empty T={T}/>}
         </CC>
-        <CC T={T} title="🔌 Backhaul Type Mix">
+        <CC T={T} title=" Backhaul Type Mix">
           <ResponsiveContainer width="100%" height={185}>
             <PieChart>
               <Pie data={backhaulMix} cx="50%" cy="45%" outerRadius={62} innerRadius={36} paddingAngle={3} dataKey="value"
@@ -1444,7 +1451,7 @@ function TransportPage({T,data,filters}) {
 
       {/* Zone util chart */}
       {zoneUtil.length>0&&(
-        <CC T={T} title="🗺 Zone-wise Link Utilization" p="14px 16px">
+        <CC T={T} title=" Zone-wise Link Utilization" p="14px 16px">
           <div style={{marginBottom:10}}>
             <ResponsiveContainer width="100%" height={160}>
               <BarChart data={zoneUtil}>
@@ -1462,10 +1469,10 @@ function TransportPage({T,data,filters}) {
       )}
 
       {/* Site search + site-level */}
-      <CC T={T} title="🏗 Site-level Transport KPI Analysis" p="14px 16px">
+      <CC T={T} title=" Site-level Transport KPI Analysis" p="14px 16px">
         <div style={{display:'flex',gap:10,marginBottom:12,alignItems:'center'}}>
           <SiteSearch T={T} layer="transport" onSelect={fetchSite} placeholder="Search transport site ID…" filters={filters}/>
-          {selectedSite&&<button onClick={()=>{setSelectedSite(null);setSiteData(null);}} style={{padding:'4px 10px',borderRadius:8,fontSize:10,border:`1px solid ${T.border}`,background:T.surface2,color:T.textSub,cursor:'pointer'}}>✕ Clear</button>}
+          {selectedSite&&<button onClick={()=>{setSelectedSite(null);setSiteData(null);}} style={{padding:'4px 10px',borderRadius:8,fontSize:10,border:`1px solid ${T.border}`,background:T.surface2,color:T.textSub,cursor:'pointer'}}> Clear</button>}
         </div>
 
         {selectedSite&&(
@@ -1477,18 +1484,18 @@ function TransportPage({T,data,filters}) {
                 <div>
                   <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:8,marginBottom:8}}>
                     {[
-                      {label:'Avg Util',    value:f(siteData.avg_util),      unit:'%', icon:'📶',color:fn(siteData.avg_util)>80?T.red:T.kpmgBlue},
-                      {label:'Latency',     value:f(siteData.avg_latency),   unit:'ms',icon:'⏱', color:T.amber},
-                      {label:'Packet Loss', value:f(siteData.packet_loss,3), unit:'%', icon:'📉',color:T.red},
-                      {label:'Availability',value:f(siteData.availability),  unit:'%', icon:'✅',color:fn(siteData.availability)<99?T.amber:T.green},
+                      {label:'Avg Util',    value:f(siteData.avg_util),      unit:'%', icon:'',color:fn(siteData.avg_util)>80?T.red:T.kpmgBlue},
+                      {label:'Latency',     value:f(siteData.avg_latency),   unit:'ms',icon:'', color:T.amber},
+                      {label:'Packet Loss', value:f(siteData.packet_loss,3), unit:'%', icon:'',color:T.red},
+                      {label:'Availability',value:f(siteData.availability),  unit:'%', icon:'',color:fn(siteData.availability)<99?T.amber:T.green},
                     ].map((k,i)=><KpiCard key={i} T={T} {...k}/>)}
                   </div>
                   <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:8}}>
                     {[
-                      {label:'Backhaul Type',   value:siteData.backhaul_type||'—', isStr:true, icon:'🔌'},
-                      {label:'Link Capacity',   value:f(siteData.link_capacity), unit:'Mbps', icon:'⚡',color:T.teal},
-                      {label:'Peak Util',       value:f(siteData.peak_util),    unit:'%', icon:'📊',color:T.amber},
-                      {label:'Jitter',          value:f(siteData.jitter,2),     unit:'ms',icon:'〰️',color:T.purple},
+                      {label:'Backhaul Type',   value:siteData.backhaul_type||'—', isStr:true, icon:''},
+                      {label:'Link Capacity',   value:f(siteData.link_capacity), unit:'Mbps', icon:'',color:T.teal},
+                      {label:'Peak Util',       value:f(siteData.peak_util),    unit:'%', icon:'',color:T.amber},
+                      {label:'Jitter',          value:f(siteData.jitter,2),     unit:'ms',icon:'〰',color:T.purple},
                     ].map((k,i)=>(
                       <div key={i} style={{...card(T),padding:'10px 12px'}}>
                         <div style={{fontSize:9,color:T.muted,fontWeight:700,textTransform:'uppercase',marginBottom:3}}>{k.label}</div>
@@ -1499,13 +1506,13 @@ function TransportPage({T,data,filters}) {
                     ))}
                   </div>
                 </div>
-                <CC T={T} title={`📍 ${selectedSite} Location`}>
+                <CC T={T} title={` ${selectedSite} Location`}>
                   {siteData.meta?.latitude&&siteData.meta?.longitude?(
                     <LeafletMap sites={[{site_id:selectedSite,lat:siteData.meta.latitude,lng:siteData.meta.longitude,cluster:siteData.meta.zone||siteData.zone||''}]} highlight={[{site_id:selectedSite,lat:siteData.meta.latitude,lng:siteData.meta.longitude,cluster:siteData.meta.zone||siteData.zone||''}]} T={T} height={180}/>
                   ):<div style={{padding:20,textAlign:'center',color:T.muted,fontSize:11}}>No location data</div>}
                 </CC>
               </div>
-              {siteData.alarms>0&&<div style={{marginTop:8,padding:'7px 10px',borderRadius:8,background:T.red+'18',border:`1px solid ${T.red}33`,color:T.red,fontSize:11,fontWeight:600}}>⚠️ {siteData.alarms} active alarm{siteData.alarms>1?'s':''} on this site</div>}
+              {siteData.alarms>0&&<div style={{marginTop:8,padding:'7px 10px',borderRadius:8,background:T.red+'18',border:`1px solid ${T.red}33`,color:T.red,fontSize:11,fontWeight:600}}> {siteData.alarms} active alarm{siteData.alarms>1?'s':''} on this site</div>}
             </div>
           ):null
         )}
@@ -1550,7 +1557,7 @@ function KPIFilterPage({T,kpiFilter,data,mapSites:_mapSites}) {
   const TipC=(p)=><Tip T={T} {...p}/>;
   const kd=data||{};
   const sites=kd.sites||[];
-  const meta=KPI_FILTERS.find(k=>k.key===kpiFilter)||{label:kpiFilter,icon:'📊',desc:''};
+  const meta=KPI_FILTERS.find(k=>k.key===kpiFilter)||{label:kpiFilter,icon:'',desc:''};
   const [focusSite,setFocusSite]=useState(null);
   const focusedSiteData=focusSite?sites.find(s=>s.site_id===focusSite):null;
 
@@ -1610,11 +1617,11 @@ function KPIFilterPage({T,kpiFilter,data,mapSites:_mapSites}) {
 
   const summaryCards=[
     {label:'Sites Affected', value:sites.length,                         icon:meta.icon, color:T.red},
-    {label:`Avg ${cfg.pl}`,  value:(avg!=null&&sites.length>0)?f(avg,1)+cfg.pu.trim():'—', icon:'📊', color:cfg.pc, isStr:true},
-    {label:'Critical',       value:critCount,                             icon:'🔴',      color:T.red},
+    {label:`Avg ${cfg.pl}`,  value:(avg!=null&&sites.length>0)?f(avg,1)+cfg.pu.trim():'—', icon:'', color:cfg.pc, isStr:true},
+    {label:'Critical',       value:critCount,                             icon:'',      color:T.red},
     extraAvg!=null
-      ?{label:`Avg ${cfg.el}`,value:f(extraAvg,1),                       icon:'📈',      color:T.purple,isStr:true}
-      :{label:'Worst Site',  value:worst?.site_id||'—',                   icon:'⚠️',      color:T.amber, isStr:true},
+      ?{label:`Avg ${cfg.el}`,value:f(extraAvg,1),                       icon:'',      color:T.purple,isStr:true}
+      :{label:'Worst Site',  value:worst?.site_id||'—',                   icon:'',      color:T.amber, isStr:true},
   ];
 
   // Filter-specific table columns: [header, renderFn(s)->string, colorFn(s)->color|null]
@@ -1747,7 +1754,7 @@ function KPIFilterPage({T,kpiFilter,data,mapSites:_mapSites}) {
                         {d.zone&&<><span style={{color:T.muted}}>Zone</span><span style={{textAlign:'right'}}>{d.zone||d.cluster}</span></>}
                       </div>
                       {cfg.sla!=null&&<div style={{marginTop:5,paddingTop:4,borderTop:`1px solid ${T.border}`,fontSize:9,
-                        color:bad?'#DC2626':T.green}}>{bad?'⚠ Violates':'✓ Within'} SLA ({cfg.sla}{cfg.pu.trim()})</div>}
+                        color:bad?'#DC2626':T.green}}>{bad?' Violates':' Within'} SLA ({cfg.sla}{cfg.pu.trim()})</div>}
                     </div>);
                 }}/>
                 {cfg.sla!=null&&<ReferenceLine x={cfg.sla} stroke={T.amber} strokeWidth={2} strokeDasharray="6 3"
@@ -1771,15 +1778,15 @@ function KPIFilterPage({T,kpiFilter,data,mapSites:_mapSites}) {
           ):<Empty T={T}/>}
         </CC>
         <div style={{display:'flex',flexDirection:'column',gap:11}}>
-          <CC T={T} title="🗺 Affected Sites Map">
+          <CC T={T} title=" Affected Sites Map">
             <LeafletMap sites={sites} highlight={focusedSiteData?[focusedSiteData]:sites} T={T} height={220}/>
             {focusSite&&<div style={{padding:'5px 10px',borderTop:`1px solid ${T.border}`,fontSize:10,color:T.muted,display:'flex',alignItems:'center',gap:6}}>
-              <span>📍 <b style={{color:T.kpmgBlue}}>{focusSite}</b></span>
+              <span> <b style={{color:T.kpmgBlue}}>{focusSite}</b></span>
               <button onClick={()=>setFocusSite(null)} style={{padding:'2px 8px',borderRadius:6,fontSize:9,border:`1px solid ${T.border}`,background:T.surface2,color:T.textSub,cursor:'pointer'}}>Show All</button>
             </div>}
           </CC>
           {/* Quick stats panel */}
-          <CC T={T} title="📊 Quick Stats">
+          <CC T={T} title=" Quick Stats">
             <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:6}}>
               {[
                 {l:'Avg '+cfg.pl, v:f(avg,1)+cfg.pu.trim(), c:cfg.pc},
@@ -1798,7 +1805,7 @@ function KPIFilterPage({T,kpiFilter,data,mapSites:_mapSites}) {
       </div>
 
       {/* Filter-specific table */}
-      <CC T={T} title={`📋 Site Detail Table — ${sites.length} sites`}>
+      <CC T={T} title={` Site Detail Table — ${sites.length} sites`}>
         <div style={{overflowX:'auto',maxHeight:400,overflowY:'auto'}}>
           <table style={{width:'100%',borderCollapse:'collapse',fontSize:10.5}}>
             <thead>
@@ -2022,11 +2029,11 @@ export default function NetworkAnalyticsDashboard() {
             </select>
             <MultiSel T={T} label="All City" options={opts.cities||[]} value={filters.city} onChange={v=>setFilters(p=>({...p,city:v}))}/>
             <button onClick={()=>setDark(d=>!d)} style={{padding:'5px 10px',borderRadius:18,fontSize:10.5,fontWeight:600,background:dark?'#F59E0B22':'#00338D10',border:`1px solid ${dark?'#F59E0B44':T.border}`,color:dark?'#F59E0B':T.kpmgBlue,cursor:'pointer'}}>
-              {dark?'☀️':'🌙'}
+              {dark?'':''}
             </button>
-            <button onClick={()=>setChatOpen(o=>!o)} style={{padding:'5px 11px',borderRadius:18,fontSize:11,fontWeight:700,background:`linear-gradient(135deg,${T.kpmgBlue},${T.blue3})`,border:'none',color:'#fff',cursor:'pointer'}}>✦ AI</button>
-            {aiView&&<button onClick={()=>{setAiView(null);setPage('overview');}} style={{padding:'5px 10px',borderRadius:18,fontSize:10.5,fontWeight:700,background:'transparent',border:`1px solid ${T.red}`,color:T.red,cursor:'pointer'}}>✕ AI</button>}
-            <button onClick={()=>fetchAll()} style={{padding:'5px 9px',borderRadius:6,fontSize:10.5,fontWeight:600,background:T.kpmgBlue,color:'#fff',border:'none',cursor:'pointer'}}>{refreshing?'⟳':'↻'}</button>
+            <button onClick={()=>setChatOpen(o=>!o)} style={{padding:'5px 11px',borderRadius:18,fontSize:11,fontWeight:700,background:`linear-gradient(135deg,${T.kpmgBlue},${T.blue3})`,border:'none',color:'#fff',cursor:'pointer'}}> AI</button>
+            {aiView&&<button onClick={()=>{setAiView(null);setPage('overview');}} style={{padding:'5px 10px',borderRadius:18,fontSize:10.5,fontWeight:700,background:'transparent',border:`1px solid ${T.red}`,color:T.red,cursor:'pointer'}}> AI</button>}
+            <button onClick={()=>fetchAll()} style={{padding:'5px 9px',borderRadius:6,fontSize:10.5,fontWeight:600,background:T.kpmgBlue,color:'#fff',border:'none',cursor:'pointer'}}>{refreshing?'':'↻'}</button>
           </div>
         </div>
 
@@ -2036,19 +2043,19 @@ export default function NetworkAnalyticsDashboard() {
             <span style={{fontSize:9,color:T.muted,fontWeight:600,textTransform:'uppercase',letterSpacing:'0.05em'}}>Active filters:</span>
             {filters.cluster&&(
               <span style={{display:'inline-flex',alignItems:'center',gap:4,padding:'2px 8px',borderRadius:12,fontSize:9.5,fontWeight:700,background:`${T.kpmgBlue}18`,color:T.kpmgBlue,border:`1px solid ${T.kpmgBlue}33`}}>
-                🏙 {filters.cluster}
+                 {filters.cluster}
                 <button onClick={()=>setFilters(p=>({...p,cluster:''}))} style={{background:'none',border:'none',color:T.kpmgBlue,cursor:'pointer',padding:0,fontSize:10,lineHeight:1}}>×</button>
               </span>
             )}
             {filters.technology&&(
               <span style={{display:'inline-flex',alignItems:'center',gap:4,padding:'2px 8px',borderRadius:12,fontSize:9.5,fontWeight:700,background:`${T.teal}18`,color:T.teal,border:`1px solid ${T.teal}33`}}>
-                📡 {filters.technology}
+                 {filters.technology}
                 <button onClick={()=>setFilters(p=>({...p,technology:''}))} style={{background:'none',border:'none',color:T.teal,cursor:'pointer',padding:0,fontSize:10,lineHeight:1}}>×</button>
               </span>
             )}
             {filters.region&&(
               <span style={{display:'inline-flex',alignItems:'center',gap:4,padding:'2px 8px',borderRadius:12,fontSize:9.5,fontWeight:700,background:`${T.purple}18`,color:T.purple,border:`1px solid ${T.purple}33`}}>
-                🌍 {filters.region}
+                 {filters.region}
                 <button onClick={()=>setFilters(p=>({...p,region:''}))} style={{background:'none',border:'none',color:T.purple,cursor:'pointer',padding:0,fontSize:10,lineHeight:1}}>×</button>
               </span>
             )}
@@ -2063,21 +2070,21 @@ export default function NetworkAnalyticsDashboard() {
         <div style={{display:'flex',alignItems:'center',gap:4,padding:'0 20px 7px',flexWrap:'wrap'}}>
           <button className="nav-btn" onClick={()=>{setPage('overview');setAiView(null);}}
             style={{padding:'4px 12px',borderRadius:16,fontSize:10.5,fontWeight:700,background:page==='overview'&&!aiView?T.kpmgBlue:'transparent',color:page==='overview'&&!aiView?'#fff':T.textSub,border:`1.5px solid ${page==='overview'&&!aiView?T.kpmgBlue:T.border}`,cursor:'pointer',transition:'all .2s'}}>
-            🌐 Overview
+             Overview
           </button>
 
           {/* Layer dropdown */}
           <div style={{position:'relative'}} onClick={e=>e.stopPropagation()}>
             <button className="nav-btn" onClick={()=>{setLayerDrop(o=>!o);setKpiDrop(false);}}
               style={{padding:'4px 12px',borderRadius:16,fontSize:10.5,fontWeight:700,background:layerActive?T.kpmgBlue:'transparent',color:layerActive?'#fff':T.textSub,border:`1.5px solid ${layerActive?T.kpmgBlue:T.border}`,cursor:'pointer',display:'flex',alignItems:'center',gap:4,transition:'all .2s'}}>
-              📡 Layers {layerActive&&<Bdg color="rgba(255,255,255,0.4)" sm>{pageLabel}</Bdg>} ▾
+               Layers {layerActive&&<Bdg color="rgba(255,255,255,0.4)" sm>{pageLabel}</Bdg>} ▾
             </button>
             {layerDrop&&(
               <div style={{position:'absolute',top:'100%',left:0,minWidth:260,background:T.surface,border:`1px solid ${T.border}`,borderRadius:10,boxShadow:'0 12px 36px rgba(0,0,0,.18)',zIndex:300,overflow:'hidden',marginTop:2}}>
                 {[
-                  {key:'ran',       icon:'📡',label:'RAN',      desc:'Call Drop · Throughput · PRB · RRC Users · DL Traffic'},
-                  {key:'core',      icon:'🖥', label:'Core',     desc:'Auth SR · CPU · Attach SR · PDP Bearer'},
-                  {key:'transport', icon:'🔌',label:'Transport', desc:'Link Util · Latency · Jitter · Packet Loss'},
+                  {key:'ran',       icon:'',label:'RAN',      desc:'Call Drop · Throughput · PRB · RRC Users · DL Traffic'},
+                  {key:'core',      icon:'', label:'Core',     desc:'Auth SR · CPU · Attach SR · PDP Bearer'},
+                  {key:'transport', icon:'',label:'Transport', desc:'Link Util · Latency · Jitter · Packet Loss'},
                 ].map(l=>(
                   <div key={l.key} className="dd-item" onClick={()=>goLayer(l.key)}
                     style={{padding:'10px 15px',cursor:'pointer',borderBottom:`1px solid ${T.border}`,background:page===l.key?`${T.kpmgBlue}14`:'transparent'}}>
@@ -2093,7 +2100,7 @@ export default function NetworkAnalyticsDashboard() {
           <div style={{position:'relative'}} onClick={e=>e.stopPropagation()}>
             <button className="nav-btn" onClick={()=>{setKpiDrop(o=>!o);setLayerDrop(false);}}
               style={{padding:'4px 12px',borderRadius:16,fontSize:10.5,fontWeight:700,background:page==='kpi'?T.kpmgBlue:'transparent',color:page==='kpi'?'#fff':T.textSub,border:`1.5px solid ${page==='kpi'?T.kpmgBlue:T.border}`,cursor:'pointer',display:'flex',alignItems:'center',gap:4,transition:'all .2s'}}>
-              📊 KPI Filters {page==='kpi'&&selKpi&&<Bdg color="rgba(255,255,255,0.4)" sm>{KPI_FILTERS.find(k=>k.key===selKpi)?.icon}</Bdg>} ▾
+               KPI Filters {page==='kpi'&&selKpi&&<Bdg color="rgba(255,255,255,0.4)" sm>{KPI_FILTERS.find(k=>k.key===selKpi)?.icon}</Bdg>} ▾
             </button>
             {kpiDrop&&(
               <div style={{position:'absolute',top:'100%',left:0,minWidth:280,maxHeight:380,overflowY:'auto',background:T.surface,border:`1px solid ${T.border}`,borderRadius:10,boxShadow:'0 12px 36px rgba(0,0,0,.18)',zIndex:300,overflow:'auto',marginTop:2}}>
@@ -2123,31 +2130,31 @@ export default function NetworkAnalyticsDashboard() {
       <div style={{background:dark?'linear-gradient(135deg,#0A1628,#0F2040)':'linear-gradient(135deg,#00338D,#005EB8,#0091DA)',padding:'14px 24px 16px',borderBottom:`1px solid ${T.border}`}}>
         <div style={{maxWidth:800,margin:'0 auto'}}>
           <div style={{display:'flex',alignItems:'center',gap:10,marginBottom:10}}>
-            <div style={{width:30,height:30,borderRadius:'50%',background:'rgba(255,255,255,.15)',display:'flex',alignItems:'center',justifyContent:'center',fontSize:14}}>✦</div>
+            <div style={{width:30,height:30,borderRadius:'50%',background:'rgba(255,255,255,.15)',display:'flex',alignItems:'center',justifyContent:'center'}}><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg></div>
             <div>
               <div style={{fontSize:13,fontWeight:800,color:'#fff'}}>Network AI — Ask in any language</div>
               <div style={{fontSize:10,color:'rgba(255,255,255,.6)'}}>English · हिंदी · Complex queries · Filters active: {Object.entries(filters).filter(([k,v])=>v&&k!=='time_range').map(([k,v])=>v).join(', ')||'None'}</div>
             </div>
           </div>
           <div style={{position:'relative'}}>
-            <span style={{position:'absolute',left:14,top:'50%',transform:'translateY(-50%)',color:'rgba(255,255,255,.5)',pointerEvents:'none'}}>🔍</span>
+            <span style={{position:'absolute',left:14,top:'50%',transform:'translateY(-50%)',color:'rgba(255,255,255,.5)',pointerEvents:'none'}}></span>
             <input value={searchIn} onChange={e=>setSearchIn(e.target.value)}
               onKeyDown={e=>e.key==='Enter'&&searchIn.trim()&&runAI(searchIn)}
               placeholder="Ask anything… 'sabse kharab 5 cell dikhao' · 'Show congestion hotspots' · 'Compare zones'"
               style={{width:'100%',padding:'11px 48px 11px 40px',borderRadius:28,border:'2px solid rgba(255,255,255,.25)',background:'rgba(255,255,255,.12)',backdropFilter:'blur(12px)',color:'#fff',fontSize:12.5,fontFamily:'inherit',outline:'none'}}/>
             <button onClick={()=>searchIn.trim()&&runAI(searchIn)} disabled={aiLoading}
               style={{position:'absolute',right:7,top:'50%',transform:'translateY(-50%)',width:36,height:36,borderRadius:'50%',border:'none',background:'rgba(255,255,255,.25)',color:'#fff',cursor:'pointer',fontSize:16,display:'flex',alignItems:'center',justifyContent:'center'}}>
-              {aiLoading?<span style={{animation:'spin .7s linear infinite',display:'inline-block'}}>⟳</span>:'→'}
+              {aiLoading?<span style={{animation:'spin .7s linear infinite',display:'inline-block'}}></span>:'→'}
             </button>
           </div>
           <div style={{display:'flex',gap:6,marginTop:8,flexWrap:'wrap'}}>
             {[
-              ['🔴 Worst 5 cells','Show 5 worst sites where E-RAB Call Drop Rate_1 is greater than 1.5% or LTE Call Setup Success Rate is less than 98.5% or LTE DL - Usr Ave Throughput is less than 8 Mbps. Show all three KPIs for each site.'],
-              ['📉 Call drops','Show top 10 sites with highest E-RAB Call Drop Rate_1 along with their LTE Call Setup Success Rate and DL PRB Utilization'],
-              ['⚡ Throughput','Show bottom 10 sites by LTE DL - Usr Ave Throughput along with their DL PRB Utilization and E-RAB Call Drop Rate_1'],
-              ['🌡 Congestion','Show top 10 sites where DL PRB Utilization (1BH) is highest along with their LTE DL - Usr Ave Throughput and Ave RRC Connected Ue'],
-              ['📶 Availability','Show sites with lowest Availability along with their E-RAB Call Drop Rate_1 and LTE Call Setup Success Rate'],
-              ['🆚 Compare zones','Compare all zones by average E-RAB Call Drop Rate_1, LTE DL - Usr Ave Throughput, DL PRB Utilization (1BH), and LTE Call Setup Success Rate'],
+              [' Worst 5 cells','Show 5 worst sites where E-RAB Call Drop Rate_1 is greater than 1.5% or LTE Call Setup Success Rate is less than 98.5% or LTE DL - Usr Ave Throughput is less than 8 Mbps. Show all three KPIs for each site.'],
+              [' Call drops','Show top 10 sites with highest E-RAB Call Drop Rate_1 along with their LTE Call Setup Success Rate and DL PRB Utilization'],
+              [' Throughput','Show bottom 10 sites by LTE DL - Usr Ave Throughput along with their DL PRB Utilization and E-RAB Call Drop Rate_1'],
+              [' Congestion','Show top 10 sites where DL PRB Utilization (1BH) is highest along with their LTE DL - Usr Ave Throughput and Ave RRC Connected Ue'],
+              [' Availability','Show sites with lowest Availability along with their E-RAB Call Drop Rate_1 and LTE Call Setup Success Rate'],
+              [' Compare zones','Compare all zones by average E-RAB Call Drop Rate_1, LTE DL - Usr Ave Throughput, DL PRB Utilization (1BH), and LTE Call Setup Success Rate'],
             ].map(([l,q])=>(
               <button key={q} onClick={()=>runAI(q)} style={{padding:'3px 10px',borderRadius:14,fontSize:10,fontWeight:600,background:'rgba(255,255,255,.12)',border:'1px solid rgba(255,255,255,.2)',color:'rgba(255,255,255,.9)',cursor:'pointer',whiteSpace:'nowrap'}}>{l}</button>
             ))}
@@ -2160,14 +2167,14 @@ export default function NetworkAnalyticsDashboard() {
         {/* Filter context banner — shown whenever non-default filters are active */}
         {(filters.cluster||filters.technology||filters.region||filters.country||filters.state||filters.city||filters.time_range!=='24h')&&page!=='ai'&&(
           <div style={{display:'flex',alignItems:'center',gap:8,padding:'6px 12px',marginBottom:12,borderRadius:9,background:`${T.kpmgBlue}0c`,border:`1px solid ${T.kpmgBlue}22`,flexWrap:'wrap'}}>
-            <span style={{fontSize:9.5,fontWeight:700,color:T.kpmgBlue,textTransform:'uppercase',letterSpacing:'0.05em'}}>📊 Filtered View</span>
-            {filters.time_range!=='24h'&&<Bdg color={T.kpmgBlue}>⏱ {filters.time_range.toUpperCase()}</Bdg>}
-            {filters.cluster&&<Bdg color={T.kpmgBlue}>🏙 Zone: {filters.cluster}</Bdg>}
-            {filters.technology&&<Bdg color={T.teal}>📡 Tech: {filters.technology}</Bdg>}
-            {filters.country&&<Bdg color={T.green}>🌍 {filters.country}</Bdg>}
-            {filters.state&&<Bdg color={T.purple}>🗺 {filters.state}</Bdg>}
-            {filters.city&&<Bdg color={T.amber}>📍 {filters.city}</Bdg>}
-            {filters.region&&<Bdg color={T.blue2}>🌐 Region: {filters.region}</Bdg>}
+            <span style={{fontSize:9.5,fontWeight:700,color:T.kpmgBlue,textTransform:'uppercase',letterSpacing:'0.05em'}}> Filtered View</span>
+            {filters.time_range!=='24h'&&<Bdg color={T.kpmgBlue}> {filters.time_range.toUpperCase()}</Bdg>}
+            {filters.cluster&&<Bdg color={T.kpmgBlue}> Zone: {filters.cluster}</Bdg>}
+            {filters.technology&&<Bdg color={T.teal}> Tech: {filters.technology}</Bdg>}
+            {filters.country&&<Bdg color={T.green}> {filters.country}</Bdg>}
+            {filters.state&&<Bdg color={T.purple}> {filters.state}</Bdg>}
+            {filters.city&&<Bdg color={T.amber}> {filters.city}</Bdg>}
+            {filters.region&&<Bdg color={T.blue2}> Region: {filters.region}</Bdg>}
             <span style={{fontSize:9,color:T.muted,marginLeft:'auto'}}>All charts and metrics reflect these filters</span>
             {refreshing&&<span style={{fontSize:9,color:T.amber,animation:'pulse 1s ease infinite'}}>↻ Refreshing…</span>}
           </div>

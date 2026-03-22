@@ -1,4 +1,4 @@
-﻿"""
+"""
 Telecom Customer Complaint Handling System - Backend
 =====================================================
 Full backend with auth, chat, tickets, and the original AI chatbot integrated.
@@ -82,13 +82,30 @@ CORS(
     supports_credentials=True,
 )
 
-# ─── Azure OpenAI Configuration (pulled from .env) ───────────────────────────
-client = AzureOpenAI(
-    api_key=os.environ.get("AZURE_OPENAI_API_KEY"),
-    azure_endpoint=os.environ.get("AZURE_OPENAI_ENDPOINT"),
-    api_version=os.environ.get("AZURE_OPENAI_API_VERSION", "2023-07-01-preview"),
-)
-DEPLOYMENT_NAME = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini")
+# ─── Azure OpenAI / Gemini Configuration (auto-detect from .env) ─────────────
+_azure_key = os.environ.get("AZURE_OPENAI_API_KEY", "")
+_azure_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT", "")
+_gemini_key = os.environ.get("GEMINI_API_KEY", "")
+_gemini_model = os.environ.get("OPENAI_MODEL", "gemini-2.0-flash")
+
+if _azure_key and _azure_endpoint:
+    client = AzureOpenAI(
+        api_key=_azure_key,
+        azure_endpoint=_azure_endpoint,
+        api_version=os.environ.get("AZURE_OPENAI_API_VERSION", "2023-07-01-preview"),
+    )
+    DEPLOYMENT_NAME = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini")
+elif _gemini_key:
+    from openai import OpenAI as _GeminiClient
+    client = _GeminiClient(
+        api_key=_gemini_key,
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+        timeout=25.0,
+    )
+    DEPLOYMENT_NAME = _gemini_model
+else:
+    client = None
+    DEPLOYMENT_NAME = "none"
 
 def _user_brief(u, off_days=None):
     return {
@@ -210,20 +227,40 @@ def _haversine(lat1, lon1, lat2, lon2):
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
-NETWORK_PROBLEM_KPI_KEYWORDS = {
+# ── Strict KPI mapping: exact KPI names from DB for each problem type ──────
+# Only KPIs DIRECTLY related to diagnosing each problem are included.
+PROBLEM_KPI_EXACT = {
     "internet_signal": [
-        "internet", "speed", "bandwidth", "data", "throughput", "latency", "packet", "prb", "resource block",
-        "sinr", "rsrp", "rsrq", "cqi", "ul", "uplink", "dl", "downlink", "lte", "nr",
-        "4g", "5g", "availability", "session", "traffic", "interference", "coverage"
-    ],
-    "call_failure": [
-        "call setup", "cssr", "asr", "blocked", "failure", "accessibility", "sdcch",
-        "tch", "moc", "mtc", "paging", "attach", "volte", "voice", "srvcc"
+        "LTE DL - Usr Ave Throughput",       # Primary: user download speed
+        "DL PRB Utilization (1BH)",           # Congestion indicator
+        "Average Latency Downlink",           # Latency
+        "Ave RRC Connected Ue",               # User load causing congestion
+        "Average NI of Carrier-",             # Interference degrading speed
+        "Availability",                       # Site up/down
     ],
     "call_drop": [
-        "drop", "cdr", "dcr", "tch drop", "rlf", "radio link failure", "handover",
-        "ho ", "ho_", "speech", "retainability", "voice", "call"
+        "E-RAB Call Drop Rate_1",             # Primary: drop rate
+        "LTE Intra-Freq HO Success Rate",     # Handover failures cause drops
+        "DL PRB Utilization (1BH)",           # Congestion causes drops
+        "Ave RRC Connected Ue",               # Overload causes drops
+        "LTE DL - Usr Ave Throughput",        # Degraded service indicator
+        "Availability",                       # Site availability
     ],
+    "call_failure": [
+        "LTE Call Setup Success Rate",        # Primary: CSSR
+        "LTE RRC Setup Success Rate",         # RRC failures block calls
+        "LTE E-RAB Setup Success Rate",       # E-RAB setup failures
+        "DL PRB Utilization (1BH)",           # Congestion blocks calls
+        "VoLTE Traffic Erlang",               # Voice traffic load
+        "Availability",                       # Site availability
+    ],
+}
+
+# Legacy keyword-based fallback for matching arbitrary KPI names
+NETWORK_PROBLEM_KPI_KEYWORDS = {
+    "internet_signal": ["throughput", "latency", "prb", "volume", "interference", "availability", "ue", "user"],
+    "call_failure": ["call setup", "rrc setup", "e-rab setup", "csfb", "volte", "availability", "prb"],
+    "call_drop": ["drop", "handover", "ho success", "prb", "ue", "throughput", "availability"],
 }
 
 
@@ -256,33 +293,42 @@ def _problem_type_label(problem_type: str) -> str:
 
 
 def _filter_kpi_names_for_problem(kpi_names, problem_type: str):
-    keys = NETWORK_PROBLEM_KPI_KEYWORDS.get(problem_type, NETWORK_PROBLEM_KPI_KEYWORDS["internet_signal"])
-    selected = [
-        name for name in sorted(kpi_names)
-        if any(k in (name or "").lower() for k in keys)
-    ]
+    """Select only KPIs strictly related to the problem type.
+    Uses exact name matching first, then keyword fallback."""
+    exact = PROBLEM_KPI_EXACT.get(problem_type, PROBLEM_KPI_EXACT["internet_signal"])
+    # First: exact match against the predefined list
+    available = set(kpi_names)
+    selected = [k for k in exact if k in available]
+    # Fallback: keyword match if exact match found nothing
+    if not selected:
+        keys = NETWORK_PROBLEM_KPI_KEYWORDS.get(problem_type, NETWORK_PROBLEM_KPI_KEYWORDS["internet_signal"])
+        selected = [name for name in sorted(kpi_names) if any(k in (name or "").lower() for k in keys)]
     if not selected:
         selected = sorted(kpi_names)[:8]
     return selected
 
 
-def _period_key_for_row(row: KpiData, period: str) -> str:
+def _period_key_for_row(row: KpiData, period: str, has_hour_data: bool = False) -> str:
     if period == "month":
         return row.date.strftime("%Y-%m")
     if period == "week":
         iso = row.date.isocalendar()
         return f"{iso[0]}-W{iso[1]:02d}"
     if period == "hour":
-        return f"{row.date.strftime('%Y-%m-%d')} {row.hour:02d}:00"
+        # Only show hourly if actual hour variation exists, otherwise fall back to daily
+        if has_hour_data and (row.hour or 0) != 0:
+            return f"{row.date.strftime('%m/%d')} {row.hour:02d}h"
+        return row.date.strftime("%Y-%m-%d")
     return row.date.strftime("%Y-%m-%d")
 
 
 def _build_period_stats(rows, period: str):
+    has_hour = any((r.hour or 0) != 0 for r in rows) if rows else False
     agg = {}
     for r in rows:
         if r.value is None:
             continue
-        key = _period_key_for_row(r, period)
+        key = _period_key_for_row(r, period, has_hour)
         agg.setdefault(key, []).append(float(r.value))
     if not agg:
         return "no data"
@@ -425,36 +471,212 @@ def _format_points_for_pdf(raw_text: str) -> str:
         plain_lines.append(f"{i}. {plain}")
     return "\n\n".join(plain_lines)
 
+def _infer_issue_flags(text: str):
+    t = (text or "").lower()
+    flags = set()
+    if any(k in t for k in ["prb", "utilization", "congestion", "overload", "traffic spike"]):
+        flags.add("congestion")
+    if any(k in t for k in ["sinr", "rsrp", "rsrq", "weak signal", "coverage", "low signal"]):
+        flags.add("coverage")
+    if any(k in t for k in ["interference", "pilot pollution", "overshoot", "over-shoot"]):
+        flags.add("interference")
+    if any(k in t for k in ["latency", "packet loss", "delay", "jitter"]):
+        flags.add("latency")
+    if any(k in t for k in ["handover", "rlf", "drop", "call drop"]):
+        flags.add("handover")
+    if any(k in t for k in ["call setup", "cssr", "paging", "accessibility", "sdcch", "call failure"]):
+        flags.add("access")
+    if "off air" in t or "off_air" in t:
+        flags.add("off_air")
+    return flags
+
+
+def _build_parameter_recommendations(problem_type, root_cause, trend_summary, nearest):
+    """Build concrete RF parameter change recommendations using actual site values."""
+    bw = nearest.get("bandwidth_mhz") if nearest else None
+    gain = nearest.get("antenna_gain_dbi") if nearest else None
+    eirp = nearest.get("rf_power_eirp_dbm") if nearest else None
+    height = nearest.get("antenna_height_agl_m") if nearest else None
+    tilt = nearest.get("e_tilt_degree") if nearest else None
+    crs = nearest.get("crs_gain") if nearest else None
+
+    def _v(val, delta):
+        """Safely adjust a numeric value."""
+        try: return round(float(val) + delta, 1)
+        except: return "N/A"
+
+    recs = []
+
+    # Generate exactly 4 unique parameter recommendations — one per parameter
+    # Each addresses a different aspect of the root cause
+    params = [
+        ("Bandwidth", bw, "MHz",
+         {"Internet Speed": (5 if bw and float(bw)<=10 else 10, "increase PRB capacity, reducing congestion and improving DL throughput by 15-25%"),
+          "Call Drop": (5, "free resources for active bearers, reducing E-RAB drops under load by ~10%"),
+          "Call Failure": (5, "free PRB resources for call setup signaling, improving CSSR by ~5%")}),
+        ("E-tilt", tilt, "°",
+         {"Internet Speed": (-1, "extend coverage footprint, improving RSRP for cell-edge users and increasing throughput by ~10%"),
+          "Call Drop": (1, "reduce overshoot into neighboring cells, minimizing inter-cell interference and reducing drop rate by ~20%"),
+          "Call Failure": (-0.5, "optimize coverage-to-interference ratio, improving RRC Setup Success Rate by ~5%")}),
+        ("EIRP", eirp, "dBm",
+         {"Internet Speed": (2, "boost signal strength at cell edge, reducing latency and improving user throughput by ~12%"),
+          "Call Drop": (-1, "reduce pilot pollution in overlapping zones, improving handover success rate by ~15%"),
+          "Call Failure": (2, "improve signal quality for call setup, increasing E-RAB Setup Success Rate by ~8%")}),
+        ("CRS Gain", crs, "",
+         {"Internet Speed": (3, "improve reference signal quality and channel estimation, boosting throughput by ~8%"),
+          "Call Drop": (3, "strengthen reference signals during mobility, reducing Radio Link Failures by ~12%"),
+          "Call Failure": (3, "improve cell detection and measurement accuracy, enhancing RRC success rate by ~6%")}),
+    ]
+
+    pt = problem_type if problem_type in ("Internet Speed","Call Drop","Call Failure") else "Internet Speed"
+    for name, val, unit, actions in params:
+        if val is not None:
+            delta, effect = actions.get(pt, actions["Internet Speed"])
+            new_val = _v(val, delta)
+            direction = "Increase" if delta > 0 else "Decrease"
+            recs.append(f"**{name} {direction}**: Current {name} is {val}{unit}. {direction} to {new_val}{unit} to {effect}.")
+
+    # Add Antenna Height as 5th option if space and value available
+    if len(recs) < 4 and height is not None:
+        recs.append(f"**Antenna Height Adjustment**: Current height is {height} m. Adjust to {_v(height, -2 if pt=='Call Drop' else 2)} m to {'reduce overshooting and improve HO success' if pt=='Call Drop' else 'improve line-of-sight coverage and signal quality'}.")
+
+    # Add Antenna Gain if still space
+    if len(recs) < 4 and gain is not None:
+        recs.append(f"**Antenna Gain Upgrade**: Current gain is {gain} dBi. Increase to {_v(gain, 1)} dBi to improve signal levels for edge users.")
+
+    if not recs:
+        recs = [
+            "**Bandwidth**: Increase carrier bandwidth by 5-10 MHz to reduce congestion.",
+            "**E-tilt**: Optimize electrical tilt to balance coverage vs interference.",
+            "**EIRP**: Adjust transmit power to improve cell-edge signal quality.",
+        ]
+
+    return recs[:4]
+
+
+def _kpi_degradation_points(rows, selected_kpis, max_points=3):
+    """Build fallback RCA points from KPI trend data by detecting significant shifts."""
+    from collections import defaultdict
+    grouped = defaultdict(list)
+    for r in rows:
+        if r.kpi_name in selected_kpis and r.value is not None:
+            grouped[r.kpi_name].append(r)
+    points = []
+    for kpi_name, kpi_rows in grouped.items():
+        kpi_rows.sort(key=lambda r: (r.date, r.hour))
+        vals = [float(r.value) for r in kpi_rows if r.value is not None]
+        if len(vals) < 2:
+            continue
+        overall = sum(vals) / len(vals)
+        latest_vals = [float(r.value) for r in kpi_rows[-min(8, len(kpi_rows)):] if r.value is not None]
+        latest = sum(latest_vals) / max(len(latest_vals), 1)
+        if overall == 0:
+            continue
+        delta_pct = (latest - overall) / overall * 100
+        if abs(delta_pct) < 20:
+            continue
+        direction = "drop" if delta_pct < 0 else "increase"
+        points.append((
+            abs(delta_pct),
+            f"**KPI Shift**: {kpi_name} shows a {direction} to {round(latest, 3)} vs baseline {round(overall, 3)} ({round(delta_pct, 1)}%)."
+        ))
+    points.sort(key=lambda x: -x[0])
+    return [p for _, p in points[:max_points]]
+
+
+def _recommendation_has_params(text: str):
+    t = (text or "").lower()
+    param_hits = 0
+    for p in ["bandwidth", "antenna gain", "eirp", "rf power", "antenna height", "e-tilt", "tilt", "crs gain"]:
+        if p in t:
+            param_hits += 1
+    has_numbers = bool(re.search(r"\d+(\.\d+)?", t))
+    return param_hits >= 2 and has_numbers
+
+
+def _filter_rca_lines(lines):
+    generic_patterns = [
+        r"\bsite status\b",
+        r"\bproblem classification\b",
+        r"\bproblem type\b",
+        r"\bprimary impact domain\b",
+        r"\bonly related kpi\b",
+        r"\btrend evidence\b",
+        r"\baction required\b",
+        r"\bfocus area\b",
+    ]
+    out = []
+    for line in lines:
+        l = line.lower()
+        if any(re.search(p, l) for p in generic_patterns):
+            continue
+        # Keep lines that mention KPI evidence or alarms/solutions
+        if re.search(r"\b(kpi|throughput|latency|prb|sinr|rsrp|rsrq|cqi|drop|handover|cssr|paging|rlf|alarm|off air|on air)\b", l):
+            out.append(line)
+            continue
+        # Keep lines with concrete numbers/percentages
+        if re.search(r"\d+(\.\d+)?", l):
+            out.append(line)
+    return out
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 def find_nearest_sites(lat, lon, n=3):
-    """Return the n nearest telecom sites to the given coordinates from DB uploads."""
+    """Return the n nearest telecom sites with averaged RF parameters across all cells."""
     if lat is None or lon is None:
         return []
 
-    sites = TelecomSite.query.all()
-    if not sites:
+    try:
+        from sqlalchemy import text as sa_text
+        rows = db.session.execute(sa_text("""
+            SELECT site_id, zone, site_status, alarms, solution, standard_solution_step,
+                   AVG(latitude) AS latitude, AVG(longitude) AS longitude,
+                   ROUND(AVG(bandwidth_mhz)::numeric, 1) AS bandwidth_mhz,
+                   ROUND(AVG(antenna_gain_dbi)::numeric, 1) AS antenna_gain_dbi,
+                   ROUND(AVG(rf_power_eirp_dbm)::numeric, 1) AS rf_power_eirp_dbm,
+                   ROUND(AVG(antenna_height_agl_m)::numeric, 1) AS antenna_height_agl_m,
+                   ROUND(AVG(e_tilt_degree)::numeric, 1) AS e_tilt_degree,
+                   ROUND(AVG(crs_gain)::numeric, 1) AS crs_gain
+            FROM telecom_sites
+            WHERE latitude IS NOT NULL AND longitude IS NOT NULL
+            GROUP BY site_id, zone, site_status, alarms, solution, standard_solution_step
+        """)).fetchall()
+    except Exception:
+        return []
+
+    if not rows:
         return []
 
     scored = []
-    for site in sites:
-        dist = _haversine(lat, lon, site.latitude, site.longitude)
-        scored.append((dist, site))
+    for r in rows:
+        dist = _haversine(lat, lon, float(r.latitude or 0), float(r.longitude or 0))
+        scored.append((dist, r))
 
     scored.sort(key=lambda x: x[0])
     results = []
-    for dist, site in scored[:n]:
-        status = (site.site_status or "on_air").upper()
+    for dist, r in scored[:n]:
+        status = (r.site_status or "on_air").lower()
         results.append({
-            "site_id": site.site_id,
-            "zone": site.zone or "",
-            "latitude": site.latitude,
-            "longitude": site.longitude,
+            "site_id": r.site_id,
+            "zone": r.zone or "",
+            "latitude": float(r.latitude or 0),
+            "longitude": float(r.longitude or 0),
+            "site_status": status,
             "status": status,
-            "alarm": site.alarms or "None",
-            "solution": site.solution or "No action required",
+            "alarms": r.alarms or "None",
+            "alarm": r.alarms or "None",
+            "solution": r.solution or "No action required",
+            "standard_solution_step": r.standard_solution_step or "",
             "distance_km": round(dist, 2),
+            # RF Parameters (averaged across all cells of this site)
+            "bandwidth_mhz": float(r.bandwidth_mhz) if r.bandwidth_mhz else None,
+            "antenna_gain_dbi": float(r.antenna_gain_dbi) if r.antenna_gain_dbi else None,
+            "rf_power_eirp_dbm": float(r.rf_power_eirp_dbm) if r.rf_power_eirp_dbm else None,
+            "antenna_height_agl_m": float(r.antenna_height_agl_m) if r.antenna_height_agl_m else None,
+            "e_tilt_degree": float(r.e_tilt_degree) if r.e_tilt_degree else None,
+            "crs_gain": float(r.crs_gain) if r.crs_gain else None,
         })
     return results
 
@@ -549,6 +771,46 @@ SECTOR_TO_DOMAIN = {
 
 VALID_EXPERT_DOMAINS = {"mobile", "broadband", "dth", "landline", "enterprise", "fiber"}
 
+# Maps complaint subcategories → agent expertise for routing
+SUBPROCESS_TO_EXPERTISE = {
+    # Mobile subcategories
+    "Billing & Payment Issues": "GENERAL",
+    "Network / Signal Problems": "NETWORK_RF",
+    "SIM Card & Activation": "GENERAL",
+    "Data Plan & Recharge Issues": "GENERAL",
+    "International Roaming": "GENERAL",
+    "Mobile Number Portability (MNP)": "GENERAL",
+    "Call / SMS Failures": "VoLTE",
+    # Broadband subcategories
+    "Slow Speed / No Connectivity": "NETWORK_OPTIMIZATION",
+    "Frequent Disconnections": "NETWORK_RF",
+    "Billing & Plan Issues": "GENERAL",
+    "New Connection / Installation": "GENERAL",
+    "Router / Equipment Problems": "GENERAL",
+    # DTH subcategories
+    "Channel Not Working / Missing": "GENERAL",
+    "Set-Top Box Issues": "GENERAL",
+    "Billing & Subscription": "GENERAL",
+    "Signal / Picture Quality": "NETWORK_RF",
+    "Package / Plan Changes": "GENERAL",
+    # Landline subcategories
+    "No Dial Tone / Dead Line": "NETWORK_RF",
+    "Call Quality Issues (Noise / Echo)": "VoLTE",
+    "Billing & Charges": "GENERAL",
+    "New Connection / Disconnection": "GENERAL",
+    "Fault Repair Request": "NETWORK_RF",
+    # Enterprise subcategories
+    "SLA Breach / Service Downtime": "NETWORK_OPTIMIZATION",
+    "Leased Line / Dedicated Connection": "TRANSPORT",
+    "Bulk / Corporate Plan Issues": "GENERAL",
+    "Cloud / VPN / MPLS Issues": "TRANSPORT",
+    "Technical Support Escalation": "NETWORK_OPTIMIZATION",
+}
+
+def _resolve_expertise(subprocess_name: str) -> str:
+    """Map a complaint subcategory to agent expertise."""
+    return SUBPROCESS_TO_EXPERTISE.get(subprocess_name or "", "GENERAL")
+
 
 def _resolve_ticket_domain(sector_name: str) -> str:
     """Return the domain slug for a sector name, defaulting to 'mobile'."""
@@ -592,86 +854,78 @@ def _extract_city_from_address(address: str | None) -> str:
     return address_lower
 
 
-def _find_best_expert(domain: str, city: str | None, priority: str = "low") -> "User | None":
+def _find_best_expert(domain: str, city: str | None, priority: str = "low", expertise: str = None) -> "User | None":
     """
-    Domain-based expert assignment with geo-preference, bandwidth enforcement,
-    and priority-aware routing.
+    Agent routing with 4 factors:
+    1. Status = ONLINE (mandatory — NEVER assign to offline agents)
+    2. Domain = complaint category (mobile/broadband/dth/landline/enterprise)
+    3. Expertise = complaint subcategory (NETWORK_RF/VoLTE/TRANSPORT/GENERAL etc.)
+    4. Location = nearest to customer (for network issues)
 
-    Priority behaviour
-    ------------------
-    Critical / High  → strict routing: only assign to an under-capacity expert;
-                       never spill onto over-capacity agents (Tier 3 skipped).
-                       Among eligible experts, the least-busy one is chosen so
-                       the most urgent work always reaches the freest expert.
-    Medium  / Low    → relaxed routing: if every online expert is full the
-                       least-loaded online expert still takes the ticket
-                       (original Tier 3 behaviour preserved).
+    Tier order (all tiers require ONLINE):
+      1. Online + same domain + same expertise + same city + under capacity
+      2. Online + same domain + same expertise + under capacity
+      3. Online + same domain + under capacity
+      4. Online + same domain (ignore capacity for non-urgent)
+      5. Online + any domain + under capacity (global fallback)
 
-    Tier order
-    ----------
-      1. Online  + same domain + same city  + under capacity  → least loaded
-      2. Online  + same domain + other city + under capacity  → least loaded
-      3. Online  + same domain (any city)   + ignore capacity → least loaded
-             ↑ skipped for critical/high priority
-      4. Offline + same domain + same city  + under capacity  → least loaded
-      5. Offline + same domain              + under capacity  → least loaded
-             (for urgent: skip fully-loaded offline agents too)
-      6. Any human_agent – global fallback                    → least loaded
+    NEVER assigns to offline agents.
     """
     city_norm = _extract_city_from_address(city)
-    is_urgent = PRIORITY_RANK.get(priority, 1) >= PRIORITY_RANK["high"]  # critical or high
+    expertise_norm = (expertise or "").strip().upper()
 
-    domain_agents = User.query.filter_by(role="human_agent", domain=domain).all()
+    # Get ALL online agents
+    online_agents = User.query.filter_by(role="human_agent", is_online=True).all()
+    if not online_agents:
+        return None  # No online agents — leave unassigned
+
+    domain_agents = [a for a in online_agents if (a.domain or "").lower() == (domain or "").lower()]
 
     def _under_capacity(agent):
         return _open_ticket_count(agent.id) < (agent.bandwidth_capacity or 10)
 
     def _same_city(agent):
-        return (agent.location or "").strip().lower() == city_norm
+        return city_norm and (agent.location or "").strip().lower() == city_norm
+
+    def _same_expertise(agent):
+        return expertise_norm and (getattr(agent, 'expertise', '') or "").strip().upper() == expertise_norm
 
     def _load(agent):
         return _open_ticket_count(agent.id)
 
-    # Tier 1 – online, same city, under capacity
+    # Tier 1 – same domain + same expertise + same city + under capacity
+    if expertise_norm and city_norm:
+        pool = [a for a in domain_agents if _same_expertise(a) and _same_city(a) and _under_capacity(a)]
+        if pool: return min(pool, key=_load)
+
+    # Tier 2 – same domain + same expertise + under capacity
+    if expertise_norm:
+        pool = [a for a in domain_agents if _same_expertise(a) and _under_capacity(a)]
+        if pool: return min(pool, key=_load)
+
+    # Tier 3 – same domain + same city + under capacity
     if city_norm:
-        pool = [a for a in domain_agents if a.is_online and _same_city(a) and _under_capacity(a)]
-        if pool:
-            return min(pool, key=_load)
+        pool = [a for a in domain_agents if _same_city(a) and _under_capacity(a)]
+        if pool: return min(pool, key=_load)
 
-    # Tier 2 – online, any city, under capacity
-    pool = [a for a in domain_agents if a.is_online and _under_capacity(a)]
-    if pool:
-        return min(pool, key=_load)
+    # Tier 4 – same domain + under capacity
+    pool = [a for a in domain_agents if _under_capacity(a)]
+    if pool: return min(pool, key=_load)
 
-    # Tier 3 – online, any city, ignore capacity (skipped for critical/high)
+    # Tier 5 – same domain, ignore capacity (for non-urgent only)
+    is_urgent = PRIORITY_RANK.get(priority, 1) >= PRIORITY_RANK.get("high", 3)
+    if not is_urgent and domain_agents:
+        return min(domain_agents, key=_load)
+
+    # Tier 6 – any online agent, under capacity
+    under = [a for a in online_agents if _under_capacity(a)]
+    if under: return min(under, key=_load)
+
+    # Tier 7 – any online agent (last resort for non-urgent)
     if not is_urgent:
-        pool = [a for a in domain_agents if a.is_online]
-        if pool:
-            return min(pool, key=_load)
+        return min(online_agents, key=_load)
 
-    # Tier 4 – offline, same city, under capacity
-    if city_norm:
-        pool = [a for a in domain_agents if not a.is_online and _same_city(a) and _under_capacity(a)]
-        if pool:
-            return min(pool, key=_load)
-
-    # Tier 5 – offline, any city, under capacity
-    # For urgent tickets we still respect capacity; for low/medium any offline agent is fine
-    offline = [a for a in domain_agents if not a.is_online]
-    if offline:
-        under = [a for a in offline if _under_capacity(a)]
-        if under:
-            return min(under, key=_load)
-        if not is_urgent:
-            return min(offline, key=_load)
-
-    # Tier 6 – global fallback: any human_agent
-    all_agents = User.query.filter_by(role="human_agent").all()
-    if all_agents:
-        under = [a for a in all_agents if _under_capacity(a)]
-        return min(under or all_agents, key=_load)
-
-    return None
+    return None  # No suitable online agent found
 
 
 def _manager_priority_load(manager_id: int) -> dict:
@@ -1821,7 +2075,8 @@ def escalate_session(session_id):
     now_utc = datetime.now(timezone.utc)
     sla_deadline = now_utc + timedelta(hours=sla_h)
 
-    assigned_agent = _find_best_expert(ticket_domain, ticket_city, priority)
+    ticket_expertise = _resolve_expertise(session.subprocess_name)
+    assigned_agent = _find_best_expert(ticket_domain, ticket_city, priority, expertise=ticket_expertise)
 
     # Create ticket
     ref = generate_ref_number()
@@ -3434,6 +3689,15 @@ def admin_update_user(uid):
     if "user_type" in data and target.role == "customer":
         ut = (data["user_type"] or "bronze").strip().lower()
         target.user_type = ut if ut in VALID_USER_TYPES else "bronze"
+    # Agent-specific fields (expertise, location, domain)
+    if "domain" in data and target.role == "human_agent":
+        target.domain = (data["domain"] or "").strip()
+    if "location" in data and target.role == "human_agent":
+        target.location = (data["location"] or "").strip()
+    if "expertise" in data and target.role == "human_agent":
+        target.expertise = (data["expertise"] or "").strip()
+    if "specialization" in data and target.role == "human_agent":
+        target.specialization = (data["specialization"] or "").strip()
 
     db.session.commit()
     return jsonify({"user": target.to_dict()})
@@ -3640,7 +3904,7 @@ def admin_agent_alerts():
         Ticket.created_at <= three_days_ago,
     ).order_by(Ticket.created_at.asc()).all()
     for t in overdue:
-        days_old = (datetime.now(timezone.utc) - t.created_at).days if t.created_at else 0
+        days_old = (datetime.utcnow() - t.created_at).days if t.created_at else 0
         alerts.append({
             "type": "overdue",
             "severity": "warning",
@@ -4862,7 +5126,10 @@ def agent_dashboard():
             return None
         return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
 
-    my_tickets = Ticket.query.filter_by(assigned_to=user_id).all()
+    from sqlalchemy import or_
+    my_tickets = Ticket.query.filter(
+        or_(Ticket.assigned_to == user_id, Ticket.escalated_by == user_id)
+    ).all()
     resolved = [t for t in my_tickets if t.status == "resolved"]
     total = len(my_tickets)
     resolved_count = len(resolved)
@@ -5196,12 +5463,25 @@ def agent_create_parameter_change(ticket_id):
 
     manager = _find_best_manager(ticket.priority)
 
+    # Approval deadline = 30% of remaining SLA for the ticket
+    from datetime import timezone as _tz
+    _now = datetime.utcnow()
+    _approval_dl = None
+    if ticket.sla_deadline:
+        _sla_dl = ticket.sla_deadline if ticket.sla_deadline.tzinfo is None else ticket.sla_deadline.replace(tzinfo=None)
+        _remaining = (_sla_dl - _now).total_seconds()
+        _window = max(_remaining * 0.3, 1800)  # at least 30 mins
+        _approval_dl = _now + timedelta(seconds=_window)
+
     change = ParameterChange(
         ticket_id=ticket_id,
         agent_id=user_id,
         proposed_change=proposed,
         status="pending",
     )
+    # Set approval_deadline if column exists
+    try: change.approval_deadline = _approval_dl
+    except: pass
     db.session.add(change)
     db.session.flush()
 
@@ -5234,6 +5514,7 @@ def agent_create_parameter_change(ticket_id):
         "cr":               cr.to_dict(),
         "ticket":           ticket.to_dict(),
         "assigned_manager": {"id": manager.id, "name": manager.name, "email": manager.email} if manager else None,
+        "approval_deadline": _approval_dl.isoformat() if _approval_dl else None,
     }), 201
 
 
@@ -5413,12 +5694,64 @@ def agent_nearest_sites(ticket_id):
     })
 
 
+def _detect_significant_drops(trend_data: list, drop_threshold_pct: float = 15.0):
+    """
+    Detect significant drops (or spikes) in a KPI trend list.
+    Returns a list of {label, value, drop_pct, type} for highlighted points.
+    A 'significant drop' is where the avg falls >=threshold% below the rolling baseline
+    (mean of all previous points). Also detects spikes (sharp increases) for metrics
+    like latency/packet_loss where a spike is bad.
+    """
+    if len(trend_data) < 3:
+        return []
+
+    drops = []
+    all_avgs = [p["avg"] for p in trend_data if p["avg"] is not None]
+    if not all_avgs:
+        return []
+
+    overall_mean = sum(all_avgs) / len(all_avgs)
+    if overall_mean == 0:
+        return []
+
+    for i, point in enumerate(trend_data):
+        val = point.get("avg")
+        if val is None:
+            continue
+        # Build baseline from preceding points (at least 2)
+        if i < 2:
+            continue
+        prev_vals = [trend_data[j]["avg"] for j in range(i) if trend_data[j]["avg"] is not None]
+        if not prev_vals:
+            continue
+        baseline = sum(prev_vals) / len(prev_vals)
+        if baseline == 0:
+            continue
+        pct_change = (val - baseline) / baseline * 100
+        if pct_change <= -drop_threshold_pct:
+            drops.append({
+                "label": point["label"],
+                "value": val,
+                "drop_pct": round(pct_change, 1),
+                "type": "drop",
+            })
+        elif pct_change >= drop_threshold_pct * 2:
+            # Spikes are reported for latency-like KPIs (positive = bad)
+            drops.append({
+                "label": point["label"],
+                "value": val,
+                "drop_pct": round(pct_change, 1),
+                "type": "spike",
+            })
+    return drops
+
+
 @app.route("/api/agent/sites/<site_id>/kpi-trends", methods=["GET"])
 @jwt_required()
 def agent_kpi_trends(site_id):
     """Get KPI trend data for a site, aggregated by period (month/week/day/hour).
     Supports data_level filter: 'site' or 'cell'."""
-    user = User.query.get(int(get_jwt_identity()))
+    user = db.session.get(User, int(get_jwt_identity()))
     if not user or user.role != "human_agent":
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -5451,6 +5784,13 @@ def agent_kpi_trends(site_id):
         if not rows:
             continue
         agg = defaultdict(list)
+        has_hour_variation = any((r.hour or 0) != 0 for r in rows)
+        # For hourly without actual hour data: show last 7 days only (zoomed in)
+        hourly_cutoff = None
+        if period == "hour" and not has_hour_variation:
+            all_dates = sorted(set(r.date for r in rows if r.date))
+            if len(all_dates) > 7:
+                hourly_cutoff = all_dates[-7]
         for r in rows:
             if r.value is None:
                 continue
@@ -5459,7 +5799,13 @@ def agent_kpi_trends(site_id):
             elif period == "week":
                 key = f"{r.date.isocalendar()[0]}-W{r.date.isocalendar()[1]:02d}"
             elif period == "hour":
-                key = f"{r.hour:02d}:00"
+                if has_hour_variation:
+                    key = f"{r.date.strftime('%m/%d')} {r.hour:02d}h"
+                else:
+                    # No hourly data — zoom to last 7 days with mm/dd labels
+                    if hourly_cutoff and r.date < hourly_cutoff:
+                        continue
+                    key = r.date.strftime("%m/%d")
             else:  # day
                 key = r.date.strftime("%Y-%m-%d")
             agg[key].append(r.value)
@@ -5476,6 +5822,13 @@ def agent_kpi_trends(site_id):
         if trend:
             result[kpi_name] = trend
 
+    # Build significant_drops map separately — trends keeps flat array format for frontend compat
+    drops_map = {}
+    for kpi_name, trend_data in result.items():
+        drops = _detect_significant_drops(trend_data)
+        if drops:
+            drops_map[kpi_name] = drops
+
     return jsonify({
         "site_id": site_id,
         "period": period,
@@ -5483,6 +5836,7 @@ def agent_kpi_trends(site_id):
         "problem_type": _problem_type_label(problem_type),
         "selected_kpis": selected_kpis,
         "trends": result,
+        "significant_drops": drops_map,
     })
 
 
@@ -5490,17 +5844,15 @@ def agent_kpi_trends(site_id):
 @jwt_required()
 def agent_root_cause(ticket_id):
     """AI root cause analysis using both site-level and cell-level KPI trends of the nearest site."""
-    user = User.query.get(int(get_jwt_identity()))
+    user = db.session.get(User, int(get_jwt_identity()))
     if not user or user.role != "human_agent":
         return jsonify({"error": "Unauthorized"}), 403
 
-    ticket = Ticket.query.get(ticket_id)
+    ticket = db.session.get(Ticket, ticket_id)
     if not ticket:
         return jsonify({"error": "Ticket not found"}), 404
-    if ticket.assigned_to != user.id:
-        return jsonify({"error": "Ticket not assigned to you"}), 403
 
-    session = ChatSession.query.get(ticket.chat_session_id) if ticket.chat_session_id else None
+    session = db.session.get(ChatSession, ticket.chat_session_id) if ticket.chat_session_id else None
     if not session or not session.latitude or not session.longitude:
         return jsonify({"error": "Customer location not available"}), 400
 
@@ -5512,9 +5864,18 @@ def agent_root_cause(ticket_id):
     nearest_site_id = nearest["site_id"]
     nearest_zone = nearest.get("zone")
     dist_km = nearest["distance_km"]
-    site_status = nearest.get("status", "on_air")  # Get status from nearest site
-    alarms_text = nearest.get("alarm", "None")  # Get alarms from nearest site
-    solution_text = nearest.get("solution", "No action required")  # Get solution from nearest site
+    site_status = (nearest.get("site_status") or nearest.get("status") or "on_air").lower()
+    alarms_text = nearest.get("alarms") or nearest.get("alarm") or "None"
+    solution_text = nearest.get("solution") or "No action required"
+    std_solution_text = nearest.get("standard_solution_step") or ""
+    site_params_text = "\n".join([
+        f"- Bandwidth (MHz): {nearest.get('bandwidth_mhz')}",
+        f"- Antenna Gain (dBi): {nearest.get('antenna_gain_dbi')}",
+        f"- RF Power (EIRP) [dBm]: {nearest.get('rf_power_eirp_dbm')}",
+        f"- Antenna height (AGL) (M): {nearest.get('antenna_height_agl_m')}",
+        f"- E-tilt (Degree): {nearest.get('e_tilt_degree')}",
+        f"- CRS Gain: {nearest.get('crs_gain')}",
+    ])
 
     problem_type = _detect_network_problem_type(ticket)
     problem_type_label = _problem_type_label(problem_type)
@@ -5528,15 +5889,18 @@ def agent_root_cause(ticket_id):
     cell_kpi_text = _build_kpi_summary_text(cell_rows, selected_kpis, "cell-level")
 
     if site_status == "off_air":
-        prompt = f"""You are an expert telecom network engineer performing root cause analysis.
+        prompt = f"""You are a senior telecom network engineer performing root cause analysis.
 
-TICKET: {ticket.reference_number} - {ticket.category} / {ticket.subcategory}
-CUSTOMER ISSUE: {ticket.description}
+TICKET: {ticket.reference_number} — {ticket.category} / {ticket.subcategory}
+CUSTOMER REPORTED ISSUE: {ticket.description}
 PROBLEM TYPE: {problem_type_label}
 NEAREST SITE: {nearest_site_id} (Zone: {nearest_zone}, Distance: {dist_km} km from customer)
 
-SITE STATUS: OFF AIR. This site is currently down.
-Use only these KPI families relevant to {problem_type_label}: {", ".join(selected_kpis) if selected_kpis else "No matched KPI names"}.
+=== SITE STATUS: OFF AIR ===
+This site is currently down. Root cause analysis must integrate:
+(1) The active alarms that caused/indicate the outage.
+(2) The standard solution steps.
+(3) Trend evidence from the KPIs most directly related to {problem_type_label} — use actual values.
 
 ACTIVE ALARMS:
 {alarms_text if alarms_text else 'No alarm data available.'}
@@ -5544,43 +5908,62 @@ ACTIVE ALARMS:
 KNOWN SOLUTION:
 {solution_text if solution_text else 'No solution data available.'}
 
-SITE-LEVEL KPI TREND DATA:
-SITE-LEVEL KPI SUMMARY FOR SITE {nearest_site_id}:
+STANDARD SOLUTION STEP:
+{std_solution_text if std_solution_text else 'No standard solution steps available.'}
+
+SITE RF PARAMETERS (NEAREST SITE):
+{site_params_text}
+
+SITE-LEVEL KPI TREND DATA (only {problem_type_label}-related KPIs: {", ".join(selected_kpis) if selected_kpis else "none matched"}):
 {site_kpi_text if site_kpi_text else 'No site-level KPI data available.'}
 
-CELL-LEVEL KPI SUMMARY FOR SITE {nearest_site_id}:
+CELL-LEVEL KPI TREND DATA:
 {cell_kpi_text if cell_kpi_text else 'No cell-level KPI data available.'}
 
-Respond with exactly 4 to 5 numbered points.
-Format each point as: **Brief Title**: One or two sentences of precise explanation with KPI evidence.
-Each point must be self-contained, technically accurate, and directly relevant.
-Do not add headings, summaries, or extra sections."""
+INSTRUCTIONS:
+- Write exactly 4–5 numbered points.
+- Format: **Concise Title**: One or two sentences with specific technical evidence.
+- Each point must be about a DIFFERENT aspect of the root cause.
+- Point 1: State the primary root cause linking the alarm to the {problem_type_label} degradation with a specific KPI value.
+- Point 2: Describe what the KPI trend shows just before/during the outage and the magnitude of the drop.
+- Point 3: Explain the RF/parameter context (use actual values from site parameters) and how they contribute.
+- Point 4: Link the alarm's standard solution step to the expected KPI recovery.
+- Point 5 (if needed): Describe secondary impact on adjacent cells/sectors visible in cell-level KPI trends.
+- Use actual numbers from the KPI data. Do NOT use vague language.
+- Do not add headings, summaries, or extra sections."""
     else:
-        prompt = f"""You are an expert telecom network engineer performing root cause analysis.
+        prompt = f"""You are a senior telecom network engineer performing root cause analysis.
 
-TICKET: {ticket.reference_number} - {ticket.category} / {ticket.subcategory}
-CUSTOMER ISSUE: {ticket.description}
+TICKET: {ticket.reference_number} — {ticket.category} / {ticket.subcategory}
+CUSTOMER REPORTED ISSUE: {ticket.description}
 PROBLEM TYPE: {problem_type_label}
 NEAREST SITE: {nearest_site_id} (Zone: {nearest_zone}, Distance: {dist_km} km from customer)
 
-SITE STATUS: ON AIR. Analysis must be based on KPI trends only.
-Use only these KPI families relevant to {problem_type_label}: {", ".join(selected_kpis) if selected_kpis else "No matched KPI names"}.
+=== SITE STATUS: ON AIR ===
+Perform root cause analysis based entirely on KPI trend evidence.
+You MUST use the actual KPI values (avg, min, max, period) provided below to explain what is happening.
+Focus only on the KPI families directly relevant to {problem_type_label}: {", ".join(selected_kpis) if selected_kpis else "none matched"}.
 
-SITE-LEVEL KPI SUMMARY:
+SITE RF PARAMETERS (NEAREST SITE):
+{site_params_text}
+
+SITE-LEVEL KPI TREND DATA:
 {site_kpi_text if site_kpi_text else 'No site-level KPI data available.'}
 
-CELL-LEVEL KPI SUMMARY:
+CELL-LEVEL KPI TREND DATA:
 {cell_kpi_text if cell_kpi_text else 'No cell-level KPI data available.'}
 
-Analyze ALL the KPI data above (both site-level and cell-level) and provide:
-1. **Site-Level KPI Assessment** - Which site KPIs are performing well and which show degradation?
-2. **Cell-Level KPI Assessment** - Which cells show poor performance? Are specific cells causing issues?
-3. **Anomaly Detection** - Any unusual patterns or outliers at site or cell level?
-4. **Root Cause Identification** - What is the most likely root cause of the network/signal issue?
-5. **Impact Assessment** - How severe is the issue and what is the scope of impact?
-6. **Correlation Analysis** - Are there related KPI degradations across site and cell levels that point to a common cause?
-
-Be specific and reference actual KPI values in your analysis."""
+INSTRUCTIONS:
+- Write exactly 4–5 numbered points.
+- Format: **Concise Title**: One or two sentences with specific technical evidence.
+- Each point must be about a DIFFERENT degradation factor contributing to the {problem_type_label} problem.
+- Point 1: Identify the PRIMARY degraded KPI, state its recent value vs. baseline (use actual numbers), and explain what network condition this reflects.
+- Point 2: Identify the SECONDARY degraded KPI, state values, and explain the chain of impact to the customer's {problem_type_label} problem.
+- Point 3: Analyze the RF parameter context (bandwidth, E-tilt, EIRP, antenna height, CRS gain) and how the current values may be amplifying the KPI degradation.
+- Point 4: Describe the temporal pattern (when did the degradation start, is it continuous or intermittent, peak hours vs. off-peak) using the trend data.
+- Point 5 (if needed): Note any cell-level vs. site-level discrepancy that narrows the fault to a specific cell or sector.
+- Be precise: use actual KPI values from the data. Do NOT write generic statements.
+- Do not add headings, summaries, or extra sections."""
 
     try:
         response = client.chat.completions.create(
@@ -5590,33 +5973,35 @@ Be specific and reference actual KPI values in your analysis."""
             max_tokens=1500,
         )
         analysis_raw = response.choices[0].message.content.strip()
-        fallback_rca = [
-            f"**Site Status**: Nearest site {nearest_site_id} ({site_status.replace('_', ' ').upper()}) is the primary impact domain for this complaint.",
-            f"**Problem Classification**: Problem type is {problem_type_label}; only related KPI groups were considered for causality and trend correlation.",
-            "**Trend Evidence**: Daily/hourly trend shift confirms a recent degradation window; weekly/monthly baseline indicates this is not normal behavior.",
-            "**Cell-Site Correlation**: Cell-level variance aligns with site-level degradation, indicating a network-origin issue rather than isolated handset behavior.",
-            "**Action Required**: Immediate technical validation on the identified degraded KPI path is required to close the fault and stabilize service.",
-        ]
-        if site_status == "off_air":
-            fallback_rca[0] = f"**Site Outage**: Nearest site {nearest_site_id} is OFF AIR and alarm state is the primary root trigger for outage impact."
-            fallback_rca[4] = "**Resolution Path**: Execute alarm-linked restoration steps first, then validate KPI recovery trend to confirm full service normalization."
+        # Trust AI output — only use KPI degradation fallback if AI returns nothing useful
+        if analysis_raw and len(analysis_raw) > 100:
+            analysis = _force_numbered_points(
+                analysis_raw,
+                min_points=4,
+                max_points=5,
+                fallback_points=_kpi_degradation_points(site_rows + cell_rows, selected_kpis, max_points=4),
+            )
+        else:
+            # AI returned too little — build from KPI data
+            fallback_rca = []
+            if site_status == "off_air":
+                fallback_rca.append(f"**Site Outage**: Site {nearest_site_id} is OFF AIR. Alarms: {alarms_text}. Solution: {solution_text}.")
+            fallback_rca += _kpi_degradation_points(site_rows + cell_rows, selected_kpis, max_points=4)
+            analysis = _force_numbered_points(
+                "\n".join(fallback_rca),
+                min_points=4,
+                max_points=5,
+                fallback_points=fallback_rca,
+            )
+    except Exception as e:
+        fallback_rca = _kpi_degradation_points(site_rows + cell_rows, selected_kpis, max_points=4)
+        if not fallback_rca:
+            fallback_rca = [f"**Error**: Root cause analysis failed: {str(e)}."]
         analysis = _force_numbered_points(
-            analysis_raw,
-            min_points=4,
+            "\n".join(fallback_rca),
+            min_points=3,
             max_points=5,
             fallback_points=fallback_rca,
-        )
-    except Exception as e:
-        analysis = _force_numbered_points(
-            "",
-            min_points=4,
-            max_points=5,
-            fallback_points=[
-                f"**Model Error**: Root cause analysis could not be generated automatically: {str(e)}.",
-                f"**Focus Area**: Nearest site {nearest_site_id} and problem type {problem_type_label} remain the active technical focus.",
-                "**Trend Review**: Review daily/hourly KPI movement against weekly/monthly baseline to isolate degradation start time.",
-                "**Fault Domain**: Correlate degraded cell-level indicators with site-level KPI shifts to validate fault domain.",
-            ],
         )
 
     # Generate PDF-friendly version (plain text, no markdown)
@@ -5638,68 +6023,79 @@ Be specific and reference actual KPI values in your analysis."""
 @jwt_required()
 def agent_recommendation(ticket_id):
     """AI recommendation based on root cause analysis and full trend analysis."""
-    user = User.query.get(int(get_jwt_identity()))
+    user = db.session.get(User, int(get_jwt_identity()))
     if not user or user.role != "human_agent":
         return jsonify({"error": "Unauthorized"}), 403
 
-    ticket = Ticket.query.get(ticket_id)
+    ticket = db.session.get(Ticket, ticket_id)
     if not ticket:
         return jsonify({"error": "Ticket not found"}), 404
-    if ticket.assigned_to != user.id:
-        return jsonify({"error": "Ticket not assigned to you"}), 403
+
+    session = db.session.get(ChatSession, ticket.chat_session_id) if ticket.chat_session_id else None
+    nearest = None
+    if session and session.latitude and session.longitude:
+        nearest_list = find_nearest_sites(session.latitude, session.longitude, n=1)
+        if nearest_list:
+            nearest = nearest_list[0]
 
     root_cause = request.json.get("root_cause", "") if request.json else ""
     trend_summary = request.json.get("trend_summary", "") if request.json else ""
     problem_type = _problem_type_label(_detect_network_problem_type(ticket))
 
-    prompt = f"""You are an expert telecom network engineer providing actionable recommendations.
+    site_context = "Nearest site data not available."
+    if nearest:
+        site_context = "\n".join([
+            f"NEAREST SITE: {nearest.get('site_id')} (Zone: {nearest.get('zone')}, Distance: {nearest.get('distance_km')} km)",
+            f"SITE STATUS: {(nearest.get('site_status') or 'on_air')}",
+            "SITE PARAMETERS:",
+            f"- Bandwidth (MHz): {nearest.get('bandwidth_mhz')}",
+            f"- Antenna Gain (dBi): {nearest.get('antenna_gain_dbi')}",
+            f"- RF Power (EIRP) [dBm]: {nearest.get('rf_power_eirp_dbm')}",
+            f"- Antenna height (AGL) (M): {nearest.get('antenna_height_agl_m')}",
+            f"- E-tilt (Degree): {nearest.get('e_tilt_degree')}",
+            f"- CRS Gain: {nearest.get('crs_gain')}",
+        ])
 
-TICKET: {ticket.reference_number} - {ticket.category} / {ticket.subcategory}
-CUSTOMER ISSUE: {ticket.description}
-PRIORITY: {ticket.priority.upper()}
-PROBLEM TYPE: {problem_type}
+    # Extract current parameter values for the prompt
+    bw = nearest.get('bandwidth_mhz', 'N/A') if nearest else 'N/A'
+    etilt = nearest.get('e_tilt_degree', 'N/A') if nearest else 'N/A'
+    eirp = nearest.get('rf_power_eirp_dbm', 'N/A') if nearest else 'N/A'
+    again = nearest.get('antenna_gain_dbi', 'N/A') if nearest else 'N/A'
+    crsg = nearest.get('crs_gain', 'N/A') if nearest else 'N/A'
+    aht = nearest.get('antenna_height_agl_m', 'N/A') if nearest else 'N/A'
 
-TREND ANALYSIS SUMMARY:
-{trend_summary if trend_summary else 'No trend analysis summary available.'}
+    prompt = f"""Based on the root cause analysis below, write exactly 3-4 RF parameter change recommendations.
 
-ROOT CAUSE ANALYSIS:
-{root_cause if root_cause else 'No root cause analysis available.'}
+ROOT CAUSE: {root_cause if root_cause else 'KPI degradation detected.'}
 
-Respond with exactly 3 to 4 numbered points.
-Format each point as: **Brief Action Title**: One or two sentences describing the specific action, expected outcome, and timeline.
-Each recommendation must be directly actionable by a network engineer.
-Do not add headings, summaries, or extra sections."""
+CURRENT SITE PARAMETERS:
+- Bandwidth = {bw} MHz
+- E-tilt = {etilt}°
+- EIRP = {eirp} dBm
+- Antenna Gain = {again} dBi
+- CRS Gain = {crsg}
+- Antenna Height = {aht} m
 
-    try:
-        response = client.chat.completions.create(
-            model=DEPLOYMENT_NAME,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-            max_tokens=1500,
-        )
-        recommendation_raw = response.choices[0].message.content.strip()
-        recommendation = _force_numbered_points(
-            recommendation_raw,
-            min_points=3,
-            max_points=4,
-            fallback_points=[
-                "**Immediate Action**: Apply corrective action on the top degraded KPI path and confirm hourly improvement at site and cell levels.",
-                "**Parameter Validation**: Run targeted parameter/hardware validation on affected cells and verify trend slope returns to weekly baseline.",
-                "**Escalation Criteria**: If recovery is partial, escalate to NOC/optimization with alarm evidence, KPI snapshots, and precise impact window.",
-                "**Customer Closure**: Communicate to customer with clear ETA after confirming stable daily trend and no recurring degradation.",
-            ],
-        )
-    except Exception as e:
-        recommendation = _force_numbered_points(
-            "",
-            min_points=3,
-            max_points=4,
-            fallback_points=[
-                f"**Model Error**: Recommendation generation failed: {str(e)}; proceed with technical triage on related KPI path.",
-                "**KPI Recovery**: Validate daily/hourly KPI recovery after corrective action before closure.",
-                "**Escalation**: Escalate with KPI and alarm evidence if stability is not achieved within the defined SLA window.",
-            ],
-        )
+Write ONLY in this exact format for each point:
+1. **[Parameter Name] Adjustment**: The current [parameter] is [current value]. Change it to [new value] to [fix what root cause identified]. This will improve [KPI name] by approximately [X%].
+
+MANDATORY RULES:
+- EVERY point must change ONE of: Bandwidth, E-tilt, EIRP, Antenna Gain, CRS Gain, or Antenna Height
+- EVERY point must use the CURRENT VALUE from above and propose a SPECIFIC NEW VALUE
+- EVERY point must say which KPI will improve
+- Do NOT write "monitor", "investigate", "drive test", "audit", or any non-parameter advice
+- Do NOT add summaries, headings, or conclusions
+- Maximum 4 points"""
+
+    # Use parameter-based recommendations directly — ensures each point covers a DIFFERENT parameter
+    # AI tends to duplicate bandwidth recommendations, so we bypass it for reliability
+    param_recs = _build_parameter_recommendations(problem_type, root_cause, trend_summary, nearest or {})
+    recommendation = _force_numbered_points(
+        "\n".join(param_recs),
+        min_points=3,
+        max_points=4,
+        fallback_points=param_recs,
+    )
 
     # Generate PDF-friendly version (plain text, no markdown)
     recommendation_pdf = _format_points_for_pdf(recommendation)
@@ -5708,6 +6104,7 @@ Do not add headings, summaries, or extra sections."""
         "recommendation": recommendation,
         "recommendation_pdf": recommendation_pdf,
     })
+
 
 @app.route("/api/agent/customer360/<int:customer_user_id>", methods=["GET"])
 @jwt_required()
@@ -6104,9 +6501,22 @@ with app.app_context():
     db.session.commit()
 
 
+# ─── Register Network Analytics Blueprint ─────────────────────────────────────
+from network_analytics import network_bp
+app.register_blueprint(network_bp)
+
+# ─── Register Network Issues Blueprint ─────────────────────────────────────
+from network_issues import network_issues_bp, NetworkIssueTicket, schedule_daily_job
+app.register_blueprint(network_issues_bp)
+
+# Create network_issue_tickets table if not exists
+with app.app_context():
+    NetworkIssueTicket.__table__.create(db.engine, checkfirst=True)
+
+# Schedule daily 07:00 AM job for worst cell ticket creation
+schedule_daily_job(app)
+
+
 if __name__ == "__main__":
     run_sla_checks()
-    app.run(debug=True, host="0.0.0.0", port=5500, use_reloader=False)
-
-
-    app.run(debug=True, port=5500, use_reloader=False)
+    app.run(debug=True, host="0.0.0.0", port=5000, use_reloader=False)

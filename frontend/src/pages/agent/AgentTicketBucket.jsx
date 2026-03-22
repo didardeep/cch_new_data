@@ -1071,46 +1071,103 @@ function TrendMiniChart({ kpiName, data, color = '#00338D' }) {
   useEffect(() => { import('recharts').then(m => setRC(m)); }, []);
 
   if (!RC || !data?.length) return (
-    <div style={{ background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 8, padding: 12, height: 140 }}>
-      <div style={{ fontSize: 11, fontWeight: 700, color: '#475569', marginBottom: 6 }}>{kpiName}</div>
+    <div style={{ background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 10, padding: 14, height: 210 }}>
+      <div style={{ fontSize: 12, fontWeight: 700, color: '#1e293b', marginBottom: 6 }}>{kpiName}</div>
       <div style={{ fontSize: 11, color: '#94a3b8' }}>{data?.length ? 'Loading...' : 'No data'}</div>
     </div>
   );
 
-  const { ResponsiveContainer, LineChart, Line, XAxis, YAxis, Tooltip } = RC;
+  const { ResponsiveContainer, ComposedChart, Area, Line, XAxis, YAxis, Tooltip, CartesianGrid, ReferenceLine } = RC;
   const vals = data.map(d => Number(d?.avg)).filter(v => Number.isFinite(v));
-  const min = vals.length ? Math.min(...vals) : 0;
-  const max = vals.length ? Math.max(...vals) : 0;
-  const range = Math.max(max - min, 1e-6);
-  const sorted = [...vals].sort((a, b) => a - b);
-  const p05 = sorted.length ? sorted[Math.floor(sorted.length * 0.05)] : min;
+  const avg = vals.length ? vals.reduce((a,b)=>a+b,0)/vals.length : 0;
+  const minV = vals.length ? Math.min(...vals) : 0;
+  const maxV = vals.length ? Math.max(...vals) : 0;
+  const range = Math.max(maxV - minV, 1e-6);
 
+  // Only flag the most significant drops (>60% below baseline AND bottom 10%)
   const dropIdx = new Set();
-  for (let i = 1; i < data.length; i++) {
-    const prev = Number(data[i - 1]?.avg);
-    const curr = Number(data[i]?.avg);
-    if (!Number.isFinite(prev) || !Number.isFinite(curr)) continue;
-    const delta = prev - curr;
-    const threshold = Math.max(Math.abs(prev) * 0.5, range * 0.5);
-    const isVeryLow = curr <= p05;
-    if (delta > threshold && isVeryLow) dropIdx.add(i);
+  if (vals.length >= 8) {
+    const sorted15 = [...vals].sort((a,b)=>a-b);
+    const threshold10 = sorted15[Math.floor(sorted15.length * 0.1)] || minV;
+    for (let i = 4; i < data.length; i++) {
+      const curr = Number(data[i]?.avg);
+      if (!Number.isFinite(curr)) continue;
+      const prior = data.slice(Math.max(0,i-6), i).map(d=>Number(d?.avg)).filter(v=>Number.isFinite(v));
+      if (prior.length < 4) continue;
+      const baseline = prior.reduce((a,b)=>a+b,0) / prior.length;
+      if (baseline === 0) continue;
+      const dropPct = (baseline - curr) / Math.abs(baseline);
+      if (dropPct > 0.6 && curr <= threshold10) dropIdx.add(i);
+    }
+    // Limit to max 3 most significant drops
+    if (dropIdx.size > 3) {
+      const sorted = [...dropIdx].map(i => {
+        const curr = Number(data[i]?.avg) || 0;
+        const prior = data.slice(Math.max(0,i-5), i).map(d=>Number(d?.avg)).filter(v=>Number.isFinite(v));
+        const bl = prior.length ? prior.reduce((a,b)=>a+b,0)/prior.length : 1;
+        return { idx: i, severity: Math.abs((bl - curr) / (Math.abs(bl) || 1)) };
+      }).sort((a,b) => b.severity - a.severity).slice(0, 3);
+      dropIdx.clear();
+      sorted.forEach(s => dropIdx.add(s.idx));
+    }
   }
 
-  const DropDot = (props) => {
+  const gradientId = `trendGrad_${kpiName.replace(/[^a-zA-Z0-9]/g,'')}`;
+
+  // Custom dot: red circles for drops, nothing for normal points
+  const CustomDot = (props) => {
     if (!dropIdx.has(props.index)) return null;
-    return <circle cx={props.cx} cy={props.cy} r={3} fill="#dc2626" stroke="#991b1b" strokeWidth={0.6} />;
+    return (
+      <g>
+        <circle cx={props.cx} cy={props.cy} r={5} fill="#dc262644" stroke="none"/>
+        <circle cx={props.cx} cy={props.cy} r={3} fill="#dc2626" stroke="#fff" strokeWidth={1.5}/>
+      </g>
+    );
   };
 
   return (
-    <div style={{ background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 8, padding: 12, height: 180 }}>
-      <div style={{ fontSize: 11, fontWeight: 700, color: '#475569', marginBottom: 4 }}>{kpiName}</div>
-      <ResponsiveContainer width="100%" height={130}>
-        <LineChart data={data}>
-          <XAxis dataKey="label" tick={{ fontSize: 8 }} interval="preserveStartEnd" />
-          <YAxis tick={{ fontSize: 8 }} width={35} />
-          <Tooltip contentStyle={{ fontSize: 11 }} />
-          <Line type="monotone" dataKey="avg" stroke={color} strokeWidth={1.5} dot={DropDot} />
-        </LineChart>
+    <div style={{ background: '#ffffff', border: '1px solid #e2e8f0', borderRadius: 10, padding: '12px 14px', height: 210,
+      boxShadow: '0 1px 4px rgba(0,0,0,.04)', transition: 'box-shadow .2s' }}
+      onMouseEnter={e=>e.currentTarget.style.boxShadow='0 4px 16px rgba(0,51,141,.1)'}
+      onMouseLeave={e=>e.currentTarget.style.boxShadow='0 1px 4px rgba(0,0,0,.04)'}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+        <span style={{ fontSize: 11.5, fontWeight: 700, color: '#1e293b' }}>{kpiName}</span>
+        {dropIdx.size > 0 && <span style={{ fontSize: 8, padding: '1px 6px', borderRadius: 8, background: '#fef2f2', color: '#dc2626', fontWeight: 700 }}>
+          {dropIdx.size} drop{dropIdx.size>1?'s':''}
+        </span>}
+      </div>
+      {/* Stats row */}
+      <div style={{ display: 'flex', gap: 12, marginBottom: 4, fontSize: 9, color: '#64748b' }}>
+        <span>Avg: <b style={{color:'#1e293b'}}>{avg.toFixed(1)}</b></span>
+        <span>Min: <b style={{color:'#dc2626'}}>{minV.toFixed(1)}</b></span>
+        <span>Max: <b style={{color:'#16a34a'}}>{maxV.toFixed(1)}</b></span>
+      </div>
+      <ResponsiveContainer width="100%" height={145}>
+        <ComposedChart data={data} margin={{top:5,right:5,bottom:0,left:-5}}>
+          <defs>
+            <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor={color} stopOpacity={0.25}/>
+              <stop offset="100%" stopColor={color} stopOpacity={0.02}/>
+            </linearGradient>
+          </defs>
+          <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" vertical={false}/>
+          <XAxis dataKey="label" tick={{ fontSize: 7.5, fill: '#94a3b8' }} axisLine={false} tickLine={false}
+            interval="preserveStartEnd" tickFormatter={v => {
+              if (!v) return '';
+              // Show compact label: "03-15" for dates, "14:00" for hours
+              if (v.includes(':')) return v;
+              if (v.length >= 10) return v.slice(5,10);
+              return v;
+            }}/>
+          <YAxis tick={{ fontSize: 8, fill: '#94a3b8' }} axisLine={false} tickLine={false} width={38}/>
+          <Tooltip contentStyle={{ fontSize: 10, borderRadius: 8, border: '1px solid #e2e8f0', boxShadow: '0 4px 12px rgba(0,0,0,.1)' }}
+            labelStyle={{ fontWeight: 700, color: '#00338D' }}
+            formatter={(v) => [Number(v).toFixed(2), kpiName]}/>
+          <ReferenceLine y={avg} stroke={color} strokeDasharray="4 3" strokeOpacity={0.4}
+            label={{ value: `avg ${avg.toFixed(1)}`, position: 'insideTopRight', fontSize: 8, fill: color+'88' }}/>
+          <Area type="monotone" dataKey="avg" fill={`url(#${gradientId})`} stroke="none"/>
+          <Line type="monotone" dataKey="avg" stroke={color} strokeWidth={2} dot={CustomDot} activeDot={{ r: 4, fill: color }}/>
+        </ComposedChart>
       </ResponsiveContainer>
     </div>
   );
@@ -1209,6 +1266,7 @@ function ParameterChangeModal({ ticket, onClose }) {
         rollback_plan: rollback.trim(),
       });
       setManagerName(d?.assigned_manager?.name || '');
+      setChange(d);  // store full response for deadline/email display
       setSubmitted(true);
       setProposed(''); setImpact(''); setRollback('');
       loadStatus();
@@ -1261,11 +1319,13 @@ function ParameterChangeModal({ ticket, onClose }) {
           }}>✓</div>
           <h3 style={{ margin: '0 0 6px', fontSize: 17, fontWeight: 700, color: '#0f172a' }}>Change Request Raised!</h3>
           <p style={{ margin: '0 0 4px', fontSize: 13, color: '#475569', lineHeight: 1.55 }}>
-            Sent to <strong>{managerName ? `Manager ${managerName}` : 'your manager'}</strong> for review.
+            Routed to <strong>{managerName ? `Manager ${managerName}` : 'your manager'}</strong> for approval.
           </p>
-          {cr && <p style={{ margin: '0 0 16px', fontSize: 12, color: '#00338D', fontFamily: 'monospace', fontWeight: 700 }}>{cr.cr_number}</p>}
-          <p style={{ margin: '0 0 20px', fontSize: 12, color: '#94a3b8' }}>
-            Track progress in the manager's <strong>Change Workflow</strong> tab.
+          {change?.assigned_manager?.email && <p style={{ margin: '0 0 4px', fontSize: 11, color: '#64748b' }}>Email: {change.assigned_manager.email}</p>}
+          {cr && <p style={{ margin: '0 0 8px', fontSize: 12, color: '#00338D', fontFamily: 'monospace', fontWeight: 700 }}>{cr.cr_number}</p>}
+          {change?.approval_deadline && <p style={{ margin: '0 0 4px', fontSize: 11, color: '#d97706', background: '#fffbeb', padding: '4px 10px', borderRadius: 6, display: 'inline-block' }}>Approval deadline: {new Date(change.approval_deadline).toLocaleString()}</p>}
+          <p style={{ margin: '8px 0 20px', fontSize: 12, color: '#94a3b8' }}>
+            Approval window: 30% of remaining SLA time
           </p>
           {cr && <MiniPipeline status={cr.status} />}
           <button className="btn btn-primary btn-sm" onClick={onClose} style={{ minWidth: 120, marginTop: 12 }}>Done</button>
