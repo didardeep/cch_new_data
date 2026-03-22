@@ -21,9 +21,17 @@ const ICON_LOGOUT = (
   </svg>
 );
 
+const ICON_NETWORK = (
+  <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <circle cx="12" cy="12" r="2"/>
+    <path d="M16.24 7.76a6 6 0 010 8.49M7.76 16.24a6 6 0 010-8.49M20.49 3.51a12 12 0 010 16.99M3.51 20.49a12 12 0 010-16.99"/>
+  </svg>
+);
+
 const navLinks = [
-  { path: '/agent/dashboard', label: 'Dashboard', icon: ICON_GRID },
-  { path: '/agent/tickets',   label: 'Assigned Ticket Bucket', icon: ICON_TICKET },
+  { path: '/agent/dashboard', label: 'Dashboard',              icon: ICON_GRID    },
+  { path: '/agent/tickets',   label: 'Assigned Ticket Bucket', icon: ICON_TICKET  },
+  { path: '/agent/network',   label: 'Network Analysis',       icon: ICON_NETWORK },
 ];
 
 export default function AgentLayout() {

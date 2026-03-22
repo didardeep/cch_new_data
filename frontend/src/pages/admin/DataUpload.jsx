@@ -3,18 +3,45 @@ import { getToken } from '../../api';
 
 const API_BASE = process.env.REACT_APP_API_URL || '';
 
+async function parseApiResponse(resp) {
+  const contentType = resp.headers.get('content-type') || '';
+  const rawText = await resp.text();
+
+  if (contentType.includes('application/json')) {
+    try {
+      return { data: rawText ? JSON.parse(rawText) : {} };
+    } catch {
+      return { data: {}, error: `Invalid JSON response (HTTP ${resp.status})` };
+    }
+  }
+
+  const cleaned = rawText
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 180);
+
+  return {
+    data: {},
+    error: cleaned || `Server returned HTTP ${resp.status} instead of JSON`,
+  };
+}
+
 export default function DataUpload() {
   const [siteFile, setSiteFile] = useState(null);
   const [siteLevelFile, setSiteLevelFile] = useState(null);
   const [cellLevelFile, setCellLevelFile] = useState(null);
+  const [sharedWorkbookFile, setSharedWorkbookFile] = useState(null);
   const [siteResult, setSiteResult] = useState(null);
   const [siteLevelResult, setSiteLevelResult] = useState(null);
   const [cellLevelResult, setCellLevelResult] = useState(null);
-  const [uploading, setUploading] = useState({ sites: false, siteLevel: false, cellLevel: false });
-  const [deleting, setDeleting] = useState({ sites: false, siteLevel: false, cellLevel: false });
+  const [sharedWorkbookResult, setSharedWorkbookResult] = useState(null);
+  const [uploading, setUploading] = useState({ sites: false, siteLevel: false, cellLevel: false, sharedWorkbook: false });
+  const [deleting, setDeleting] = useState({ sites: false, siteLevel: false, cellLevel: false, sharedWorkbook: false });
   const [siteKpiList, setSiteKpiList] = useState([]);
   const [cellKpiList, setCellKpiList] = useState([]);
   const [siteCount, setSiteCount] = useState(0);
+  const [sharedWorkbookStats, setSharedWorkbookStats] = useState({ total_sites: 0, total_records: 0 });
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
 
@@ -23,14 +50,32 @@ export default function DataUpload() {
       const resp = await fetch(`${API_BASE}/api/admin/uploaded-kpis`, {
         headers: { Authorization: `Bearer ${getToken()}` },
       });
-      const d = await resp.json();
+      const { data: d } = await parseApiResponse(resp);
       if (d.site_kpis) setSiteKpiList(d.site_kpis);
       if (d.cell_kpis) setCellKpiList(d.cell_kpis);
       if (d.site_count !== undefined) setSiteCount(d.site_count);
     } catch { /* ignore */ }
   }, []);
 
-  useEffect(() => { fetchKpiList(); }, [fetchKpiList]);
+  const fetchSharedWorkbookStats = useCallback(async () => {
+    try {
+      const resp = await fetch(`${API_BASE}/api/admin/shared-site-workbook-summary`, {
+        headers: { Authorization: `Bearer ${getToken()}` },
+      });
+      const { data: d } = await parseApiResponse(resp);
+      if (resp.ok) {
+        setSharedWorkbookStats({
+          total_sites: d.total_sites ?? 0,
+          total_records: d.total_records ?? 0,
+        });
+      }
+    } catch { /* ignore */ }
+  }, []);
+
+  useEffect(() => {
+    fetchKpiList();
+    fetchSharedWorkbookStats();
+  }, [fetchKpiList, fetchSharedWorkbookStats]);
 
   const uploadSites = async () => {
     if (!siteFile) return;
@@ -44,13 +89,13 @@ export default function DataUpload() {
         headers: { Authorization: `Bearer ${getToken()}` },
         body: form,
       });
-      const d = await resp.json();
+      const { data: d, error: parseError } = await parseApiResponse(resp);
       if (resp.ok) {
         setSiteResult(d);
         setSiteFile(null);
         fetchKpiList();
       } else {
-        setError(d.error || 'Upload failed');
+        setError(d.error || parseError || `Upload failed (HTTP ${resp.status})`);
       }
     } catch (e) { setError('Upload failed: ' + e.message); }
     setUploading(p => ({ ...p, sites: false }));
@@ -65,12 +110,12 @@ export default function DataUpload() {
         method: 'DELETE',
         headers: { Authorization: `Bearer ${getToken()}` },
       });
-      const d = await resp.json();
+      const { data: d, error: parseError } = await parseApiResponse(resp);
       if (resp.ok) {
         setSuccess(`Deleted ${d.deleted} sites from database.`);
         setSiteResult(null);
         fetchKpiList();
-      } else { setError(d.error || 'Delete failed'); }
+      } else { setError(d.error || parseError || `Delete failed (HTTP ${resp.status})`); }
     } catch (e) { setError('Delete failed: ' + e.message); }
     setDeleting(p => ({ ...p, sites: false }));
   };
@@ -87,12 +132,12 @@ export default function DataUpload() {
         headers: { Authorization: `Bearer ${getToken()}` },
         body: form,
       });
-      const d = await resp.json();
+      const { data: d, error: parseError } = await parseApiResponse(resp);
       if (resp.ok) {
         setSiteLevelResult(d);
         setSiteLevelFile(null);
         fetchKpiList();
-      } else { setError(d.error || 'Upload failed'); }
+      } else { setError(d.error || parseError || `Upload failed (HTTP ${resp.status})`); }
     } catch (e) { setError('Upload failed: ' + e.message); }
     setUploading(p => ({ ...p, siteLevel: false }));
   };
@@ -106,12 +151,12 @@ export default function DataUpload() {
         method: 'DELETE',
         headers: { Authorization: `Bearer ${getToken()}` },
       });
-      const d = await resp.json();
+      const { data: d, error: parseError } = await parseApiResponse(resp);
       if (resp.ok) {
         setSuccess(`Deleted ${d.deleted} site-level KPI records.`);
         setSiteLevelResult(null);
         fetchKpiList();
-      } else { setError(d.error || 'Delete failed'); }
+      } else { setError(d.error || parseError || `Delete failed (HTTP ${resp.status})`); }
     } catch (e) { setError('Delete failed: ' + e.message); }
     setDeleting(p => ({ ...p, siteLevel: false }));
   };
@@ -128,14 +173,64 @@ export default function DataUpload() {
         headers: { Authorization: `Bearer ${getToken()}` },
         body: form,
       });
-      const d = await resp.json();
+      const { data: d, error: parseError } = await parseApiResponse(resp);
       if (resp.ok) {
         setCellLevelResult(d);
         setCellLevelFile(null);
         fetchKpiList();
-      } else { setError(d.error || 'Upload failed'); }
+      } else { setError(d.error || parseError || `Upload failed (HTTP ${resp.status})`); }
     } catch (e) { setError('Upload failed: ' + e.message); }
     setUploading(p => ({ ...p, cellLevel: false }));
+  };
+
+  const uploadSharedWorkbook = async () => {
+    if (!sharedWorkbookFile) return;
+    setUploading(p => ({ ...p, sharedWorkbook: true }));
+    setSharedWorkbookResult(null); setError(''); setSuccess('');
+    try {
+      const form = new FormData();
+      form.append('file', sharedWorkbookFile);
+      const resp = await fetch(`${API_BASE}/api/admin/upload-shared-site-workbook`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${getToken()}` },
+        body: form,
+      });
+      const { data: d, error: parseError } = await parseApiResponse(resp);
+      if (resp.ok) {
+        setSharedWorkbookResult(d);
+        setSharedWorkbookFile(null);
+        fetchKpiList();
+        fetchSharedWorkbookStats();
+      } else {
+        setError(d.error || parseError || `Upload failed (HTTP ${resp.status})`);
+      }
+    } catch (e) {
+      setError('Upload failed: ' + e.message);
+    }
+    setUploading(p => ({ ...p, sharedWorkbook: false }));
+  };
+
+  const deleteSharedWorkbook = async () => {
+    if (!window.confirm('Delete ALL shared workbook data from database? This cannot be undone.')) return;
+    setDeleting(p => ({ ...p, sharedWorkbook: true }));
+    setSharedWorkbookResult(null); setError(''); setSuccess('');
+    try {
+      const resp = await fetch(`${API_BASE}/api/admin/delete-shared-site-workbook`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${getToken()}` },
+      });
+      const { data: d, error: parseError } = await parseApiResponse(resp);
+      if (resp.ok) {
+        setSuccess(`Deleted ${d.deleted} shared workbook records.`);
+        fetchKpiList();
+        fetchSharedWorkbookStats();
+      } else {
+        setError(d.error || parseError || `Delete failed (HTTP ${resp.status})`);
+      }
+    } catch (e) {
+      setError('Delete failed: ' + e.message);
+    }
+    setDeleting(p => ({ ...p, sharedWorkbook: false }));
   };
 
   const deleteCellLevel = async () => {
@@ -147,12 +242,12 @@ export default function DataUpload() {
         method: 'DELETE',
         headers: { Authorization: `Bearer ${getToken()}` },
       });
-      const d = await resp.json();
+      const { data: d, error: parseError } = await parseApiResponse(resp);
       if (resp.ok) {
         setSuccess(`Deleted ${d.deleted} cell-level KPI records.`);
         setCellLevelResult(null);
         fetchKpiList();
-      } else { setError(d.error || 'Delete failed'); }
+      } else { setError(d.error || parseError || `Delete failed (HTTP ${resp.status})`); }
     } catch (e) { setError('Delete failed: ' + e.message); }
     setDeleting(p => ({ ...p, cellLevel: false }));
   };
@@ -311,6 +406,61 @@ export default function DataUpload() {
               </div>
             )}
           </div>
+        </div>
+      </div>
+
+      <div className="section-card" style={{ marginBottom: 24 }}>
+        <div className="section-card-header">
+          <h3>Site Users and Site Revenue Upload</h3>
+        </div>
+        <div className="section-card-body">
+          <p style={{ fontSize: 13, color: '#64748b', marginBottom: 12 }}>
+            Upload an Excel workbook (.xlsx/.xlsm) with <strong>2 sheets</strong>. Each sheet name <strong>Site User</strong> and <strong>Site Revenue</strong>.<br />
+            Sheet columns: <strong>HomeSitecode, Site Type, On Air Date, SiteTechnology, Site AV, Site Utilization, Feb Avg, Mar Avg, Growth, Feb Total, Mar Total</strong>, then date columns with values.
+          </p>
+          <div style={{ background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 8, padding: '10px 14px', marginBottom: 12 }}>
+            <div style={{ fontSize: 12, color: '#64748b' }}>Total sites: <strong style={{ color: '#00338D' }}>{sharedWorkbookStats.total_sites.toLocaleString()}</strong></div>
+            <div style={{ fontSize: 12, color: '#64748b' }}>Total records: <strong style={{ color: '#00338D' }}>{sharedWorkbookStats.total_records.toLocaleString()}</strong></div>
+          </div>
+          <input
+            type="file"
+            accept=".xlsx,.xlsm"
+            onChange={e => { setSharedWorkbookFile(e.target.files[0]); setSharedWorkbookResult(null); setError(''); setSuccess(''); }}
+            style={{ display: 'block', marginBottom: 12, fontSize: 13 }}
+          />
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+            <button
+              className="btn btn-primary btn-sm"
+              onClick={uploadSharedWorkbook}
+              disabled={!sharedWorkbookFile || uploading.sharedWorkbook}
+            >
+              {uploading.sharedWorkbook ? 'Adding...' : 'Add Site Users and Site Revenue'}
+            </button>
+            <button
+              className="btn btn-sm"
+              onClick={deleteSharedWorkbook}
+              disabled={deleting.sharedWorkbook || sharedWorkbookStats.total_records === 0}
+              style={{ background: '#dc2626', color: '#fff', border: 'none', borderRadius: 6, padding: '6px 14px', fontSize: 12, fontWeight: 600, cursor: sharedWorkbookStats.total_records === 0 ? 'not-allowed' : 'pointer', opacity: sharedWorkbookStats.total_records === 0 ? 0.5 : 1 }}
+            >
+              {deleting.sharedWorkbook ? 'Deleting...' : 'Delete All'}
+            </button>
+          </div>
+          {sharedWorkbookResult && (
+            <div style={{ marginTop: 14, background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: 8, padding: 12, fontSize: 13 }}>
+              <strong style={{ color: '#16a34a' }}>Database Update Successful</strong>
+              <div style={{ marginTop: 6, color: '#475569' }}>
+                {sharedWorkbookResult.message || 'Workbook data added to database.'}
+              </div>
+              <div style={{ marginTop: 4, color: '#475569' }}>
+                Sheets processed: {sharedWorkbookResult.kpis_processed ?? 0}
+              </div>
+              {sharedWorkbookResult.errors?.length > 0 && (
+                <div style={{ marginTop: 6, color: '#d97706', fontSize: 12 }}>
+                  {sharedWorkbookResult.errors.join('; ')}
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </div>
 

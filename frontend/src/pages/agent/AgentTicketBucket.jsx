@@ -1116,22 +1116,83 @@ function TrendMiniChart({ kpiName, data, color = '#00338D' }) {
   );
 }
 
+/* ── CR Stage Pipeline (mini) ────────────────────────────────────────────────────── */
+const CR_STAGES = ['Created','Validated','Classified','Approved','Implemented','Closed'];
+const CR_STAGE_MAP = {
+  created:0, invalid:0, auto_rejected:0,
+  validated:1, classified:2,
+  approved:3, rejected:2,
+  implementing:3, implemented:4, failed:4, rolled_back:4,
+  closed:5,
+};
+const CR_STATUS_COLOR = {
+  created:'#00338D', invalid:'#dc2626', auto_rejected:'#991b1b',
+  validated:'#0369a1', classified:'#7c3aed',
+  approved:'#16a34a', rejected:'#dc2626',
+  implementing:'#d97706', implemented:'#15803d',
+  failed:'#dc2626', rolled_back:'#92400e', closed:'#475569',
+};
+const CR_STATUS_LABEL = {
+  created:'Pending Validation', invalid:'Validation Rejected',
+  auto_rejected:'Permanently Rejected', validated:'Validated',
+  classified:'Classified', approved:'Approved — Ready to Implement',
+  rejected:'Approval Rejected', implementing:'Implementing',
+  implemented:'Implemented', failed:'Implementation Failed',
+  rolled_back:'Rolled Back', closed:'Closed',
+};
+
+function MiniPipeline({ status }) {
+  const stage = CR_STAGE_MAP[status] ?? 0;
+  const isFail = ['invalid','auto_rejected','rejected','failed'].includes(status);
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 0, margin: '8px 0' }}>
+      {CR_STAGES.map((s, i) => {
+        const done    = status === 'closed' ? true : i < stage;
+        const current = status === 'closed' ? false : i === stage;
+        const fail    = current && isFail;
+        const dot     = done ? '#16a34a' : fail ? '#dc2626' : current ? '#00338D' : '#e2e8f0';
+        return (
+          <div key={s} style={{ display: 'flex', alignItems: 'center', flex: i < CR_STAGES.length - 1 ? 1 : 'none' }}>
+            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', minWidth: 40 }}>
+              <div style={{ width: 16, height: 16, borderRadius: '50%', background: dot, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 9, color: '#fff', fontWeight: 700 }}>
+                {done ? '✓' : fail ? '✕' : i + 1}
+              </div>
+              <div style={{ fontSize: 7, color: dot, marginTop: 2, textAlign: 'center', whiteSpace: 'nowrap', fontWeight: 600, textTransform: 'uppercase' }}>{s}</div>
+            </div>
+            {i < CR_STAGES.length - 1 && <div style={{ flex: 1, height: 2, marginBottom: 10, background: done ? '#16a34a' : '#e2e8f0' }} />}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 /* ── Parameter Change Modal ──────────────────────────────────────────────────────── */
 function ParameterChangeModal({ ticket, onClose }) {
   const [proposed, setProposed]       = useState('');
-  const [change, setChange]           = useState(null);
-  const [loading, setLoading]         = useState(true);
+  const [impact,   setImpact]         = useState('');
+  const [rollback, setRollback]       = useState('');
+  const [change,   setChange]         = useState(null);
+  const [cr,       setCr]             = useState(null);
+  const [loading,  setLoading]        = useState(true);
   const [submitting, setSubmitting]   = useState(false);
-  const [errMsg, setErrMsg]           = useState('');
+  const [implNotes,  setImplNotes]    = useState('');
+  const [implLoading, setImplLoading] = useState(false);
+  const [errMsg,   setErrMsg]         = useState('');
   const [submitted, setSubmitted]     = useState(false);
   const [managerName, setManagerName] = useState('');
+  const [showExtra, setShowExtra]     = useState(false);
 
   const loadStatus = useCallback(async () => {
     setLoading(true);
     try {
-      const d = await apiGet(`/api/agent/tickets/${ticket.id}/parameter-change`);
-      setChange(d?.change || null);
-    } catch (_) { setChange(null); }
+      const [changeRes, crRes] = await Promise.allSettled([
+        apiGet(`/api/agent/tickets/${ticket.id}/parameter-change`),
+        apiGet(`/api/agent/change-requests/ticket/${ticket.id}`),
+      ]);
+      if (changeRes.status === 'fulfilled') setChange(changeRes.value?.change || null);
+      if (crRes.status === 'fulfilled')     setCr(crRes.value?.cr || null);
+    } catch (_) {}
     setLoading(false);
   }, [ticket.id]);
 
@@ -1142,10 +1203,14 @@ function ParameterChangeModal({ ticket, onClose }) {
     setSubmitting(true);
     setErrMsg('');
     try {
-      const d = await apiPost(`/api/agent/tickets/${ticket.id}/parameter-change`, { proposed_change: proposed.trim() });
+      const d = await apiPost(`/api/agent/tickets/${ticket.id}/parameter-change`, {
+        proposed_change: proposed.trim(),
+        impact_assessment: impact.trim(),
+        rollback_plan: rollback.trim(),
+      });
       setManagerName(d?.assigned_manager?.name || '');
       setSubmitted(true);
-      setProposed('');
+      setProposed(''); setImpact(''); setRollback('');
       loadStatus();
     } catch (err) {
       setErrMsg(err?.message || 'Failed to submit request. Please try again.');
@@ -1153,8 +1218,36 @@ function ParameterChangeModal({ ticket, onClose }) {
     setSubmitting(false);
   };
 
+  const implement = async (result) => {
+    if (!cr) return;
+    setImplLoading(true);
+    setErrMsg('');
+    try {
+      await apiPut(`/api/agent/change-requests/${cr.id}/implement`, { result, notes: implNotes.trim() });
+      setImplNotes('');
+      loadStatus();
+    } catch (err) { setErrMsg(err?.message || 'Failed to update implementation status.'); }
+    setImplLoading(false);
+  };
+
+  const rollbackCR = async () => {
+    if (!cr) return;
+    setImplLoading(true);
+    setErrMsg('');
+    try {
+      await apiPut(`/api/agent/change-requests/${cr.id}/rollback`, { notes: implNotes.trim() });
+      setImplNotes('');
+      loadStatus();
+    } catch (err) { setErrMsg(err?.message || 'Failed to report rollback.'); }
+    setImplLoading(false);
+  };
+
+  // Determine if CR needs implementation action from agent
+  const crNeedsImpl = cr && (cr.status === 'approved' || cr.status === 'implementing');
+  const crFailed    = cr && cr.status === 'failed';
+
   return (
-    <Modal title="Parameter Change Request" onClose={onClose} width={560}>
+    <Modal title="Parameter Change Request" onClose={onClose} width={580}>
 
       {/* ── Success screen ── */}
       {submitted ? (
@@ -1165,122 +1258,169 @@ function ParameterChangeModal({ ticket, onClose }) {
             display: 'flex', alignItems: 'center', justifyContent: 'center',
             fontSize: 28, margin: '0 auto 16px',
             boxShadow: '0 4px 12px rgba(22,163,74,0.2)',
-          }}>
-            ✓
-          </div>
-          <h3 style={{ margin: '0 0 8px', fontSize: 17, fontWeight: 700, color: '#0f172a' }}>
-            Approval Request Sent!
-          </h3>
-          <p style={{ margin: '0 0 6px', fontSize: 13, color: '#475569', lineHeight: 1.55 }}>
-            Your request has been sent to{' '}
-            <strong style={{ color: '#0f172a' }}>
-              {managerName ? `Manager ${managerName}` : 'your manager'}
-            </strong>{' '}
-            for review.
+          }}>✓</div>
+          <h3 style={{ margin: '0 0 6px', fontSize: 17, fontWeight: 700, color: '#0f172a' }}>Change Request Raised!</h3>
+          <p style={{ margin: '0 0 4px', fontSize: 13, color: '#475569', lineHeight: 1.55 }}>
+            Sent to <strong>{managerName ? `Manager ${managerName}` : 'your manager'}</strong> for review.
           </p>
+          {cr && <p style={{ margin: '0 0 16px', fontSize: 12, color: '#00338D', fontFamily: 'monospace', fontWeight: 700 }}>{cr.cr_number}</p>}
           <p style={{ margin: '0 0 20px', fontSize: 12, color: '#94a3b8' }}>
-            You'll be notified once a decision is made.
+            Track progress in the manager's <strong>Change Workflow</strong> tab.
           </p>
-          {/* Show the submitted change status */}
-          {change && (
-            <div style={{
-              background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 8,
-              padding: '10px 14px', marginBottom: 20, textAlign: 'left',
-            }}>
-              <div style={{ fontSize: 10, fontWeight: 700, color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 6 }}>
-                Submitted Request
-              </div>
-              <div style={{ fontSize: 13, color: '#374151', lineHeight: 1.5 }}>{change.proposed_change}</div>
-              <div style={{ marginTop: 8, display: 'flex', alignItems: 'center', gap: 8 }}>
-                <span style={{
-                  fontSize: 11, fontWeight: 700, padding: '2px 8px', borderRadius: 4,
-                  background: '#fffbeb', color: '#92400e', border: '1px solid #fde68a',
-                }}>
-                  Pending Review
-                </span>
-                <span style={{ fontSize: 11, color: '#94a3b8' }}>
-                  {change.created_at ? new Date(change.created_at).toLocaleString() : ''}
-                </span>
-              </div>
-            </div>
-          )}
-          <button
-            className="btn btn-primary btn-sm"
-            onClick={onClose}
-            style={{ minWidth: 120 }}
-          >
-            Done
-          </button>
+          {cr && <MiniPipeline status={cr.status} />}
+          <button className="btn btn-primary btn-sm" onClick={onClose} style={{ minWidth: 120, marginTop: 12 }}>Done</button>
         </div>
       ) : (
-        /* ── Normal form ── */
         <>
-          <div style={{ marginBottom: 12, fontSize: 13, color: 'var(--text-secondary)', lineHeight: 1.55 }}>
-            Submit a parameter change request for manager approval — Ticket{' '}
-            <strong style={{ color: 'var(--text)', fontFamily: 'monospace' }}>{ticket.reference_number}</strong>.
-          </div>
-
-          {/* Existing change status */}
+          {/* ── CR status panel (if CR exists) ── */}
           {loading ? (
             <div className="page-loader" style={{ height: 80 }}><div className="spinner" /></div>
-          ) : change ? (
-            <div style={{
-              background: 'var(--bg)', border: '1px solid var(--border)',
-              borderRadius: 'var(--radius-sm)', padding: 12, marginBottom: 14,
-            }}>
-              <div style={{ fontSize: 11, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 6 }}>
-                Latest Request Status
-              </div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
-                <span className={`badge badge-${change.status === 'approved' ? 'resolved' : change.status === 'disapproved' ? 'critical' : 'pending'}`}>
-                  {change.status === 'disapproved' ? 'Rejected' : change.status}
+          ) : cr ? (
+            <div style={{ background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 10, padding: '14px 16px', marginBottom: 16 }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+                <span style={{ fontFamily: 'monospace', fontSize: 12, fontWeight: 800, color: '#00338D' }}>{cr.cr_number}</span>
+                <span style={{
+                  fontSize: 11, fontWeight: 700, padding: '2px 8px', borderRadius: 4,
+                  background: `${CR_STATUS_COLOR[cr.status] || '#64748b'}15`,
+                  color: CR_STATUS_COLOR[cr.status] || '#64748b',
+                  border: `1px solid ${CR_STATUS_COLOR[cr.status] || '#64748b'}30`,
+                }}>
+                  {CR_STATUS_LABEL[cr.status] || cr.status}
                 </span>
-                {change.reviewed_at && (
-                  <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-                    Reviewed {new Date(change.reviewed_at).toLocaleString()}
-                  </span>
-                )}
               </div>
-              <div style={{ fontSize: 12, color: 'var(--text)' }}>
-                <strong>Proposed:</strong> {change.proposed_change}
-              </div>
-              {change.manager_note && (
-                <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 6 }}>
-                  <strong>Manager Note:</strong> {change.manager_note}
+              <MiniPipeline status={cr.status} />
+
+              {/* Validation remark if rejected */}
+              {cr.status === 'invalid' && cr.validation_remark && (
+                <div style={{ fontSize: 12, color: '#dc2626', background: '#fef2f2', border: '1px solid #fecaca', borderRadius: 6, padding: '6px 10px', marginTop: 6 }}>
+                  <strong>Rejection Remark:</strong> {cr.validation_remark}
+                  <div style={{ marginTop: 3, fontWeight: 700 }}>Rejections used: {cr.rejection_count}/2</div>
+                </div>
+              )}
+              {cr.status === 'auto_rejected' && (
+                <div style={{ fontSize: 12, color: '#991b1b', background: '#fef2f2', border: '1px solid #fecaca', borderRadius: 6, padding: '6px 10px', marginTop: 6 }}>
+                  ✕ CR permanently rejected after 2 validation failures. Please raise a new ticket.
+                </div>
+              )}
+              {/* Approval remark */}
+              {cr.approval_remark && (
+                <div style={{ fontSize: 12, color: '#374151', background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: 6, padding: '6px 10px', marginTop: 6 }}>
+                  <strong>Manager Note:</strong> {cr.approval_remark}
+                </div>
+              )}
+
+              {/* ── Implementation panel ── */}
+              {crNeedsImpl && (
+                <div style={{ marginTop: 12, background: '#ecfdf5', border: '1px solid #86efac', borderRadius: 8, padding: '12px 14px' }}>
+                  <div style={{ fontSize: 13, fontWeight: 700, color: '#166534', marginBottom: 8 }}>
+                    ✓ CR Approved — Report Implementation
+                  </div>
+                  <textarea value={implNotes} onChange={e => setImplNotes(e.target.value)}
+                    rows={2} placeholder="Implementation notes (optional)..."
+                    style={{ width: '100%', borderRadius: 6, border: '1px solid #86efac', padding: '6px 10px', fontSize: 12, resize: 'none', boxSizing: 'border-box', fontFamily: 'inherit', marginBottom: 8 }}
+                  />
+                  <div style={{ display: 'flex', gap: 8 }}>
+                    <button onClick={() => implement('success')} disabled={implLoading}
+                      style={{ flex: 1, padding: '7px 0', borderRadius: 6, fontSize: 12, fontWeight: 700, background: '#16a34a', color: '#fff', border: 'none', cursor: 'pointer' }}>
+                      {implLoading ? '…' : '✓ Implementation Successful'}
+                    </button>
+                    <button onClick={() => implement('failed')} disabled={implLoading}
+                      style={{ flex: 1, padding: '7px 0', borderRadius: 6, fontSize: 12, fontWeight: 700, background: '#fff', color: '#dc2626', border: '1px solid #fca5a5', cursor: 'pointer' }}>
+                      {implLoading ? '…' : '✕ Implementation Failed'}
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* ── Rollback panel ── */}
+              {crFailed && (
+                <div style={{ marginTop: 12, background: '#fffbeb', border: '1px solid #fde68a', borderRadius: 8, padding: '12px 14px' }}>
+                  <div style={{ fontSize: 13, fontWeight: 700, color: '#92400e', marginBottom: 8 }}>
+                    ↩ Implementation Failed — Execute Rollback
+                  </div>
+                  <textarea value={implNotes} onChange={e => setImplNotes(e.target.value)}
+                    rows={2} placeholder="Describe rollback steps taken..."
+                    style={{ width: '100%', borderRadius: 6, border: '1px solid #fde68a', padding: '6px 10px', fontSize: 12, resize: 'none', boxSizing: 'border-box', fontFamily: 'inherit', marginBottom: 8 }}
+                  />
+                  <button onClick={rollbackCR} disabled={implLoading}
+                    style={{ width: '100%', padding: '8px 0', borderRadius: 6, fontSize: 12, fontWeight: 700, background: '#92400e', color: '#fff', border: 'none', cursor: 'pointer' }}>
+                    {implLoading ? '…' : '↩ Rollback Complete'}
+                  </button>
                 </div>
               )}
             </div>
           ) : null}
 
-          <div className="form-group">
-            <label>Describe the Requested Change</label>
-            <textarea
-              className="feedback-textarea"
-              rows={4}
-              value={proposed}
-              onChange={e => setProposed(e.target.value)}
-              placeholder="Describe the parameter/configuration change needed and the expected impact..."
-            />
-          </div>
+          {/* ── New CR form (only if no active CR or CR is in terminal state) ── */}
+          {(!cr || ['rejected','auto_rejected','closed'].includes(cr?.status)) && (
+            <>
+              <div style={{ marginBottom: 12, fontSize: 13, color: 'var(--text-secondary)', lineHeight: 1.55 }}>
+                Raise a Change Request for ticket{' '}
+                <strong style={{ color: 'var(--text)', fontFamily: 'monospace' }}>{ticket.reference_number}</strong>.
+                This creates a CR in the ITIL Change Workflow.
+              </div>
 
-          {errMsg && (
-            <div style={{ marginTop: 6, padding: '8px 12px', borderRadius: 6, background: '#fef2f2', border: '1px solid #fecaca', fontSize: 12, color: '#dc2626' }}>
+              <div className="form-group">
+                <label>Describe the Requested Change <span style={{ color: '#dc2626' }}>*</span></label>
+                <textarea className="feedback-textarea" rows={3} value={proposed}
+                  onChange={e => setProposed(e.target.value)}
+                  placeholder="What parameter/configuration needs to change and why?"
+                />
+              </div>
+
+              {/* Optional fields toggle */}
+              <button onClick={() => setShowExtra(v => !v)}
+                style={{ fontSize: 12, color: '#00338D', background: 'none', border: 'none', cursor: 'pointer', padding: '0 0 8px', fontWeight: 600 }}>
+                {showExtra ? '▾' : '▸'} {showExtra ? 'Hide' : 'Add'} Impact Assessment & Rollback Plan
+              </button>
+
+              {showExtra && (
+                <>
+                  <div className="form-group">
+                    <label>Impact Assessment</label>
+                    <textarea className="feedback-textarea" rows={2} value={impact}
+                      onChange={e => setImpact(e.target.value)}
+                      placeholder="What is the expected impact of this change?"
+                    />
+                  </div>
+                  <div className="form-group">
+                    <label>Rollback Plan</label>
+                    <textarea className="feedback-textarea" rows={2} value={rollback}
+                      onChange={e => setRollback(e.target.value)}
+                      placeholder="What steps will you take if the change needs to be reverted?"
+                    />
+                  </div>
+                </>
+              )}
+
+              {errMsg && (
+                <div style={{ marginTop: 6, padding: '8px 12px', borderRadius: 6, background: '#fef2f2', border: '1px solid #fecaca', fontSize: 12, color: '#dc2626' }}>
+                  {errMsg}
+                </div>
+              )}
+
+              <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end', marginTop: 16 }}>
+                <button className="btn btn-ghost btn-sm" onClick={onClose} disabled={submitting}>Cancel</button>
+                <button className="btn btn-primary btn-sm" onClick={submit} disabled={submitting || !proposed.trim()}>
+                  {submitting ? 'Raising CR...' : 'Raise Change Request →'}
+                </button>
+              </div>
+            </>
+          )}
+
+          {/* Error for impl actions */}
+          {errMsg && !(!cr || ['rejected','auto_rejected','closed'].includes(cr?.status)) && (
+            <div style={{ marginTop: 8, padding: '8px 12px', borderRadius: 6, background: '#fef2f2', border: '1px solid #fecaca', fontSize: 12, color: '#dc2626' }}>
               {errMsg}
             </div>
           )}
 
-          <div style={{ display: 'flex', gap: 10, justifyContent: 'flex-end', marginTop: 16 }}>
-            <button className="btn btn-ghost btn-sm" onClick={onClose} disabled={submitting}>
-              Cancel
-            </button>
-            <button
-              className="btn btn-primary btn-sm"
-              onClick={submit}
-              disabled={submitting || !proposed.trim()}
-            >
-              {submitting ? 'Sending...' : 'Send Approval Request'}
-            </button>
-          </div>
+          {/* Close button when CR is in a waiting/terminal state with no action needed */}
+          {cr && !crNeedsImpl && !crFailed && !['rejected','auto_rejected','closed'].includes(cr.status) && (
+            <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 16 }}>
+              <button className="btn btn-ghost btn-sm" onClick={onClose}>Close</button>
+            </div>
+          )}
         </>
       )}
     </Modal>

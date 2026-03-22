@@ -11,27 +11,25 @@ import time
 import math
 import random
 import string
-import hashlib
-from datetime import datetime, timezone, timedelta, date
+from datetime import datetime, timezone, timedelta
 
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_jwt_extended import (
     JWTManager, create_access_token, jwt_required, get_jwt_identity
 )
 from flask_mail import Mail, Message
 from flask_socketio import SocketIO, join_room, emit
-from openai import AzureOpenAI, OpenAI
+from openai import AzureOpenAI
 from dotenv import load_dotenv
 from types import SimpleNamespace
 import urllib.request
 import urllib.parse
 import urllib.error
-from flask_jwt_extended import decode_token
 
-from sqlalchemy import case as sql_case
+from sqlalchemy import case as sql_case, text
 from sqlalchemy.orm import joinedload
-from models import db, bcrypt, User, ChatSession, ChatMessage, Ticket, Feedback, SystemSetting, SlaAlert, TelecomSite, KpiData, ParameterChange
+from models import db, bcrypt, User, ChatSession, ChatMessage, Ticket, Feedback, SystemSetting, SlaAlert, TelecomSite, KpiData, ParameterChange, ChangeRequest
 # Add this import after other imports
 from whatsapp_integration import send_whatsapp_message, format_chat_summary_for_whatsapp, format_ticket_alert_for_whatsapp
 import network_prompts
@@ -46,7 +44,7 @@ def _get_jwt_secret():
         if len(raw) >= 32:
             return raw
         # Upgrade short secrets to a SHA-256 derived key to avoid insecure length warnings.
-        print("[WARN] JWT_SECRET is shorter than 32 bytes; deriving a stronger key.")
+        print("⚠️ JWT_SECRET is shorter than 32 bytes; deriving a stronger key.")
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
     return os.urandom(32).hex()
 
@@ -57,7 +55,7 @@ app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get(
     "postgresql://postgres:postgres@localhost:5432/telecom_complaints"
 )
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-app.config["JWT_SECRET_KEY"] = _get_jwt_secret()
+app.config["JWT_SECRET_KEY"] = os.environ.get("JWT_SECRET", "super-secret-jwt-key-change-in-prod")
 app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(hours=24)
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16MB max for image uploads
 
@@ -269,22 +267,10 @@ def _build_duty_roster(target_date):
 # ─── Nearest-Tower Lookup (loaded once at startup) ────────────────────────────
 _SITE_DATA = []
 
-def _load_site_data():
-    """Dynamically find and load the telecom site Excel file."""
-    global _SITE_DATA
-    backend_dir = os.path.dirname(__file__)
-    
-    # 1. Search for any .xlsx file in the folder that has "Sites" in the name
-    potential_files = [f for f in os.listdir(backend_dir) 
-                       if f.endswith('.xlsx') and 'Sites' in f]
-    
-    if not potential_files:
-        # Fallback: just take the first xlsx file found if the "Sites" keyword fails
-        potential_files = [f for f in os.listdir(backend_dir) if f.endswith('.xlsx')]
 
-    if not potential_files:
-        print(f"[WARN] No Excel site data found in {backend_dir} - tower lookup disabled")
-        return
+def _load_site_data():
+    """Legacy Excel loader (disabled). Site data is now loaded via admin upload into DB."""
+    return
 
 
 def _haversine(lat1, lon1, lat2, lon2):
@@ -365,42 +351,28 @@ def find_nearest_sites(lat, lon, n=3):
     if lat is None or lon is None:
         return []
 
-    rows = TelecomSite.query.all()
-    if not rows:
+    sites = TelecomSite.query.all()
+    if not sites:
         return []
 
-    best_by_site = {}
-    for site in rows:
+    scored = []
+    for site in sites:
         dist = _haversine(lat, lon, site.latitude, site.longitude)
-        existing = best_by_site.get(site.site_id)
-        if existing is None or dist < existing[0]:
-            best_by_site[site.site_id] = (dist, site)
+        scored.append((dist, site))
 
-    scored = sorted(best_by_site.values(), key=lambda x: x[0])
+    scored.sort(key=lambda x: x[0])
     results = []
     for dist, site in scored[:n]:
-        status = (site.site_status or "on_air").lower()
+        status = (site.site_status or "on_air").upper()
         results.append({
             "site_id": site.site_id,
-            "site_name": site.site_name or site.site_id,
-            "cell_id": site.cell_id or "",
             "zone": site.zone or "",
             "latitude": site.latitude,
             "longitude": site.longitude,
-            "site_status": status,
-            "alarms": site.alarms or "",
-            "solution": site.solution or site.standard_solution_step or "",
-            "standard_solution_step": site.standard_solution_step or "",
-            "bandwidth_mhz": site.bandwidth_mhz,
-            "antenna_gain_dbi": site.antenna_gain_dbi,
-            "rf_power_eirp_dbm": site.rf_power_eirp_dbm,
-            "antenna_height_agl_m": site.antenna_height_agl_m,
-            "e_tilt_degree": site.e_tilt_degree,
-            "crs_gain": site.crs_gain,
-            "distance_km": round(dist, 2),
-            # Backward-compatible keys
             "status": status,
-            "alarm": site.alarms or "",
+            "alarm": site.alarms or "None",
+            "solution": site.solution or "No action required",
+            "distance_km": round(dist, 2),
         })
     return results
 
@@ -587,7 +559,27 @@ def generate_single_solution(sector_name, subprocess_name, language, user_query=
         response = client.chat.completions.create(
             model=DEPLOYMENT_NAME,
             messages=[
-                {"role": "system", "content": system_prompt},
+                {"role": "system", "content": (
+                    f"You are an expert telecom customer support agent. The user has an issue "
+                    f"under the sector: '{sector_name}' and subprocess: '{subprocess_name}'.\n\n"
+                    f"This is solution attempt #{attempt}.\n\n"
+                    "IMPORTANT: Base this solution on BOTH the selected dropdown context "
+                    "(sector/subprocess) and the user's latest query. "
+                    "If they conflict, prioritize the latest query while staying within telecom scope.\n\n"
+                    "Provide ONE focused, actionable solution at a time with steps that explain how to perform that action. "
+                    "Be concise and specific. Do not provide multiple alternative solutions -- just one.\n"
+                    "Do NOT include any URLs, links, or website references in your response.\n"
+                    "STRICT RULE: Do NOT suggest the user to 'contact customer support', 'call customer care', "
+                    "'raise a ticket', 'reach out to support', 'visit a service center', or any form of escalation. "
+                    "Only provide self-help troubleshooting steps that the user can do on their own.\n"
+                    "Acknowledge the issue briefly and give the steps."
+                    + query_block
+                    + context_block
+                    + diagnosis_block
+                    + prev_block +
+                    f"\n\nIMPORTANT: Respond entirely in {language}. "
+                    "Keep the tone professional, empathetic, and helpful."
+                )},
                 {"role": "user", "content": user_query if user_query else f"I have an issue with {subprocess_name} in {sector_name}"},
             ],
             temperature=0.5,
@@ -861,15 +853,6 @@ def get_me():
     user = db.session.get(User, int(get_jwt_identity()))
     if not user:
         return jsonify({"error": "User not found"}), 404
-    return jsonify({"user": user.to_dict()})
-
-
-@app.route("/api/user/settings", methods=["PUT"])
-@jwt_required()
-def update_user_settings():
-    user = db.session.get(User, int(get_jwt_identity()))
-    if not user:
-        return jsonify({"error": "User not found"}), 404
     data = request.json or {}
     if 'name' in data and data['name'].strip():
         user.name = data['name'].strip()
@@ -885,23 +868,6 @@ def update_user_settings():
     db.session.commit()
     return jsonify({"user": user.to_dict()})
 
-
-@app.route("/api/user/password", methods=["PUT"])
-@jwt_required()
-def update_user_password():
-    user = db.session.get(User, int(get_jwt_identity()))
-    if not user:
-        return jsonify({"error": "User not found"}), 404
-    data = request.json or {}
-    current_password = data.get('current_password', '')
-    new_password = data.get('new_password', '')
-    if not user.check_password(current_password):
-        return jsonify({"error": "Current password is incorrect"}), 400
-    if len(new_password) < 6:
-        return jsonify({"error": "New password must be at least 6 characters"}), 400
-    user.set_password(new_password)
-    db.session.commit()
-    return jsonify({"message": "Password updated successfully"})
 
 
 # CHATBOT ROUTES 
@@ -1047,101 +1013,30 @@ def classify_response_route():
 @app.route("/api/chat/session", methods=["POST"])
 @jwt_required()
 def create_chat_session():
-    """Create a new chat session or reuse the latest active one for the user."""
     user_id = int(get_jwt_identity())
-    data = request.json or {}
-    force_new = bool(data.get("force_new"))
-    current_step = data.get("current_step") or "greeting"
-
-    if not force_new:
-        existing = ChatSession.query.filter(
-            ChatSession.user_id == user_id,
-            ChatSession.status.in_(["active", "escalated"])
-        ).order_by(ChatSession.last_message_at.desc()).first()
-        if existing:
-            return jsonify({
-                "session": existing.to_dict(),
-                "messages": [m.to_dict() for m in existing.messages],
-                "reused": True,
-            }), 200
-
-    session = ChatSession(
-        user_id=user_id,
-        status="active",
-        current_step=current_step,
-        last_message_at=datetime.now(timezone.utc),
-    )
+    session = ChatSession(user_id=user_id, status="active")
     db.session.add(session)
     db.session.commit()
-    return jsonify({"session": session.to_dict(), "messages": []}), 201
-
-
-@app.route("/api/chat/session/active", methods=["GET"])
-@jwt_required()
-def get_active_session():
-    """Return the most recent active (or latest) session with full message history."""
-    user_id = int(get_jwt_identity())
-    session = ChatSession.query.filter(
-        ChatSession.user_id == user_id,
-        ChatSession.status.in_(["active", "escalated"])
-    ).order_by(ChatSession.last_message_at.desc()).first()
-
-    if not session:
-        session = ChatSession.query.filter_by(user_id=user_id).order_by(ChatSession.last_message_at.desc()).first()
-
-    if not session:
-        return jsonify({"session": None, "messages": []}), 200
-
-    now_utc = datetime.now(timezone.utc)
-    updated = False
-    for m in session.messages:
-        if m.sender == "agent" and m.delivered_at is None:
-            m.delivered_at = now_utc
-            updated = True
-    if updated:
-        db.session.commit()
-
-    return jsonify({
-        "session": session.to_dict(),
-        "messages": [m.to_dict() for m in session.messages],
-    }), 200
-
-
-@app.route("/api/chat/sessions", methods=["GET"])
-@jwt_required()
-def list_sessions():
-    """List all chat sessions for the logged-in customer (most recent first)."""
-    user_id = int(get_jwt_identity())
-    sessions = ChatSession.query.filter_by(user_id=user_id).order_by(ChatSession.last_message_at.desc()).all()
-    return jsonify({
-        "sessions": [s.to_dict() for s in sessions]
-    })
+    return jsonify({"session": session.to_dict()}), 201
 
 
 @app.route("/api/chat/session/<int:session_id>/message", methods=["POST"])
 @jwt_required()
 def add_chat_message(session_id):
     user_id = int(get_jwt_identity())
-    user = User.query.get(user_id)
     session = ChatSession.query.get(session_id)
     if not session:
         return jsonify({"error": "Session not found"}), 404
-    if session.user_id != user_id and (not user or user.role != "human_agent"):
-        return jsonify({"error": "Unauthorized"}), 403
 
     data = request.json
-    payload = data.get("payload")
     msg = ChatMessage(
         session_id=session_id,
         sender=data.get("sender", "user"),
-        content=data.get("content", "") or "",
-        content_json=payload if isinstance(payload, dict) else None,
+        content=data.get("content", ""),
     )
     db.session.add(msg)
 
     # Update session metadata
-    if data.get("current_step"):
-        session.current_step = data["current_step"]
     if data.get("sector_name"):
         session.sector_name = data["sector_name"]
     if data.get("subprocess_name"):
@@ -1152,10 +1047,8 @@ def add_chat_message(session_id):
         session.resolution = data["resolution"]
     if data.get("language"):
         session.language = data["language"]
-    session.last_message_at = datetime.now(timezone.utc)
 
     db.session.commit()
-    _emit_session_message(msg)
     return jsonify({"message": msg.to_dict()})
 # ═══════════════════════════════════════════════════════════════════
 # ADD THIS NEW ROUTE to app.py
@@ -1167,7 +1060,7 @@ def add_chat_message(session_id):
 def save_session_location(session_id):
     """Save customer's GPS location for network signal complaints."""
     user_id = int(get_jwt_identity())
-    session = db.session.get(ChatSession, session_id)
+    session = ChatSession.query.get(session_id)
 
     if not session:
         return jsonify({"error": "Session not found"}), 404
@@ -1178,7 +1071,7 @@ def save_session_location(session_id):
     if data.get("location_description"):
         session.location_description = data.get("location_description")
 
-    # Use coordinates sent by the client; fall back to Gurgaon only if missing
+    # ── Default coordinates (Gurgaon, Haryana) ────────────────────────────────
     DEFAULT_LATITUDE  = 28.4595
     DEFAULT_LONGITUDE = 77.0266
     session.latitude  = data.get("latitude")  or DEFAULT_LATITUDE
@@ -1199,19 +1092,15 @@ def save_session_location(session_id):
 def analyze_signal(session_id):
     """Analyze a signal screenshot using Azure OpenAI Vision."""
     user_id = int(get_jwt_identity())
-    user = User.query.get(user_id)
     session = ChatSession.query.get(session_id)
 
     if not session:
         return jsonify({"error": "Session not found"}), 404
-    if not user:
-        return jsonify({"error": "Unauthorized"}), 401
-    if session.user_id != user_id and user.role != "human_agent":
+    if session.user_id != user_id:
         return jsonify({"error": "Unauthorized"}), 403
 
     data = request.json
     image_base64 = data.get("image")
-    image_data_url = data.get("image_data_url")
 
     if not image_base64:
         return jsonify({"error": "No image provided"}), 400
@@ -1221,16 +1110,6 @@ def analyze_signal(session_id):
         return jsonify({"error": "Image too large. Please upload a smaller screenshot."}), 400
 
     try:
-        # Send customer screenshot to agent view (if any)
-        if not image_data_url:
-            image_data_url = f"data:image/png;base64,{image_base64}"
-        image_msg = ChatMessage(
-            session_id=session_id,
-            sender="customer",
-            content=f"__IMAGE__:{image_data_url}",
-        )
-        db.session.add(image_msg)
-
         result = analyze_signal_screenshot(image_base64)
 
         # If signal is red (Poor), do not include nearest tower sites in user-facing diagnosis
@@ -1252,12 +1131,7 @@ def analyze_signal(session_id):
 
         msg = ChatMessage(session_id=session_id, sender="bot", content=diagnosis_text)
         db.session.add(msg)
-        # Mark that diagnosis has been completed for this session
-        session.diagnosis_ran = True
-        session.last_message_at = datetime.now(timezone.utc)
         db.session.commit()
-        _emit_session_message(image_msg)
-        _emit_session_message(msg)
 
         return jsonify({"diagnosis": result}), 200
     except Exception as e:
@@ -1268,16 +1142,13 @@ def analyze_signal(session_id):
 @jwt_required()
 def resolve_session(session_id):
     user_id = int(get_jwt_identity())
-    session = db.session.get(ChatSession, session_id)
+    session = ChatSession.query.get(session_id)
     if not session:
         return jsonify({"error": "Session not found"}), 404
 
     session.status = "resolved"
     session.resolved_at = datetime.now(timezone.utc)
-    session.current_step = "resolved"
-    session.last_message_at = datetime.now(timezone.utc)
     db.session.commit()
-    _emit_session_update(session)
 
     # Generate summary
     try:
@@ -1289,7 +1160,7 @@ def resolve_session(session_id):
 
     # ← NEW: Send WhatsApp message
     try:
-        user = db.session.get(User, user_id)
+        user = User.query.get(user_id)
         if user and user.phone_number:
             whatsapp_msg = format_chat_summary_for_whatsapp(session, user.name)
             result = send_whatsapp_message(user.phone_number, whatsapp_msg)
@@ -1362,13 +1233,11 @@ def send_ticket_assignment_email(agent, ticket, session):
 @jwt_required()
 def escalate_session(session_id):
     user_id = int(get_jwt_identity())
-    session = db.session.get(ChatSession, session_id)
+    session = ChatSession.query.get(session_id)
     if not session:
         return jsonify({"error": "Session not found"}), 404
 
     session.status = "escalated"
-    session.current_step = "human_handoff"
-    session.last_message_at = datetime.now(timezone.utc)
 
     # Generate summary
     msgs = [{"sender": m.sender, "content": m.content} for m in session.messages]
@@ -1416,7 +1285,7 @@ def escalate_session(session_id):
 
     # Send WhatsApp message for ticket
     try:
-        user = db.session.get(User, user_id)
+        user = User.query.get(user_id)
         if user and user.phone_number:
             whatsapp_msg = format_ticket_alert_for_whatsapp(ticket, user.name, session)
             result = send_whatsapp_message(user.phone_number, whatsapp_msg)
@@ -1451,11 +1320,11 @@ def escalate_session(session_id):
 def send_summary_email(session_id):
     """Send chat summary to the user's email saved in DB."""
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if not user:
         return jsonify({"error": "User not found"}), 404
 
-    session = db.session.get(ChatSession, session_id)
+    session = ChatSession.query.get(session_id)
     if not session:
         return jsonify({"error": "Session not found"}), 404
 
@@ -1599,61 +1468,17 @@ def get_chat_session(session_id):
         return jsonify({"error": "Session not found"}), 404
     if session.user_id != user_id:
         return jsonify({"error": "Unauthorized"}), 403
-    now_utc = datetime.now(timezone.utc)
-    updated = False
-    for m in session.messages:
-        if m.sender == "agent" and m.delivered_at is None:
-            m.delivered_at = now_utc
-            updated = True
-    if updated:
-        db.session.commit()
     return jsonify({
         "session": session.to_dict(),
         "messages": [m.to_dict() for m in session.messages],
     })
 
 
-@app.route("/api/chat/session/<int:session_id>/seen", methods=["POST"])
-@jwt_required()
-def mark_chat_seen(session_id):
-    user_id = int(get_jwt_identity())
-    session = ChatSession.query.get(session_id)
-    if not session:
-        return jsonify({"error": "Session not found"}), 404
-    if session.user_id != user_id:
-        return jsonify({"error": "Unauthorized"}), 403
-
-    data = request.json or {}
-    message_ids = data.get("message_ids") or []
-    if message_ids and not isinstance(message_ids, list):
-        return jsonify({"error": "message_ids must be a list"}), 400
-
-    q = ChatMessage.query.filter(
-        ChatMessage.session_id == session_id,
-        ChatMessage.sender == "agent",
-    )
-    if message_ids:
-        q = q.filter(ChatMessage.id.in_(message_ids))
-
-    now_utc = datetime.now(timezone.utc)
-    updated = 0
-    for m in q.all():
-        if m.seen_at is None:
-            m.seen_at = now_utc
-            if m.delivered_at is None:
-                m.delivered_at = now_utc
-            updated += 1
-    if updated:
-        db.session.commit()
-
-    return jsonify({"updated": updated})
-
-
 @app.route("/api/chat/session/<int:session_id>/status", methods=["GET"])
 @jwt_required()
 def get_session_status(session_id):
     """Lightweight poll endpoint: return session status + latest bot message."""
-    session = db.session.get(ChatSession, session_id)
+    session = ChatSession.query.get(session_id)
     if not session:
         return jsonify({"error": "Session not found"}), 404
     ticket = Ticket.query.filter_by(chat_session_id=session_id).order_by(Ticket.created_at.desc()).first()
@@ -1676,7 +1501,7 @@ def get_session_status(session_id):
 def session_presence(session_id):
     """Update customer presence for a chat session."""
     user_id = int(get_jwt_identity())
-    session = db.session.get(ChatSession, session_id)
+    session = ChatSession.query.get(session_id)
     if not session:
         return jsonify({"error": "Session not found"}), 404
     if session.user_id != user_id:
@@ -1829,7 +1654,7 @@ def submit_feedback():
 @jwt_required()
 def list_feedback():
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if user.role == "customer":
         feedbacks = Feedback.query.filter_by(user_id=user_id).order_by(Feedback.created_at.desc()).all()
     else:
@@ -1845,7 +1670,7 @@ def list_feedback():
 @jwt_required()
 def manager_dashboard():
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if user.role not in ("manager", "cto", "admin"):
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -1926,7 +1751,7 @@ def manager_dashboard():
 @jwt_required()
 def manager_tickets():
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if user.role not in ("manager", "cto", "admin"):
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -2015,19 +1840,209 @@ def manager_review_parameter_change(change_id):
     return jsonify({"change": change.to_dict()})
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# CHANGE WORKFLOW (ITIL) — Manager Endpoints
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _cr_auth(user):
+    return user and user.role in ("manager", "cto", "admin")
+
+
+@app.route("/api/manager/change-requests", methods=["GET"])
+@jwt_required()
+def manager_list_change_requests():
+    user_id = int(get_jwt_identity())
+    user    = db.session.get(User, user_id)
+    if not _cr_auth(user):
+        return jsonify({"error": "Unauthorized"}), 403
+
+    status  = request.args.get("status")
+    query   = ChangeRequest.query
+    if status:
+        if status == "needs_action":
+            query = query.filter(ChangeRequest.status.in_(["created", "invalid", "validated", "classified", "implemented", "rolled_back"]))
+        else:
+            query = query.filter_by(status=status)
+
+    crs = query.order_by(ChangeRequest.created_at.desc()).all()
+    all_crs = ChangeRequest.query.all()
+    stats = {
+        "total":        len(all_crs),
+        "needs_action": sum(1 for c in all_crs if c.status in ("created","invalid","validated","classified","implemented","rolled_back")),
+        "approved":     sum(1 for c in all_crs if c.status in ("approved","implementing")),
+        "closed":       sum(1 for c in all_crs if c.status in ("closed","rejected","auto_rejected")),
+    }
+    return jsonify({"change_requests": [c.to_dict() for c in crs], "stats": stats})
+
+
+@app.route("/api/manager/change-requests/<int:cr_id>", methods=["GET"])
+@jwt_required()
+def manager_get_change_request(cr_id):
+    user_id = int(get_jwt_identity())
+    user    = db.session.get(User, user_id)
+    if not _cr_auth(user):
+        return jsonify({"error": "Unauthorized"}), 403
+    cr = db.session.get(ChangeRequest, cr_id)
+    if not cr:
+        return jsonify({"error": "Change request not found"}), 404
+    return jsonify({"cr": cr.to_dict()})
+
+
+@app.route("/api/manager/change-requests/<int:cr_id>/validate", methods=["PUT"])
+@jwt_required()
+def manager_validate_cr(cr_id):
+    """Stage 1: Manager validates whether the CR is acceptable."""
+    user_id = int(get_jwt_identity())
+    user    = db.session.get(User, user_id)
+    if not _cr_auth(user):
+        return jsonify({"error": "Unauthorized"}), 403
+
+    cr = db.session.get(ChangeRequest, cr_id)
+    if not cr:
+        return jsonify({"error": "Change request not found"}), 404
+    if cr.status not in ("created", "invalid"):
+        return jsonify({"error": f"CR cannot be validated in status '{cr.status}'"}), 409
+
+    data     = request.json or {}
+    decision = (data.get("decision") or "").strip()
+    remark   = (data.get("remark")   or "").strip()
+    if decision not in ("valid", "invalid"):
+        return jsonify({"error": "decision must be 'valid' or 'invalid'"}), 400
+
+    now = datetime.now(timezone.utc)
+    cr.validation_remark = remark
+    cr.validated_by      = user_id
+    cr.validated_at      = now
+    cr.updated_at        = now
+
+    if decision == "valid":
+        cr.status = "validated"
+    else:
+        cr.rejection_count += 1
+        if cr.rejection_count >= 2:
+            cr.status = "auto_rejected"
+        else:
+            cr.status = "invalid"
+
+    db.session.commit()
+    return jsonify({"cr": cr.to_dict()})
+
+
+@app.route("/api/manager/change-requests/<int:cr_id>/classify", methods=["PUT"])
+@jwt_required()
+def manager_classify_cr(cr_id):
+    """Stage 2: Manager classifies the change type."""
+    user_id = int(get_jwt_identity())
+    user    = db.session.get(User, user_id)
+    if not _cr_auth(user):
+        return jsonify({"error": "Unauthorized"}), 403
+
+    cr = db.session.get(ChangeRequest, cr_id)
+    if not cr:
+        return jsonify({"error": "Change request not found"}), 404
+    if cr.status != "validated":
+        return jsonify({"error": f"CR must be validated before classification (current: {cr.status})"}), 409
+
+    data        = request.json or {}
+    change_type = (data.get("change_type") or "").strip()
+    note        = (data.get("note")        or "").strip()
+    if change_type not in ("standard", "normal", "emergency"):
+        return jsonify({"error": "change_type must be standard, normal, or emergency"}), 400
+
+    now = datetime.now(timezone.utc)
+    cr.change_type         = change_type
+    cr.classification_note = note
+    cr.classified_by       = user_id
+    cr.classified_at       = now
+    cr.status              = "classified"
+    cr.updated_at          = now
+    db.session.commit()
+    return jsonify({"cr": cr.to_dict()})
+
+
+@app.route("/api/manager/change-requests/<int:cr_id>/approve", methods=["PUT"])
+@jwt_required()
+def manager_approve_cr(cr_id):
+    """Stage 3: Manager approves or rejects the classified CR."""
+    user_id = int(get_jwt_identity())
+    user    = db.session.get(User, user_id)
+    if not _cr_auth(user):
+        return jsonify({"error": "Unauthorized"}), 403
+
+    cr = db.session.get(ChangeRequest, cr_id)
+    if not cr:
+        return jsonify({"error": "Change request not found"}), 404
+    if cr.status != "classified":
+        return jsonify({"error": f"CR must be classified before approval (current: {cr.status})"}), 409
+
+    data     = request.json or {}
+    decision = (data.get("decision") or "").strip()
+    remark   = (data.get("remark")   or "").strip()
+    if decision not in ("approved", "rejected"):
+        return jsonify({"error": "decision must be 'approved' or 'rejected'"}), 400
+
+    now = datetime.now(timezone.utc)
+    cr.approval_remark = remark
+    cr.approved_by     = user_id
+    cr.approved_at     = now
+    cr.status          = decision
+    cr.updated_at      = now
+
+    if cr.parameter_change_id:
+        pc = db.session.get(ParameterChange, cr.parameter_change_id)
+        if pc:
+            pc.status       = "approved" if decision == "approved" else "disapproved"
+            pc.reviewed_by  = user_id
+            pc.reviewed_at  = now
+            pc.manager_note = remark
+
+    db.session.commit()
+    return jsonify({"cr": cr.to_dict()})
+
+
+@app.route("/api/manager/change-requests/<int:cr_id>/close", methods=["PUT"])
+@jwt_required()
+def manager_close_cr(cr_id):
+    """Stage 5: Manager closes the CR after implementation (success or rollback)."""
+    user_id = int(get_jwt_identity())
+    user    = db.session.get(User, user_id)
+    if not _cr_auth(user):
+        return jsonify({"error": "Unauthorized"}), 403
+
+    cr = db.session.get(ChangeRequest, cr_id)
+    if not cr:
+        return jsonify({"error": "Change request not found"}), 404
+    if cr.status not in ("implemented", "rolled_back"):
+        return jsonify({"error": f"CR can only be closed after implementation (current: {cr.status})"}), 409
+
+    data = request.json or {}
+    now  = datetime.now(timezone.utc)
+    cr.closure_notes = (data.get("notes") or "").strip()
+    cr.closed_at     = now
+    cr.status        = "closed"
+    cr.updated_at    = now
+    db.session.commit()
+    return jsonify({"cr": cr.to_dict()})
+
+
+@app.route("/api/agent/change-requests/ticket/<int:ticket_id>", methods=["GET"])
+@jwt_required()
+def agent_get_cr_for_ticket(ticket_id):
+    user_id = int(get_jwt_identity())
+    user    = db.session.get(User, user_id)
+    if not user or user.role != "human_agent":
+        return jsonify({"error": "Unauthorized"}), 403
+    cr = (ChangeRequest.query
+          .filter_by(ticket_id=ticket_id, raised_by=user_id)
+          .order_by(ChangeRequest.created_at.desc())
+          .first())
+    return jsonify({"cr": cr.to_dict() if cr else None})
+
+
 @app.route("/api/manager/tickets/<int:ticket_id>/escalation-review", methods=["PUT"])
 @jwt_required()
 def manager_escalation_review(ticket_id):
-    """
-    Manager approves or rejects an escalated ticket.
-
-    Payload:
-      { "decision": "approved" | "rejected", "note": "<optional text>" }
-
-    Approved  → ticket status becomes "in_progress" (manager now owns it).
-    Rejected  → ticket is reassigned back to the original expert with status
-                "in_progress" so they can continue working on it.
-    """
+    """Manager approves or rejects an escalated ticket."""
     user_id = int(get_jwt_identity())
     user = db.session.get(User, user_id)
     if not user or user.role != "manager":
@@ -2048,10 +2063,7 @@ def manager_escalation_review(ticket_id):
     if decision not in ("approved", "rejected"):
         return jsonify({"error": "decision must be 'approved' or 'rejected'"}), 400
 
-    # Update the linked ParameterChange record(s) that are still pending
-    pending_changes = ParameterChange.query.filter_by(
-        ticket_id=ticket_id, status="pending"
-    ).all()
+    pending_changes = ParameterChange.query.filter_by(ticket_id=ticket_id, status="pending").all()
     for pc in pending_changes:
         pc.status = "approved" if decision == "approved" else "disapproved"
         pc.manager_note = note
@@ -2059,12 +2071,10 @@ def manager_escalation_review(ticket_id):
         pc.reviewed_by = user_id
 
     if decision == "approved":
-        # Manager takes ownership — move ticket to in_progress
         ticket.status = "in_progress"
         if note:
             ticket.resolution_notes = note
     else:
-        # Reject — send back to the original expert
         if ticket.escalated_by:
             ticket.assigned_to = ticket.escalated_by
         ticket.status = "in_progress"
@@ -2081,11 +2091,11 @@ def manager_escalation_review(ticket_id):
 @jwt_required()
 def update_ticket(ticket_id):
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if user.role not in ("manager", "cto", "admin"):
         return jsonify({"error": "Unauthorized"}), 403
 
-    ticket = db.session.get(Ticket, ticket_id)
+    ticket = Ticket.query.get(ticket_id)
     if not ticket:
         return jsonify({"error": "Ticket not found"}), 404
 
@@ -2114,7 +2124,7 @@ def update_ticket(ticket_id):
 @jwt_required()
 def manager_chats():
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if user.role not in ("manager", "cto", "admin"):
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -2131,7 +2141,7 @@ def manager_chats():
 @jwt_required()
 def manager_users():
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if user.role not in ("manager", "cto", "admin"):
         return jsonify({"error": "Unauthorized"}), 403
     managers = User.query.filter(User.role.in_(["manager"])).all()
@@ -2146,7 +2156,7 @@ def manager_users():
 @jwt_required()
 def cto_overview():
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if user.role != "cto":
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -2180,30 +2190,303 @@ def cto_overview():
     })
 
 
-@app.route("/api/cto/duty-roster", methods=["GET"])
+def _require_cto_user():
+    user = User.query.get(int(get_jwt_identity()))
+    if not user or user.role != "cto":
+        return None
+    return user
+
+
+def _latest_site_values_for_kpi(kpi_name):
+    rows = KpiData.query.filter_by(data_level="site", kpi_name=kpi_name).order_by(KpiData.site_id, KpiData.date.desc()).all()
+    latest = {}
+    for row in rows:
+        if row.site_id not in latest and row.value is not None:
+            latest[row.site_id] = {"date": row.date, "value": float(row.value)}
+    return latest
+
+
+def _series_for_kpi_patterns(patterns):
+    rows = KpiData.query.filter(
+        KpiData.data_level == "site",
+        db.or_(*[KpiData.kpi_name.ilike(pattern) for pattern in patterns])
+    ).all()
+
+    grouped = {}
+    for row in rows:
+        if row.value is None:
+            continue
+        key = row.date.isoformat()
+        bucket = grouped.setdefault(key, {"date": key, "total": 0.0, "count": 0})
+        bucket["total"] += float(row.value)
+        bucket["count"] += 1
+
+    series = []
+    for day in sorted(grouped.keys()):
+        bucket = grouped[day]
+        avg = bucket["total"] / bucket["count"] if bucket["count"] else 0
+        series.append({"date": day, "value": round(avg, 2)})
+    return series
+
+
+def _latest_average_for_patterns(patterns):
+    series = _series_for_kpi_patterns(patterns)
+    return round(series[-1]["value"], 2) if series else 0
+
+
+@app.route("/api/cto/map-data", methods=["GET"])
 @jwt_required()
-def cto_duty_roster():
-    user = db.session.get(User, int(get_jwt_identity()))
-    if user.role != "cto":
+def cto_map_data():
+    user = _require_cto_user()
+    if not user:
         return jsonify({"error": "Unauthorized"}), 403
 
-    date_str = request.args.get("date")
-    try:
-        target_date = date.fromisoformat(date_str) if date_str else datetime.now().date()
-    except Exception:
-        return jsonify({"error": "Invalid date format. Use YYYY-MM-DD"}), 400
-
-    roster, err = _build_duty_roster(target_date)
-    if err:
-        return jsonify({"error": err}), 400
+    sites = TelecomSite.query.with_entities(
+        TelecomSite.site_id,
+        TelecomSite.latitude,
+        TelecomSite.longitude,
+        TelecomSite.zone,
+        TelecomSite.site_status,
+        TelecomSite.alarms,
+        TelecomSite.solution,
+    ).all()
 
     return jsonify({
-        "date": target_date.isoformat(),
-        "day": target_date.strftime("%A"),
-        "shift_times": roster["shift_times"],
-        "shifts": roster["shifts"],
-        "teams": roster["teams"],
-        "meta": roster["meta"],
+        "sites": [
+            {
+                "site_id": site.site_id,
+                "lat": site.latitude,
+                "lng": site.longitude,
+                "zone": site.zone or "",
+                "status": (site.site_status or "active").lower(),
+                "alarm": site.alarms or "",
+                "solution": site.solution or "",
+            }
+            for site in sites
+            if (
+                site.latitude is not None and
+                site.longitude is not None and
+                float(site.latitude) != 0 and
+                float(site.longitude) != 0
+            )
+        ]
+    })
+
+
+@app.route("/api/cto/technical-kpi", methods=["GET"])
+@jwt_required()
+def cto_technical_kpi():
+    user = _require_cto_user()
+    if not user:
+        return jsonify({"error": "Unauthorized"}), 403
+
+    kpi_defs = [
+        {
+            "key": "accessibility",
+            "label": "Accessibility",
+            "patterns": [
+                "%availability%",
+                "%rrc setup success rate%",
+                "%call setup success rate%",
+                "%e-rab setup success rate%",
+                "%access success rate%",
+            ],
+        },
+        {
+            "key": "retainability",
+            "label": "Retainability",
+            "patterns": [
+                "%call drop rate%",
+                "%ho success rate%",
+                "%handover success rate%",
+            ],
+        },
+        {
+            "key": "downlink_throughput",
+            "label": "Downlink Throughput",
+            "patterns": [
+                "%dl - cell ave throughput%",
+                "%dl - usr ave throughput%",
+                "%downlink throughput%",
+                "%dl throughput%",
+            ],
+        },
+        {
+            "key": "prb_utilization",
+            "label": "PRB Utilization",
+            "patterns": [
+                "%prb utilization%",
+                "%prb util%",
+            ],
+        },
+        {
+            "key": "downlink_volume",
+            "label": "Downlink Volume",
+            "patterns": [
+                "%dl data total volume%",
+                "%downlink volume%",
+                "%dl volume%",
+            ],
+        },
+        {
+            "key": "uplink_volume",
+            "label": "Uplink Volume",
+            "patterns": [
+                "%ul data total volume%",
+                "%uplink volume%",
+                "%ul volume%",
+            ],
+        },
+    ]
+
+    cards = []
+    chart_series = {}
+    for item in kpi_defs:
+        series = _series_for_kpi_patterns(item["patterns"])
+        cards.append({
+            "key": item["key"],
+            "label": item["label"],
+            "value": round(series[-1]["value"], 2) if series else 0,
+        })
+        chart_series[item["key"]] = series[-30:]
+
+    return jsonify({
+        "cards": cards,
+        "series": chart_series,
+    })
+
+
+@app.route("/api/cto/business-kpi", methods=["GET"])
+@jwt_required()
+def cto_business_kpi():
+    user = _require_cto_user()
+    if not user:
+        return jsonify({"error": "Unauthorized"}), 403
+
+    users_latest = _latest_site_values_for_kpi("Site Users")
+    revenue_latest = _latest_site_values_for_kpi("Site Revenue")
+    prb_latest = _latest_site_values_for_kpi("PRB Utilization")
+
+    users_series = _series_for_kpi_patterns(["Site Users"])
+    revenue_series = _series_for_kpi_patterns(["Site Revenue"])
+
+    all_site_ids = sorted(set(users_latest.keys()) | set(revenue_latest.keys()))
+    site_rows = []
+    for site_id in all_site_ids:
+        user_val = users_latest.get(site_id, {}).get("value", 0.0)
+        revenue_val = revenue_latest.get(site_id, {}).get("value", 0.0)
+        util_val = prb_latest.get(site_id, {}).get("value", 0.0)
+        arpu = (revenue_val / user_val) if user_val else 0.0
+        site_rows.append({
+            "site_id": site_id,
+            "users": round(user_val, 2),
+            "revenue": round(revenue_val, 2),
+            "utilization": round(util_val, 2),
+            "arpu": round(arpu, 2),
+        })
+
+    total_users = round(sum(row["users"] for row in site_rows), 2)
+    avg_users = round(total_users / len(site_rows), 2) if site_rows else 0
+    total_revenue = round(sum(row["revenue"] for row in site_rows), 2)
+    arpu = round(total_revenue / total_users, 2) if total_users else 0
+
+    if len(users_series) >= 2 and users_series[-2]["value"]:
+        growth = round(((users_series[-1]["value"] - users_series[-2]["value"]) / users_series[-2]["value"]) * 100, 2)
+    else:
+        growth = 0
+
+    declining_sites = []
+    overloaded_sites = []
+    revenue_at_risk = 0.0
+
+    for row in site_rows:
+        growth_pct = 0.0
+        if row["users"] and avg_users:
+            growth_pct = round(((row["users"] - avg_users) / avg_users) * 100, 2)
+        item = {**row, "growth": growth_pct}
+        if growth_pct < 0:
+            declining_sites.append(item)
+        if row["utilization"] > 80:
+            overloaded_sites.append(item)
+        if growth_pct < 0 or row["utilization"] > 80:
+            revenue_at_risk += row["users"] * arpu
+
+    top_sites = sorted(site_rows, key=lambda row: (row["revenue"], row["users"]), reverse=True)[:10]
+    declining_sites = sorted(declining_sites, key=lambda row: row["growth"])[:10]
+    overloaded_sites = sorted(overloaded_sites, key=lambda row: row["utilization"], reverse=True)[:10]
+
+    trend = []
+    revenue_by_day = {row["date"]: row["value"] for row in revenue_series}
+    for row in users_series[-30:]:
+        trend.append({
+            "date": row["date"],
+            "users": row["value"],
+            "revenue": revenue_by_day.get(row["date"], 0),
+        })
+
+    return jsonify({
+        "summary": {
+            "total_users": total_users,
+            "avg_users": avg_users,
+            "growth": growth,
+            "arpu": arpu,
+            "revenue_at_risk": round(revenue_at_risk, 2),
+        },
+        "top_sites": top_sites,
+        "declining_sites": declining_sites,
+        "overloaded_sites": overloaded_sites,
+        "trend": trend,
+    })
+
+
+@app.route("/api/cto/operational-kpi", methods=["GET"])
+@jwt_required()
+def cto_operational_kpi():
+    user = _require_cto_user()
+    if not user:
+        return jsonify({"error": "Unauthorized"}), 403
+
+    tickets = Ticket.query.all()
+    total_tickets = len(tickets)
+    resolved_tickets = [t for t in tickets if t.status == "resolved"]
+    sla_breaches = len([t for t in tickets if t.sla_breached])
+    sla_compliance = round(((total_tickets - sla_breaches) / total_tickets) * 100, 1) if total_tickets else 0
+
+    resolution_hours = []
+    for ticket in resolved_tickets:
+        if ticket.created_at and ticket.resolved_at:
+            resolution_hours.append((ticket.resolved_at - ticket.created_at).total_seconds() / 3600)
+    avg_resolution_time = round(sum(resolution_hours) / len(resolution_hours), 2) if resolution_hours else 0
+
+    csat_raw = db.session.query(db.func.avg(Feedback.rating)).filter(Feedback.rating > 0).scalar() or 0
+    csat = round(float(csat_raw), 2)
+
+    status_breakdown = db.session.query(Ticket.status, db.func.count(Ticket.id)).group_by(Ticket.status).all()
+    status_data = [{"name": status or "unknown", "value": count} for status, count in status_breakdown]
+
+    agent_workload = db.session.query(
+        User.name,
+        db.func.count(Ticket.id)
+    ).outerjoin(Ticket, Ticket.assigned_to == User.id).filter(User.role == "human_agent").group_by(User.name).all()
+    workload_data = [{"agent": name or "Unassigned", "tickets": count} for name, count in agent_workload]
+
+    escalated_count = len([t for t in tickets if t.status == "escalated"])
+    escalation_rate = round((escalated_count / total_tickets) * 100, 1) if total_tickets else 0
+
+    breach_alerts = SlaAlert.query.filter_by(recipient_role="cto").count()
+
+    return jsonify({
+        "summary": {
+            "total_tickets": total_tickets,
+            "sla_compliance": sla_compliance,
+            "sla_breaches": sla_breaches,
+            "avg_resolution_time": avg_resolution_time,
+            "csat": csat,
+            "escalation_rate": escalation_rate,
+            "breach_alerts": breach_alerts,
+        },
+        "status_breakdown": status_data,
+        "agent_workload": workload_data,
     })
 
 
@@ -2214,7 +2497,7 @@ def cto_duty_roster():
 @app.route("/api/manager/sla-alerts", methods=["GET"])
 @jwt_required()
 def manager_sla_alerts():
-    user = db.session.get(User, int(get_jwt_identity()))
+    user = User.query.get(int(get_jwt_identity()))
     if user.role not in ("manager", "admin"):
         return jsonify({"error": "Unauthorized"}), 403
     unread_only = request.args.get("unread_only", "false").lower() == "true"
@@ -2228,7 +2511,7 @@ def manager_sla_alerts():
 @app.route("/api/cto/sla-alerts", methods=["GET"])
 @jwt_required()
 def cto_sla_alerts():
-    user = db.session.get(User, int(get_jwt_identity()))
+    user = User.query.get(int(get_jwt_identity()))
     if user.role != "cto":
         return jsonify({"error": "Unauthorized"}), 403
     unread_only = request.args.get("unread_only", "false").lower() == "true"
@@ -2242,10 +2525,10 @@ def cto_sla_alerts():
 @app.route("/api/manager/sla-alerts/<int:alert_id>/read", methods=["PUT"])
 @jwt_required()
 def manager_mark_alert_read(alert_id):
-    user = db.session.get(User, int(get_jwt_identity()))
+    user = User.query.get(int(get_jwt_identity()))
     if user.role not in ("manager", "admin"):
         return jsonify({"error": "Unauthorized"}), 403
-    alert = db.session.get(SlaAlert, alert_id)
+    alert = SlaAlert.query.get(alert_id)
     if not alert or alert.recipient_role != "manager":
         return jsonify({"error": "Alert not found"}), 404
     alert.is_read = True
@@ -2256,10 +2539,10 @@ def manager_mark_alert_read(alert_id):
 @app.route("/api/cto/sla-alerts/<int:alert_id>/read", methods=["PUT"])
 @jwt_required()
 def cto_mark_alert_read(alert_id):
-    user = db.session.get(User, int(get_jwt_identity()))
+    user = User.query.get(int(get_jwt_identity()))
     if user.role != "cto":
         return jsonify({"error": "Unauthorized"}), 403
-    alert = db.session.get(SlaAlert, alert_id)
+    alert = SlaAlert.query.get(alert_id)
     if not alert or alert.recipient_role != "cto":
         return jsonify({"error": "Alert not found"}), 404
     alert.is_read = True
@@ -2270,7 +2553,7 @@ def cto_mark_alert_read(alert_id):
 @app.route("/api/manager/sla-alerts/read-all", methods=["PUT"])
 @jwt_required()
 def manager_mark_all_alerts_read():
-    user = db.session.get(User, int(get_jwt_identity()))
+    user = User.query.get(int(get_jwt_identity()))
     if user.role not in ("manager", "admin"):
         return jsonify({"error": "Unauthorized"}), 403
     SlaAlert.query.filter_by(recipient_role="manager", is_read=False).update({"is_read": True})
@@ -2281,7 +2564,7 @@ def manager_mark_all_alerts_read():
 @app.route("/api/cto/sla-alerts/read-all", methods=["PUT"])
 @jwt_required()
 def cto_mark_all_alerts_read():
-    user = db.session.get(User, int(get_jwt_identity()))
+    user = User.query.get(int(get_jwt_identity()))
     if user.role != "cto":
         return jsonify({"error": "Unauthorized"}), 403
     SlaAlert.query.filter_by(recipient_role="cto", is_read=False).update({"is_read": True})
@@ -2321,7 +2604,7 @@ def generate_employee_id(role):
 @jwt_required()
 def admin_dashboard():
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if user.role != "admin":
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -2402,12 +2685,11 @@ def admin_dashboard():
     })
 
 
-
 @app.route("/api/admin/users", methods=["GET"])
 @jwt_required()
 def admin_list_users():
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if user.role != "admin":
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -2433,7 +2715,7 @@ def admin_list_users():
 @jwt_required()
 def admin_create_user():
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if user.role != "admin":
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -2471,7 +2753,7 @@ def admin_create_user():
 @jwt_required()
 def admin_upload_users():
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if user.role != "admin":
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -2556,11 +2838,11 @@ def admin_upload_users():
 @jwt_required()
 def admin_update_user(uid):
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if user.role != "admin":
         return jsonify({"error": "Unauthorized"}), 403
 
-    target = db.session.get(User, uid)
+    target = User.query.get(uid)
     if not target:
         return jsonify({"error": "User not found"}), 404
 
@@ -2601,14 +2883,14 @@ def admin_update_user(uid):
 @jwt_required()
 def admin_delete_user(uid):
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if user.role != "admin":
         return jsonify({"error": "Unauthorized"}), 403
 
     if uid == user_id:
         return jsonify({"error": "Cannot delete your own account"}), 400
 
-    target = db.session.get(User, uid)
+    target = User.query.get(uid)
     if not target:
         return jsonify({"error": "User not found"}), 404
 
@@ -2677,7 +2959,7 @@ def admin_update_expert(uid):
 @jwt_required()
 def admin_agent_tickets():
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if user.role != "admin":
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -2722,7 +3004,7 @@ def admin_agent_tickets():
 @jwt_required()
 def admin_agent_alerts():
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if user.role != "admin":
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -2819,7 +3101,7 @@ def admin_agent_alerts():
 @jwt_required()
 def admin_feedback():
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if user.role != "admin":
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -2838,42 +3120,15 @@ def admin_feedback():
 # SITE & KPI DATA UPLOAD (Admin)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-haversine = _haversine  # alias — keep backward compat
-
-# In-memory upload progress store: {job_id: {status, total, processed, created, updated, skipped, error}}
-import threading as _threading
-_upload_jobs = {}
-_upload_jobs_lock = _threading.Lock()
-
-
-def _new_upload_job():
-    import uuid
-    job_id = str(uuid.uuid4())
-    with _upload_jobs_lock:
-        _upload_jobs[job_id] = {
-            "status": "processing",
-            "total": 0,
-            "processed": 0,
-            "created": 0,
-            "updated": 0,
-            "skipped": [],
-            "error": None,
-        }
-    return job_id
-
-
-@app.route("/api/admin/upload-jobs/<job_id>", methods=["GET"])
-@jwt_required()
-def admin_upload_job_status(job_id):
-    """Poll progress of an async site upload job."""
-    user = db.session.get(User, int(get_jwt_identity()))
-    if not user or user.role != "admin":
-        return jsonify({"error": "Unauthorized"}), 403
-    with _upload_jobs_lock:
-        job = _upload_jobs.get(job_id)
-    if not job:
-        return jsonify({"error": "Job not found"}), 404
-    return jsonify(job)
+def haversine(lat1, lon1, lat2, lon2):
+    """Calculate distance in km between two lat/lng points."""
+    R = 6371
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = (math.sin(dlat / 2) ** 2 +
+         math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) *
+         math.sin(dlon / 2) ** 2)
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
 def _validate_ooxml_excel_upload(file_storage):
@@ -2900,12 +3155,53 @@ def _validate_ooxml_excel_upload(file_storage):
     return True, None
 
 
+def _normalize_excel_header(value):
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
+
+
+def _find_site_id_column(headers):
+    """Find a site identifier column across multiple workbook formats."""
+    for i, header in enumerate(headers):
+        normalized = _normalize_excel_header(header)
+        if normalized in {"siteid", "homesitecode", "cellsiteid"}:
+            return i
+        if "site" in normalized and "id" in normalized:
+            return i
+    return None
+
+
+def _extract_excel_date_columns(headers, skip_indices=None):
+    """Return (column_index, date) for headers that can be parsed as dates."""
+    skip_indices = set(skip_indices or [])
+    date_columns = []
+    for col_idx, header in enumerate(headers):
+        if col_idx in skip_indices or header is None:
+            continue
+        try:
+            if isinstance(header, datetime):
+                date_columns.append((col_idx, header.date()))
+            elif isinstance(header, str):
+                for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d", "%d-%b-%y", "%d-%b-%Y"):
+                    try:
+                        date_columns.append((col_idx, datetime.strptime(header.strip(), fmt).date()))
+                        break
+                    except ValueError:
+                        continue
+            elif hasattr(header, "date"):
+                date_columns.append((col_idx, header.date()))
+        except Exception:
+            continue
+    return date_columns
+
+
+SHARED_WORKBOOK_KPI_NAMES = ("Site Users", "Site Revenue")
+
+
 @app.route("/api/admin/upload-sites", methods=["POST"])
 @jwt_required()
 def admin_upload_sites():
-    """Upload site data Excel — processes in background chunks for large files.
-    Returns a job_id immediately. Poll /api/admin/upload-jobs/<job_id> for progress."""
-    user = db.session.get(User, int(get_jwt_identity()))
+    """Upload site data Excel (site_id, latitude, longitude, zone)."""
+    user = User.query.get(int(get_jwt_identity()))
     if not user or user.role != "admin":
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -2919,238 +3215,83 @@ def admin_upload_sites():
     if not ok:
         return jsonify({"error": err}), 400
 
-    import tempfile
-    fd, tmp_path = tempfile.mkstemp(suffix=".xlsx")
-    with os.fdopen(fd, "wb") as tmp:
-        file.save(tmp)
+    import openpyxl
+    wb = openpyxl.load_workbook(file, data_only=True)
+    ws = wb.active
 
-    job_id = _new_upload_job()
+    headers = [str(c.value).strip().lower() if c.value else "" for c in ws[1]]
+    col_map = {}
+    for i, h in enumerate(headers):
+        if ("site" in h and "id" in h) or h in ("site name", "sitename", "site"):
+            col_map["site_id"] = i
+        elif "lat" in h:
+            col_map["latitude"] = i
+        elif "lon" in h:
+            col_map["longitude"] = i
+        elif "zone" in h:
+            col_map["zone"] = i
+        elif h == "status" or "site status" in h:
+            col_map["site_status"] = i
+        elif "alarm" in h:
+            col_map["alarms"] = i
+        elif h in ("solution", "standard solution step", "standard solution"):
+            col_map["solution"] = i
 
-    def _run_upload(path, jid):
-        import openpyxl as _openpyxl
+    required = ["site_id", "latitude", "longitude"]
+    missing = [k for k in required if k not in col_map]
+    if missing:
+        return jsonify({"error": f"Missing columns: {', '.join(missing)}. Found headers: {headers}"}), 400
 
-        def _norm_header(val):
-            return re.sub(r"[^a-z0-9]+", " ", (val or "").strip().lower()).strip()
-
-        def _parse_float(v):
-            if v is None:
-                return None
-            try:
-                s = str(v).strip()
-                return float(s) if s else None
-            except Exception:
-                return None
-
-        def _parse_str(v):
-            return "" if v is None else str(v).strip()
-
-        def _normalize_status(v):
-            s = _parse_str(v).lower()
-            if not s:
-                return "on_air"
-            if any(x in s for x in ["off", "down", "out", "inactive", "shutdown"]):
-                return "off_air"
-            return "on_air"
-
-        def _apply_batch(batch):
-            c_count = u_count = 0
-            deduped = {}
-            for b in batch:
-                key = (b.get("site_id"), b.get("cell_id"))
-                deduped[key] = b
-            site_ids = list({k[0] for k in deduped.keys()})
-            existing_rows = TelecomSite.query.filter(TelecomSite.site_id.in_(site_ids)).all()
-            existing_map = {(s.site_id, s.cell_id): s for s in existing_rows}
-            for b in deduped.values():
-                key = (b.get("site_id"), b.get("cell_id"))
-                site = existing_map.get(key)
-                if site:
-                    for field, val in b.items():
-                        if field != "site_id" and val is not None:
-                            setattr(site, field, val)
-                    u_count += 1
-                else:
-                    db.session.add(TelecomSite(**b))
-                    c_count += 1
-            db.session.commit()
-            return c_count, u_count
-
+    created = 0
+    updated = 0
+    skipped = []
+    for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
         try:
-            wb = _openpyxl.load_workbook(path, data_only=True, read_only=True)
-            ws = wb.active
-
-            _fs = {
-                "site_id": ["site id", "site_id", "siteid", "site code"],
-                "site_name": ["site name", "sitename", "name"],
-                "cell_id": ["cell id", "cell_id", "cellid", "cell"],
-                "latitude": ["latitude", "lat"],
-                "longitude": ["longitude", "long", "lon", "lng"],
-                "zone": ["zone", "circle", "region", "area"],
-                "site_status": ["status", "site status", "site_status", "operational status"],
-                "alarms": ["alarm", "alarms", "alarm text", "active alarm"],
-                "standard_solution_step": ["standard solution step", "solution step", "standard solution", "standard_solution_step"],
-                "solution": ["solution", "resolution", "action", "recommended action"],
-                "bandwidth_mhz": ["bandwidth (mhz)", "bandwidth mhz", "bandwidth", "bw", "bandwidth(mhz)", "bw (mhz)"],
-                "antenna_gain_dbi": ["antenna gain (dbi)", "antenna gain", "gain dbi", "antenna gain(dbi)", "gain (dbi)"],
-                "rf_power_eirp_dbm": ["rf power (eirp) [dbm]", "rf power eirp", "eirp dbm", "eirp", "rf power", "rf power(eirp)[dbm]", "eirp [dbm]", "rf power eirp dbm"],
-                "antenna_height_agl_m": ["antenna height (above ground level) (m)", "antenna height (above ground level)(m)", "antenna height", "above ground", "agl", "antenna height agl", "height (m)", "height(m)", "antenna height (agl) (m)", "antenna height(above ground level)(m)"],
-                "e_tilt_degree": ["e-tilt (degree)", "e tilt", "e-tilt", "etilt", "electrical tilt", "tilt", "e tilt (degree)", "e-tilt(degree)"],
-                "crs_gain": ["crs gain", "crs", "crs_gain"],
-            }
-
-            headers = [str(c.value).strip() if c.value else "" for c in ws[1]]
-            norm_headers = [_norm_header(h) for h in headers]
-            col_map = {}
-            for i, nh in enumerate(norm_headers):
-                for field, synonyms in _fs.items():
-                    if field in col_map:
-                        continue
-                    if any(s in nh for s in synonyms):
-                        col_map[field] = i
-                        break
-            # Heuristic fallback
-            for i, nh in enumerate(norm_headers):
-                if "latitude" not in col_map and "lat" in nh:
-                    col_map["latitude"] = i
-                if "longitude" not in col_map and any(x in nh for x in ["lon", "lng", "long"]):
-                    col_map["longitude"] = i
-                if "site_id" not in col_map and "site" in nh and "id" in nh:
-                    col_map["site_id"] = i
-                if "site_name" not in col_map and "site" in nh and "name" in nh:
-                    col_map["site_name"] = i
-                if "cell_id" not in col_map and "cell" in nh and "id" in nh:
-                    col_map["cell_id"] = i
-                if "zone" not in col_map and "zone" in nh:
-                    col_map["zone"] = i
-                if "site_status" not in col_map and "status" in nh:
-                    col_map["site_status"] = i
-                if "alarms" not in col_map and "alarm" in nh:
-                    col_map["alarms"] = i
-                if "solution" not in col_map and "solution" in nh:
-                    col_map["solution"] = i
-                if "standard_solution_step" not in col_map and "standard" in nh and "solution" in nh:
-                    col_map["standard_solution_step"] = i
-                if "bandwidth_mhz" not in col_map and "bandwidth" in nh:
-                    col_map["bandwidth_mhz"] = i
-                if "antenna_gain_dbi" not in col_map and "antenna" in nh and "gain" in nh:
-                    col_map["antenna_gain_dbi"] = i
-                if "rf_power_eirp_dbm" not in col_map and ("eirp" in nh or ("rf" in nh and "power" in nh)):
-                    col_map["rf_power_eirp_dbm"] = i
-                if "antenna_height_agl_m" not in col_map and "antenna" in nh and "height" in nh:
-                    col_map["antenna_height_agl_m"] = i
-                if "e_tilt_degree" not in col_map and "tilt" in nh:
-                    col_map["e_tilt_degree"] = i
-                if "crs_gain" not in col_map and "crs" in nh:
-                    col_map["crs_gain"] = i
-
-            required = ["latitude", "longitude"]
-            if "site_id" not in col_map and "site_name" not in col_map:
-                required.append("site_id")
-            missing = [k for k in required if k not in col_map]
-            if missing:
-                with _upload_jobs_lock:
-                    _upload_jobs[jid]["status"] = "failed"
-                    _upload_jobs[jid]["error"] = f"Missing columns: {', '.join(missing)}. Found headers: {headers}"
-                return
-
-            all_rows = list(ws.iter_rows(min_row=2, values_only=True))
-            total_rows = len(all_rows)
-            with _upload_jobs_lock:
-                _upload_jobs[jid]["total"] = total_rows
-
-            created = updated = 0
-            skipped = []
-            batch = []
-            BATCH_SIZE = 500
-
-            with app.app_context():
-                for row_idx, row in enumerate(all_rows, start=2):
-                    try:
-                        raw_site_id = row[col_map["site_id"]] if "site_id" in col_map else None
-                        raw_site_name = row[col_map["site_name"]] if "site_name" in col_map else None
-                        sid = _parse_str(raw_site_id or raw_site_name)
-                        if not sid:
-                            raise ValueError("Missing site identifier")
-                        lat = _parse_float(row[col_map["latitude"]]) if "latitude" in col_map else None
-                        lon = _parse_float(row[col_map["longitude"]]) if "longitude" in col_map else None
-                        if lat is None or lon is None:
-                            raise ValueError("Missing latitude/longitude")
-                        zone = _parse_str(row[col_map["zone"]]) if "zone" in col_map else ""
-                        status = _normalize_status(row[col_map["site_status"]]) if "site_status" in col_map else "on_air"
-                        alarms = _parse_str(row[col_map["alarms"]]) if "alarms" in col_map else ""
-                        solution = _parse_str(row[col_map["solution"]]) if "solution" in col_map else ""
-                        std_solution = _parse_str(row[col_map["standard_solution_step"]]) if "standard_solution_step" in col_map else ""
-                        if not solution and std_solution:
-                            solution = std_solution
-                        cell_id_val = _parse_str(row[col_map["cell_id"]]) if "cell_id" in col_map else ""
-                        if not cell_id_val:
-                            cell_id_val = None
-                        entry = {
-                            "site_id": sid,
-                            "site_name": _parse_str(raw_site_name) if raw_site_name is not None else sid,
-                            "cell_id": cell_id_val,
-                            "latitude": lat,
-                            "longitude": lon,
-                            "zone": zone,
-                            "site_status": status,
-                            "alarms": alarms,
-                            "solution": solution,
-                            "standard_solution_step": std_solution,
-                            "bandwidth_mhz": _parse_float(row[col_map["bandwidth_mhz"]]) if "bandwidth_mhz" in col_map else None,
-                            "antenna_gain_dbi": _parse_float(row[col_map["antenna_gain_dbi"]]) if "antenna_gain_dbi" in col_map else None,
-                            "rf_power_eirp_dbm": _parse_float(row[col_map["rf_power_eirp_dbm"]]) if "rf_power_eirp_dbm" in col_map else None,
-                            "antenna_height_agl_m": _parse_float(row[col_map["antenna_height_agl_m"]]) if "antenna_height_agl_m" in col_map else None,
-                            "e_tilt_degree": _parse_float(row[col_map["e_tilt_degree"]]) if "e_tilt_degree" in col_map else None,
-                            "crs_gain": _parse_float(row[col_map["crs_gain"]]) if "crs_gain" in col_map else None,
-                        }
-                        batch.append(entry)
-                    except Exception as e:
-                        skipped.append(f"Row {row_idx}: {e}")
-                        continue
-
-                    if len(batch) >= BATCH_SIZE:
-                        c, u = _apply_batch(batch)
-                        created += c
-                        updated += u
-                        batch = []
-                        with _upload_jobs_lock:
-                            _upload_jobs[jid]["processed"] = row_idx - 1
-                            _upload_jobs[jid]["created"] = created
-                            _upload_jobs[jid]["updated"] = updated
-                            _upload_jobs[jid]["skipped"] = skipped[-20:]
-
-                if batch:
-                    c, u = _apply_batch(batch)
-                    created += c
-                    updated += u
-
-            with _upload_jobs_lock:
-                _upload_jobs[jid]["status"] = "done"
-                _upload_jobs[jid]["processed"] = total_rows
-                _upload_jobs[jid]["created"] = created
-                _upload_jobs[jid]["updated"] = updated
-                _upload_jobs[jid]["skipped"] = skipped
-                _upload_jobs[jid]["total"] = created + updated
-
-            wb.close()
-
+            sid = str(row[col_map["site_id"]]).strip()
+            lat = float(row[col_map["latitude"]])
+            lon = float(row[col_map["longitude"]])
+            zone = str(row[col_map.get("zone", -1)]).strip() if col_map.get("zone") is not None and col_map.get("zone") < len(row) and row[col_map.get("zone")] else ""
+            raw_status = str(row[col_map.get("site_status", -1)]).strip().lower() if col_map.get("site_status") is not None and col_map.get("site_status") < len(row) and row[col_map.get("site_status")] else "on_air"
+            alarms = str(row[col_map.get("alarms", -1)]).strip() if col_map.get("alarms") is not None and col_map.get("alarms") < len(row) and row[col_map.get("alarms")] else ""
+            solution = str(row[col_map.get("solution", -1)]).strip() if col_map.get("solution") is not None and col_map.get("solution") < len(row) and row[col_map.get("solution")] else ""
         except Exception as e:
-            with _upload_jobs_lock:
-                _upload_jobs[jid]["status"] = "failed"
-                _upload_jobs[jid]["error"] = str(e)
-        finally:
-            try:
-                os.remove(path)
-            except Exception:
-                pass
+            skipped.append(f"Row {row_idx}: {e}")
+            continue
 
-    t = _threading.Thread(target=_run_upload, args=(tmp_path, job_id), daemon=True)
-    t.start()
+        status_map = {
+            "active": "on_air",
+            "on_air": "on_air",
+            "on air": "on_air",
+            "down": "off_air",
+            "off_air": "off_air",
+            "off air": "off_air",
+            "alarm": "off_air",
+        }
+        site_status = status_map.get(raw_status, raw_status or "on_air")
 
-    return jsonify({
-        "job_id": job_id,
-        "message": "Upload started. Poll /api/admin/upload-jobs/<job_id> for progress.",
-    }), 202
+        existing = TelecomSite.query.filter_by(site_id=sid).first()
+        if existing:
+            existing.latitude = lat
+            existing.longitude = lon
+            existing.zone = zone
+            existing.site_status = site_status
+            existing.alarms = alarms
+            existing.solution = solution
+            updated += 1
+        else:
+            db.session.add(TelecomSite(
+                site_id=sid,
+                latitude=lat,
+                longitude=lon,
+                zone=zone,
+                site_status=site_status,
+                alarms=alarms,
+                solution=solution,
+            ))
+            created += 1
+
+    db.session.commit()
+    return jsonify({"created": created, "updated": updated, "skipped": skipped, "total": created + updated})
 
 
 @app.route("/api/admin/upload-kpi-site-level", methods=["POST"])
@@ -3158,9 +3299,7 @@ def admin_upload_sites():
 def admin_upload_kpi_site_level():
     """Upload site-level KPI workbook (27 sheets, sheet name = KPI name).
     Each sheet: Site_ID column, then date columns with values."""
-    user = db.session.get(User, int(get_jwt_identity()))
-
-    user = db.session.get(User, int(get_jwt_identity()))
+    user = User.query.get(int(get_jwt_identity()))
     if not user or user.role != "admin":
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -3168,161 +3307,236 @@ def admin_upload_kpi_site_level():
         return jsonify({"error": "No file provided"}), 400
 
     file = request.files["file"]
-    if not file.filename.endswith((".xlsx", ".xls")):
-        return jsonify({"error": "Only .xlsx or .xls files accepted"}), 400
+    if not file.filename.lower().endswith((".xlsx", ".xlsm")):
+        return jsonify({"error": "Only .xlsx or .xlsm files are supported (.xls is not supported)."}), 400
+    ok, err = _validate_ooxml_excel_upload(file)
+    if not ok:
+        return jsonify({"error": err}), 400
 
-    import openpyxl, tempfile, io, csv
-    from sqlalchemy import text as sa_text
+    import openpyxl
+    wb = openpyxl.load_workbook(file, data_only=True)
 
-    fd, path = tempfile.mkstemp(suffix=".xlsx")
-    wb = None
+    # Clear old site-level KPI data
+    KpiData.query.filter_by(data_level="site").delete()
+    db.session.flush()
 
-    try:
-        with os.fdopen(fd, 'wb') as tmp:
-            file.save(tmp)
+    total_inserted = 0
+    kpi_summary = []
+    errors = []
 
-        wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+    for ws in wb.worksheets:
+        kpi_name = ws.title.strip()
+        if not kpi_name:
+            continue
 
-        KPI_INDEXES = [
-            "idx_kpi_site_name_date",
-            "idx_kpi_data_level",
-            "ix_kpi_data_site_id",
-            "ix_kpi_data_kpi_name",
-        ]
+        headers = [c.value for c in ws[1]]
+        if not headers or len(headers) < 2:
+            errors.append(f"Sheet '{kpi_name}': insufficient columns")
+            continue
 
-        COPY_SQL = """COPY kpi_data
-        (site_id, kpi_name, date, hour, value, data_level)
-        FROM STDIN WITH (FORMAT CSV, NULL '')"""
+        # First column is Site_ID, remaining columns are dates
+        date_columns = []
+        for col_idx in range(1, len(headers)):
+            h = headers[col_idx]
+            if h is None:
+                continue
+            try:
+                if isinstance(h, datetime):
+                    date_columns.append((col_idx, h.date()))
+                elif isinstance(h, str):
+                    for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%d-%m-%Y", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d"):
+                        try:
+                            date_columns.append((col_idx, datetime.strptime(h.strip(), fmt).date()))
+                            break
+                        except ValueError:
+                            continue
+                elif hasattr(h, 'date'):
+                    date_columns.append((col_idx, h.date()))
+            except Exception:
+                continue
 
-        FLUSH_AT = 1_000_000
+        if not date_columns:
+            errors.append(f"Sheet '{kpi_name}': no valid date columns found")
+            continue
 
-        raw_conn = db.engine.raw_connection()
-        cur = raw_conn.cursor()
+        sheet_inserted = 0
+        batch = []
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            site_id = str(row[0]).strip() if row[0] else None
+            if not site_id or site_id == "None":
+                continue
 
-        cur.execute("SET synchronous_commit TO OFF")
-
-        try:
-            for idx in KPI_INDEXES:
-                cur.execute(f"DROP INDEX IF EXISTS {idx}")
-            raw_conn.commit()
-
-            buf = io.StringIO()
-            writer = csv.writer(buf)
-
-            row_count = 0
-            total_inserted = 0
-
-            for sheet_name in wb.sheetnames:
-
-                ws = wb[sheet_name]
-                rows_iter = ws.iter_rows(values_only=True)
-
-                headers = next(rows_iter, None)
-                if not headers:
-                    continue
-
-                kpi_name = sheet_name.strip()
-
-                date_map = []
-
-                for i in range(1, len(headers)):
-                    h = headers[i]
-                    if h is None:
+            for col_idx, date_val in date_columns:
+                if col_idx < len(row) and row[col_idx] is not None:
+                    try:
+                        val = float(row[col_idx])
+                    except (ValueError, TypeError):
                         continue
+                    batch.append(KpiData(
+                        site_id=site_id, kpi_name=kpi_name, date=date_val,
+                        hour=0, value=val, data_level="site"
+                    ))
+                    sheet_inserted += 1
 
-                    parsed_date = None
+                    if len(batch) >= 2000:
+                        db.session.bulk_save_objects(batch)
+                        batch = []
 
-                    if isinstance(h, datetime):
-                        parsed_date = h.date()
-                    elif isinstance(h, date):
-                        parsed_date = h
-                    else:
-                        for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d"):
-                            try:
-                                parsed_date = datetime.strptime(str(h).strip(), fmt).date()
-                                break
-                            except:
-                                pass
+        if batch:
+            db.session.bulk_save_objects(batch)
 
-                    if parsed_date is None:
-                        parsed_date = datetime.now().date()
+        total_inserted += sheet_inserted
+        kpi_summary.append({"name": kpi_name, "rows": sheet_inserted})
 
-                    date_map.append((i, parsed_date))
+    db.session.commit()
+    return jsonify({
+        "inserted": total_inserted,
+        "kpis_processed": len(kpi_summary),
+        "kpi_summary": kpi_summary,
+        "errors": errors,
+    })
 
-                if not date_map:
-                    continue
 
-                for row in rows_iter:
+@app.route("/api/admin/upload-shared-site-workbook", methods=["POST"])
+@jwt_required()
+def admin_upload_shared_site_workbook():
+    """Upload the shared telecom_site_dataset workbook format as site-level KPI data."""
+    user = User.query.get(int(get_jwt_identity()))
+    if not user or user.role != "admin":
+        return jsonify({"error": "Unauthorized"}), 403
 
-                    if not row or row[0] is None:
+    if "file" not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+
+    file = request.files["file"]
+    if not file.filename.lower().endswith((".xlsx", ".xlsm")):
+        return jsonify({"error": "Only .xlsx or .xlsm files are supported (.xls is not supported)."}), 400
+    ok, err = _validate_ooxml_excel_upload(file)
+    if not ok:
+        return jsonify({"error": err}), 400
+
+    import openpyxl
+    wb = openpyxl.load_workbook(file, data_only=True)
+
+    KpiData.query.filter(
+        KpiData.data_level == "site",
+        KpiData.kpi_name.in_(SHARED_WORKBOOK_KPI_NAMES)
+    ).delete(synchronize_session=False)
+    db.session.flush()
+
+    total_inserted = 0
+    kpi_summary = []
+    errors = []
+
+    for ws in wb.worksheets:
+        kpi_name = ws.title.strip()
+        if not kpi_name:
+            continue
+
+        headers = [c.value for c in ws[1]]
+        if not headers:
+            errors.append(f"Sheet '{kpi_name}': missing header row")
+            continue
+
+        site_id_col = _find_site_id_column(headers)
+        if site_id_col is None:
+            errors.append(f"Sheet '{kpi_name}': no HomeSitecode/site ID column found")
+            continue
+
+        date_columns = _extract_excel_date_columns(headers, skip_indices={site_id_col})
+        if not date_columns:
+            errors.append(f"Sheet '{kpi_name}': no valid date columns found")
+            continue
+
+        sheet_inserted = 0
+        batch = []
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            site_id = str(row[site_id_col]).strip() if site_id_col < len(row) and row[site_id_col] else None
+            if not site_id or site_id == "None":
+                continue
+
+            for col_idx, date_val in date_columns:
+                if col_idx < len(row) and row[col_idx] is not None:
+                    try:
+                        val = float(row[col_idx])
+                    except (ValueError, TypeError):
                         continue
+                    batch.append(KpiData(
+                        site_id=site_id, kpi_name=kpi_name, date=date_val,
+                        hour=0, value=val, data_level="site"
+                    ))
+                    sheet_inserted += 1
 
-                    site_id = row[0]
+                    if len(batch) >= 2000:
+                        db.session.bulk_save_objects(batch)
+                        batch = []
 
-                    row_len = len(row)
+        if batch:
+            db.session.bulk_save_objects(batch)
 
-                    for col_idx, col_date in date_map:
+        total_inserted += sheet_inserted
+        kpi_summary.append({"name": kpi_name, "rows": sheet_inserted})
 
-                        if col_idx < row_len and row[col_idx] is not None:
+    db.session.commit()
+    return jsonify({
+        "message": f"Shared workbook data added to database: {total_inserted} records inserted across {len(kpi_summary)} sheets.",
+        "inserted": total_inserted,
+        "kpis_processed": len(kpi_summary),
+        "kpi_summary": kpi_summary,
+        "errors": errors,
+    })
 
-                            try:
-                                writer.writerow((site_id, kpi_name, col_date, 0, float(row[col_idx]), "site"))
-                                row_count += 1
-                            except:
-                                continue
 
-                    if row_count >= FLUSH_AT:
+@app.route("/api/admin/shared-site-workbook-summary", methods=["GET"])
+@jwt_required()
+def admin_shared_site_workbook_summary():
+    """Return summary for shared workbook KPI data only."""
+    user = User.query.get(int(get_jwt_identity()))
+    if not user or user.role != "admin":
+        return jsonify({"error": "Unauthorized"}), 403
 
-                        buf.seek(0)
-                        cur.copy_expert(COPY_SQL, buf)
+    total_records = db.session.query(db.func.count(KpiData.id)).filter(
+        KpiData.data_level == "site",
+        KpiData.kpi_name.in_(SHARED_WORKBOOK_KPI_NAMES)
+    ).scalar() or 0
 
-                        total_inserted += row_count
-                        raw_conn.commit()
+    total_sites = db.session.query(db.func.count(db.distinct(KpiData.site_id))).filter(
+        KpiData.data_level == "site",
+        KpiData.kpi_name.in_(SHARED_WORKBOOK_KPI_NAMES)
+    ).scalar() or 0
 
-                        buf.truncate(0)
-                        buf.seek(0)
+    return jsonify({
+        "total_sites": total_sites,
+        "total_records": total_records,
+    })
 
-                        row_count = 0
 
-            if row_count > 0:
-                buf.seek(0)
-                cur.copy_expert(COPY_SQL, buf)
-                total_inserted += row_count
-                raw_conn.commit()
+@app.route("/api/admin/delete-shared-site-workbook", methods=["DELETE"])
+@jwt_required()
+def admin_delete_shared_site_workbook():
+    """Delete all shared workbook KPI data only."""
+    user = User.query.get(int(get_jwt_identity()))
+    if not user or user.role != "admin":
+        return jsonify({"error": "Unauthorized"}), 403
 
-        finally:
+    count = KpiData.query.filter(
+        KpiData.data_level == "site",
+        KpiData.kpi_name.in_(SHARED_WORKBOOK_KPI_NAMES)
+    ).count()
+    KpiData.query.filter(
+        KpiData.data_level == "site",
+        KpiData.kpi_name.in_(SHARED_WORKBOOK_KPI_NAMES)
+    ).delete(synchronize_session=False)
+    db.session.commit()
+    return jsonify({"deleted": count})
 
-            for stmt in [
-                "CREATE INDEX IF NOT EXISTS idx_kpi_site_name_date ON kpi_data (site_id, kpi_name, date)",
-                "CREATE INDEX IF NOT EXISTS idx_kpi_data_level ON kpi_data (data_level, kpi_name)",
-                "CREATE INDEX IF NOT EXISTS ix_kpi_data_site_id ON kpi_data (site_id)",
-                "CREATE INDEX IF NOT EXISTS ix_kpi_data_kpi_name ON kpi_data (kpi_name)",
-            ]:
-                try:
-                    cur.execute(stmt)
-                except:
-                    pass
-
-            raw_conn.commit()
-            cur.close()
-            raw_conn.close()
-
-        return jsonify({"message": f"Successfully uploaded {total_inserted} site-level KPI records."}), 200
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-    finally:
-        if wb:
-            wb.close()
-        if os.path.exists(path):
-            os.remove(path)
 
 @app.route("/api/admin/upload-kpi-cell-level", methods=["POST"])
 @jwt_required()
 def admin_upload_kpi_cell_level():
-
-    user = db.session.get(User, int(get_jwt_identity()))
+    """Upload cell-level KPI workbook (27 sheets, sheet name = KPI name).
+    Each sheet: Site_ID, Cell_ID, Cell_Site_ID columns, then date columns with values."""
+    user = User.query.get(int(get_jwt_identity()))
     if not user or user.role != "admin":
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -3330,165 +3544,104 @@ def admin_upload_kpi_cell_level():
         return jsonify({"error": "No file provided"}), 400
 
     file = request.files["file"]
+    if not file.filename.lower().endswith((".xlsx", ".xlsm")):
+        return jsonify({"error": "Only .xlsx or .xlsm files are supported (.xls is not supported)."}), 400
+    ok, err = _validate_ooxml_excel_upload(file)
+    if not ok:
+        return jsonify({"error": err}), 400
 
-    if not file.filename.lower().endswith(('.xlsx', '.xlsm')):
-        return jsonify({"error": "Invalid file format."}), 400
+    import openpyxl
+    wb = openpyxl.load_workbook(file, data_only=True)
 
-    import openpyxl, tempfile, io, csv
-    from sqlalchemy import text as sa_text
+    # Clear old cell-level KPI data
+    KpiData.query.filter_by(data_level="cell").delete()
+    db.session.flush()
 
-    fd, path = tempfile.mkstemp(suffix=".xlsx")
-    wb = None
+    total_inserted = 0
+    kpi_summary = []
+    errors = []
 
-    try:
-        with os.fdopen(fd, 'wb') as tmp:
-            file.save(tmp)
+    for ws in wb.worksheets:
+        kpi_name = ws.title.strip()
+        if not kpi_name:
+            continue
 
-        wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+        headers = [c.value for c in ws[1]]
+        if not headers or len(headers) < 4:
+            errors.append(f"Sheet '{kpi_name}': insufficient columns (need Site_ID, Cell_ID, Cell_Site_ID + dates)")
+            continue
 
-        KPI_INDEXES = [
-            "idx_kpi_site_name_date",
-            "idx_kpi_data_level",
-            "ix_kpi_data_site_id",
-            "ix_kpi_data_kpi_name",
-        ]
+        # First 3 columns: Site_ID, Cell_ID, Cell_Site_ID; remaining are dates
+        date_columns = []
+        for col_idx in range(3, len(headers)):
+            h = headers[col_idx]
+            if h is None:
+                continue
+            try:
+                if isinstance(h, datetime):
+                    date_columns.append((col_idx, h.date()))
+                elif isinstance(h, str):
+                    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d"):
+                        try:
+                            date_columns.append((col_idx, datetime.strptime(h.strip(), fmt).date()))
+                            break
+                        except ValueError:
+                            continue
+                elif hasattr(h, 'date'):
+                    date_columns.append((col_idx, h.date()))
+            except Exception:
+                continue
 
-        COPY_SQL = """COPY kpi_data
-        (site_id, cell_id, cell_site_id, kpi_name, date, hour, value, data_level)
-        FROM STDIN WITH (FORMAT CSV, NULL '')"""
+        if not date_columns:
+            errors.append(f"Sheet '{kpi_name}': no valid date columns found")
+            continue
 
-        FLUSH_AT = 1_000_000
+        sheet_inserted = 0
+        batch = []
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            site_id = str(row[0]).strip() if row[0] else None
+            cell_id = str(row[1]).strip() if row[1] else None
+            cell_site_id = str(row[2]).strip() if row[2] else None
+            if not site_id or site_id == "None":
+                continue
 
-        raw_conn = db.engine.raw_connection()
-        cur = raw_conn.cursor()
-
-        cur.execute("SET synchronous_commit TO OFF")
-
-        try:
-            for idx in KPI_INDEXES:
-                cur.execute(f"DROP INDEX IF EXISTS {idx}")
-            raw_conn.commit()
-
-            buf = io.StringIO()
-            writer = csv.writer(buf)
-
-            row_count = 0
-            total_inserted = 0
-
-            for sheet_name in wb.sheetnames:
-
-                ws = wb[sheet_name]
-                rows_iter = ws.iter_rows(values_only=True)
-
-                headers = next(rows_iter, None)
-                if not headers:
-                    continue
-
-                kpi_name = sheet_name.strip()
-
-                date_map = []
-
-                for i in range(3, len(headers)):
-
-                    h = headers[i]
-                    if h is None:
+            for col_idx, date_val in date_columns:
+                if col_idx < len(row) and row[col_idx] is not None:
+                    try:
+                        val = float(row[col_idx])
+                    except (ValueError, TypeError):
                         continue
+                    batch.append(KpiData(
+                        site_id=site_id, kpi_name=kpi_name, date=date_val,
+                        hour=0, value=val, data_level="cell",
+                        cell_id=cell_id, cell_site_id=cell_site_id
+                    ))
+                    sheet_inserted += 1
 
-                    parsed_date = None
+                    if len(batch) >= 2000:
+                        db.session.bulk_save_objects(batch)
+                        batch = []
 
-                    if isinstance(h, datetime):
-                        parsed_date = h.date()
-                    elif isinstance(h, date):
-                        parsed_date = h
-                    else:
-                        for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d"):
-                            try:
-                                parsed_date = datetime.strptime(str(h).strip(), fmt).date()
-                                break
-                            except:
-                                pass
+        if batch:
+            db.session.bulk_save_objects(batch)
 
-                    if parsed_date is None:
-                        parsed_date = datetime.now().date()
+        total_inserted += sheet_inserted
+        kpi_summary.append({"name": kpi_name, "rows": sheet_inserted})
 
-                    date_map.append((i, parsed_date))
+    db.session.commit()
+    return jsonify({
+        "inserted": total_inserted,
+        "kpis_processed": len(kpi_summary),
+        "kpi_summary": kpi_summary,
+        "errors": errors,
+    })
 
-                if not date_map:
-                    continue
-
-                for row in rows_iter:
-
-                    if not row or not row[0]:
-                        continue
-
-                    site_id = row[0]
-                    cell_id = row[1] if len(row) > 1 else None
-                    cell_site_id = row[2] if len(row) > 2 else None
-
-                    row_len = len(row)
-
-                    for col_idx, col_date in date_map:
-
-                        if col_idx < row_len and row[col_idx] is not None:
-
-                            try:
-                                writer.writerow((site_id, cell_id, cell_site_id, kpi_name, col_date, 0, float(row[col_idx]), "cell"))
-                                row_count += 1
-                            except:
-                                continue
-
-                    if row_count >= FLUSH_AT:
-
-                        buf.seek(0)
-                        cur.copy_expert(COPY_SQL, buf)
-
-                        total_inserted += row_count
-                        raw_conn.commit()
-
-                        buf.truncate(0)
-                        buf.seek(0)
-
-                        row_count = 0
-
-            if row_count > 0:
-                buf.seek(0)
-                cur.copy_expert(COPY_SQL, buf)
-                total_inserted += row_count
-                raw_conn.commit()
-
-        finally:
-
-            for stmt in [
-                "CREATE INDEX IF NOT EXISTS idx_kpi_site_name_date ON kpi_data (site_id, kpi_name, date)",
-                "CREATE INDEX IF NOT EXISTS idx_kpi_data_level ON kpi_data (data_level, kpi_name)",
-                "CREATE INDEX IF NOT EXISTS ix_kpi_data_site_id ON kpi_data (site_id)",
-                "CREATE INDEX IF NOT EXISTS ix_kpi_data_kpi_name ON kpi_data (kpi_name)",
-            ]:
-                try:
-                    cur.execute(stmt)
-                except:
-                    pass
-
-            raw_conn.commit()
-            cur.close()
-            raw_conn.close()
-
-        return jsonify({"message": f"Successfully uploaded {total_inserted} cell-level KPI records."}), 200
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-    finally:
-        if wb:
-            wb.close()
-        if os.path.exists(path):
-            os.remove(path)
 
 @app.route("/api/admin/delete-sites", methods=["DELETE"])
 @jwt_required()
 def admin_delete_sites():
     """Delete all telecom site data."""
-    user = db.session.get(User, int(get_jwt_identity()))
+    user = User.query.get(int(get_jwt_identity()))
     if not user or user.role != "admin":
         return jsonify({"error": "Unauthorized"}), 403
     count = TelecomSite.query.count()
@@ -3501,7 +3654,7 @@ def admin_delete_sites():
 @jwt_required()
 def admin_delete_kpi_site_level():
     """Delete all site-level KPI data."""
-    user = db.session.get(User, int(get_jwt_identity()))
+    user = User.query.get(int(get_jwt_identity()))
     if not user or user.role != "admin":
         return jsonify({"error": "Unauthorized"}), 403
     count = KpiData.query.filter_by(data_level="site").count()
@@ -3514,7 +3667,7 @@ def admin_delete_kpi_site_level():
 @jwt_required()
 def admin_delete_kpi_cell_level():
     """Delete all cell-level KPI data."""
-    user = db.session.get(User, int(get_jwt_identity()))
+    user = User.query.get(int(get_jwt_identity()))
     if not user or user.role != "admin":
         return jsonify({"error": "Unauthorized"}), 403
     count = KpiData.query.filter_by(data_level="cell").count()
@@ -3527,13 +3680,16 @@ def admin_delete_kpi_cell_level():
 @jwt_required()
 def admin_uploaded_kpis():
     """Return list of uploaded KPI names with row counts, split by data level."""
-    user = db.session.get(User, int(get_jwt_identity()))
+    user = User.query.get(int(get_jwt_identity()))
     if not user or user.role != "admin":
         return jsonify({"error": "Unauthorized"}), 403
 
     site_kpis = db.session.query(
         KpiData.kpi_name, db.func.count(KpiData.id)
-    ).filter_by(data_level="site").group_by(KpiData.kpi_name).order_by(KpiData.kpi_name).all()
+    ).filter(
+        KpiData.data_level == "site",
+        ~KpiData.kpi_name.in_(SHARED_WORKBOOK_KPI_NAMES)
+    ).group_by(KpiData.kpi_name).order_by(KpiData.kpi_name).all()
 
     cell_kpis = db.session.query(
         KpiData.kpi_name, db.func.count(KpiData.id)
@@ -3602,7 +3758,7 @@ def calc_trend(current, previous):
 @jwt_required()
 def reports_overview():
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if user.role not in ("manager", "admin"):
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -3755,7 +3911,7 @@ def reports_overview():
 @jwt_required()
 def reports_agents():
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if user.role not in ("manager", "admin"):
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -3830,7 +3986,7 @@ def reports_agents():
 @jwt_required()
 def reports_csat():
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if user.role not in ("manager", "admin"):
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -3907,7 +4063,7 @@ def reports_csat():
 @jwt_required()
 def reports_sla():
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if user.role not in ("manager", "admin"):
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -4043,7 +4199,7 @@ def reports_sla():
 @jwt_required()
 def reports_export():
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if user.role not in ("manager", "admin"):
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -4117,24 +4273,8 @@ def reports_export():
 def agent_toggle_status():
     """Toggle human agent online/offline status."""
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if not user or user.role != "human_agent":
-        return jsonify({"error": "Unauthorized"}), 403
-    data = request.json or {}
-    if "is_online" in data:
-        user.is_online = bool(data["is_online"])
-    else:
-        user.is_online = not user.is_online
-    db.session.commit()
-    return jsonify({"is_online": user.is_online, "message": f"Status set to {'online' if user.is_online else 'offline'}"})
-
-
-@app.route("/api/manager/status", methods=["PUT"])
-@jwt_required()
-def manager_toggle_status():
-    user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
-    if not user or user.role != "manager":
         return jsonify({"error": "Unauthorized"}), 403
     data = request.json or {}
     if "is_online" in data:
@@ -4150,7 +4290,7 @@ def manager_toggle_status():
 def agent_dashboard():
     """Return KPIs for the human agent."""
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if not user or user.role != "human_agent":
         return jsonify({"error": "Unauthorized"}), 403
 
@@ -4297,10 +4437,14 @@ def agent_dashboard():
 def agent_tickets():
     """Return tickets assigned to the current human agent."""
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if not user or user.role != "human_agent":
         return jsonify({"error": "Unauthorized"}), 403
-    tickets = Ticket.query.filter_by(assigned_to=user_id).order_by(Ticket.created_at.desc()).all()
+    from sqlalchemy import or_
+    tickets = (Ticket.query
+               .filter(or_(Ticket.assigned_to == user_id, Ticket.escalated_by == user_id))
+               .order_by(Ticket.created_at.desc())
+               .all())
     return jsonify({"tickets": [t.to_dict() for t in tickets]})
 
 
@@ -4309,10 +4453,10 @@ def agent_tickets():
 def agent_resolve_ticket(ticket_id):
     """Mark a ticket as resolved by the agent."""
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if not user or user.role != "human_agent":
         return jsonify({"error": "Unauthorized"}), 403
-    ticket = db.session.get(Ticket, ticket_id)
+    ticket = Ticket.query.get(ticket_id)
     if not ticket:
         return jsonify({"error": "Ticket not found"}), 404
     if ticket.assigned_to != user_id:
@@ -4334,7 +4478,7 @@ def agent_resolve_ticket(ticket_id):
     # ── Add a bot message to the chat session so the customer sees it ──
     chat_session = None
     if ticket.chat_session_id:
-        chat_session = db.session.get(ChatSession, ticket.chat_session_id)
+        chat_session = ChatSession.query.get(ticket.chat_session_id)
         if chat_session:
             resolve_text = (
                 f"Great news! Your support ticket ({ticket.reference_number}) has been resolved by "
@@ -4357,7 +4501,7 @@ def agent_resolve_ticket(ticket_id):
     db.session.commit()
 
     # ── Notify customer via Email ──
-    customer_user = db.session.get(User, ticket.user_id)
+    customer_user = User.query.get(ticket.user_id)
     if customer_user and customer_user.email:
         try:
             notes_row = f"<tr><td style='padding:8px 0;color:#64748b;width:140px;'>Resolution</td><td style='padding:8px 0;color:#1e293b;'>{resolution_notes}</td></tr>" if resolution_notes else ""
@@ -4449,17 +4593,23 @@ def agent_get_parameter_change(ticket_id):
     return jsonify({"change": change.to_dict() if change else None})
 
 
+def _generate_cr_number():
+    """Generate a unique CR number: CR-YYYYMMDD-XXXX."""
+    today = datetime.now(timezone.utc).strftime("%Y%m%d")
+    suffix = ''.join(random.choices(string.ascii_uppercase + string.digits, k=4))
+    candidate = f"CR-{today}-{suffix}"
+    while ChangeRequest.query.filter_by(cr_number=candidate).first():
+        suffix = ''.join(random.choices(string.ascii_uppercase + string.digits, k=4))
+        candidate = f"CR-{today}-{suffix}"
+    return candidate
+
+
 @app.route("/api/agent/tickets/<int:ticket_id>/parameter-change", methods=["POST"])
 @jwt_required()
 def agent_create_parameter_change(ticket_id):
     """
     Create a parameter-change request AND escalate the ticket to a manager.
-
-    Once submitted:
-    - A ParameterChange record is created (for the approval matrix).
-    - The ticket is reassigned to the best manager (priority-driven).
-    - Ticket status is set to 'manager_escalated'.
-    - The ticket disappears from the expert's queue immediately.
+    Also creates a ChangeRequest (CR) for the full ITIL Change Workflow.
     """
     user_id = int(get_jwt_identity())
     user = db.session.get(User, user_id)
@@ -4475,7 +4625,9 @@ def agent_create_parameter_change(ticket_id):
         return jsonify({"error": "Ticket is already escalated to a manager"}), 409
 
     data = request.json or {}
-    proposed = (data.get("proposed_change") or "").strip()
+    proposed = (data.get("proposed_change")   or "").strip()
+    impact   = (data.get("impact_assessment") or "").strip()
+    rollback = (data.get("rollback_plan")     or "").strip()
     if not proposed:
         return jsonify({"error": "Proposed change is required"}), 400
 
@@ -4486,10 +4638,8 @@ def agent_create_parameter_change(ticket_id):
     if existing_pending:
         return jsonify({"error": "A pending change request already exists"}), 409
 
-    # ── Find best manager based on ticket priority ────────────────────────────
     manager = _find_best_manager(ticket.priority)
 
-    # ── Create the parameter-change record ────────────────────────────────────
     change = ParameterChange(
         ticket_id=ticket_id,
         agent_id=user_id,
@@ -4497,12 +4647,26 @@ def agent_create_parameter_change(ticket_id):
         status="pending",
     )
     db.session.add(change)
+    db.session.flush()
 
-    # ── Escalate the ticket: reassign to manager, update status & audit fields ─
+    cr_title = f"Parameter Change: {ticket.category or 'General'} — {ticket.reference_number}"
+    cr = ChangeRequest(
+        cr_number           = _generate_cr_number(),
+        ticket_id           = ticket_id,
+        parameter_change_id = change.id,
+        raised_by           = user_id,
+        title               = cr_title,
+        description         = proposed,
+        impact_assessment   = impact,
+        rollback_plan       = rollback,
+        status              = "created",
+    )
+    db.session.add(cr)
+
     now_utc = datetime.now(timezone.utc)
-    ticket.status = "manager_escalated"
-    ticket.escalated_by = user_id
-    ticket.escalated_at = now_utc
+    ticket.status          = "manager_escalated"
+    ticket.escalated_by    = user_id
+    ticket.escalated_at    = now_utc
     ticket.escalation_note = proposed
     if manager:
         ticket.assigned_to = manager.id
@@ -4510,14 +4674,100 @@ def agent_create_parameter_change(ticket_id):
     db.session.commit()
 
     return jsonify({
-        "change": change.to_dict(),
-        "ticket": ticket.to_dict(),
-        "assigned_manager": {
-            "id": manager.id,
-            "name": manager.name,
-            "email": manager.email,
-        } if manager else None,
+        "change":           change.to_dict(),
+        "cr":               cr.to_dict(),
+        "ticket":           ticket.to_dict(),
+        "assigned_manager": {"id": manager.id, "name": manager.name, "email": manager.email} if manager else None,
     }), 201
+
+
+@app.route("/api/agent/change-requests/<int:cr_id>/resubmit", methods=["PUT"])
+@jwt_required()
+def agent_resubmit_cr(cr_id):
+    user_id = int(get_jwt_identity())
+    user    = db.session.get(User, user_id)
+    if not user or user.role != "human_agent":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    cr = db.session.get(ChangeRequest, cr_id)
+    if not cr:
+        return jsonify({"error": "Change request not found"}), 404
+    if cr.raised_by != user_id:
+        return jsonify({"error": "Not your change request"}), 403
+    if cr.status != "invalid":
+        return jsonify({"error": "Only invalid CRs can be resubmitted"}), 409
+    if cr.rejection_count >= 2:
+        return jsonify({"error": "Maximum rejections reached. CR is permanently closed."}), 409
+
+    data        = request.json or {}
+    description = (data.get("description")      or "").strip()
+    impact      = (data.get("impact_assessment") or "").strip()
+    rollback    = (data.get("rollback_plan")     or "").strip()
+    if not description:
+        return jsonify({"error": "Description is required"}), 400
+
+    cr.description       = description
+    cr.impact_assessment = impact
+    cr.rollback_plan     = rollback
+    cr.status            = "created"
+    cr.updated_at        = datetime.now(timezone.utc)
+    db.session.commit()
+    return jsonify({"cr": cr.to_dict()})
+
+
+@app.route("/api/agent/change-requests/<int:cr_id>/implement", methods=["PUT"])
+@jwt_required()
+def agent_implement_cr(cr_id):
+    user_id = int(get_jwt_identity())
+    user    = db.session.get(User, user_id)
+    if not user or user.role != "human_agent":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    cr = db.session.get(ChangeRequest, cr_id)
+    if not cr:
+        return jsonify({"error": "Change request not found"}), 404
+    if cr.raised_by != user_id:
+        return jsonify({"error": "Not your change request"}), 403
+    if cr.status not in ("approved", "implementing"):
+        return jsonify({"error": "CR is not in approved state"}), 409
+
+    data   = request.json or {}
+    result = (data.get("result") or "").strip()
+    notes  = (data.get("notes")  or "").strip()
+    if result not in ("success", "failed"):
+        return jsonify({"error": "result must be 'success' or 'failed'"}), 400
+
+    now = datetime.now(timezone.utc)
+    cr.status               = "implemented" if result == "success" else "failed"
+    cr.implementation_notes = notes
+    cr.implemented_by       = user_id
+    cr.implemented_at       = now
+    cr.updated_at           = now
+    db.session.commit()
+    return jsonify({"cr": cr.to_dict()})
+
+
+@app.route("/api/agent/change-requests/<int:cr_id>/rollback", methods=["PUT"])
+@jwt_required()
+def agent_rollback_cr(cr_id):
+    user_id = int(get_jwt_identity())
+    user    = db.session.get(User, user_id)
+    if not user or user.role != "human_agent":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    cr = db.session.get(ChangeRequest, cr_id)
+    if not cr or cr.raised_by != user_id:
+        return jsonify({"error": "Not found or unauthorized"}), 404
+    if cr.status != "failed":
+        return jsonify({"error": "CR is not in failed state"}), 409
+
+    data = request.json or {}
+    cr.status         = "rolled_back"
+    cr.rollback_notes = (data.get("notes") or "").strip()
+    cr.rollback_at    = datetime.now(timezone.utc)
+    cr.updated_at     = datetime.now(timezone.utc)
+    db.session.commit()
+    return jsonify({"cr": cr.to_dict()})
 
 
 # ── Network diagnosis routes (delegated to network_diagnosis.py) ──────────────
@@ -4533,11 +4783,11 @@ def agent_create_parameter_change(ticket_id):
 def agent_customer360(customer_user_id):
     """Return 360-degree customer view: plan, billing history, past complaints, location, loyalty."""
     user_id = int(get_jwt_identity())
-    agent = db.session.get(User, user_id)
+    agent = User.query.get(user_id)
     if not agent or agent.role != "human_agent":
         return jsonify({"error": "Unauthorized"}), 403
 
-    customer = db.session.get(User, customer_user_id)
+    customer = User.query.get(customer_user_id)
     if not customer:
         return jsonify({"error": "Customer not found"}), 404
 
@@ -4621,10 +4871,10 @@ def agent_customer360(customer_user_id):
 def agent_view_chat(session_id):
     """Allow human agent to view full chat history of a session."""
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if not user or user.role != "human_agent":
         return jsonify({"error": "Unauthorized"}), 403
-    session = db.session.get(ChatSession, session_id)
+    session = ChatSession.query.get(session_id)
     if not session:
         return jsonify({"error": "Session not found"}), 404
     # Verify the agent has an assigned ticket for this session
@@ -4649,10 +4899,10 @@ def agent_view_chat(session_id):
 def agent_send_message(session_id):
     """Human agent sends a message into a customer chat session."""
     user_id = int(get_jwt_identity())
-    user = db.session.get(User, user_id)
+    user = User.query.get(user_id)
     if not user or user.role != "human_agent":
         return jsonify({"error": "Unauthorized"}), 403
-    session = db.session.get(ChatSession, session_id)
+    session = ChatSession.query.get(session_id)
     if not session:
         return jsonify({"error": "Session not found"}), 404
     assigned_ticket = Ticket.query.filter_by(
@@ -4673,33 +4923,6 @@ def agent_send_message(session_id):
     )
     db.session.add(msg)
     db.session.commit()
-    _emit_session_message(msg)
-    return jsonify({"message": msg.to_dict()}), 201
-
-
-@app.route("/api/agent/chat/<int:session_id>/request-diagnosis", methods=["POST"])
-@jwt_required()
-def agent_request_diagnosis(session_id):
-    """Agent requests the customer to run a signal diagnosis."""
-    user_id = int(get_jwt_identity())
-    user = User.query.get(user_id)
-    if not user or user.role != "human_agent":
-        return jsonify({"error": "Unauthorized"}), 403
-    session = ChatSession.query.get(session_id)
-    if not session:
-        return jsonify({"error": "Session not found"}), 404
-    if session.diagnosis_ran:
-        return jsonify({"error": "Diagnosis already completed for this session"}), 400
-
-    # Insert a special system-trigger message the customer's chat will detect
-    msg = ChatMessage(
-        session_id=session_id,
-        sender="agent",
-        content="__AGENT_REQUEST_DIAGNOSIS__",
-    )
-    db.session.add(msg)
-    db.session.commit()
-    _emit_session_message(msg)
     return jsonify({"message": msg.to_dict()}), 201
 
 
@@ -4888,53 +5111,6 @@ with app.app_context():
     # Migrate: add new columns to kpi_data if they don't exist
     from sqlalchemy import inspect as sa_inspect, text as sa_text
     insp = sa_inspect(db.engine)
-
-    def _safe_exec(conn, sql, label):
-        """Execute DDL safely: rollback on error so later statements still run."""
-        try:
-            conn.execute(sa_text(sql))
-            conn.commit()
-            print(f">>> {label}")
-        except Exception as e:
-            conn.rollback()
-            print(f"⚠️ Skipped {label}: {e}")
-
-    if insp.has_table("chat_sessions"):
-        existing_cols = [c["name"] for c in insp.get_columns("chat_sessions")]
-        with db.engine.connect() as conn:
-            if "customer_present" not in existing_cols:
-                _safe_exec(conn, "ALTER TABLE chat_sessions ADD COLUMN customer_present BOOLEAN NOT NULL DEFAULT FALSE", "Added customer_present column to chat_sessions")
-    if insp.has_table("telecom_sites"):
-        existing_cols = [c["name"] for c in insp.get_columns("telecom_sites")]
-        with db.engine.connect() as conn:
-            # Drop legacy unique constraint on site_id if present
-            _safe_exec(conn, "ALTER TABLE telecom_sites DROP CONSTRAINT IF EXISTS telecom_sites_site_id_key", "Dropped legacy telecom_sites_site_id_key constraint")
-            # Add composite unique constraint (site_id, cell_id)
-            _safe_exec(conn,
-                "DO $$ BEGIN "
-                "IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'uq_telecom_sites_site_cell') THEN "
-                "ALTER TABLE telecom_sites ADD CONSTRAINT uq_telecom_sites_site_cell UNIQUE (site_id, cell_id); "
-                "END IF; "
-                "END $$;",
-                "Ensured uq_telecom_sites_site_cell unique constraint")
-            if "site_name" not in existing_cols:
-                _safe_exec(conn, "ALTER TABLE telecom_sites ADD COLUMN site_name VARCHAR(100)", "Added site_name column to telecom_sites")
-            if "cell_id" not in existing_cols:
-                _safe_exec(conn, "ALTER TABLE telecom_sites ADD COLUMN cell_id VARCHAR(100)", "Added cell_id column to telecom_sites")
-            if "standard_solution_step" not in existing_cols:
-                _safe_exec(conn, "ALTER TABLE telecom_sites ADD COLUMN standard_solution_step TEXT", "Added standard_solution_step column to telecom_sites")
-            if "bandwidth_mhz" not in existing_cols:
-                _safe_exec(conn, "ALTER TABLE telecom_sites ADD COLUMN bandwidth_mhz DOUBLE PRECISION", "Added bandwidth_mhz column to telecom_sites")
-            if "antenna_gain_dbi" not in existing_cols:
-                _safe_exec(conn, "ALTER TABLE telecom_sites ADD COLUMN antenna_gain_dbi DOUBLE PRECISION", "Added antenna_gain_dbi column to telecom_sites")
-            if "rf_power_eirp_dbm" not in existing_cols:
-                _safe_exec(conn, "ALTER TABLE telecom_sites ADD COLUMN rf_power_eirp_dbm DOUBLE PRECISION", "Added rf_power_eirp_dbm column to telecom_sites")
-            if "antenna_height_agl_m" not in existing_cols:
-                _safe_exec(conn, "ALTER TABLE telecom_sites ADD COLUMN antenna_height_agl_m DOUBLE PRECISION", "Added antenna_height_agl_m column to telecom_sites")
-            if "e_tilt_degree" not in existing_cols:
-                _safe_exec(conn, "ALTER TABLE telecom_sites ADD COLUMN e_tilt_degree DOUBLE PRECISION", "Added e_tilt_degree column to telecom_sites")
-            if "crs_gain" not in existing_cols:
-                _safe_exec(conn, "ALTER TABLE telecom_sites ADD COLUMN crs_gain DOUBLE PRECISION", "Added crs_gain column to telecom_sites")
     if insp.has_table("kpi_data"):
         existing_cols = [c["name"] for c in insp.get_columns("kpi_data")]
         with db.engine.connect() as conn:
@@ -4950,40 +5126,22 @@ with app.app_context():
                 conn.execute(sa_text("ALTER TABLE kpi_data ADD COLUMN cell_site_id VARCHAR(100)"))
                 conn.commit()
                 print(">>> Added cell_site_id column to kpi_data")
-    if insp.has_table("chat_messages"):
-        existing_cols = [c["name"] for c in insp.get_columns("chat_messages")]
+
+    if insp.has_table("telecom_sites"):
+        existing_cols = [c["name"] for c in insp.get_columns("telecom_sites")]
         with db.engine.connect() as conn:
-            if "delivered_at" not in existing_cols:
-                conn.execute(sa_text("ALTER TABLE chat_messages ADD COLUMN delivered_at TIMESTAMP"))
+            if "site_status" not in existing_cols:
+                conn.execute(text("ALTER TABLE telecom_sites ADD COLUMN site_status VARCHAR(20) DEFAULT 'on_air'"))
                 conn.commit()
-                print(">>> Added delivered_at column to chat_messages")
-            if "seen_at" not in existing_cols:
-                conn.execute(sa_text("ALTER TABLE chat_messages ADD COLUMN seen_at TIMESTAMP"))
+                print(">>> Added site_status column to telecom_sites")
+            if "alarms" not in existing_cols:
+                conn.execute(text("ALTER TABLE telecom_sites ADD COLUMN alarms TEXT DEFAULT ''"))
                 conn.commit()
-                print(">>> Added seen_at column to chat_messages")
-            if "content_json" not in existing_cols:
-                conn.execute(sa_text("ALTER TABLE chat_messages ADD COLUMN content_json JSON"))
+                print(">>> Added alarms column to telecom_sites")
+            if "solution" not in existing_cols:
+                conn.execute(text("ALTER TABLE telecom_sites ADD COLUMN solution TEXT DEFAULT ''"))
                 conn.commit()
-                print(">>> Added content_json column to chat_messages")
-    if insp.has_table("chat_sessions"):
-        existing_cols = [c["name"] for c in insp.get_columns("chat_sessions")]
-        with db.engine.connect() as conn:
-            if "diagnosis_ran" not in existing_cols:
-                conn.execute(sa_text("ALTER TABLE chat_sessions ADD COLUMN diagnosis_ran BOOLEAN NOT NULL DEFAULT FALSE"))
-                conn.commit()
-                print(">>> Added diagnosis_ran column to chat_sessions")
-            if "current_step" not in existing_cols:
-                conn.execute(sa_text("ALTER TABLE chat_sessions ADD COLUMN current_step VARCHAR(50) NOT NULL DEFAULT 'greeting'"))
-                conn.commit()
-                print(">>> Added current_step column to chat_sessions")
-            if "last_message_at" not in existing_cols:
-                conn.execute(sa_text("ALTER TABLE chat_sessions ADD COLUMN last_message_at TIMESTAMP DEFAULT NOW()"))
-                conn.commit()
-                print(">>> Added last_message_at column to chat_sessions")
-            if "customer_present" not in existing_cols:
-                conn.execute(sa_text("ALTER TABLE chat_sessions ADD COLUMN customer_present BOOLEAN NOT NULL DEFAULT FALSE"))
-                conn.commit()
-                print(">>> Added customer_present column to chat_sessions")
+                print(">>> Added solution column to telecom_sites")
 
     # Seed default admin if none exists
     if not User.query.filter_by(role="admin").first():
@@ -5045,3 +5203,6 @@ def serve_react(path):
 if __name__ == "__main__":
     run_sla_checks()
     app.run(debug=True, host="0.0.0.0", port=5500, use_reloader=False)
+
+
+    app.run(debug=True, port=5500, use_reloader=False)
