@@ -3717,18 +3717,25 @@ def admin_upload_kpi_site_level():
         return jsonify({"error": err}), 400
 
     import openpyxl
-    wb = openpyxl.load_workbook(file, data_only=True)
+    wb = openpyxl.load_workbook(file, data_only=True, read_only=True)
 
     total_inserted = 0
     kpi_summary = []
     errors = []
+    CHUNK = 3000
 
     for ws in wb.worksheets:
         kpi_name = ws.title.strip()
         if not kpi_name:
             continue
 
-        headers = [c.value for c in ws[1]]
+        rows_iter = ws.iter_rows(values_only=True)
+        try:
+            headers = next(rows_iter)
+        except StopIteration:
+            errors.append(f"Sheet '{kpi_name}': empty sheet")
+            continue
+
         if not headers or len(headers) < 2:
             errors.append(f"Sheet '{kpi_name}': insufficient columns")
             continue
@@ -3760,7 +3767,7 @@ def admin_upload_kpi_site_level():
 
         sheet_inserted = 0
         batch = []
-        for row in ws.iter_rows(min_row=2, values_only=True):
+        for row in rows_iter:
             site_id = str(row[0]).strip() if row[0] else None
             if not site_id or site_id == "None":
                 continue
@@ -3771,23 +3778,34 @@ def admin_upload_kpi_site_level():
                         val = float(row[col_idx])
                     except (ValueError, TypeError):
                         continue
-                    batch.append(KpiData(
-                        site_id=site_id, kpi_name=kpi_name, date=date_val,
-                        hour=0, value=val, data_level="site"
-                    ))
+                    batch.append({
+                        "site_id": site_id, "kpi_name": kpi_name,
+                        "date": date_val, "hour": 0, "value": val,
+                        "data_level": "site", "cell_id": None, "cell_site_id": None,
+                    })
                     sheet_inserted += 1
 
-                    if len(batch) >= 2000:
-                        db.session.bulk_save_objects(batch)
+                    if len(batch) >= CHUNK:
+                        db.session.execute(
+                            text("INSERT INTO kpi_data (site_id,kpi_name,date,hour,value,data_level,cell_id,cell_site_id) VALUES (:site_id,:kpi_name,:date,:hour,:value,:data_level,:cell_id,:cell_site_id)"),
+                            batch,
+                        )
+                        db.session.commit()
                         batch = []
 
         if batch:
-            db.session.bulk_save_objects(batch)
+            db.session.execute(
+                text("INSERT INTO kpi_data (site_id,kpi_name,date,hour,value,data_level,cell_id,cell_site_id) VALUES (:site_id,:kpi_name,:date,:hour,:value,:data_level,:cell_id,:cell_site_id)"),
+                batch,
+            )
+            db.session.commit()
 
         total_inserted += sheet_inserted
         kpi_summary.append({"name": kpi_name, "rows": sheet_inserted})
+        app.logger.info(f"Site-level upload: sheet '{kpi_name}' done — {sheet_inserted} rows")
 
-    db.session.commit()
+    wb.close()
+    clear_analytics_cache()
     return jsonify({
         "inserted": total_inserted,
         "kpis_processed": len(kpi_summary),
@@ -3941,18 +3959,25 @@ def admin_upload_kpi_cell_level():
         return jsonify({"error": err}), 400
 
     import openpyxl
-    wb = openpyxl.load_workbook(file, data_only=True)
+    wb = openpyxl.load_workbook(file, data_only=True, read_only=True)
 
     total_inserted = 0
     kpi_summary = []
     errors = []
+    CHUNK = 3000
 
     for ws in wb.worksheets:
         kpi_name = ws.title.strip()
         if not kpi_name:
             continue
 
-        headers = [c.value for c in ws[1]]
+        rows_iter = ws.iter_rows(values_only=True)
+        try:
+            headers = next(rows_iter)
+        except StopIteration:
+            errors.append(f"Sheet '{kpi_name}': empty sheet")
+            continue
+
         if not headers or len(headers) < 4:
             errors.append(f"Sheet '{kpi_name}': insufficient columns (need Site_ID, Cell_ID, Cell_Site_ID + dates)")
             continue
@@ -3984,7 +4009,7 @@ def admin_upload_kpi_cell_level():
 
         sheet_inserted = 0
         batch = []
-        for row in ws.iter_rows(min_row=2, values_only=True):
+        for row in rows_iter:
             site_id = str(row[0]).strip() if row[0] else None
             cell_id = str(row[1]).strip() if row[1] else None
             cell_site_id = str(row[2]).strip() if row[2] else None
@@ -3997,24 +4022,34 @@ def admin_upload_kpi_cell_level():
                         val = float(row[col_idx])
                     except (ValueError, TypeError):
                         continue
-                    batch.append(KpiData(
-                        site_id=site_id, kpi_name=kpi_name, date=date_val,
-                        hour=0, value=val, data_level="cell",
-                        cell_id=cell_id, cell_site_id=cell_site_id
-                    ))
+                    batch.append({
+                        "site_id": site_id, "kpi_name": kpi_name,
+                        "date": date_val, "hour": 0, "value": val,
+                        "data_level": "cell", "cell_id": cell_id, "cell_site_id": cell_site_id,
+                    })
                     sheet_inserted += 1
 
-                    if len(batch) >= 2000:
-                        db.session.bulk_save_objects(batch)
+                    if len(batch) >= CHUNK:
+                        db.session.execute(
+                            text("INSERT INTO kpi_data (site_id,kpi_name,date,hour,value,data_level,cell_id,cell_site_id) VALUES (:site_id,:kpi_name,:date,:hour,:value,:data_level,:cell_id,:cell_site_id)"),
+                            batch,
+                        )
+                        db.session.commit()
                         batch = []
 
         if batch:
-            db.session.bulk_save_objects(batch)
+            db.session.execute(
+                text("INSERT INTO kpi_data (site_id,kpi_name,date,hour,value,data_level,cell_id,cell_site_id) VALUES (:site_id,:kpi_name,:date,:hour,:value,:data_level,:cell_id,:cell_site_id)"),
+                batch,
+            )
+            db.session.commit()
 
         total_inserted += sheet_inserted
         kpi_summary.append({"name": kpi_name, "rows": sheet_inserted})
+        app.logger.info(f"Cell-level upload: sheet '{kpi_name}' done — {sheet_inserted} rows")
 
-    db.session.commit()
+    wb.close()
+    clear_analytics_cache()
     return jsonify({
         "inserted": total_inserted,
         "kpis_processed": len(kpi_summary),
