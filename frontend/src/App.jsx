@@ -67,6 +67,7 @@ export default function App() {
 
       {/* Customer Routes */}
       <Route path="/customer" element={<ProtectedRoute roles={['customer']}><CustomerLayout /></ProtectedRoute>}>
+        <Route index element={<Navigate to="dashboard" replace />} />
         <Route path="dashboard" element={<CustomerDashboard />} />
         <Route path="chat" element={<ChatSupport />} />
         <Route path="feedback" element={<FeedbackPage />} />
@@ -75,6 +76,7 @@ export default function App() {
 
       {/* Manager Routes */}
       <Route path="/manager" element={<ProtectedRoute roles={['manager']}><ManagerLayout /></ProtectedRoute>}>
+        <Route index element={<Navigate to="dashboard" replace />} />
         <Route path="dashboard" element={<ManagerDashboard />} />
         <Route path="chat" element={<ManagerChatSupport />} />
         <Route path="tickets" element={<ActiveTickets />} />
@@ -88,6 +90,7 @@ export default function App() {
 
       {/* CTO Routes */}
       <Route path="/cto" element={<ProtectedRoute roles={['cto']}><CTOLayout /></ProtectedRoute>}>
+        <Route index element={<Navigate to="dashboard" replace />} />
         <Route path="dashboard" element={<CTODashboard />} />
         <Route path="technical" element={<TechnicalKPI />} />
         <Route path="business" element={<BusinessKPI />} />
@@ -102,6 +105,7 @@ export default function App() {
 
       {/* Admin Routes */}
       <Route path="/admin" element={<ProtectedRoute roles={['admin']}><AdminLayout /></ProtectedRoute>}>
+        <Route index element={<Navigate to="dashboard" replace />} />
         <Route path="dashboard" element={<AdminDashboard />} />
         <Route path="users" element={<UserManagement />} />
         <Route path="tickets" element={<ActiveTickets />} />
@@ -116,6 +120,7 @@ export default function App() {
 
       {/* Human Agent Routes */}
       <Route path="/agent" element={<ProtectedRoute roles={['human_agent']}><AgentLayout /></ProtectedRoute>}>
+        <Route index element={<Navigate to="dashboard" replace />} />
         <Route path="dashboard" element={<AgentDashboard />} />
         <Route path="tickets" element={<AgentTicketBucket />} />
         <Route path="chat/:sessionId" element={<AgentChatView />} />
@@ -124,7 +129,7 @@ export default function App() {
         <Route path="network-issues" element={<NetworkIssues />} />
       </Route>
 
-      <Route path="*" element={<Navigate to="/" />} />
+      <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
   );
 }

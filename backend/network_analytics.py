@@ -3281,7 +3281,7 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text):
 
     azure_key        = _cfg("AZURE_OPENAI_API_KEY")
     azure_endpoint   = _cfg("AZURE_OPENAI_ENDPOINT")
-    azure_deployment = _cfg("AZURE_DEPLOYMENT_NAME", "gpt-4o-mini")
+    azure_deployment = _cfg("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini")
     azure_version    = _cfg("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
     gemini_key       = _cfg("GEMINI_API_KEY")
     gemini_model     = _cfg("OPENAI_MODEL", "gemini-2.0-flash")

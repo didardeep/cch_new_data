@@ -142,13 +142,6 @@ def _build_llm_client():
 
 
 client, DEPLOYMENT_NAME = _build_llm_client()
-# ─── Azure OpenAI Configuration (pulled from .env) ───────────────────────────
-client = AzureOpenAI(
-    api_key=os.environ.get("AZURE_OPENAI_API_KEY"),
-    azure_endpoint=os.environ.get("AZURE_OPENAI_ENDPOINT"),
-    api_version=os.environ.get("AZURE_OPENAI_API_VERSION", "2023-07-01-preview"),
-)
-DEPLOYMENT_NAME = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini")
 
 # ─── Init AI prompt modules ───────────────────────────────────────────────────
 # Initialise both modules with the shared Azure OpenAI client so they can
@@ -1149,6 +1142,196 @@ def auto_assign_priority(query_text, subprocess_name):
     return "low"
 
 
+# ─── Agent Routing Constants & Helpers ─────────────────────────────────────────
+
+SECTOR_TO_DOMAIN = {
+    "Mobile Services (Prepaid / Postpaid)": "mobile",
+    "Broadband / Internet Services": "broadband",
+    "DTH / Cable TV Services": "dth",
+    "Landline / Fixed Line Services": "landline",
+    "Enterprise / Business Solutions": "enterprise",
+}
+
+VALID_EXPERT_DOMAINS = {"mobile", "broadband", "dth", "landline", "enterprise", "fiber"}
+
+# Maps complaint subcategories → agent expertise for routing
+SUBPROCESS_TO_EXPERTISE = {
+    # Mobile subcategories
+    "Billing & Payment Issues": "GENERAL",
+    "Network / Signal Problems": "NETWORK_RF",
+    "SIM Card & Activation": "GENERAL",
+    "Data Plan & Recharge Issues": "GENERAL",
+    "International Roaming": "GENERAL",
+    "Mobile Number Portability (MNP)": "GENERAL",
+    "Call / SMS Failures": "VoLTE",
+    # Broadband subcategories
+    "Slow Speed / No Connectivity": "NETWORK_OPTIMIZATION",
+    "Frequent Disconnections": "NETWORK_RF",
+    "Billing & Plan Issues": "GENERAL",
+    "New Connection / Installation": "GENERAL",
+    "Router / Equipment Problems": "GENERAL",
+    # DTH subcategories
+    "Channel Not Working / Missing": "GENERAL",
+    "Set-Top Box Issues": "GENERAL",
+    "Billing & Subscription": "GENERAL",
+    "Signal / Picture Quality": "NETWORK_RF",
+    "Package / Plan Changes": "GENERAL",
+    # Landline subcategories
+    "No Dial Tone / Dead Line": "NETWORK_RF",
+    "Call Quality Issues (Noise / Echo)": "VoLTE",
+    "Billing & Charges": "GENERAL",
+    "New Connection / Disconnection": "GENERAL",
+    "Fault Repair Request": "NETWORK_RF",
+    # Enterprise subcategories
+    "SLA Breach / Service Downtime": "NETWORK_OPTIMIZATION",
+    "Leased Line / Dedicated Connection": "TRANSPORT",
+    "Bulk / Corporate Plan Issues": "GENERAL",
+    "Cloud / VPN / MPLS Issues": "TRANSPORT",
+    "Technical Support Escalation": "NETWORK_OPTIMIZATION",
+}
+
+
+def _resolve_expertise(subprocess_name: str) -> str:
+    """Map a complaint subcategory to agent expertise."""
+    return SUBPROCESS_TO_EXPERTISE.get(subprocess_name or "", "GENERAL")
+
+
+def _resolve_ticket_domain(sector_name: str) -> str:
+    """Return the domain slug for a sector name, defaulting to 'mobile'."""
+    return SECTOR_TO_DOMAIN.get(sector_name or "", "mobile")
+
+
+def _open_ticket_count(agent_id: int) -> int:
+    """Count open (pending/in_progress) tickets assigned to an agent."""
+    return Ticket.query.filter(
+        Ticket.assigned_to == agent_id,
+        Ticket.status.in_(["pending", "in_progress"]),
+    ).count()
+
+
+def _extract_city_from_address(address: str | None) -> str:
+    """
+    Extract a clean city name from a free-text address string.
+    Scans all known expert cities and returns the first one found as a
+    substring (case-insensitive).
+    """
+    if not address:
+        return ""
+    address_lower = address.strip().lower()
+    cities = {
+        (u.location or "").strip().lower()
+        for u in User.query.filter_by(role="human_agent").with_entities(User.location).all()
+        if u.location
+    }
+    for city in sorted(cities, key=len, reverse=True):
+        if city and city in address_lower:
+            return city
+    return address_lower
+
+
+def _find_best_expert(domain: str, city: str | None, priority: str = "low", expertise: str = None) -> "User | None":
+    """
+    Agent routing with 4 factors:
+    1. Domain = complaint category (mobile/broadband/dth/landline/enterprise)
+    2. Expertise = complaint subcategory (NETWORK_RF/VoLTE/TRANSPORT/GENERAL etc.)
+    3. Location = nearest to customer (for network issues)
+    4. Capacity = agents under bandwidth limit get priority
+
+    Tier order:
+      1. Same domain + same expertise + same city + under capacity
+      2. Same domain + same expertise + under capacity
+      3. Same domain + same city + under capacity
+      4. Same domain + under capacity
+      5. Same domain (ignore capacity for non-urgent)
+      6. Any agent under capacity (global fallback)
+      7. Any agent (last resort for non-urgent)
+    """
+    city_norm = _extract_city_from_address(city)
+    expertise_norm = (expertise or "").strip().upper()
+
+    all_agents = User.query.filter_by(role="human_agent").all()
+    if not all_agents:
+        return None
+
+    domain_agents = [a for a in all_agents if (a.domain or "").lower() == (domain or "").lower()]
+
+    def _under_capacity(agent):
+        return _open_ticket_count(agent.id) < (agent.bandwidth_capacity or 10)
+
+    def _same_city(agent):
+        return city_norm and (agent.location or "").strip().lower() == city_norm
+
+    def _same_expertise(agent):
+        return expertise_norm and (getattr(agent, 'expertise', '') or "").strip().upper() == expertise_norm
+
+    def _load(agent):
+        return _open_ticket_count(agent.id)
+
+    # Tier 1 – same domain + same expertise + same city + under capacity
+    if expertise_norm and city_norm:
+        pool = [a for a in domain_agents if _same_expertise(a) and _same_city(a) and _under_capacity(a)]
+        if pool: return min(pool, key=_load)
+
+    # Tier 2 – same domain + same expertise + under capacity
+    if expertise_norm:
+        pool = [a for a in domain_agents if _same_expertise(a) and _under_capacity(a)]
+        if pool: return min(pool, key=_load)
+
+    # Tier 3 – same domain + same city + under capacity
+    if city_norm:
+        pool = [a for a in domain_agents if _same_city(a) and _under_capacity(a)]
+        if pool: return min(pool, key=_load)
+
+    # Tier 4 – same domain + under capacity
+    pool = [a for a in domain_agents if _under_capacity(a)]
+    if pool: return min(pool, key=_load)
+
+    # Tier 5 – same domain, ignore capacity (for non-urgent only)
+    is_urgent = PRIORITY_RANK.get(priority, 1) >= PRIORITY_RANK.get("high", 3)
+    if not is_urgent and domain_agents:
+        return min(domain_agents, key=_load)
+
+    # Tier 6 – any agent, under capacity
+    under = [a for a in all_agents if _under_capacity(a)]
+    if under: return min(under, key=_load)
+
+    # Tier 7 – any agent (last resort for non-urgent)
+    if not is_urgent:
+        return min(all_agents, key=_load)
+
+    return None
+
+
+def _manager_priority_load(manager_id: int) -> dict:
+    """Return a breakdown of open tickets assigned to a manager, keyed by priority."""
+    OPEN_STATUSES = ["pending", "in_progress", "manager_escalated"]
+    counts = {"critical": 0, "high": 0, "medium": 0, "low": 0, "total": 0}
+    tickets = Ticket.query.filter(
+        Ticket.assigned_to == manager_id,
+        Ticket.status.in_(OPEN_STATUSES),
+    ).with_entities(Ticket.priority).all()
+    for (p,) in tickets:
+        level = (p or "low").lower()
+        counts[level] = counts.get(level, 0) + 1
+        counts["total"] += 1
+    return counts
+
+
+def _find_best_manager(priority: str) -> "User | None":
+    """
+    Assign an escalated ticket to the most suitable manager using
+    priority-driven load balancing.
+    """
+    managers = User.query.filter_by(role="manager").all()
+    if not managers:
+        return None
+    if len(managers) == 1:
+        return managers[0]
+
+    level = (priority or "low").lower()
+    loads = {m.id: _manager_priority_load(m.id) for m in managers}
+
+    return min(managers, key=lambda m: (loads[m.id].get(level, 0), loads[m.id]["total"]))
 
 
 # Broadband routes (/api/broadband/*) are registered via broadband_prompts.register_routes(app)
@@ -1492,6 +1675,7 @@ def analyze_signal(session_id):
 
         msg = ChatMessage(session_id=session_id, sender="bot", content=diagnosis_text)
         db.session.add(msg)
+        session.diagnosis_ran = True
         db.session.commit()
 
         return jsonify({"diagnosis": result}), 200
@@ -3716,78 +3900,69 @@ def admin_upload_kpi_site_level():
     if not ok:
         return jsonify({"error": err}), 400
 
-    import openpyxl
-    wb = openpyxl.load_workbook(file, data_only=True)
+    import io, openpyxl
+    from bulk_insert import bulk_insert_from_sheet_site
+
+    # Read file into memory so openpyxl can read it reliably
+    raw_bytes = file.read()
+    wb = openpyxl.load_workbook(io.BytesIO(raw_bytes), data_only=True, read_only=True)
 
     total_inserted = 0
     kpi_summary = []
     errors = []
 
-    for ws in wb.worksheets:
-        kpi_name = ws.title.strip()
-        if not kpi_name:
-            continue
-
-        headers = [c.value for c in ws[1]]
-        if not headers or len(headers) < 2:
-            errors.append(f"Sheet '{kpi_name}': insufficient columns")
-            continue
-
-        # First column is Site_ID, remaining columns are dates
-        date_columns = []
-        for col_idx in range(1, len(headers)):
-            h = headers[col_idx]
-            if h is None:
+    try:
+        for ws in wb.worksheets:
+            kpi_name = ws.title.strip()
+            if not kpi_name:
                 continue
+
+            rows_iter = ws.iter_rows(values_only=True)
             try:
-                if isinstance(h, datetime):
-                    date_columns.append((col_idx, h.date()))
-                elif isinstance(h, str):
-                    for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%d-%m-%Y", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d"):
-                        try:
-                            date_columns.append((col_idx, datetime.strptime(h.strip(), fmt).date()))
-                            break
-                        except ValueError:
-                            continue
-                elif hasattr(h, 'date'):
-                    date_columns.append((col_idx, h.date()))
-            except Exception:
+                headers = next(rows_iter)
+            except StopIteration:
+                errors.append(f"Sheet '{kpi_name}': empty sheet")
                 continue
 
-        if not date_columns:
-            errors.append(f"Sheet '{kpi_name}': no valid date columns found")
-            continue
-
-        sheet_inserted = 0
-        batch = []
-        for row in ws.iter_rows(min_row=2, values_only=True):
-            site_id = str(row[0]).strip() if row[0] else None
-            if not site_id or site_id == "None":
+            if not headers or len(headers) < 2:
+                errors.append(f"Sheet '{kpi_name}': insufficient columns")
                 continue
 
-            for col_idx, date_val in date_columns:
-                if col_idx < len(row) and row[col_idx] is not None:
-                    try:
-                        val = float(row[col_idx])
-                    except (ValueError, TypeError):
-                        continue
-                    batch.append(KpiData(
-                        site_id=site_id, kpi_name=kpi_name, date=date_val,
-                        hour=0, value=val, data_level="site"
-                    ))
-                    sheet_inserted += 1
+            date_columns = []
+            for col_idx in range(1, len(headers)):
+                h = headers[col_idx]
+                if h is None:
+                    continue
+                try:
+                    if isinstance(h, datetime):
+                        date_columns.append((col_idx, h.date()))
+                    elif isinstance(h, str):
+                        for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%d-%m-%Y", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d"):
+                            try:
+                                date_columns.append((col_idx, datetime.strptime(h.strip(), fmt).date()))
+                                break
+                            except ValueError:
+                                continue
+                    elif hasattr(h, 'date'):
+                        date_columns.append((col_idx, h.date()))
+                except Exception:
+                    continue
 
-                    if len(batch) >= 2000:
-                        db.session.bulk_save_objects(batch)
-                        batch = []
+            if not date_columns:
+                errors.append(f"Sheet '{kpi_name}': no valid date columns found")
+                continue
 
-        if batch:
-            db.session.bulk_save_objects(batch)
+            sheet_inserted = bulk_insert_from_sheet_site(db, rows_iter, kpi_name, date_columns)
+            total_inserted += sheet_inserted
+            kpi_summary.append({"name": kpi_name, "rows": sheet_inserted})
+            app.logger.info(f"Site-level upload: sheet '{kpi_name}' done — {sheet_inserted} rows")
+    except Exception as e:
+        app.logger.error(f"Site-level upload error: {e}")
+        return jsonify({"error": f"Upload failed: {e}"}), 500
+    finally:
+        wb.close()
 
-        total_inserted += sheet_inserted
-        kpi_summary.append({"name": kpi_name, "rows": sheet_inserted})
-
-    db.session.commit()
+    clear_analytics_cache()
     return jsonify({
         "inserted": total_inserted,
         "kpis_processed": len(kpi_summary),
@@ -3940,81 +4115,68 @@ def admin_upload_kpi_cell_level():
     if not ok:
         return jsonify({"error": err}), 400
 
-    import openpyxl
-    wb = openpyxl.load_workbook(file, data_only=True)
+    import io, openpyxl
+    from bulk_insert import bulk_insert_from_sheet_cell
+
+    raw_bytes = file.read()
+    wb = openpyxl.load_workbook(io.BytesIO(raw_bytes), data_only=True, read_only=True)
 
     total_inserted = 0
     kpi_summary = []
     errors = []
 
-    for ws in wb.worksheets:
-        kpi_name = ws.title.strip()
-        if not kpi_name:
-            continue
-
-        headers = [c.value for c in ws[1]]
-        if not headers or len(headers) < 4:
-            errors.append(f"Sheet '{kpi_name}': insufficient columns (need Site_ID, Cell_ID, Cell_Site_ID + dates)")
-            continue
-
-        # First 3 columns: Site_ID, Cell_ID, Cell_Site_ID; remaining are dates
-        date_columns = []
-        for col_idx in range(3, len(headers)):
-            h = headers[col_idx]
-            if h is None:
+    try:
+        for ws in wb.worksheets:
+            kpi_name = ws.title.strip()
+            if not kpi_name:
                 continue
+
+            rows_iter = ws.iter_rows(values_only=True)
             try:
-                if isinstance(h, datetime):
-                    date_columns.append((col_idx, h.date()))
-                elif isinstance(h, str):
-                    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d"):
-                        try:
-                            date_columns.append((col_idx, datetime.strptime(h.strip(), fmt).date()))
-                            break
-                        except ValueError:
-                            continue
-                elif hasattr(h, 'date'):
-                    date_columns.append((col_idx, h.date()))
-            except Exception:
+                headers = next(rows_iter)
+            except StopIteration:
+                errors.append(f"Sheet '{kpi_name}': empty sheet")
                 continue
 
-        if not date_columns:
-            errors.append(f"Sheet '{kpi_name}': no valid date columns found")
-            continue
-
-        sheet_inserted = 0
-        batch = []
-        for row in ws.iter_rows(min_row=2, values_only=True):
-            site_id = str(row[0]).strip() if row[0] else None
-            cell_id = str(row[1]).strip() if row[1] else None
-            cell_site_id = str(row[2]).strip() if row[2] else None
-            if not site_id or site_id == "None":
+            if not headers or len(headers) < 4:
+                errors.append(f"Sheet '{kpi_name}': insufficient columns (need Site_ID, Cell_ID, Cell_Site_ID + dates)")
                 continue
 
-            for col_idx, date_val in date_columns:
-                if col_idx < len(row) and row[col_idx] is not None:
-                    try:
-                        val = float(row[col_idx])
-                    except (ValueError, TypeError):
-                        continue
-                    batch.append(KpiData(
-                        site_id=site_id, kpi_name=kpi_name, date=date_val,
-                        hour=0, value=val, data_level="cell",
-                        cell_id=cell_id, cell_site_id=cell_site_id
-                    ))
-                    sheet_inserted += 1
+            date_columns = []
+            for col_idx in range(3, len(headers)):
+                h = headers[col_idx]
+                if h is None:
+                    continue
+                try:
+                    if isinstance(h, datetime):
+                        date_columns.append((col_idx, h.date()))
+                    elif isinstance(h, str):
+                        for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d"):
+                            try:
+                                date_columns.append((col_idx, datetime.strptime(h.strip(), fmt).date()))
+                                break
+                            except ValueError:
+                                continue
+                    elif hasattr(h, 'date'):
+                        date_columns.append((col_idx, h.date()))
+                except Exception:
+                    continue
 
-                    if len(batch) >= 2000:
-                        db.session.bulk_save_objects(batch)
-                        batch = []
+            if not date_columns:
+                errors.append(f"Sheet '{kpi_name}': no valid date columns found")
+                continue
 
-        if batch:
-            db.session.bulk_save_objects(batch)
+            sheet_inserted = bulk_insert_from_sheet_cell(db, rows_iter, kpi_name, date_columns)
+            total_inserted += sheet_inserted
+            kpi_summary.append({"name": kpi_name, "rows": sheet_inserted})
+            app.logger.info(f"Cell-level upload: sheet '{kpi_name}' done — {sheet_inserted} rows")
+    except Exception as e:
+        app.logger.error(f"Cell-level upload error: {e}")
+        return jsonify({"error": f"Upload failed: {e}"}), 500
+    finally:
+        wb.close()
 
-        total_inserted += sheet_inserted
-        kpi_summary.append({"name": kpi_name, "rows": sheet_inserted})
-
-    db.session.commit()
+    clear_analytics_cache()
     return jsonify({
         "inserted": total_inserted,
         "kpis_processed": len(kpi_summary),
@@ -5574,6 +5736,83 @@ with app.app_context():
                 conn.execute(sa_text("ALTER TABLE users ADD COLUMN bandwidth_capacity INTEGER NOT NULL DEFAULT 10"))
                 conn.commit()
                 print(">>> Added bandwidth_capacity column to users")
+
+    # Migrate: add network_issue_id to parameter_changes if missing
+    # ── Comprehensive migration: parameter_changes ──────────────────────────
+    if insp.has_table("parameter_changes"):
+        existing_cols = [c["name"] for c in insp.get_columns("parameter_changes")]
+        _pc_adds = [
+            ("network_issue_id", "INTEGER"),
+            ("approval_deadline", "TIMESTAMP"),
+        ]
+        with db.engine.connect() as conn:
+            for col, typ in _pc_adds:
+                if col not in existing_cols:
+                    conn.execute(sa_text(f"ALTER TABLE parameter_changes ADD COLUMN {col} {typ}"))
+                    conn.commit()
+                    print(f">>> Added {col} column to parameter_changes")
+            # Make ticket_id nullable (network issues use network_issue_id instead)
+            try:
+                conn.execute(sa_text("ALTER TABLE parameter_changes ALTER COLUMN ticket_id DROP NOT NULL"))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+            # Make agent_id nullable just in case
+            try:
+                conn.execute(sa_text("ALTER TABLE parameter_changes ALTER COLUMN agent_id DROP NOT NULL"))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+
+    # ── Comprehensive migration: change_requests ──────────────────────────
+    if insp.has_table("change_requests"):
+        existing_cols = [c["name"] for c in insp.get_columns("change_requests")]
+        _cr_adds = [
+            ("parameter_change_id", "INTEGER"),
+            ("change_type", "VARCHAR(20)"),
+            ("rejection_count", "INTEGER DEFAULT 0"),
+            ("validation_remark", "TEXT DEFAULT ''"),
+            ("validated_by", "INTEGER"),
+            ("validated_at", "TIMESTAMP"),
+            ("classification_note", "TEXT DEFAULT ''"),
+            ("classified_by", "INTEGER"),
+            ("classified_at", "TIMESTAMP"),
+            ("approval_remark", "TEXT DEFAULT ''"),
+            ("approved_by", "INTEGER"),
+            ("approved_at", "TIMESTAMP"),
+            ("implementation_notes", "TEXT DEFAULT ''"),
+            ("implemented_by", "INTEGER"),
+            ("implemented_at", "TIMESTAMP"),
+            ("rollback_notes", "TEXT DEFAULT ''"),
+            ("rollback_at", "TIMESTAMP"),
+            ("closure_notes", "TEXT DEFAULT ''"),
+            ("closed_at", "TIMESTAMP"),
+            ("updated_at", "TIMESTAMP"),
+        ]
+        with db.engine.connect() as conn:
+            for col, typ in _cr_adds:
+                if col not in existing_cols:
+                    conn.execute(sa_text(f"ALTER TABLE change_requests ADD COLUMN {col} {typ}"))
+                    conn.commit()
+                    print(f">>> Added {col} column to change_requests")
+            # Make nullable columns that may have been created as NOT NULL
+            for col in ["ticket_id", "raised_by", "parameter_change_id"]:
+                try:
+                    conn.execute(sa_text(f"ALTER TABLE change_requests ALTER COLUMN {col} DROP NOT NULL"))
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+            # title/description should stay NOT NULL but ensure they exist
+            for col in ["title", "description", "impact_assessment", "rollback_plan", "status"]:
+                if col not in existing_cols:
+                    default = "''" if col in ("impact_assessment", "rollback_plan") else ("'created'" if col == "status" else None)
+                    typ = "TEXT" if col in ("description", "impact_assessment", "rollback_plan") else "VARCHAR(200)" if col == "title" else "VARCHAR(30)"
+                    sql = f"ALTER TABLE change_requests ADD COLUMN {col} {typ}"
+                    if default:
+                        sql += f" DEFAULT {default}"
+                    conn.execute(sa_text(sql))
+                    conn.commit()
+                    print(f">>> Added {col} column to change_requests")
 
     # Seed default admin if none exists
     if not User.query.filter_by(role="admin").first():

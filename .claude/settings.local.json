@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find '/c/Users/didar/Downloads/files \\(12\\)/telecom-complaint-system/backend' -maxdepth 1 -name '*.py' -type f)"
+    ]
+  }
+}

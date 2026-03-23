@@ -1280,7 +1280,7 @@ export default function ChatSupport() {
       html: `Your ticket is being raised now.<br><br>Your ticket has been raised successfully!` +
         (refNum ? `<br>Reference: <strong>${refNum}</strong>` : '') +
         (assignedAgent
-          ? `<br><br>Dedicated support agent:<br><div style="background:#eff6ff;border:1px solid #93c5fd;border-radius:8px;padding:10px 14px;margin:8px 0;display:inline-block;min-width:220px;"><div style="font-size:13px;font-weight:700;color:#1e40af;">${assignedAgent.name}</div>${assignedAgent.phone ? `<div style="font-size:12px;color:#0ea5e9;margin-top:4px;">Phone: ${assignedAgent.phone}</div>` : ''}${slaHours ? `<div style="font-size:12px;color:#16a34a;margin-top:6px;font-weight:600;">SLA: ${slaHours} hour${slaHours !== 1 ? 's' : ''}</div>` : ''}</div>`
+          ? `<br><br>Dedicated support agent:<br><div style="background:#eff6ff;border:1px solid #93c5fd;border-radius:8px;padding:10px 14px;margin:8px 0;display:inline-block;min-width:220px;"><div style="font-size:13px;font-weight:700;color:#1e40af;">${assignedAgent.name}</div>${assignedAgent.phone ? `<div style="font-size:12px;color:#0ea5e9;margin-top:4px;">${assignedAgent.phone}</div>` : ''}${assignedAgent.email ? `<div style="font-size:12px;color:#0ea5e9;margin-top:4px;">${assignedAgent.email}</div>` : ''}${assignedAgent.employee_id ? `<div style="font-size:11px;color:#64748b;margin-top:2px;">ID: ${assignedAgent.employee_id}</div>` : ''}${slaHours ? `<div style="font-size:12px;color:#16a34a;margin-top:6px;font-weight:600;">SLA: ${slaHours} hour${slaHours !== 1 ? 's' : ''}</div>` : ''}</div>`
           : `<br><br>Our support team will reach out to you shortly.${slaHours ? `<br><span style="color:#16a34a;font-weight:600;">SLA: ${slaHours} hour${slaHours !== 1 ? 's' : ''}</span>` : ''}`) +
         `<br>You can track your ticket from the dashboard.`,
     });
@@ -1375,8 +1375,7 @@ export default function ChatSupport() {
       addMessage({
         type: 'bot',
         html: `Your ticket is being raised now.<br><br>Your request has been submitted. Reference: <strong>${refNum}</strong><br><br>` +
-          (assignedAgent ? `Dedicated agent: <strong>${assignedAgent.name}</strong>${assignedAgent.phone ? ` — ${assignedAgent.phone}` : ''}` : `Our support team will contact you shortly.`) +
-          (slaHours ? `<br><span style="color:#16a34a;font-weight:600;">SLA: ${slaHours} hour${slaHours !== 1 ? 's' : ''}</span>` : '') +
+          (assignedAgent ? `Dedicated support agent:<br><div style="background:#eff6ff;border:1px solid #93c5fd;border-radius:8px;padding:10px 14px;margin:8px 0;display:inline-block;min-width:220px;"><div style="font-size:13px;font-weight:700;color:#1e40af;">${assignedAgent.name}</div>${assignedAgent.phone ? `<div style="font-size:12px;color:#0ea5e9;margin-top:4px;">${assignedAgent.phone}</div>` : ''}${assignedAgent.email ? `<div style="font-size:12px;color:#0ea5e9;margin-top:4px;">${assignedAgent.email}</div>` : ''}${assignedAgent.employee_id ? `<div style="font-size:11px;color:#64748b;margin-top:2px;">ID: ${assignedAgent.employee_id}</div>` : ''}${slaHours ? `<div style="font-size:12px;color:#16a34a;margin-top:6px;font-weight:600;">SLA: ${slaHours} hour${slaHours !== 1 ? 's' : ''}</div>` : ''}</div>` : `Our support team will contact you shortly.${slaHours ? `<br><span style="color:#16a34a;font-weight:600;">SLA: ${slaHours} hour${slaHours !== 1 ? 's' : ''}</span>` : ''}`) +
           `<br><br>The agent may send you messages below — please stay in this chat.`,
       });
     }, 1500);
