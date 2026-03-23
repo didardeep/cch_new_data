@@ -142,13 +142,6 @@ def _build_llm_client():
 
 
 client, DEPLOYMENT_NAME = _build_llm_client()
-# ─── Azure OpenAI Configuration (pulled from .env) ───────────────────────────
-client = AzureOpenAI(
-    api_key=os.environ.get("AZURE_OPENAI_API_KEY"),
-    azure_endpoint=os.environ.get("AZURE_OPENAI_ENDPOINT"),
-    api_version=os.environ.get("AZURE_OPENAI_API_VERSION", "2023-07-01-preview"),
-)
-DEPLOYMENT_NAME = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini")
 
 # ─── Init AI prompt modules ───────────────────────────────────────────────────
 # Initialise both modules with the shared Azure OpenAI client so they can
