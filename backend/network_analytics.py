@@ -1521,10 +1521,12 @@ def network_summary():
 def network_map():
     """Site map with KPI colours. Primary: kpi_data + telecom_sites. Fallback: network_kpi_timeseries."""
     filters = _get_filters()
+    fresh = request.args.get("fresh") == "1"
     ck = _cache_key("map_v8", filters)
-    cached = _from_cache(ck)
-    if cached:
-        return jsonify(cached)
+    if not fresh:
+        cached = _from_cache(ck)
+        if cached:
+            return jsonify(cached)
 
     sites = []
     _MAP_PRB  = "DL PRB Utilization (1BH)"
@@ -1684,10 +1686,12 @@ def ran_analytics():
     Source: kpi_data (data_level='site') — fast CASE WHEN queries.
     """
     filters = _get_filters()
+    fresh = request.args.get("fresh") == "1"
     ck = _cache_key("ran_v11", filters)
-    cached = _from_cache(ck)
-    if cached:
-        return jsonify(cached)
+    if not fresh:
+        cached = _from_cache(ck)
+        if cached:
+            return jsonify(cached)
 
     # KPI name constants (must match kpi_data.kpi_name exactly)
     _DROP  = "E-RAB Call Drop Rate_1"
@@ -1922,10 +1926,12 @@ def core_analytics():
     3. Returns zeros with upload_needed=True if no core data exists
     """
     filters = _get_filters()
+    fresh = request.args.get("fresh") == "1"
     ck = _cache_key("core_v10", filters)
-    cached = _from_cache(ck)
-    if cached:
-        return jsonify(cached)
+    if not fresh:
+        cached = _from_cache(ck)
+        if cached:
+            return jsonify(cached)
 
     avg_auth = avg_cpu = avg_attach = avg_pdp = 0
     auth_trend = cpu_trend = attach_trend = pdp_trend = []
@@ -2114,10 +2120,12 @@ def core_analytics():
 @jwt_required()
 def transport_analytics():
     filters = _get_filters()
+    fresh = request.args.get("fresh") == "1"
     ck = _cache_key("transport_v5", filters)
-    cached = _from_cache(ck)
-    if cached:
-        return jsonify(cached)
+    if not fresh:
+        cached = _from_cache(ck)
+        if cached:
+            return jsonify(cached)
 
     # Build geo site filter for transport_kpi_data
     _t_sub = ""
@@ -4367,12 +4375,14 @@ def overview_stats():
     Optimised: uses targeted CASE WHEN SQL — never loads all 40K rows into Python.
     """
     filters = _get_filters()
+    fresh = request.args.get("fresh") == "1"
     # Include today's date in cache key so worst cells update daily
     from datetime import date as _date_type
     ck = _cache_key(f"overview_v19_{_date_type.today().isoformat()}", filters)
-    cached = _from_cache(ck)
-    if cached:
-        return jsonify(cached)
+    if not fresh:
+        cached = _from_cache(ck)
+        if cached:
+            return jsonify(cached)
 
     _PRB   = "DL PRB Utilization (1BH)"
     _TPUT  = "LTE DL - Cell Ave Throughput"

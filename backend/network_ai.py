@@ -653,44 +653,99 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text):
 # Follow-up / Conversation Context Handling
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Words that indicate a follow-up referencing the previous chart/result
-_FOLLOWUP_CUES = {
-    'scale', 'zoom', 'resize', 'bigger', 'smaller', 'enlarge', 'expand',
-    'change', 'modify', 'update', 'adjust', 'convert', 'switch', 'make it',
-    'the graph', 'the chart', 'this graph', 'this chart', 'that chart',
-    'same', 'previous', 'last one', 'above', 'earlier',
-    'bar chart', 'line chart', 'pie chart', 'area chart', 'table',
-    'add', 'include', 'also show', 'overlay',
-    'remove', 'hide', 'exclude',
-    'more days', 'fewer days', 'last 30', 'last 60', 'extend',
-    'different color', 'colour',
-    'yes', 'ok', 'sure', 'do it', 'go ahead', 'please do',
+# KPI keywords used for follow-up detection (same as in _rule_based_query)
+_FU_KPI_WORDS = {
+    'cssr', 'call setup', 'rrc', 'drop', 'cdr', 'throughput', 'tput',
+    'dl throughput', 'speed', 'prb', 'congestion', 'availability',
+    'latency', 'delay', 'volte', 'handover', 'volume', 'traffic',
+    'connected', 'users',
 }
 
+# Strong new-query keywords — if the prompt matches these AND has substance, it's NOT a follow-up
+_NEW_QUERY_WORDS = {
+    'top', 'bottom', 'worst', 'best', 'compare zones', 'zone wise',
+    'overall', 'network wide', 'all sites', 'show me', 'give me',
+}
+
+
 def _is_followup(prompt_lower: str) -> bool:
-    """Check if query is a follow-up referencing a previous chart/result."""
+    """
+    Determine if the user's query is a follow-up referencing the previous chart,
+    or a fresh standalone request.
+    """
     import re
-    # If it has specific site IDs or strong KPI keywords with day count,
-    # it's a NEW query, not a follow-up
-    has_site = bool(re.findall(r'[a-z]{2,}[_\-][a-z]{2,}[_\-]\d{3,}', prompt_lower))
-    has_days = bool(re.search(r'last\s+\d+\s*days?', prompt_lower))
+    p = prompt_lower.strip()
+    words = p.split()
+
+    # ── Definitely a NEW query (not follow-up) ─────────────────────────────
+    # Has site ID + day count → specific new request
+    has_site = bool(re.findall(r'[a-z]{2,}[_\-][a-z]{2,}[_\-]\d{3,}', p))
+    has_days = bool(re.search(r'last\s+\d+\s*days?', p))
     if has_site and has_days:
         return False
-    # Check for follow-up cues
-    for cue in _FOLLOWUP_CUES:
-        if cue in prompt_lower:
-            return True
-    # Very short queries (< 8 words) without KPI keywords are likely follow-ups
-    words = prompt_lower.split()
-    if len(words) <= 6:
+
+    # Has "top N" / "bottom N" / "worst N" pattern → ranking query
+    if re.search(r'(top|bottom|worst|best)\s+\d+', p):
+        return False
+
+    # Long query (>10 words) with a KPI keyword + site → likely new
+    has_kpi = any(kw in p for kw in _FU_KPI_WORDS)
+    if has_site and has_kpi and len(words) > 8:
+        return False
+
+    # ── Definitely a FOLLOW-UP ─────────────────────────────────────────────
+    # Direct references to previous chart / context
+    ref_words = [
+        'the graph', 'the chart', 'this graph', 'this chart', 'that chart',
+        'same', 'previous', 'last one', 'above', 'earlier', 'the data',
+        'the result', 'it', 'these', 'instead', 'rather', 'in place',
+        'swap', 'replace', 'for this', 'for that',
+    ]
+    if any(w in p for w in ref_words):
         return True
+
+    # Modification intents
+    mod_words = [
+        'scale', 'zoom', 'resize', 'bigger', 'smaller', 'enlarge', 'expand',
+        'change', 'modify', 'update', 'adjust', 'convert', 'switch',
+        'make it', 'turn it', 'show as', 'display as',
+        'bar chart', 'line chart', 'pie chart', 'area chart',
+        'more days', 'fewer days', 'extend', 'shorten',
+        'difference', 'interval', 'step', 'tick',
+        'add', 'include', 'also show', 'overlay', 'combine',
+        'remove', 'hide', 'exclude',
+        'different color', 'colour', 'color',
+    ]
+    if any(w in p for w in mod_words):
+        return True
+
+    # Affirmative / vague
+    if p in ('yes', 'ok', 'sure', 'do it', 'go ahead', 'please do',
+             'please', 'thanks', 'thank you', 'good', 'nice', 'great'):
+        return True
+
+    # Very short query (≤5 words) without a specific KPI → likely follow-up
+    if len(words) <= 5 and not has_kpi and not has_site:
+        return True
+
+    # Has only a KPI keyword but no site/days → could be "what about throughput?"
+    # which is a follow-up asking to switch KPI in context of previous site
+    if has_kpi and not has_site and not has_days and len(words) <= 8:
+        only_kpi = True
+        for nw in _NEW_QUERY_WORDS:
+            if nw in p:
+                only_kpi = False
+                break
+        if only_kpi:
+            return True
+
     return False
 
 
 def _handle_followup(prompt_orig: str, p: str, prev: dict, time_filter: str) -> dict:
     """
     Handle a follow-up query using the previous assistant message's context.
-    prev = content_json from the last assistant message (has sql, title, chart_type, etc.)
+    prev = content_json from the last assistant message.
     Returns a result dict or None if it can't handle the follow-up.
     """
     import re
@@ -701,97 +756,154 @@ def _handle_followup(prompt_orig: str, p: str, prev: dict, time_filter: str) -> 
     prev_y = prev.get("y_axes", [])
     prev_x = prev.get("x_axis", "date")
     prev_response = prev.get("response", "")
-
-    # If prev was multi_chart, get the charts list
+    prev_cfg = prev.get("chart_config", {}) or {}
     prev_charts = prev.get("charts", [])
 
     if not prev_sql and not prev_charts:
         return None
 
-    # ── Chart type change ──────────────────────────────────────────────────
+    # ── Helper: extract site/kpi/days from prev SQL ────────────────────────
+    prev_sites = re.findall(r"site_id\s*=\s*'([^']+)'", prev_sql)
+    prev_kpi_names = re.findall(r"kpi_name\s*=\s*'([^']+)'", prev_sql)
+    prev_days_m = re.search(r"INTERVAL\s+'(\d+)\s+days?'", prev_sql)
+    prev_days = int(prev_days_m.group(1)) if prev_days_m else None
+
+    # ── KPI mapping (same as rule-based engine) ────────────────────────────
+    KPI_MAP = {
+        'cssr': ('LTE Call Setup Success Rate', 'cssr'),
+        'call setup': ('LTE Call Setup Success Rate', 'cssr'),
+        'rrc': ('LTE RRC Setup Success Rate', 'rrc_sr'),
+        'drop': ('E-RAB Call Drop Rate_1', 'drop_rate'),
+        'cdr': ('E-RAB Call Drop Rate_1', 'drop_rate'),
+        'throughput': ('LTE DL - Cell Ave Throughput', 'dl_tput'),
+        'tput': ('LTE DL - Cell Ave Throughput', 'dl_tput'),
+        'dl throughput': ('LTE DL - Cell Ave Throughput', 'dl_tput'),
+        'speed': ('LTE DL - Cell Ave Throughput', 'dl_tput'),
+        'prb': ('DL PRB Utilization (1BH)', 'dl_prb'),
+        'congestion': ('DL PRB Utilization (1BH)', 'dl_prb'),
+        'availability': ('Availability', 'availability'),
+        'latency': ('Average Latency Downlink', 'latency'),
+        'delay': ('Average Latency Downlink', 'latency'),
+        'volte': ('VoLTE Traffic Erlang', 'volte_erl'),
+        'handover': ('LTE Intra-Freq HO Success Rate', 'ho_sr'),
+        'volume': ('DL Data Total Volume', 'dl_volume'),
+        'traffic': ('DL Data Total Volume', 'dl_volume'),
+        'connected': ('Ave RRC Connected Ue', 'avg_rrc_ue'),
+        'users': ('Ave RRC Connected Ue', 'avg_rrc_ue'),
+    }
+    def _detect_kpi(text):
+        t = text.lower()
+        for kw in sorted(KPI_MAP.keys(), key=len, reverse=True):
+            if kw in t:
+                return KPI_MAP[kw]
+        return None
+
+    new_sites = re.findall(r'[A-Za-z]{2,}[_\-][A-Za-z]{2,}[_\-]\d{3,}', prompt_orig)
+    new_kpi = _detect_kpi(p)
+    new_days_m = re.search(r'(?:last|past|recent)\s+(\d+)\s*days?', p)
+    new_days = int(new_days_m.group(1)) if new_days_m else None
+    if not new_days:
+        dm = re.search(r'(\d+)\s*days?', p)
+        if dm and not re.search(r'(top|bottom|worst|best)\s+' + dm.group(1), p):
+            new_days = int(dm.group(1))
+
+    # ── 1. KPI switch: "what about throughput?" / "show drop rate instead" ──
+    # User mentions a different KPI but no site → swap KPI, keep site & days
+    if new_kpi and not new_sites and prev_sites:
+        kpi_name, alias = new_kpi
+        days = new_days or prev_days or 14
+        site = prev_sites[0]
+        date_clause = f"AND k.date >= CURRENT_DATE - INTERVAL '{days} days' AND k.date <= CURRENT_DATE"
+        return {
+            "sql": f"""SELECT k.date::text AS date, AVG(k.value) AS {alias}
+                FROM kpi_data k
+                WHERE k.kpi_name = '{kpi_name}' AND k.site_id = '{site}'
+                  AND k.data_level = 'site' AND k.value IS NOT NULL {date_clause}
+                GROUP BY k.date ORDER BY k.date""",
+            "query_type": "line", "chart_type": "line",
+            "title": f"{kpi_name} — {site} (last {days}d)",
+            "x_axis": "date", "y_axes": [alias],
+            "response": f"Switched to {kpi_name} for site {site} over last {days} days.",
+        }
+
+    # ── 2. Site switch: "show for GUR_LTE_1400 instead" ───────────────────
+    # User mentions a different site but context has a KPI → swap site
+    if new_sites and prev_kpi_names and not new_kpi:
+        site = new_sites[0]
+        kpi_name = prev_kpi_names[0]
+        # Find alias from KPI_MAP
+        alias = 'value'
+        for kw, (kn, al) in KPI_MAP.items():
+            if kn == kpi_name:
+                alias = al
+                break
+        days = new_days or prev_days or 14
+        date_clause = f"AND k.date >= CURRENT_DATE - INTERVAL '{days} days' AND k.date <= CURRENT_DATE"
+        return {
+            "sql": f"""SELECT k.date::text AS date, AVG(k.value) AS {alias}
+                FROM kpi_data k
+                WHERE k.kpi_name = '{kpi_name}' AND k.site_id = '{site}'
+                  AND k.data_level = 'site' AND k.value IS NOT NULL {date_clause}
+                GROUP BY k.date ORDER BY k.date""",
+            "query_type": "line", "chart_type": "line",
+            "title": f"{kpi_name} — {site} (last {days}d)",
+            "x_axis": "date", "y_axes": [alias],
+            "response": f"Showing {kpi_name} for site {site} over last {days} days.",
+        }
+
+    # ── 3. Chart type change ──────────────────────────────────────────────
     new_chart = None
-    if 'bar' in p and 'chart' in p:
+    if 'bar' in p and ('chart' in p or 'graph' in p or 'as bar' in p):
         new_chart = 'bar'
-    elif 'line' in p and ('chart' in p or 'graph' in p):
+    elif 'line' in p and ('chart' in p or 'graph' in p or 'as line' in p):
         new_chart = 'line'
     elif 'pie' in p:
         new_chart = 'pie'
     elif 'area' in p and ('chart' in p or 'graph' in p):
         new_chart = 'area'
-    elif 'table' in p and ('show' in p or 'as' in p or 'view' in p or 'convert' in p):
-        new_chart = 'bar'  # table view handled by frontend
+    elif 'table' in p:
+        new_chart = 'bar'
 
     if new_chart and prev_sql:
         return {
             "sql": prev_sql,
-            "query_type": new_chart,
-            "chart_type": new_chart,
-            "title": prev_title,
-            "x_axis": prev_x,
-            "y_axes": prev_y,
-            "response": f"Changed chart type to {new_chart}.",
+            "query_type": new_chart, "chart_type": new_chart,
+            "title": prev_title, "x_axis": prev_x, "y_axes": prev_y,
+            "response": f"Changed chart to {new_chart} view.",
         }
 
-    # ── Time range change ──────────────────────────────────────────────────
-    new_days = None
-    m = re.search(r'(?:last|past|recent)\s+(\d+)\s*days?', p)
-    if m:
-        new_days = int(m.group(1))
-    elif re.search(r'(\d+)\s*days?', p):
-        new_days = int(re.search(r'(\d+)\s*days?', p).group(1))
-    elif 'more days' in p or 'extend' in p or 'longer' in p:
-        new_days = 30  # default extend
-
+    # ── 4. Time range change ──────────────────────────────────────────────
     if new_days and prev_sql:
-        # Replace the date interval in the SQL
-        updated_sql = re.sub(
-            r"INTERVAL\s+'(\d+)\s+days?'",
-            f"INTERVAL '{new_days} days'",
-            prev_sql
-        )
-        # Update title
+        updated_sql = re.sub(r"INTERVAL\s+'(\d+)\s+days?'", f"INTERVAL '{new_days} days'", prev_sql)
         updated_title = re.sub(r'\(last \d+d\)', f'(last {new_days}d)', prev_title)
         if updated_title == prev_title:
             updated_title = prev_title + f" (last {new_days}d)"
 
-        # For multi_chart, update each chart's SQL
         if prev_charts:
             new_charts = []
             for ch in prev_charts:
-                ch_sql = re.sub(
-                    r"INTERVAL\s+'(\d+)\s+days?'",
-                    f"INTERVAL '{new_days} days'",
-                    ch.get("sql", "")
-                )
+                ch_sql = re.sub(r"INTERVAL\s+'(\d+)\s+days?'", f"INTERVAL '{new_days} days'", ch.get("sql", ""))
                 ch_title = re.sub(r'\(last \d+d\)', f'(last {new_days}d)', ch.get("title", ""))
                 new_charts.append({**ch, "sql": ch_sql, "title": ch_title})
             return {
-                "multi_chart": True,
-                "charts": new_charts,
+                "multi_chart": True, "charts": new_charts,
                 "sql": new_charts[0]["sql"],
-                "query_type": "multi_chart",
-                "chart_type": "multi_chart",
+                "query_type": "multi_chart", "chart_type": "multi_chart",
                 "title": " & ".join(c["title"] for c in new_charts)[:80],
-                "x_axis": "date",
-                "y_axes": ["value"],
-                "response": f"Updated time range to last {new_days} days.",
+                "x_axis": "date", "y_axes": ["value"],
+                "response": f"Updated to last {new_days} days.",
             }
-
         return {
             "sql": updated_sql,
-            "query_type": prev_chart,
-            "chart_type": prev_chart,
-            "title": updated_title,
-            "x_axis": prev_x,
-            "y_axes": prev_y,
+            "query_type": prev_chart, "chart_type": prev_chart,
+            "title": updated_title, "x_axis": prev_x, "y_axes": prev_y,
             "response": f"Updated to show last {new_days} days.",
         }
 
-    # ── Scale / zoom / resize — parse specific scale requests ────────────────
+    # ── 5. Scale / Y-axis change ──────────────────────────────────────────
     if any(w in p for w in ['scale', 'zoom', 'resize', 'bigger', 'smaller',
                              'enlarge', 'expand', 'y axis', 'y-axis', 'range',
                              'difference', 'interval', 'step', 'tick']):
-        # Parse a numeric scale/interval: "scale to 10", "10 difference", "interval 5"
         scale_num = None
         sm = re.search(r'(?:to|of|at|interval|difference|step|every)\s*(\d+)', p)
         if sm:
@@ -799,73 +911,82 @@ def _handle_followup(prompt_orig: str, p: str, prev: dict, time_filter: str) -> 
         elif re.search(r'(\d+)\s*(?:difference|interval|step|tick|unit|gap)', p):
             scale_num = int(re.search(r'(\d+)\s*(?:difference|interval|step|tick|unit|gap)', p).group(1))
 
-        cfg = prev.get("chart_config", {}) or {}
+        cfg = dict(prev_cfg)
         if scale_num:
             cfg["y_tick_interval"] = scale_num
             resp_msg = f"Changed Y-axis scale to intervals of {scale_num}."
         else:
-            # No specific number — just reset to auto-scale
             cfg.pop("y_tick_interval", None)
             resp_msg = "Re-rendered chart with auto-scaled axes."
 
         if prev_charts:
             for ch in prev_charts:
-                ch_cfg = ch.get("chart_config", {}) or {}
+                ch_cfg = dict(ch.get("chart_config", {}) or {})
                 if scale_num:
                     ch_cfg["y_tick_interval"] = scale_num
                 ch["chart_config"] = ch_cfg
             return {
-                "multi_chart": True,
-                "charts": prev_charts,
+                "multi_chart": True, "charts": prev_charts,
                 "sql": prev_charts[0].get("sql", ""),
-                "query_type": "multi_chart",
-                "chart_type": "multi_chart",
-                "title": prev_title,
-                "x_axis": "date",
-                "y_axes": ["value"],
-                "chart_config": cfg,
-                "response": resp_msg,
+                "query_type": "multi_chart", "chart_type": "multi_chart",
+                "title": prev_title, "x_axis": "date", "y_axes": ["value"],
+                "chart_config": cfg, "response": resp_msg,
             }
         return {
             "sql": prev_sql,
-            "query_type": prev_chart,
-            "chart_type": prev_chart,
-            "title": prev_title,
-            "x_axis": prev_x,
-            "y_axes": prev_y,
-            "chart_config": cfg,
-            "response": resp_msg,
+            "query_type": prev_chart, "chart_type": prev_chart,
+            "title": prev_title, "x_axis": prev_x, "y_axes": prev_y,
+            "chart_config": cfg, "response": resp_msg,
         }
 
-    # ── Generic follow-up: just re-run the previous query ──────────────────
-    # For very short queries like "yes", "ok", "show me", etc. re-render previous
-    words = p.split()
-    if len(words) <= 5 or any(w in p for w in ['same', 'again', 'previous', 'repeat',
-                                                 'the graph', 'the chart', 'this',
-                                                 'that', 'above', 'earlier']):
-        if prev_charts:
+    # ── 6. Add a KPI to the existing chart ("also show throughput") ───────
+    if any(w in p for w in ['add', 'include', 'also show', 'overlay', 'combine']):
+        add_kpi = _detect_kpi(p)
+        if add_kpi and prev_sites and prev_kpi_names:
+            kpi_name, alias = add_kpi
+            site = prev_sites[0]
+            days = prev_days or 14
+            date_clause = f"AND k.date >= CURRENT_DATE - INTERVAL '{days} days' AND k.date <= CURRENT_DATE"
+            # Build UNION ALL with previous + new KPI
+            prev_alias = prev_y[0] if prev_y else 'value'
+            prev_kpi = prev_kpi_names[0]
+            new_sql = f"""SELECT k.date::text AS date, k.site_id,
+                       AVG(k.value) AS value, '{prev_kpi}' AS kpi_name
+                FROM kpi_data k
+                WHERE k.kpi_name = '{prev_kpi}' AND k.site_id = '{site}'
+                  AND k.data_level = 'site' AND k.value IS NOT NULL {date_clause}
+                GROUP BY k.date, k.site_id
+            UNION ALL
+            SELECT k.date::text AS date, k.site_id,
+                       AVG(k.value) AS value, '{kpi_name}' AS kpi_name
+                FROM kpi_data k
+                WHERE k.kpi_name = '{kpi_name}' AND k.site_id = '{site}'
+                  AND k.data_level = 'site' AND k.value IS NOT NULL {date_clause}
+                GROUP BY k.date, k.site_id
+            ORDER BY date"""
             return {
-                "multi_chart": True,
-                "charts": prev_charts,
-                "sql": prev_charts[0].get("sql", ""),
-                "query_type": "multi_chart",
-                "chart_type": "multi_chart",
-                "title": prev_title,
-                "x_axis": "date",
-                "y_axes": ["value"],
-                "response": prev_response or "Here are the previous results again.",
+                "sql": new_sql,
+                "query_type": "composed", "chart_type": "composed",
+                "title": f"{site} — {prev_alias} & {alias} (last {days}d)",
+                "x_axis": "date", "y_axes": ["value"],
+                "response": f"Added {kpi_name} alongside {prev_kpi} for {site}.",
             }
+
+    # ── 7. Generic follow-up: re-run previous query ───────────────────────
+    if prev_charts:
         return {
-            "sql": prev_sql,
-            "query_type": prev_chart,
-            "chart_type": prev_chart,
-            "title": prev_title,
-            "x_axis": prev_x,
-            "y_axes": prev_y,
+            "multi_chart": True, "charts": prev_charts,
+            "sql": prev_charts[0].get("sql", ""),
+            "query_type": "multi_chart", "chart_type": "multi_chart",
+            "title": prev_title, "x_axis": "date", "y_axes": ["value"],
             "response": prev_response or "Here are the previous results.",
         }
-
-    return None  # Could not handle as follow-up; fall through to normal processing
+    return {
+        "sql": prev_sql,
+        "query_type": prev_chart, "chart_type": prev_chart,
+        "title": prev_title, "x_axis": prev_x, "y_axes": prev_y,
+        "response": prev_response or "Here are the previous results.",
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────

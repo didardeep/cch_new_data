@@ -361,13 +361,21 @@ def schedule_daily_job(app):
 @network_issues_bp.route("/api/network-issues/worst-cells", methods=["GET"])
 @jwt_required()
 def get_worst_cells():
-    """Return pre-scanned worst cells for the dashboard (updated every 30 min)."""
+    """Return worst cells — always queries DB fresh for up-to-date data."""
     user_id = int(get_jwt_identity())
     user = db.session.get(User, user_id)
     if not user or user.role != "human_agent":
         return jsonify({"error": "Unauthorized"}), 403
+
+    # Always query DB for fresh data
+    try:
+        fresh = _get_worst_cells_by_site()
+    except Exception as e:
+        _LOG.error("worst-cells live query failed, falling back to cache: %s", e)
+        fresh = _LATEST_WORST_CELLS
+
     sites = []
-    for site_id, data in _LATEST_WORST_CELLS.items():
+    for site_id, data in fresh.items():
         sites.append({
             "site_id": site_id,
             "cells": data.get("cells", []),
@@ -382,7 +390,7 @@ def get_worst_cells():
     return jsonify({
         "sites": sites,
         "count": len(sites),
-        "scan_time": _LATEST_SCAN_TIME.isoformat() if _LATEST_SCAN_TIME else None,
+        "scan_time": datetime.utcnow().isoformat(),
     })
 
 
