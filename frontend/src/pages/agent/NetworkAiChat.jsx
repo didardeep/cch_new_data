@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   LineChart, Line, BarChart, Bar, AreaChart, Area,
@@ -140,8 +140,9 @@ function pivotMultiSeries(data, columns, xKey) {
 }
 
 // ── Inline Chart Renderer ──────────────────────────────────────────────────
-function InlineChart({result,T}) {
+function InlineChart({result,T,chartId}) {
   const [showTable,setShowTable]=useState(false);
+  const uid=useMemo(()=>chartId||Math.random().toString(36).slice(2,8),[chartId]);
   if(!result||!result.data?.length) return null;
 
   const {title,data:rawData=[],columns=[],x_axis,y_axes,response,row_count,chart_type,query_type,chart_config,provider,sql}=result;
@@ -219,25 +220,29 @@ function InlineChart({result,T}) {
     if(ctype==='composed'&&yKeys.length>=2){
       const cTickInterval=data.length>15?Math.ceil(data.length/10):0;
       const chartColors=[PAL[0],PAL[1],PAL[2],PAL[3],PAL[4]];
+      // Auto-scale each Y axis
+      const lVals=data.map(r=>parseFloat(r[yKeys[0]])).filter(v=>!isNaN(v));
+      const rVals=yKeys[1]?data.map(r=>parseFloat(r[yKeys[1]])).filter(v=>!isNaN(v)):[];
+      const domainOf=vals=>{if(!vals.length)return[0,'auto'];const mn=Math.min(...vals),mx=Math.max(...vals),rng=mx-mn||1,p=rng*.1;return[Math.max(0,Math.floor((mn-p)*100)/100),Math.ceil((mx+p)*100)/100];};
       return(
         <ResponsiveContainer width="100%" height={h+30}>
           <ComposedChart data={data} margin={{top:5,right:25,left:5,bottom:35}}>
             <defs>
               {yKeys.map((k,i)=>(
-                <linearGradient key={k} id={`cg${i}`} x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor={chartColors[i%chartColors.length]} stopOpacity={.4}/><stop offset="100%" stopColor={chartColors[i%chartColors.length]} stopOpacity={.03}/></linearGradient>
+                <linearGradient key={k} id={`cg${uid}${i}`} x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor={chartColors[i%chartColors.length]} stopOpacity={.4}/><stop offset="100%" stopColor={chartColors[i%chartColors.length]} stopOpacity={.03}/></linearGradient>
               ))}
             </defs>
             <CartesianGrid strokeDasharray="3 3" stroke={T.border} vertical={false}/>
             <XAxis dataKey={xKey} tick={{fontSize:8,fill:T.muted}} axisLine={false} tickLine={false} interval={cTickInterval} angle={-35} textAnchor="end" height={45} tickFormatter={v=>{if(typeof v!=='string')return v;if(v.length>10)return v.slice(5,10);return v;}}/>
-            <YAxis yAxisId="l" tick={{fontSize:9,fill:T.muted}} axisLine={false} width={45} label={yKeys[0]?{value:keyLabel(yKeys[0]).slice(0,20),angle:-90,position:'insideLeft',fontSize:8,fill:T.muted}:undefined}/>
-            {yKeys.length>1&&<YAxis yAxisId="r" orientation="right" tick={{fontSize:9,fill:T.muted}} axisLine={false} width={45} label={yKeys[1]?{value:keyLabel(yKeys[1]).slice(0,20),angle:90,position:'insideRight',fontSize:8,fill:T.muted}:undefined}/>}
+            <YAxis yAxisId="l" tick={{fontSize:9,fill:T.muted}} axisLine={false} width={45} domain={domainOf(lVals)} tickFormatter={v=>f(v,2)} label={yKeys[0]?{value:keyLabel(yKeys[0]).slice(0,20),angle:-90,position:'insideLeft',fontSize:8,fill:T.muted}:undefined}/>
+            {yKeys.length>1&&<YAxis yAxisId="r" orientation="right" tick={{fontSize:9,fill:T.muted}} axisLine={false} width={45} domain={domainOf(rVals)} tickFormatter={v=>f(v,2)} label={yKeys[1]?{value:keyLabel(yKeys[1]).slice(0,20),angle:90,position:'insideRight',fontSize:8,fill:T.muted}:undefined}/>}
             <Tooltip content={<TipC/>} cursor={{stroke:T.kpmgBlue,strokeWidth:1,strokeDasharray:'4 2'}}/>
             {threshold!=null&&<ReferenceLine yAxisId="l" y={threshold} stroke={T.amber} strokeDasharray="4 2"/>}
             {yKeys.map((k,i)=>{
               const yId=i===0?'l':(i===1?'r':'l');
               const color=chartColors[i%chartColors.length];
               return i%2===0?(
-                <Area key={k} yAxisId={yId} type="natural" dataKey={k} name={keyLabel(k)} fill={`url(#cg${i})`} stroke={color} strokeWidth={2.5} activeDot={{r:5,strokeWidth:2,stroke:'#fff'}} animationDuration={1000} animationEasing="ease-in-out"/>
+                <Area key={k} yAxisId={yId} type="natural" dataKey={k} name={keyLabel(k)} fill={`url(#cg${uid}${i})`} stroke={color} strokeWidth={2.5} activeDot={{r:5,strokeWidth:2,stroke:'#fff'}} animationDuration={1000} animationEasing="ease-in-out"/>
               ):(
                 <Line key={k} yAxisId={yId} type="natural" dataKey={k} name={keyLabel(k)} stroke={color} strokeWidth={2.5} dot={data.length<=20?{r:3,strokeWidth:2,stroke:'#fff'}:false} activeDot={{r:6,strokeWidth:2,stroke:'#fff'}} animationDuration={1200} animationEasing="ease-in-out"/>
               );
@@ -249,16 +254,33 @@ function InlineChart({result,T}) {
 
     if(ctype==='line'||ctype==='area'||isTimeSeries){
       const tickInterval=data.length>20?Math.ceil(data.length/8):data.length>10?2:0;
+      // Y-axis domain: use chart_config.y_tick_interval if set, otherwise auto-scale
+      const yTickInt=cfg.y_tick_interval?parseFloat(cfg.y_tick_interval):null;
+      const allVals=yKeys.flatMap(k=>data.map(r=>parseFloat(r[k])).filter(v=>!isNaN(v)));
+      const dMin=allVals.length?Math.min(...allVals):0;
+      const dMax=allVals.length?Math.max(...allVals):100;
+      let yDomain, yTicks;
+      if(yTickInt){
+        // User requested specific tick interval (e.g. "scale to 10 difference")
+        const lo=Math.max(0,Math.floor(dMin/yTickInt)*yTickInt);
+        const hi=Math.ceil(dMax/yTickInt)*yTickInt;
+        yDomain=[lo,hi];
+        yTicks=[];for(let t=lo;t<=hi;t+=yTickInt)yTicks.push(t);
+      }else{
+        const dRange=dMax-dMin||1;const pad=dRange*0.1;
+        yDomain=[Math.max(0,Math.floor((dMin-pad)*100)/100), Math.ceil((dMax+pad)*100)/100];
+        yTicks=undefined;
+      }
       return(
         <ResponsiveContainer width="100%" height={h+40}>
           <AreaChart data={data} margin={{top:5,right:30,left:5,bottom:45}}>
-            <defs>{yKeys.map((k,i)=><linearGradient key={k} id={`aig${i}`} x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor={PAL[i%10]} stopOpacity={.45}/><stop offset="100%" stopColor={PAL[i%10]} stopOpacity={.03}/></linearGradient>)}</defs>
+            <defs>{yKeys.map((k,i)=><linearGradient key={k} id={`aig${uid}${i}`} x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor={PAL[i%10]} stopOpacity={.45}/><stop offset="100%" stopColor={PAL[i%10]} stopOpacity={.03}/></linearGradient>)}</defs>
             <CartesianGrid strokeDasharray="3 3" stroke={T.border} vertical={false}/>
             <XAxis dataKey={xKey} tick={{fontSize:8,fill:T.muted}} axisLine={false} tickLine={false} interval={tickInterval} angle={-40} textAnchor="end" height={55} tickFormatter={v=>{if(typeof v!=='string')return v;return v.replace(/^20\d{2}-/,'').slice(0,5);}}/>
-            <YAxis tick={{fontSize:9,fill:T.muted}} axisLine={false} tickLine={false} width={42}/>
+            <YAxis tick={{fontSize:9,fill:T.muted}} axisLine={false} tickLine={false} width={42} domain={yDomain} ticks={yTicks} tickFormatter={v=>f(v,2)}/>
             <Tooltip content={<TipC/>} cursor={{stroke:T.kpmgBlue,strokeWidth:1,strokeDasharray:'4 2'}}/>
             {threshold!=null&&<ReferenceLine y={threshold} stroke={T.amber} strokeDasharray="4 2" label={{value:`${threshold}`,fontSize:9,fill:T.amber}}/>}
-            {yKeys.map((k,i)=><Area key={k} type="natural" dataKey={k} stroke={PAL[i%10]} fill={`url(#aig${i})`} strokeWidth={2.5} dot={data.length<=30?{r:3,strokeWidth:2,stroke:'#fff'}:false} activeDot={{r:6,strokeWidth:2,stroke:'#fff'}} name={keyLabel(k)} animationDuration={1000} animationEasing="ease-in-out"/>)}
+            {yKeys.map((k,i)=><Area key={k} type="natural" dataKey={k} stroke={PAL[i%10]} fill={`url(#aig${uid}${i})`} strokeWidth={2.5} dot={data.length<=30?{r:3,strokeWidth:2,stroke:'#fff'}:false} activeDot={{r:6,strokeWidth:2,stroke:'#fff'}} name={keyLabel(k)} animationDuration={1000} animationEasing="ease-in-out"/>)}
             <Legend iconType="circle" iconSize={7} wrapperStyle={{fontSize:10}}/>
           </AreaChart>
         </ResponsiveContainer>);
@@ -270,7 +292,7 @@ function InlineChart({result,T}) {
       return(
         <ResponsiveContainer width="100%" height={Math.max(h,data.length*36+60)}>
           <BarChart data={data} layout="vertical" margin={{top:5,right:25,left:110,bottom:5}}>
-            <defs>{yKeys.slice(0,3).map((k,i)=><linearGradient key={k} id={`hbg${i}`} x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stopColor={PAL[i%10]} stopOpacity={.85}/><stop offset="100%" stopColor={PAL[(i+1)%10]} stopOpacity={.95}/></linearGradient>)}</defs>
+            <defs>{yKeys.slice(0,3).map((k,i)=><linearGradient key={k} id={`hbg${uid}${i}`} x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stopColor={PAL[i%10]} stopOpacity={.85}/><stop offset="100%" stopColor={PAL[(i+1)%10]} stopOpacity={.95}/></linearGradient>)}</defs>
             <CartesianGrid strokeDasharray="3 3" stroke={T.border} horizontal={false}/>
             <XAxis type="number" tick={{fontSize:9,fill:T.muted}} axisLine={false} tickLine={false}/>
             <YAxis type="category" dataKey={xKey} width={105} tick={{fontSize:8.5,fill:T.muted}} tickFormatter={shortLbl} axisLine={false} tickLine={false}/>
@@ -278,7 +300,7 @@ function InlineChart({result,T}) {
             {threshold!=null&&<ReferenceLine x={threshold} stroke={T.amber} strokeDasharray="4 2"/>}
             {yKeys.slice(0,3).map((k,i)=>(
               <Bar key={k} dataKey={k} name={keyLabel(k)} radius={[0,6,6,0]} barSize={yKeys.length>1?14:22} animationDuration={1200} animationEasing="ease-in-out">
-                {yKeys.length===1?data.map((d,di)=>{const v=parseFloat(d[k]);const bad=threshold!=null&&(cfg.threshold_dir==='below'?v<threshold:v>threshold);return<Cell key={di} fill={bad?T.red:`url(#hbg${i})`}/>;}):<Cell fill={`url(#hbg${i})`}/>}
+                {yKeys.length===1?data.map((d,di)=>{const v=parseFloat(d[k]);const bad=threshold!=null&&(cfg.threshold_dir==='below'?v<threshold:v>threshold);return<Cell key={di} fill={bad?T.red:`url(#hbg${uid}${i})`}/>;}):<Cell fill={`url(#hbg${uid}${i})`}/>}
               </Bar>))}
             <Legend iconType="circle" iconSize={7} wrapperStyle={{fontSize:10}}/>
           </BarChart>
@@ -287,13 +309,13 @@ function InlineChart({result,T}) {
     return(
       <ResponsiveContainer width="100%" height={h}>
         <BarChart data={data} margin={{top:5,right:10,left:0,bottom:30}}>
-          <defs>{yKeys.slice(0,3).map((k,i)=><linearGradient key={k} id={`vbg${i}`} x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor={PAL[i%10]} stopOpacity={.95}/><stop offset="100%" stopColor={PAL[i%10]} stopOpacity={.6}/></linearGradient>)}</defs>
+          <defs>{yKeys.slice(0,3).map((k,i)=><linearGradient key={k} id={`vbg${uid}${i}`} x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor={PAL[i%10]} stopOpacity={.95}/><stop offset="100%" stopColor={PAL[i%10]} stopOpacity={.6}/></linearGradient>)}</defs>
           <CartesianGrid strokeDasharray="3 3" stroke={T.border} vertical={false}/>
           <XAxis dataKey={xKey} tick={{fontSize:9,fill:T.muted}} axisLine={false} tickLine={false} angle={-35} textAnchor="end" tickFormatter={shortLbl}/>
           <YAxis tick={{fontSize:9,fill:T.muted}} axisLine={false} tickLine={false} width={35}/>
           <Tooltip content={<TipC/>} cursor={{fill:T.kpmgBlue+'0a'}}/>
           {threshold!=null&&<ReferenceLine y={threshold} stroke={T.amber} strokeDasharray="4 2"/>}
-          {yKeys.slice(0,3).map((k,i)=><Bar key={k} dataKey={k} name={keyLabel(k)} radius={[6,6,0,0]} fill={`url(#vbg${i})`} barSize={20} animationDuration={1200} animationEasing="ease-in-out"/>)}
+          {yKeys.slice(0,3).map((k,i)=><Bar key={k} dataKey={k} name={keyLabel(k)} radius={[6,6,0,0]} fill={`url(#vbg${uid}${i})`} barSize={20} animationDuration={1200} animationEasing="ease-in-out"/>)}
           <Legend iconType="circle" iconSize={7} wrapperStyle={{fontSize:10}}/>
         </BarChart>
       </ResponsiveContainer>);
@@ -574,7 +596,7 @@ export default function NetworkAiChat() {
                   <div key={m.id} style={{display:'flex',justifyContent:m.role==='user'?'flex-end':'flex-start',marginBottom:16,animation:'fadeIn .3s ease'}}>
                     <div style={{
                       maxWidth:m.role==='user'?'55%':'92%',
-                      minWidth:m.role==='assistant'&&m.payload?.data?.length>0?'min(680px,100%)':undefined,
+                      minWidth:m.role==='assistant'&&(m.payload?.data?.length>0||m.payload?.charts?.length>0)?'min(680px,100%)':undefined,
                       padding:m.role==='user'?'10px 16px':'14px 18px',
                       borderRadius:m.role==='user'?'18px 18px 4px 18px':'18px 18px 18px 4px',
                       background:m.role==='user'?`linear-gradient(135deg,${T.kpmgBlue},${T.blue2})`:T.surface,
@@ -590,8 +612,15 @@ export default function NetworkAiChat() {
                       {/* Text content */}
                       <div style={{fontSize:12.5,lineHeight:1.65,whiteSpace:'pre-wrap'}}>{m.content}</div>
 
-                      {/* Inline chart for assistant messages */}
-                      {m.role==='assistant'&&m.payload&&m.payload.data?.length>0&&(
+                      {/* Inline charts for assistant messages */}
+                      {m.role==='assistant'&&m.payload&&m.payload.chart_type==='multi_chart'&&m.payload.charts?.length>0&&(
+                        m.payload.charts.map((chart,ci)=>(
+                          <div key={ci} style={{marginTop:ci===0?10:16}}>
+                            <InlineChart result={chart} T={T} chartId={`mc${m.id}_${ci}`}/>
+                          </div>
+                        ))
+                      )}
+                      {m.role==='assistant'&&m.payload&&m.payload.chart_type!=='multi_chart'&&m.payload.data?.length>0&&(
                         <InlineChart result={m.payload} T={T}/>
                       )}
 

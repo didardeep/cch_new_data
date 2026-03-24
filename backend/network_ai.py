@@ -476,16 +476,24 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text):
 
     # ── Fallback: rule-based query engine ─────────────────────────────────────
     if not ai_result:
-        ai_result = _rule_based_query(prompt, time_filter)
+        # Extract previous context from session for follow-up detection
+        prev_context = None
+        if ai_session and session_id:
+            try:
+                last_asst = (NetworkAiMessage.query
+                             .filter_by(session_id=session_id, role="assistant")
+                             .order_by(NetworkAiMessage.created_at.desc())
+                             .first())
+                if last_asst and last_asst.content_json:
+                    prev_context = last_asst.content_json
+            except Exception:
+                pass
+        ai_result = _rule_based_query(prompt, time_filter, prev_context=prev_context)
         if not provider:
             provider = {"provider": "rule-based"}
         _LOG.info("AI query handled by rule-based fallback")
 
-    # Execute SQL with timeout protection
-    sql = ai_result.get("sql", "")
-    if not sql or not sql.strip().upper().startswith("SELECT"):
-        return jsonify({"error": "Could not generate a safe query"}), 400
-
+    # ── Helper functions ──────────────────────────────────────────────────────
     def _sql_with_timeout(query, timeout_sec=10):
         """Execute SQL with a statement timeout to prevent long-running queries."""
         with db.engine.connect() as conn:
@@ -493,6 +501,75 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text):
             result = conn.execute(sa_text(query))
             cols = list(result.keys())
             return [dict(zip(cols, row)) for row in result.fetchall()]
+
+    def _serial(v):
+        if v is None: return None
+        if hasattr(v, "isoformat"): return v.isoformat()
+        if isinstance(v, float) and math.isnan(v): return None
+        try:    return float(v)
+        except: return str(v)
+
+    # ── MULTI-CHART: execute each chart's SQL separately ───────────────────────
+    if ai_result.get("multi_chart") and ai_result.get("charts"):
+        charts_out = []
+        for chart_spec in ai_result["charts"]:
+            c_sql = chart_spec.get("sql", "")
+            try:
+                c_rows = _sql_with_timeout(c_sql, timeout_sec=15)
+            except Exception as e:
+                _LOG.warning("Multi-chart SQL failed: %s — %s", e, c_sql[:150])
+                c_rows = []
+            c_cols = list(c_rows[0].keys()) if c_rows else []
+            c_safe = [{k: _serial(v) for k, v in r.items()} for r in c_rows]
+            charts_out.append({
+                "title":      chart_spec.get("title", ""),
+                "chart_type": chart_spec.get("chart_type", "line"),
+                "x_axis":     chart_spec.get("x_axis", c_cols[0] if c_cols else "date"),
+                "y_axes":     chart_spec.get("y_axes", c_cols[1:] if c_cols else []),
+                "data":       c_safe,
+                "columns":    c_cols,
+                "row_count":  len(c_rows),
+                "sql":        c_sql,
+            })
+
+        resp_text = ai_result.get("response", f"Here are {len(charts_out)} charts.")
+        resp_title = ai_result.get("title", prompt[:70])
+
+        if ai_session:
+            try:
+                if ai_session.title == "New Chat":
+                    ai_session.title = (resp_title or prompt[:60])[:200]
+                assistant_msg = NetworkAiMessage(
+                    session_id=ai_session.id, role="assistant",
+                    content=resp_text,
+                    content_json={
+                        "title": resp_title, "chart_type": "multi_chart",
+                        "charts": charts_out, "response": resp_text,
+                        "provider": provider["provider"] if provider else "rule-based",
+                    },
+                )
+                db.session.add(assistant_msg)
+                db.session.commit()
+            except Exception as e:
+                _LOG.error("Failed to persist AI message: %s", e)
+
+        return jsonify({
+            "response":     resp_text,
+            "query_type":   "multi_chart",
+            "chart_type":   "multi_chart",
+            "title":        resp_title,
+            "charts":       charts_out,
+            "data":         [],  # no single data array for multi-chart
+            "columns":      [],
+            "row_count":    sum(c["row_count"] for c in charts_out),
+            "provider":     provider["provider"] if provider else "rule-based",
+            "session_id":   ai_session.id if ai_session else None,
+        })
+
+    # ── SINGLE CHART: execute SQL normally ─────────────────────────────────────
+    sql = ai_result.get("sql", "")
+    if not sql or not sql.strip().upper().startswith("SELECT"):
+        return jsonify({"error": "Could not generate a safe query"}), 400
 
     try:
         rows = _sql_with_timeout(sql, timeout_sec=15)
@@ -514,14 +591,6 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text):
 
     columns = list(rows[0].keys()) if rows else []
     has_geo = any(r.get("lat") or r.get("latitude") for r in rows)
-
-    def _serial(v):
-        if v is None: return None
-        if hasattr(v, "isoformat"): return v.isoformat()
-        if isinstance(v, float) and math.isnan(v): return None
-        try:    return float(v)
-        except: return str(v)
-
     safe_rows = [{k: _serial(v) for k, v in r.items()} for r in rows]
     y_axes = ai_result.get("y_axes") or [
         c for c in columns[1:5]
@@ -581,16 +650,243 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Follow-up / Conversation Context Handling
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Words that indicate a follow-up referencing the previous chart/result
+_FOLLOWUP_CUES = {
+    'scale', 'zoom', 'resize', 'bigger', 'smaller', 'enlarge', 'expand',
+    'change', 'modify', 'update', 'adjust', 'convert', 'switch', 'make it',
+    'the graph', 'the chart', 'this graph', 'this chart', 'that chart',
+    'same', 'previous', 'last one', 'above', 'earlier',
+    'bar chart', 'line chart', 'pie chart', 'area chart', 'table',
+    'add', 'include', 'also show', 'overlay',
+    'remove', 'hide', 'exclude',
+    'more days', 'fewer days', 'last 30', 'last 60', 'extend',
+    'different color', 'colour',
+    'yes', 'ok', 'sure', 'do it', 'go ahead', 'please do',
+}
+
+def _is_followup(prompt_lower: str) -> bool:
+    """Check if query is a follow-up referencing a previous chart/result."""
+    import re
+    # If it has specific site IDs or strong KPI keywords with day count,
+    # it's a NEW query, not a follow-up
+    has_site = bool(re.findall(r'[a-z]{2,}[_\-][a-z]{2,}[_\-]\d{3,}', prompt_lower))
+    has_days = bool(re.search(r'last\s+\d+\s*days?', prompt_lower))
+    if has_site and has_days:
+        return False
+    # Check for follow-up cues
+    for cue in _FOLLOWUP_CUES:
+        if cue in prompt_lower:
+            return True
+    # Very short queries (< 8 words) without KPI keywords are likely follow-ups
+    words = prompt_lower.split()
+    if len(words) <= 6:
+        return True
+    return False
+
+
+def _handle_followup(prompt_orig: str, p: str, prev: dict, time_filter: str) -> dict:
+    """
+    Handle a follow-up query using the previous assistant message's context.
+    prev = content_json from the last assistant message (has sql, title, chart_type, etc.)
+    Returns a result dict or None if it can't handle the follow-up.
+    """
+    import re
+
+    prev_sql = prev.get("sql", "")
+    prev_title = prev.get("title", "")
+    prev_chart = prev.get("chart_type", "bar")
+    prev_y = prev.get("y_axes", [])
+    prev_x = prev.get("x_axis", "date")
+    prev_response = prev.get("response", "")
+
+    # If prev was multi_chart, get the charts list
+    prev_charts = prev.get("charts", [])
+
+    if not prev_sql and not prev_charts:
+        return None
+
+    # ── Chart type change ──────────────────────────────────────────────────
+    new_chart = None
+    if 'bar' in p and 'chart' in p:
+        new_chart = 'bar'
+    elif 'line' in p and ('chart' in p or 'graph' in p):
+        new_chart = 'line'
+    elif 'pie' in p:
+        new_chart = 'pie'
+    elif 'area' in p and ('chart' in p or 'graph' in p):
+        new_chart = 'area'
+    elif 'table' in p and ('show' in p or 'as' in p or 'view' in p or 'convert' in p):
+        new_chart = 'bar'  # table view handled by frontend
+
+    if new_chart and prev_sql:
+        return {
+            "sql": prev_sql,
+            "query_type": new_chart,
+            "chart_type": new_chart,
+            "title": prev_title,
+            "x_axis": prev_x,
+            "y_axes": prev_y,
+            "response": f"Changed chart type to {new_chart}.",
+        }
+
+    # ── Time range change ──────────────────────────────────────────────────
+    new_days = None
+    m = re.search(r'(?:last|past|recent)\s+(\d+)\s*days?', p)
+    if m:
+        new_days = int(m.group(1))
+    elif re.search(r'(\d+)\s*days?', p):
+        new_days = int(re.search(r'(\d+)\s*days?', p).group(1))
+    elif 'more days' in p or 'extend' in p or 'longer' in p:
+        new_days = 30  # default extend
+
+    if new_days and prev_sql:
+        # Replace the date interval in the SQL
+        updated_sql = re.sub(
+            r"INTERVAL\s+'(\d+)\s+days?'",
+            f"INTERVAL '{new_days} days'",
+            prev_sql
+        )
+        # Update title
+        updated_title = re.sub(r'\(last \d+d\)', f'(last {new_days}d)', prev_title)
+        if updated_title == prev_title:
+            updated_title = prev_title + f" (last {new_days}d)"
+
+        # For multi_chart, update each chart's SQL
+        if prev_charts:
+            new_charts = []
+            for ch in prev_charts:
+                ch_sql = re.sub(
+                    r"INTERVAL\s+'(\d+)\s+days?'",
+                    f"INTERVAL '{new_days} days'",
+                    ch.get("sql", "")
+                )
+                ch_title = re.sub(r'\(last \d+d\)', f'(last {new_days}d)', ch.get("title", ""))
+                new_charts.append({**ch, "sql": ch_sql, "title": ch_title})
+            return {
+                "multi_chart": True,
+                "charts": new_charts,
+                "sql": new_charts[0]["sql"],
+                "query_type": "multi_chart",
+                "chart_type": "multi_chart",
+                "title": " & ".join(c["title"] for c in new_charts)[:80],
+                "x_axis": "date",
+                "y_axes": ["value"],
+                "response": f"Updated time range to last {new_days} days.",
+            }
+
+        return {
+            "sql": updated_sql,
+            "query_type": prev_chart,
+            "chart_type": prev_chart,
+            "title": updated_title,
+            "x_axis": prev_x,
+            "y_axes": prev_y,
+            "response": f"Updated to show last {new_days} days.",
+        }
+
+    # ── Scale / zoom / resize — parse specific scale requests ────────────────
+    if any(w in p for w in ['scale', 'zoom', 'resize', 'bigger', 'smaller',
+                             'enlarge', 'expand', 'y axis', 'y-axis', 'range',
+                             'difference', 'interval', 'step', 'tick']):
+        # Parse a numeric scale/interval: "scale to 10", "10 difference", "interval 5"
+        scale_num = None
+        sm = re.search(r'(?:to|of|at|interval|difference|step|every)\s*(\d+)', p)
+        if sm:
+            scale_num = int(sm.group(1))
+        elif re.search(r'(\d+)\s*(?:difference|interval|step|tick|unit|gap)', p):
+            scale_num = int(re.search(r'(\d+)\s*(?:difference|interval|step|tick|unit|gap)', p).group(1))
+
+        cfg = prev.get("chart_config", {}) or {}
+        if scale_num:
+            cfg["y_tick_interval"] = scale_num
+            resp_msg = f"Changed Y-axis scale to intervals of {scale_num}."
+        else:
+            # No specific number — just reset to auto-scale
+            cfg.pop("y_tick_interval", None)
+            resp_msg = "Re-rendered chart with auto-scaled axes."
+
+        if prev_charts:
+            for ch in prev_charts:
+                ch_cfg = ch.get("chart_config", {}) or {}
+                if scale_num:
+                    ch_cfg["y_tick_interval"] = scale_num
+                ch["chart_config"] = ch_cfg
+            return {
+                "multi_chart": True,
+                "charts": prev_charts,
+                "sql": prev_charts[0].get("sql", ""),
+                "query_type": "multi_chart",
+                "chart_type": "multi_chart",
+                "title": prev_title,
+                "x_axis": "date",
+                "y_axes": ["value"],
+                "chart_config": cfg,
+                "response": resp_msg,
+            }
+        return {
+            "sql": prev_sql,
+            "query_type": prev_chart,
+            "chart_type": prev_chart,
+            "title": prev_title,
+            "x_axis": prev_x,
+            "y_axes": prev_y,
+            "chart_config": cfg,
+            "response": resp_msg,
+        }
+
+    # ── Generic follow-up: just re-run the previous query ──────────────────
+    # For very short queries like "yes", "ok", "show me", etc. re-render previous
+    words = p.split()
+    if len(words) <= 5 or any(w in p for w in ['same', 'again', 'previous', 'repeat',
+                                                 'the graph', 'the chart', 'this',
+                                                 'that', 'above', 'earlier']):
+        if prev_charts:
+            return {
+                "multi_chart": True,
+                "charts": prev_charts,
+                "sql": prev_charts[0].get("sql", ""),
+                "query_type": "multi_chart",
+                "chart_type": "multi_chart",
+                "title": prev_title,
+                "x_axis": "date",
+                "y_axes": ["value"],
+                "response": prev_response or "Here are the previous results again.",
+            }
+        return {
+            "sql": prev_sql,
+            "query_type": prev_chart,
+            "chart_type": prev_chart,
+            "title": prev_title,
+            "x_axis": prev_x,
+            "y_axes": prev_y,
+            "response": prev_response or "Here are the previous results.",
+        }
+
+    return None  # Could not handle as follow-up; fall through to normal processing
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Rule-based NL → SQL fallback engine
 # ─────────────────────────────────────────────────────────────────────────────
-def _rule_based_query(prompt: str, time_filter: str = '1=1') -> dict:
+def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict = None) -> dict:
     """
     Smart NL → SQL rule-based engine.
     Supports: specific site IDs, exact day counts, multi-part/compound queries,
-    and single KPI trend requests.
+    single KPI trend requests, and FOLLOW-UP queries using prev_context.
     """
     import re
     p = prompt.lower()
+
+    # ── Follow-up detection ──────────────────────────────────────────────────
+    # If the user query is vague/contextual AND we have previous context,
+    # treat it as a follow-up referencing the previous chart/result.
+    if prev_context and _is_followup(p):
+        result = _handle_followup(prompt, p, prev_context, time_filter)
+        if result:
+            return result
 
     # ── Extract site IDs (e.g. GUR_LTE_1500) ────────────────────────────────
     site_ids = re.findall(r'[A-Za-z]{2,}[_\-][A-Za-z]{2,}[_\-]\d{3,}', prompt)
@@ -655,8 +951,15 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1') -> dict:
             kpis2 = _detect_kpis(part2)
             sites1 = re.findall(r'[A-Za-z]{2,}[_\-][A-Za-z]{2,}[_\-]\d{3,}', part1)
             sites2 = re.findall(r'[A-Za-z]{2,}[_\-][A-Za-z]{2,}[_\-]\d{3,}', part2)
-            # Valid compound if both parts have a KPI or a site
-            if (kpis1 or sites1) and (kpis2 or sites2):
+            # Valid compound ONLY if both parts have a KPI AND at least one part has a site
+            # This prevents "throughput and prb for SITE" from being split
+            # (that should be handled as multi-KPI single-site query instead)
+            if kpis1 and kpis2 and (sites1 or sites2):
+                # If one part lacks a site, inherit from the other or from global site_ids
+                if not sites1 and sites2:
+                    sites1 = site_ids[:1] if site_ids else sites2[:1]
+                elif not sites2 and sites1:
+                    sites2 = site_ids[:1] if site_ids else sites1[:1]
                 return [(part1, kpis1, sites1), (part2, kpis2, sites2)]
         return None
 
@@ -674,41 +977,47 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1') -> dict:
     GEO_JOIN = "LEFT JOIN telecom_sites ts ON LOWER(k.site_id) = LOWER(ts.site_id)"
 
     # ── Try compound query first ─────────────────────────────────────────────
+    # Returns multi_chart: each part gets its own separate chart
     compound = _try_split_compound(prompt)
-    if compound and len(compound) == 2:
-        parts_sql = []
-        titles = []
+    if compound and len(compound) >= 2:
+        charts = []
         for part_text, part_kpis, part_sites in compound:
             days = _extract_days(part_text)
             kpi = part_kpis[0] if part_kpis else ('DL PRB Utilization (1BH)', 'dl_prb')
             site = part_sites[0] if part_sites else None
             date_clause = f"AND k.date >= CURRENT_DATE - INTERVAL '{days} days' AND k.date <= CURRENT_DATE" if days else "AND k.date <= CURRENT_DATE"
             site_clause = f"AND k.site_id = '{site}'" if site else ""
-            label = f"{kpi[0]}"
+
+            chart_title = kpi[0]
             if site:
-                label += f" ({site})"
-                titles.append(f"{kpi[1].upper()} {site}")
-            else:
-                titles.append(kpi[1].upper())
+                chart_title += f" — {site}"
+            if days:
+                chart_title += f" (last {days}d)"
 
-            parts_sql.append(f"""SELECT k.date::text AS date, k.site_id,
-                   AVG(k.value) AS value,
-                   '{kpi[0]}' AS kpi_name
-            FROM kpi_data k
-            WHERE k.kpi_name = '{kpi[0]}'
-              AND k.data_level = 'site' AND k.value IS NOT NULL
-              {site_clause} {date_clause}
-            GROUP BY k.date, k.site_id""")
+            charts.append({
+                "sql": f"""SELECT k.date::text AS date, AVG(k.value) AS {kpi[1]}
+                    FROM kpi_data k
+                    WHERE k.kpi_name = '{kpi[0]}'
+                      AND k.data_level = 'site' AND k.value IS NOT NULL
+                      {site_clause} {date_clause}
+                    GROUP BY k.date ORDER BY k.date""",
+                "chart_type": "line",
+                "title": chart_title,
+                "x_axis": "date",
+                "y_axes": [kpi[1]],
+            })
 
-        full_sql = "\nUNION ALL\n".join(parts_sql) + "\nORDER BY date"
+        chart_labels = [c["title"] for c in charts]
         return {
-            "sql": full_sql,
-            "query_type": "composed",
-            "chart_type": "composed",
-            "title": " & ".join(titles)[:60],
+            "multi_chart": True,
+            "charts": charts,
+            "sql": charts[0]["sql"],  # primary SQL for logging
+            "query_type": "multi_chart",
+            "chart_type": "multi_chart",
+            "title": " & ".join(chart_labels)[:80],
             "x_axis": "date",
             "y_axes": ["value"],
-            "response": f"Showing {titles[0]} and {titles[1]} trends.",
+            "response": f"Here are {len(charts)} charts as requested: {', '.join(chart_labels)}.",
         }
 
     # ── Single query with specific site + KPI + days ─────────────────────────
