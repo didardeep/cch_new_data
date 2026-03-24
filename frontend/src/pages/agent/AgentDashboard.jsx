@@ -236,7 +236,7 @@ export default function AgentDashboard() {
     { label:'MTTR',                      value: kpis.mttr ?? 0,                          unit:'hrs', icon: IC.clock,  sub:'Mean Time To Resolve' },
     { label:'SLA Compliance',            value: `${kpis.sla_compliance_rate ?? 0}`,      unit:'%',   icon: IC.check,  sub:'Resolved within SLA' },
     { label:'First Contact Resolution',  value: `${kpis.first_contact_resolution ?? 0}`, unit:'%',   icon: IC.target, sub:'No re-open needed' },
-    { label:'CSAT Score',                value: `${kpis.csat_pct ?? 0}`,                  unit:'%',   icon: IC.star,   sub: `${kpis.csat ?? 0} / 5 avg rating` },
+    { label:'CSAT Score',                value: kpis.csat ?? 0,                          unit:'/ 5', icon: IC.star,   sub: `${kpis.csat_pct ?? 0}% rated 4+` },
     { label:'Reopen Rate',               value: `${kpis.reopen_rate ?? 0}`,              unit:'%',   icon: IC.repeat, sub:'Tickets re-opened', alert: (kpis.reopen_rate ?? 0) > 10 },
     { label:'H/S Incident Resolution',   value: kpis.hs_incident_resolution_time ?? 0,   unit:'hrs', icon: IC.alert,  sub:'Critical & High tickets', alert: true },
     { label:'H/S Incident Response',     value: kpis.hs_incident_response_time ?? 0,     unit:'hrs', icon: IC.zap,    sub:'Avg first response' },

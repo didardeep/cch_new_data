@@ -4973,12 +4973,11 @@ def agent_dashboard():
             "mttr": mttr,
             "sla_compliance_rate": sla_compliance,
             "first_contact_resolution": fcr,
-            "csat": csat_avg,
+            "csat": csat,
             "csat_pct": csat_pct,
             "reopen_rate": reopen_rate,
             "hs_incident_resolution_time": hs_resolution_time,
             "hs_incident_response_time": hs_response_time,
-            "pending_overdue": pending_overdue,
             "complaint_resolution_time": complaint_resolution_time,
             "rca_timely_completion": rca_completion,
             "avg_aging_hours": avg_aging,
@@ -5863,6 +5862,10 @@ with app.app_context():
 # ─── Register Network Analytics Blueprint ─────────────────────────────────────
 from network_analytics import network_bp, clear_analytics_cache
 app.register_blueprint(network_bp)
+
+# ─── Register Network AI Blueprint ───────────────────────────────────────────
+from network_ai import network_ai_bp
+app.register_blueprint(network_ai_bp)
 
 # ─── Register Network Issues Blueprint ─────────────────────────────────────
 from network_issues import network_issues_bp, NetworkIssueTicket, schedule_daily_job
