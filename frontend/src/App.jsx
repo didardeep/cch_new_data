@@ -37,6 +37,7 @@ import AgentChatView from './pages/agent/AgentChatView';
 import NetworkAnalyticsDashboard from './pages/agent/NetworkAnalyticsDashboard';
 import SettingsPage from './pages/SettingsPage';
 import NetworkIssues from './pages/agent/NetworkIssues';
+import NetworkAiChat from './pages/agent/NetworkAiChat';
 
 function ProtectedRoute({ children, roles }) {
   const { user, loading } = useAuth();
@@ -125,6 +126,7 @@ export default function App() {
         <Route path="tickets" element={<AgentTicketBucket />} />
         <Route path="chat/:sessionId" element={<AgentChatView />} />
         <Route path="network" element={<NetworkAnalyticsDashboard />} />
+        <Route path="network-ai" element={<NetworkAiChat />} />
         <Route path="settings" element={<SettingsPage />} />
         <Route path="network-issues" element={<NetworkIssues />} />
       </Route>
