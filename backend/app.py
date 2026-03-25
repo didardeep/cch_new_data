@@ -1558,10 +1558,46 @@ def classify_response_route():
 @jwt_required()
 def create_chat_session():
     user_id = int(get_jwt_identity())
+
+    # ── Clean up empty/abandoned sessions before creating a new one ──────────
+    # Delete active sessions that have zero messages and are older than 1 hour
+    from datetime import timedelta
+    stale_cutoff = datetime.now(timezone.utc) - timedelta(hours=1)
+    stale_sessions = ChatSession.query.filter(
+        ChatSession.user_id == user_id,
+        ChatSession.status == "active",
+        ChatSession.last_message_at < stale_cutoff,
+    ).all()
+    for s in stale_sessions:
+        msg_count = ChatMessage.query.filter_by(session_id=s.id).count()
+        if msg_count == 0:
+            db.session.delete(s)
+    db.session.flush()
+    # ─────────────────────────────────────────────────────────────────────────
+
     session = ChatSession(user_id=user_id, status="active")
     db.session.add(session)
     db.session.commit()
     return jsonify({"session": session.to_dict()}), 201
+
+
+@app.route("/api/admin/cleanup-sessions", methods=["POST"])
+@jwt_required()
+def cleanup_old_sessions():
+    """Admin route: delete resolved sessions older than 30 days."""
+    from datetime import timedelta
+    cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+    old_sessions = ChatSession.query.filter(
+        ChatSession.status == "resolved",
+        ChatSession.resolved_at < cutoff,
+    ).all()
+    count = 0
+    for s in old_sessions:
+        ChatMessage.query.filter_by(session_id=s.id).delete()
+        db.session.delete(s)
+        count += 1
+    db.session.commit()
+    return jsonify({"deleted": count, "message": f"Deleted {count} old resolved sessions"})
 
 
 @app.route("/api/chat/session/<int:session_id>/message", methods=["POST"])
@@ -1577,6 +1613,7 @@ def add_chat_message(session_id):
         session_id=session_id,
         sender=data.get("sender", "user"),
         content=data.get("content", ""),
+        content_json=data.get("payload"),   # ← saves full card/UI payload for restoration
     )
     db.session.add(msg)
 
@@ -1591,6 +1628,9 @@ def add_chat_message(session_id):
         session.resolution = data["resolution"]
     if data.get("language"):
         session.language = data["language"]
+    if data.get("current_step"):            # ← saves step so resume works correctly
+        session.current_step = data["current_step"]
+    session.last_message_at = datetime.now(timezone.utc)  # ← keeps session timestamp fresh
 
     db.session.commit()
     return jsonify({"message": msg.to_dict()})

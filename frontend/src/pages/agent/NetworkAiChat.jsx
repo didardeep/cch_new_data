@@ -72,26 +72,21 @@ function Tip({T,active,payload,label}) {
 
 // ── Pivot helper for UNION ALL multi-series data ──────────────────────────
 function pivotMultiSeries(data, columns, xKey) {
-  // Detect if data has a 'kpi_name' or series differentiator column + single 'value' column
   const hasKpiName = columns.includes('kpi_name');
   const hasSiteId = columns.includes('site_id');
   const hasValue = columns.includes('value');
   if (!hasValue || !xKey) return null;
 
-  // Build series key from kpi_name + site_id (whichever are present)
   const distinctKpis = hasKpiName ? [...new Set(data.map(r => r.kpi_name).filter(Boolean))] : [];
   const distinctSites = hasSiteId ? [...new Set(data.map(r => r.site_id).filter(Boolean))] : [];
 
-  // Only pivot if there are multiple distinct series (kpi or site)
   const multiKpi = distinctKpis.length > 1;
   const multiSite = distinctSites.length > 1;
   if (!multiKpi && !multiSite) return null;
 
-  // Build series label for each row
   const seriesKey = (r) => {
     const parts = [];
     if (multiKpi && r.kpi_name) {
-      // Shorten KPI name for column key
       const short = String(r.kpi_name).replace(/[^a-zA-Z0-9]/g, '_').replace(/_+/g, '_').slice(0, 30);
       parts.push(short);
     }
@@ -103,7 +98,6 @@ function pivotMultiSeries(data, columns, xKey) {
     return parts.join('_') || 'value';
   };
 
-  // Build series label (human readable) for legend
   const seriesLabel = (r) => {
     const parts = [];
     if (multiKpi && r.kpi_name) parts.push(String(r.kpi_name));
@@ -111,8 +105,7 @@ function pivotMultiSeries(data, columns, xKey) {
     return parts.join(' — ') || 'value';
   };
 
-  // Collect all unique series keys + labels
-  const seriesMap = new Map(); // key → label
+  const seriesMap = new Map();
   data.forEach(r => {
     const k = seriesKey(r);
     if (!seriesMap.has(k)) seriesMap.set(k, seriesLabel(r));
@@ -120,7 +113,6 @@ function pivotMultiSeries(data, columns, xKey) {
   const seriesKeys = [...seriesMap.keys()];
   const seriesLabels = Object.fromEntries(seriesMap);
 
-  // Pivot: group by xKey, spread value into series columns
   const grouped = new Map();
   data.forEach(r => {
     const x = r[xKey];
@@ -139,17 +131,75 @@ function pivotMultiSeries(data, columns, xKey) {
   return { data: pivoted, yKeys: seriesKeys, labels: seriesLabels };
 }
 
+// ── Empty / Error state for charts with no data ────────────────────────────
+function ChartEmptyState({ T, title, error, sql }) {
+  const [showSql, setShowSql] = useState(false);
+  return (
+    <div style={{ marginTop: 8 }}>
+      {/* Title bar */}
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+        <div style={{ fontSize: 12, fontWeight: 700, color: T.text }}>{title || 'Chart'}</div>
+        <span style={{ fontSize: 9, padding: '2px 7px', borderRadius: 8, background: T.red + '18', color: T.red, fontWeight: 600 }}>
+          no data
+        </span>
+      </div>
+      {/* Error card */}
+      <div style={{
+        border: `1.5px dashed ${T.amber}66`,
+        borderRadius: 10,
+        padding: '20px 24px',
+        background: T.amber + '08',
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'center',
+        gap: 8,
+        textAlign: 'center',
+      }}>
+        <div style={{ fontSize: 22, opacity: 0.5 }}>📭</div>
+        <div style={{ fontSize: 12, fontWeight: 700, color: T.amber }}>No data returned</div>
+        <div style={{ fontSize: 11, color: T.textSub, maxWidth: 420, lineHeight: 1.6 }}>
+          {error || 'The query ran successfully but returned 0 rows. The site ID or KPI may not exist in the available data.'}
+        </div>
+        {sql && (
+          <button
+            onClick={() => setShowSql(s => !s)}
+            style={{ marginTop: 4, padding: '3px 10px', borderRadius: 12, fontSize: 9.5, fontWeight: 600, background: 'transparent', border: `1px solid ${T.border}`, color: T.muted, cursor: 'pointer' }}
+          >
+            {showSql ? 'Hide SQL' : 'View SQL'}
+          </button>
+        )}
+        {showSql && sql && (
+          <pre style={{ background: T.surface2, border: `1px solid ${T.border}`, borderRadius: 6, padding: '8px 10px', fontSize: 9, color: T.textSub, overflow: 'auto', width: '100%', textAlign: 'left', marginTop: 4, lineHeight: 1.5 }}>
+            {sql}
+          </pre>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ── Inline Chart Renderer ──────────────────────────────────────────────────
 function InlineChart({result,T,chartId}) {
   const [showTable,setShowTable]=useState(false);
   const uid=useMemo(()=>chartId||Math.random().toString(36).slice(2,8),[chartId]);
-  if(!result||!result.data?.length) return null;
+  if(!result) return null;
+
+  // ── Show empty/error state instead of silently returning null ──────────
+  if(!result.data?.length) {
+    return (
+      <ChartEmptyState
+        T={T}
+        title={result.title}
+        error={result.error}
+        sql={result.sql}
+      />
+    );
+  }
 
   const {title,data:rawData=[],columns=[],x_axis,y_axes,response,row_count,chart_type,query_type,chart_config,provider,sql}=result;
   const xKey=x_axis||columns[0]||'';
   const SKIP_COLS=new Set(['lat','lng','latitude','longitude','site_id','cell_id','cluster','region','zone','technology','color','status','kpi_name']);
 
-  // Try to detect and pivot UNION ALL multi-series data
   const pivoted = pivotMultiSeries(rawData, columns, xKey);
 
   const data = pivoted ? pivoted.data : rawData;
@@ -220,7 +270,6 @@ function InlineChart({result,T,chartId}) {
     if(ctype==='composed'&&yKeys.length>=2){
       const cTickInterval=data.length>15?Math.ceil(data.length/10):0;
       const chartColors=[PAL[0],PAL[1],PAL[2],PAL[3],PAL[4]];
-      // Auto-scale each Y axis
       const lVals=data.map(r=>parseFloat(r[yKeys[0]])).filter(v=>!isNaN(v));
       const rVals=yKeys[1]?data.map(r=>parseFloat(r[yKeys[1]])).filter(v=>!isNaN(v)):[];
       const domainOf=vals=>{if(!vals.length)return[0,'auto'];const mn=Math.min(...vals),mx=Math.max(...vals),rng=mx-mn||1,p=rng*.1;return[Math.max(0,Math.floor((mn-p)*100)/100),Math.ceil((mx+p)*100)/100];};
@@ -254,14 +303,12 @@ function InlineChart({result,T,chartId}) {
 
     if(ctype==='line'||ctype==='area'||isTimeSeries){
       const tickInterval=data.length>20?Math.ceil(data.length/8):data.length>10?2:0;
-      // Y-axis domain: use chart_config.y_tick_interval if set, otherwise auto-scale
       const yTickInt=cfg.y_tick_interval?parseFloat(cfg.y_tick_interval):null;
       const allVals=yKeys.flatMap(k=>data.map(r=>parseFloat(r[k])).filter(v=>!isNaN(v)));
       const dMin=allVals.length?Math.min(...allVals):0;
       const dMax=allVals.length?Math.max(...allVals):100;
       let yDomain, yTicks;
       if(yTickInt){
-        // User requested specific tick interval (e.g. "scale to 10 difference")
         const lo=Math.max(0,Math.floor(dMin/yTickInt)*yTickInt);
         const hi=Math.ceil(dMax/yTickInt)*yTickInt;
         yDomain=[lo,hi];
@@ -394,7 +441,6 @@ export default function NetworkAiChat() {
   const T = dark ? T_DARK : T_LIGHT;
   const navigate = useNavigate();
 
-  // Session management
   const [sessions, setSessions]         = useState([]);
   const [activeSessionId, setActiveId]  = useState(null);
   const [messages, setMessages]         = useState([]);
@@ -406,17 +452,14 @@ export default function NetworkAiChat() {
   const endRef  = useRef(null);
   const inputRef = useRef(null);
 
-  // Auto-scroll
   useEffect(()=>{ endRef.current?.scrollIntoView({behavior:'smooth'}); },[messages]);
 
-  // Load sessions on mount
   useEffect(()=>{
     apiGet('/api/network/ai-sessions')
       .then(r=>{ setSessions(r.sessions||[]); setSessLoad(false); })
       .catch(()=>setSessLoad(false));
   },[]);
 
-  // Load messages when session changes
   const loadSession = useCallback(async(id)=>{
     setActiveId(id);
     if(!id){ setMessages([]); return; }
@@ -450,7 +493,6 @@ export default function NetworkAiChat() {
     if(!text?.trim()||loading) return;
 
     let sid = activeSessionId;
-    // Auto-create session if none
     if(!sid){
       try{
         const r = await apiPost('/api/network/ai-sessions',{});
@@ -460,7 +502,6 @@ export default function NetworkAiChat() {
       }catch{ return; }
     }
 
-    // Optimistic UI
     const userMsg = { id:Date.now(), role:'user', content:text, created_at:new Date().toISOString() };
     setMessages(prev=>[...prev,userMsg]);
     setInput('');
@@ -482,7 +523,6 @@ export default function NetworkAiChat() {
       };
       setMessages(prev=>[...prev,assistantMsg]);
 
-      // Update session title
       if(result.title){
         setSessions(prev=>prev.map(s=>
           s.id===sid&&s.title==='New Chat' ? {...s,title:result.title} : s
@@ -535,7 +575,6 @@ export default function NetworkAiChat() {
         {/* ── Session Sidebar ── */}
         {sidebarOpen&&(
           <div style={{width:260,borderRight:`1px solid ${T.border}`,background:T.surface,display:'flex',flexDirection:'column',flexShrink:0}}>
-            {/* New Chat */}
             <div style={{padding:12}}>
               <button onClick={handleNewChat}
                 style={{width:'100%',padding:'9px 14px',borderRadius:10,border:`1.5px dashed ${T.border}`,background:'transparent',color:T.kpmgBlue,fontWeight:700,fontSize:12,cursor:'pointer',fontFamily:'inherit',display:'flex',alignItems:'center',justifyContent:'center',gap:6}}>
@@ -543,7 +582,6 @@ export default function NetworkAiChat() {
               </button>
             </div>
 
-            {/* Sessions list */}
             <div style={{flex:1,overflowY:'auto',padding:'0 8px 12px'}}>
               {sessionsLoading?(
                 <div style={{textAlign:'center',padding:20,color:T.muted,fontSize:11}}>Loading...</div>
@@ -570,10 +608,8 @@ export default function NetworkAiChat() {
         {/* ── Chat Area ── */}
         <div style={{flex:1,display:'flex',flexDirection:'column',overflow:'hidden'}}>
 
-          {/* Messages */}
           <div style={{flex:1,overflowY:'auto',padding:'20px 24px'}}>
             {messages.length===0?(
-              /* Welcome Screen */
               <div style={{display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',height:'100%',gap:16}}>
                 <div style={{fontSize:40,opacity:.3}}>🤖</div>
                 <div style={{fontSize:20,fontWeight:800,color:T.text,opacity:.7}}>Network AI Assistant</div>
@@ -590,7 +626,6 @@ export default function NetworkAiChat() {
                 </div>
               </div>
             ):(
-              /* Message Thread */
               <div style={{maxWidth:1100,margin:'0 auto',width:'100%'}}>
                 {messages.map(m=>(
                   <div key={m.id} style={{display:'flex',justifyContent:m.role==='user'?'flex-end':'flex-start',marginBottom:16,animation:'fadeIn .3s ease'}}>
@@ -604,15 +639,13 @@ export default function NetworkAiChat() {
                       boxShadow:m.role==='user'?'0 2px 12px rgba(0,51,141,.2)':T.cardShadow,
                       border:m.role==='user'?'none':`1px solid ${T.border}`,
                     }}>
-                      {/* Role label */}
                       <div style={{fontSize:9,fontWeight:700,marginBottom:4,opacity:.6,textTransform:'uppercase'}}>
                         {m.role==='user'?'You':'AI Assistant'}
                       </div>
 
-                      {/* Text content */}
                       <div style={{fontSize:12.5,lineHeight:1.65,whiteSpace:'pre-wrap'}}>{m.content}</div>
 
-                      {/* Inline charts for assistant messages */}
+                      {/* Multi-chart: render ALL charts including ones with no data */}
                       {m.role==='assistant'&&m.payload&&m.payload.chart_type==='multi_chart'&&m.payload.charts?.length>0&&(
                         m.payload.charts.map((chart,ci)=>(
                           <div key={ci} style={{marginTop:ci===0?10:16}}>
@@ -620,11 +653,11 @@ export default function NetworkAiChat() {
                           </div>
                         ))
                       )}
-                      {m.role==='assistant'&&m.payload&&m.payload.chart_type!=='multi_chart'&&m.payload.data?.length>0&&(
+                      {/* Single chart */}
+                      {m.role==='assistant'&&m.payload&&m.payload.chart_type!=='multi_chart'&&(m.payload.data?.length>0||m.payload.error)&&(
                         <InlineChart result={m.payload} T={T}/>
                       )}
 
-                      {/* Timestamp */}
                       <div style={{fontSize:8.5,opacity:.4,marginTop:6,textAlign:m.role==='user'?'right':'left'}}>
                         {m.created_at?new Date(m.created_at).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}):''}
                       </div>
@@ -632,7 +665,6 @@ export default function NetworkAiChat() {
                   </div>
                 ))}
 
-                {/* Loading indicator */}
                 {loading&&(
                   <div style={{display:'flex',justifyContent:'flex-start',marginBottom:16}}>
                     <div style={{padding:'14px 20px',borderRadius:'18px 18px 18px 4px',background:T.surface,border:`1px solid ${T.border}`,boxShadow:T.cardShadow}}>
