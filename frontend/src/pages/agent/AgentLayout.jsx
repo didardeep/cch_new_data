@@ -35,11 +35,17 @@ const ICON_ALERT = (
     <line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
   </svg>
 );
+const ICON_AI = (
+  <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M12 2L15.09 8.26L22 9.27L17 14.14L18.18 21.02L12 17.77L5.82 21.02L7 14.14L2 9.27L8.91 8.26L12 2z"/>
+  </svg>
+);
 
 const navLinks = [
   { path: '/agent/dashboard', label: 'Dashboard',              icon: ICON_GRID    },
   { path: '/agent/tickets',   label: 'Assigned Ticket Bucket', icon: ICON_TICKET  },
   { path: '/agent/network',   label: 'Network Analysis',       icon: ICON_NETWORK },
+  { path: '/agent/network-ai', label: 'Network AI',            icon: ICON_AI      },
   { path: '/agent/network-issues', label: 'Network Issues',    icon: ICON_ALERT   },
 ];
 
@@ -134,7 +140,7 @@ export default function AgentLayout() {
           {navLinks.map(link => (
             <button
               key={link.path}
-              className={`sidebar-link${location.pathname.startsWith(link.path) ? ' active' : ''}`}
+              className={`sidebar-link${location.pathname===link.path||location.pathname.startsWith(link.path+'/') ? ' active' : ''}`}
               onClick={() => navigate(link.path)}
             >
               {link.icon}

@@ -139,6 +139,52 @@ class ChatMessage(db.Model):
         }
 
 
+class NetworkAiSession(db.Model):
+    __tablename__ = "network_ai_sessions"
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
+    title = db.Column(db.String(200), default="New Chat")
+    status = db.Column(db.String(20), default="active")
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+    last_message_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+
+    messages = db.relationship("NetworkAiMessage", backref="session", lazy=True,
+                               order_by="NetworkAiMessage.created_at")
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "user_id": self.user_id,
+            "title": self.title,
+            "status": self.status,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "last_message_at": self.last_message_at.isoformat() if self.last_message_at else None,
+            "message_count": len(self.messages) if self.messages else 0,
+        }
+
+
+class NetworkAiMessage(db.Model):
+    __tablename__ = "network_ai_messages"
+
+    id = db.Column(db.Integer, primary_key=True)
+    session_id = db.Column(db.Integer, db.ForeignKey("network_ai_sessions.id"), nullable=False)
+    role = db.Column(db.String(10), nullable=False)
+    content = db.Column(db.Text, nullable=False)
+    content_json = db.Column(db.JSON, nullable=True)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "session_id": self.session_id,
+            "role": self.role,
+            "content": self.content,
+            "payload": self.content_json,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
 class Ticket(db.Model):
     __tablename__ = "tickets"
 

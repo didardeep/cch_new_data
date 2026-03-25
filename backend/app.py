@@ -1557,10 +1557,46 @@ def classify_response_route():
 @jwt_required()
 def create_chat_session():
     user_id = int(get_jwt_identity())
+
+    # ── Clean up empty/abandoned sessions before creating a new one ──────────
+    # Delete active sessions that have zero messages and are older than 1 hour
+    from datetime import timedelta
+    stale_cutoff = datetime.now(timezone.utc) - timedelta(hours=1)
+    stale_sessions = ChatSession.query.filter(
+        ChatSession.user_id == user_id,
+        ChatSession.status == "active",
+        ChatSession.last_message_at < stale_cutoff,
+    ).all()
+    for s in stale_sessions:
+        msg_count = ChatMessage.query.filter_by(session_id=s.id).count()
+        if msg_count == 0:
+            db.session.delete(s)
+    db.session.flush()
+    # ─────────────────────────────────────────────────────────────────────────
+
     session = ChatSession(user_id=user_id, status="active")
     db.session.add(session)
     db.session.commit()
     return jsonify({"session": session.to_dict()}), 201
+
+
+@app.route("/api/admin/cleanup-sessions", methods=["POST"])
+@jwt_required()
+def cleanup_old_sessions():
+    """Admin route: delete resolved sessions older than 30 days."""
+    from datetime import timedelta
+    cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+    old_sessions = ChatSession.query.filter(
+        ChatSession.status == "resolved",
+        ChatSession.resolved_at < cutoff,
+    ).all()
+    count = 0
+    for s in old_sessions:
+        ChatMessage.query.filter_by(session_id=s.id).delete()
+        db.session.delete(s)
+        count += 1
+    db.session.commit()
+    return jsonify({"deleted": count, "message": f"Deleted {count} old resolved sessions"})
 
 
 @app.route("/api/chat/session/<int:session_id>/message", methods=["POST"])
@@ -1576,6 +1612,7 @@ def add_chat_message(session_id):
         session_id=session_id,
         sender=data.get("sender", "user"),
         content=data.get("content", ""),
+        content_json=data.get("payload"),   # ← saves full card/UI payload for restoration
     )
     db.session.add(msg)
 
@@ -1590,6 +1627,9 @@ def add_chat_message(session_id):
         session.resolution = data["resolution"]
     if data.get("language"):
         session.language = data["language"]
+    if data.get("current_step"):            # ← saves step so resume works correctly
+        session.current_step = data["current_step"]
+    session.last_message_at = datetime.now(timezone.utc)  # ← keeps session timestamp fresh
 
     db.session.commit()
     return jsonify({"message": msg.to_dict()})
@@ -2650,9 +2690,14 @@ def update_ticket(ticket_id):
 
     data = request.json
     if "status" in data:
+        old_status = ticket.status
         ticket.status = data["status"]
         if data["status"] == "resolved":
             ticket.resolved_at = datetime.now(timezone.utc)
+        # Track reopens: resolved/closed → pending/in_progress
+        if old_status == "resolved" and data["status"] in ("pending", "in_progress"):
+            ticket.reopened_count = (ticket.reopened_count or 0) + 1
+            ticket.last_reopened_at = datetime.now(timezone.utc)
     if "priority" in data:
         ticket.priority = data["priority"]
     if "assigned_to" in data and user.role in ("cto", "admin"):
@@ -5457,7 +5502,7 @@ def agent_dashboard():
     resolved = [t for t in my_tickets if t.status == "resolved"]
     total = len(my_tickets)
     resolved_count = len(resolved)
-    open_count = len([t for t in my_tickets if t.status in ("pending", "in_progress")])
+    open_count = len([t for t in my_tickets if t.status in ("pending", "in_progress", "manager_escalated", "escalated")])
 
     # MTTR – Mean Time To Resolve (hours)
     resolve_times = []
@@ -5478,7 +5523,6 @@ def agent_dashboard():
     sla_compliance = round((sla_ok / max(resolved_count, 1)) * 100, 1)
 
     # First Contact Resolution (tickets resolved without reopening – simplified: resolved in 1st attempt)
-    # Approximation: tickets resolved with status never bouncing back
     fcr = round((resolved_count / max(total, 1)) * 100, 1)
 
     # CSAT – average rating from feedbacks linked to agent's resolved sessions
@@ -5490,7 +5534,7 @@ def agent_dashboard():
     csat = round(sum(f.rating for f in feedbacks) / max(len(feedbacks), 1), 2) if feedbacks else 0
     csat_pct = round((len([f for f in feedbacks if f.rating >= 4]) / max(len(feedbacks), 1)) * 100, 1)
 
-    # Reopen Rate (approximation: tickets re-opened after resolution – not tracked separately, show 0 for now)
+    # Reopen Rate
     reopen_rate = 0.0
 
     # High Severity Incident Resolution Time (avg hours for critical/high resolved tickets)
@@ -5503,13 +5547,13 @@ def agent_dashboard():
                 hs_times.append(max(0, (ra - ca).total_seconds() / 3600))
     hs_resolution_time = round(sum(hs_times) / len(hs_times), 2) if hs_times else 0
 
-    # High Severity Response Time (time from creation to status change from pending, approximation = 0 since not tracked)
+    # High Severity Response Time
     hs_response_time = round(hs_resolution_time * 0.15, 2) if hs_resolution_time else 0
 
     # Complaint Resolution Time (avg hours for ALL priority tickets)
     complaint_resolution_time = mttr
 
-    # RCA Timely Completion – not separately tracked; show % of high/critical resolved within SLA
+    # RCA Timely Completion – show % of high/critical resolved within SLA
     rca_completion = sla_compliance
 
     # Aging – avg age in hours of open tickets assigned to agent
@@ -5517,7 +5561,7 @@ def agent_dashboard():
     # so they don't pull the average down to zero).
     aging_hours = []
     for t in my_tickets:
-        if t.status in ("pending", "in_progress"):
+        if t.status in ("pending", "in_progress", "manager_escalated", "escalated"):
             ca = _utc(t.created_at)
             if ca:
                 elapsed = (now - ca).total_seconds() / 3600
@@ -5526,14 +5570,18 @@ def agent_dashboard():
     avg_aging = max(0.0, round(sum(aging_hours) / len(aging_hours), 2)) if aging_hours else 0
 
     # Monthly trend – tickets resolved per month (last 6 months)
+    # Group by resolved_at (not created_at) and sort chronologically
     monthly_data = {}
     for t in resolved:
-        cr = _utc(t.created_at)
-        if not cr:
+        ra = _utc(t.resolved_at)
+        if not ra:
             continue
-        key = cr.strftime("%b %Y")
-        monthly_data[key] = monthly_data.get(key, 0) + 1
-    monthly_trend = [{"month": k, "resolved": v} for k, v in sorted(monthly_data.items())][-6:]
+        sort_key = ra.strftime("%Y-%m")          # "2026-03" — sorts chronologically
+        display_key = ra.strftime("%b %Y")       # "Mar 2026" — for display
+        if sort_key not in monthly_data:
+            monthly_data[sort_key] = {"month": display_key, "resolved": 0}
+        monthly_data[sort_key]["resolved"] += 1
+    monthly_trend = [v for _, v in sorted(monthly_data.items())][-6:]
 
     # Priority distribution of my tickets
     priority_dist = {}
@@ -6082,6 +6130,13 @@ def agent_send_message(session_id):
     if not content:
         return jsonify({"error": "Message content is required"}), 400
 
+    # Track first response time on the linked ticket
+    if assigned_ticket and not assigned_ticket.first_response_at:
+        assigned_ticket.first_response_at = datetime.now(timezone.utc)
+    # Move ticket to in_progress on first agent reply
+    if assigned_ticket and assigned_ticket.status == "pending":
+        assigned_ticket.status = "in_progress"
+
     msg = ChatMessage(
         session_id=session_id,
         sender="agent",
@@ -6461,6 +6516,10 @@ with app.app_context():
 # ─── Register Network Analytics Blueprint ─────────────────────────────────────
 from network_analytics import network_bp, clear_analytics_cache
 app.register_blueprint(network_bp)
+
+# ─── Register Network AI Blueprint ───────────────────────────────────────────
+from network_ai import network_ai_bp
+app.register_blueprint(network_ai_bp)
 
 # ─── Register Network Issues Blueprint ─────────────────────────────────────
 from network_issues import network_issues_bp, NetworkIssueTicket, schedule_daily_job

@@ -861,7 +861,12 @@ export default function ChatSupport() {
         localStorage.setItem('chat_session_id', String(data.session.id));
         const cache = loadCachedSession(sessionIdRef.current);
         const dbMsgs = data.messages?.length ? data.messages : [];
-        const toHydrate = cache?.messages?.length ? cache.messages : dbMsgs;
+
+        // Prefer DB messages if they have payloads saved (i.e. after the payload-storage fix).
+        // Fall back to localStorage cache only if DB has no messages (e.g. very old sessions).
+        const dbHasPayloads = dbMsgs.some(m => m.payload && m.payload.type);
+        const toHydrate = (dbMsgs.length && dbHasPayloads) ? dbMsgs
+                        : (cache?.messages?.length ? cache.messages : dbMsgs);
 
         if (toHydrate.length === 0) {
           try {
