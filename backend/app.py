@@ -254,6 +254,18 @@ def _build_duty_roster(target_date):
     }, None
 
 
+@app.route("/api/cto/duty-roster")
+@jwt_required()
+def cto_duty_roster():
+    date_str = request.args.get("date")
+    try:
+        target_date = datetime.strptime(date_str, "%Y-%m-%d").date() if date_str else datetime.utcnow().date()
+    except ValueError:
+        return jsonify({"error": "Invalid date format, use YYYY-MM-DD"}), 400
+    roster, err = _build_duty_roster(target_date)
+    if err:
+        return jsonify({"error": err}), 400
+    return jsonify(roster)
 
 
 # ─── Nearest-Tower Lookup (loaded once at startup) ────────────────────────────
