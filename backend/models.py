@@ -256,6 +256,9 @@ class Ticket(db.Model):
             "escalated_by_name": self.escalator.name if self.escalator else None,
             "escalated_at": self.escalated_at.isoformat() if self.escalated_at else None,
             "escalation_note": self.escalation_note or "",
+            "first_response_at": self.first_response_at.isoformat() if self.first_response_at else None,
+            "reopened_count": self.reopened_count,
+            "last_reopened_at": self.last_reopened_at.isoformat() if self.last_reopened_at else None,
         }
 
 

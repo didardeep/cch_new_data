@@ -25,26 +25,46 @@ function statusLabel(status) {
 
 function createSiteIcon(status) {
   const color = statusColor(status);
+  const normalized = String(status || '').toLowerCase();
+  const isAlert = ['down', 'off_air', 'alarm', 'warning'].includes(normalized);
   return L.divIcon({
     className: 'cto-site-marker',
-    html: `<div style="width:14px;height:14px;border-radius:999px;background:${color};border:2px solid #fff;box-shadow:0 2px 8px rgba(15,23,42,0.28)"></div>`,
-    iconSize: [14, 14],
-    iconAnchor: [7, 7],
+    html: `<div class="${isAlert ? 'cto-marker-alert' : ''}" style="width:18px;height:18px;border-radius:999px;background:${color};border:2.5px solid #fff;box-shadow:0 2px 12px ${color}99,0 0 0 4px ${color}33"></div>`,
+    iconSize: [18, 18],
+    iconAnchor: [9, 9],
   });
 }
 
 function MapBounds({ sites }) {
   const map = useMap();
-
   useEffect(() => {
-    if (!sites.length) {
-      map.setView(INDIA_CENTER, 5);
-      return;
-    }
+    if (!sites.length) { map.setView(INDIA_CENTER, 5); return; }
     const bounds = L.latLngBounds(sites.map((site) => [site.lat, site.lng]));
     map.fitBounds(bounds, { padding: [28, 28], maxZoom: 12 });
   }, [map, sites]);
+  return null;
+}
 
+function FlyToSite({ target }) {
+  const map = useMap();
+  useEffect(() => {
+    if (!target) return;
+    map.flyTo([target.lat, target.lng], 18, { duration: 1.2 });
+    // After fly animation completes, open the matching marker's popup
+    setTimeout(() => {
+      map.eachLayer(layer => {
+        if (layer instanceof L.Marker) {
+          const pos = layer.getLatLng();
+          if (
+            Math.abs(pos.lat - target.lat) < 0.0001 &&
+            Math.abs(pos.lng - target.lng) < 0.0001
+          ) {
+            layer.openPopup();
+          }
+        }
+      });
+    }, 1400);
+  }, [target, map]);
   return null;
 }
 
@@ -82,16 +102,40 @@ const SiteMarkers = memo(function SiteMarkers({ sites }) {
     [sites]
   );
 
-  return <MarkerClusterGroup chunkedLoading>{markers}</MarkerClusterGroup>;
+  return (
+    <MarkerClusterGroup
+      chunkedLoading
+      disableClusteringAtZoom={18}
+      iconCreateFunction={(cluster) => {
+        const count = cluster.getChildCount();
+        const size = count >= 100 ? 28 : count >= 10 ? 24 : 20;
+        return L.divIcon({
+          html: `<div style="
+            width:${size}px;height:${size}px;border-radius:50%;
+            background:#002266;color:#fff;border:2px solid #fff;
+            box-shadow:0 2px 8px rgba(0,34,102,0.45);
+            display:flex;align-items:center;justify-content:center;
+            font-size:${count >= 100 ? 9 : 10}px;font-weight:700;font-family:sans-serif;
+          ">${count}</div>`,
+          className: 'cto-cluster-icon',
+          iconSize: [size, size],
+          iconAnchor: [size / 2, size / 2],
+        });
+      }}
+    >
+      {markers}
+    </MarkerClusterGroup>
+  );
 });
 
 export default function CTOMap() {
-  const [sites, setSites] = useState([]);
+  const [sites, setSites]   = useState([]);
   const [loading, setLoading] = useState(true);
+  const [query, setQuery]   = useState('');
+  const [flyTo, setFlyTo]   = useState(null);
 
   useEffect(() => {
     let mounted = true;
-
     apiGet('/api/cto/map-data')
       .then((data) => {
         if (!mounted) return;
@@ -104,16 +148,9 @@ export default function CTOMap() {
           })
         );
       })
-      .catch(() => {
-        if (mounted) setSites([]);
-      })
-      .finally(() => {
-        if (mounted) setLoading(false);
-      });
-
-    return () => {
-      mounted = false;
-    };
+      .catch(() => { if (mounted) setSites([]); })
+      .finally(() => { if (mounted) setLoading(false); });
+    return () => { mounted = false; };
   }, []);
 
   const averageCenter = useMemo(() => {
@@ -125,20 +162,88 @@ export default function CTOMap() {
     return [lat / sites.length, lng / sites.length];
   }, [sites]);
 
+  const results = query.length >= 2
+    ? sites.filter(s => s.site_id.toLowerCase().includes(query.toLowerCase())).slice(0, 8)
+    : [];
+
   if (loading) {
     return <div className="page-loader" style={{ minHeight: '84vh' }}><div className="spinner" /></div>;
   }
 
   return (
-    <div style={{ height: '84vh', width: '100%', background: '#e2e8f0' }}>
-      <MapContainer center={averageCenter} zoom={5} style={{ height: '100%', width: '100%' }} scrollWheelZoom>
-        <TileLayer
-          attribution="&copy; OpenStreetMap contributors"
-          url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-        />
-        <MapBounds sites={sites} />
-        <SiteMarkers sites={sites} />
-      </MapContainer>
-    </div>
+    <>
+      <style>{`
+        @keyframes ctoAlarmPulse {
+          0%   { transform: scale(1);   opacity: 1;   }
+          50%  { transform: scale(1.4); opacity: 0.75; }
+          100% { transform: scale(1);   opacity: 1;   }
+        }
+        .cto-marker-alert { animation: ctoAlarmPulse 1.6s ease-in-out infinite; }
+      `}</style>
+
+      <div style={{ position: 'relative', height: '84vh', width: '100%', background: '#e2e8f0' }}>
+
+        {/* ── Search bar overlay ── */}
+        <div style={{ position: 'absolute', top: 12, right: 12, zIndex: 1000, width: 280 }}>
+          <input
+            placeholder="Search site ID..."
+            value={query}
+            onChange={e => { setQuery(e.target.value); setFlyTo(null); }}
+            onKeyDown={e => {
+              if (e.key === 'Enter' && results.length > 0) {
+                setFlyTo(results[0]);
+                setQuery(results[0].site_id);
+              }
+            }}
+            style={{
+              width: '100%', padding: '9px 14px', borderRadius: 10,
+              border: '1px solid #cbd5e1', fontSize: 13, fontWeight: 500,
+              boxShadow: '0 2px 12px rgba(0,0,0,0.12)',
+              outline: 'none', background: '#fff', boxSizing: 'border-box',
+            }}
+          />
+          {results.length > 0 && (
+            <div style={{
+              background: '#fff', borderRadius: 10, marginTop: 4,
+              boxShadow: '0 4px 20px rgba(0,0,0,0.15)',
+              border: '1px solid #e2e8f0', overflow: 'hidden',
+            }}>
+              {results.map(s => (
+                <div
+                  key={s.site_id}
+                  onClick={() => { setFlyTo(s); setQuery(s.site_id); }}
+                  style={{
+                    padding: '8px 14px', cursor: 'pointer', fontSize: 13,
+                    display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                    borderBottom: '1px solid #f1f5f9', background: '#fff',
+                  }}
+                  onMouseEnter={e => e.currentTarget.style.background = '#f8fafc'}
+                  onMouseLeave={e => e.currentTarget.style.background = '#fff'}
+                >
+                  <span style={{ fontWeight: 600, color: '#002266' }}>{s.site_id}</span>
+                  <span style={{
+                    fontSize: 11, padding: '2px 7px', borderRadius: 999, fontWeight: 600,
+                    background: ['down','off_air'].includes(String(s.status).toLowerCase()) ? '#fee2e2' : '#dcfce7',
+                    color:      ['down','off_air'].includes(String(s.status).toLowerCase()) ? '#dc2626' : '#16a34a',
+                  }}>
+                    {statusLabel(s.status)}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <MapContainer center={averageCenter} zoom={5} style={{ height: '100%', width: '100%' }} scrollWheelZoom>
+          <TileLayer
+            attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/">CARTO</a>'
+            url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png"
+          />
+          <MapBounds sites={sites} />
+          <FlyToSite target={flyTo} />
+          <SiteMarkers sites={sites} />
+        </MapContainer>
+      </div>
+    </>
   );
 }

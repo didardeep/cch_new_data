@@ -1889,7 +1889,7 @@ export default function NetworkAnalyticsDashboard() {
     }).catch(()=>{});
   },[qs,fetchWithTimeout]);
 
-  useEffect(()=>{fetchAll(false,true);},[]);// eslint-disable-line — fresh=true on mount
+  useEffect(()=>{fetchAll(false,true);},[]);// eslint-disable-line 
   const mounted=useRef(false);
   // Keep refs so filter-change effect can see current page/selKpi without stale closure
   const pageRef=useRef('overview');
