@@ -29,7 +29,7 @@ import urllib.error
 
 from sqlalchemy import case as sql_case, text
 from sqlalchemy.orm import joinedload
-from models import db, bcrypt, User, ChatSession, ChatMessage, Ticket, Feedback, SystemSetting, SlaAlert, TelecomSite, KpiData, ParameterChange, ChangeRequest
+from models import db, bcrypt, User, ChatSession, ChatMessage, Ticket, Feedback, SystemSetting, SlaAlert, TelecomSite, KpiData, ParameterChange, ChangeRequest, FlexibleKpiUpload
 # Add this import after other imports
 from whatsapp_integration import send_whatsapp_message, format_chat_summary_for_whatsapp, format_ticket_alert_for_whatsapp
 import network_prompts
@@ -57,7 +57,7 @@ app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get(
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 app.config["JWT_SECRET_KEY"] = os.environ.get("JWT_SECRET", "super-secret-jwt-key-change-in-prod")
 app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(hours=24)
-app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024  # 200MB max for large Excel uploads
+app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024  # 500MB max for large Excel uploads
 
 # Flask-Mail Configuration
 app.config["MAIL_SERVER"] = os.environ.get("MAIL_SERVER", "smtp.gmail.com")
@@ -76,7 +76,7 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 # Dev default: localhost:3000. Production: set CORS_ORIGINS=https://yourdomain.com
 _cors_origins = [
     o.strip()
-    for o in os.environ.get("CORS_ORIGINS", "http://localhost:3000,http://localhost:3001").split(",")
+    for o in os.environ.get("CORS_ORIGINS", "http://localhost:3000,http://localhost:3001,http://127.0.0.1:3000").split(",")
     if o.strip()
 ]
 CORS(
@@ -179,20 +179,22 @@ def _build_duty_roster(target_date):
 
     resources = managers + agents
     total = len(resources)
-    if total % 3 != 0:
-        return None, "Total resources must be divisible by 3 to keep equal team size and two-day-off rotation"
 
     day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
     weekday_idx = target_date.weekday()  # Mon=0
 
+    # Assign off-days in groups of 3 (extra members get last group's off-days)
     off_days_map = {}
-    group_count = total // 3
+    group_count = max(total // 3, 1)
     for g in range(group_count):
         off1 = (g * 2) % 7
         off2 = (off1 + 3) % 7
         names = [day_names[off1], day_names[off2]]
         for member in resources[g * 3:(g + 1) * 3]:
             off_days_map[member.id] = names
+    # Assign any remaining members to the last group's off-days
+    for member in resources[group_count * 3:]:
+        off_days_map[member.id] = off_days_map.get(resources[group_count * 3 - 1].id, [])
 
     available = [u for u in resources if day_names[weekday_idx] not in off_days_map.get(u.id, [])]
     managers_available = [u for u in available if u.role == "manager"]
@@ -200,9 +202,6 @@ def _build_duty_roster(target_date):
         return None, "Not enough managers available today to cover 3 shifts. Adjust admin resources."
 
     total_available = len(available)
-    if total_available % 3 != 0:
-        return None, "Available resources today are not divisible by 3. Adjust admin resources."
-
     team_size = total_available // 3
     rotation = target_date.timetuple().tm_yday % len(managers_available)
     rotated = managers_available[rotation:] + managers_available[:rotation]
@@ -2752,6 +2751,20 @@ def _latest_site_values_for_kpi(kpi_name):
     return latest
 
 
+def _site_values_near_date(kpi_name, target_date):
+    """Return {site_id: value} for the closest date <= target_date per site."""
+    rows = KpiData.query.filter(
+        KpiData.data_level == "site",
+        KpiData.kpi_name == kpi_name,
+        KpiData.date <= target_date,
+    ).order_by(KpiData.site_id, KpiData.date.desc()).all()
+    result = {}
+    for row in rows:
+        if row.site_id not in result and row.value is not None:
+            result[row.site_id] = float(row.value)
+    return result
+
+
 def _series_for_kpi_patterns(patterns):
     rows = KpiData.query.filter(
         KpiData.data_level == "site",
@@ -2902,6 +2915,129 @@ def cto_technical_kpi():
     })
 
 
+@app.route("/api/cto/core-kpi", methods=["GET"])
+@jwt_required()
+def cto_core_kpi():
+    """Return Core Network KPI data from the flexible upload table."""
+    from sqlalchemy import func as sa_func
+
+    user = User.query.get(int(get_jwt_identity()))
+    if not user or user.role not in ("cto", "admin"):
+        return jsonify({"error": "Unauthorized"}), 403
+
+    # Check if any core data exists
+    total = FlexibleKpiUpload.query.filter_by(kpi_type="core").count()
+    if total == 0:
+        return jsonify({"available": False, "message": "No Core KPI data uploaded yet."})
+
+    # Get all distinct numeric KPI columns (with display labels)
+    col_rows = db.session.query(
+        FlexibleKpiUpload.column_name,
+        FlexibleKpiUpload.str_value,
+    ).filter_by(kpi_type="core", column_type="numeric").distinct(
+        FlexibleKpiUpload.column_name
+    ).order_by(FlexibleKpiUpload.column_name, FlexibleKpiUpload.id.desc()).all()
+
+    # Build column metadata
+    cols_meta = {}
+    for col_name, str_val in col_rows:
+        label = str_val if (str_val and str_val != col_name) else col_name
+        cols_meta[col_name] = label
+
+    # Date range
+    latest_date = db.session.query(
+        sa_func.max(FlexibleKpiUpload.row_date)
+    ).filter_by(kpi_type="core").scalar()
+    min_date = db.session.query(
+        sa_func.min(FlexibleKpiUpload.row_date)
+    ).filter_by(kpi_type="core").scalar()
+
+    def _iso(d):
+        return d.isoformat() if d and hasattr(d, 'isoformat') else (str(d) if d else None)
+
+    # Summary: avg over all time + avg for latest date
+    summary = {}
+    for col_name, label in cols_meta.items():
+        avg_all = db.session.query(
+            sa_func.avg(FlexibleKpiUpload.num_value)
+        ).filter_by(kpi_type="core", column_name=col_name).scalar()
+        avg_latest = None
+        if latest_date is not None:
+            avg_latest = db.session.query(
+                sa_func.avg(FlexibleKpiUpload.num_value)
+            ).filter(
+                FlexibleKpiUpload.kpi_type == "core",
+                FlexibleKpiUpload.column_name == col_name,
+                FlexibleKpiUpload.row_date == latest_date,
+            ).scalar()
+        summary[col_name] = {
+            "label": label,
+            "avg": round(float(avg_all), 2) if avg_all is not None else None,
+            "latest_avg": round(float(avg_latest), 2) if avg_latest is not None else None,
+        }
+
+    # Trend: per-date averages across all sites for each KPI
+    trend_rows = db.session.query(
+        FlexibleKpiUpload.column_name,
+        FlexibleKpiUpload.row_date,
+        sa_func.avg(FlexibleKpiUpload.num_value).label("avg_val"),
+    ).filter_by(kpi_type="core", column_type="numeric").filter(
+        FlexibleKpiUpload.row_date.isnot(None)
+    ).group_by(
+        FlexibleKpiUpload.column_name,
+        FlexibleKpiUpload.row_date,
+    ).order_by(FlexibleKpiUpload.row_date).all()
+
+    trend_pivot = {}
+    for col_name, row_date, avg_val in trend_rows:
+        if col_name not in cols_meta:
+            continue
+        d_str = _iso(row_date)
+        if d_str not in trend_pivot:
+            trend_pivot[d_str] = {"date": d_str}
+        trend_pivot[d_str][col_name] = round(float(avg_val), 2) if avg_val is not None else None
+    trend = sorted(trend_pivot.values(), key=lambda x: x["date"])
+
+    # Per-site table: latest date only
+    site_rows_q = db.session.query(
+        FlexibleKpiUpload.site_id,
+        FlexibleKpiUpload.column_name,
+        FlexibleKpiUpload.num_value,
+    ).filter(
+        FlexibleKpiUpload.kpi_type == "core",
+        FlexibleKpiUpload.column_type == "numeric",
+        FlexibleKpiUpload.row_date == latest_date,
+    ).order_by(FlexibleKpiUpload.site_id).all()
+
+    pivot = {}
+    for site_id, col_name, num_value in site_rows_q:
+        if col_name not in cols_meta:
+            continue
+        if site_id not in pivot:
+            pivot[site_id] = {}
+        if col_name not in pivot[site_id]:
+            pivot[site_id][col_name] = num_value
+
+    site_ids = sorted(pivot.keys())
+    site_table = []
+    for site_id in site_ids:
+        row = {"site_id": site_id}
+        for col_name in cols_meta:
+            val = pivot[site_id].get(col_name)
+            row[col_name] = round(float(val), 2) if val is not None else None
+        site_table.append(row)
+
+    return jsonify({
+        "available": True,
+        "total_sites": len(site_ids),
+        "date_range": {"from": _iso(min_date), "to": _iso(latest_date)},
+        "columns": [{"key": k, "label": v} for k, v in cols_meta.items()],
+        "summary": summary,
+        "trend": trend,
+        "sites": site_table,
+    })
+
+
 @app.route("/api/cto/business-kpi", methods=["GET"])
 @jwt_required()
 def cto_business_kpi():
@@ -2911,7 +3047,15 @@ def cto_business_kpi():
 
     users_latest = _latest_site_values_for_kpi("Site Users")
     revenue_latest = _latest_site_values_for_kpi("Site Revenue")
-    prb_latest = _latest_site_values_for_kpi("PRB Utilization")
+    prb_latest = _latest_site_values_for_kpi("DL PRB Utilization (1BH)")
+
+    # Per-site users 7 days before the latest date → for WoW decline detection
+    if users_latest:
+        _latest_date_val = max(v["date"] for v in users_latest.values())
+        _date_7d_ago = _latest_date_val - timedelta(days=7)
+        users_7d_ago = _site_values_near_date("Site Users", _date_7d_ago)
+    else:
+        users_7d_ago = {}
 
     users_series = _series_for_kpi_patterns(["Site Users"])
     revenue_series = _series_for_kpi_patterns(["Site Revenue"])
@@ -2931,24 +3075,55 @@ def cto_business_kpi():
             "arpu": round(arpu, 2),
         })
 
-    total_users = round(sum(row["users"] for row in site_rows), 2)
-    avg_users = round(total_users / len(site_rows), 2) if site_rows else 0
+    # ── Weekly helpers ────────────────────────────────────────────────────────
+    revenue_by_day = {row["date"]: row["value"] for row in revenue_series}
+
+    def _week_avg(series, offset=0):
+        if offset == 0:
+            window = series[-7:]
+        else:
+            end   = -(offset * 7)
+            start = end - 7
+            window = series[start:end]
+        return sum(p["value"] for p in window) / len(window) if window else None
+
+    # Total Users → weekly avg of daily totals (per-site avg × site count), integer
+    num_sites = len(site_rows) or 1
+    this_week_users_vals = [p["value"] * num_sites for p in users_series[-7:]]
+    total_users = int(round(sum(this_week_users_vals) / len(this_week_users_vals), 0)) if this_week_users_vals else 0
+
+    # Avg Users per Site → weekly avg (integer)
+    avg_users = int(round(total_users / num_sites, 0)) if num_sites else 0
+
     total_revenue = round(sum(row["revenue"] for row in site_rows), 2)
-    arpu = round(total_revenue / total_users, 2) if total_users else 0
 
-    if len(users_series) >= 2 and users_series[-2]["value"]:
-        growth = round(((users_series[-1]["value"] - users_series[-2]["value"]) / users_series[-2]["value"]) * 100, 2)
-    else:
-        growth = 0
+    # ARPU → weekly avg revenue (total) / weekly avg users (total)
+    this_week_rev_vals = [revenue_by_day.get(p["date"], 0) * num_sites for p in users_series[-7:]]
+    avg_weekly_revenue = sum(this_week_rev_vals) / len(this_week_rev_vals) if this_week_rev_vals else 0
+    arpu = round(avg_weekly_revenue / total_users, 4) if total_users else 0
 
+    # Growth → week-over-week
+    this_w = _week_avg(users_series, 0)
+    last_w = _week_avg(users_series, 1)
+    growth = round(((this_w - last_w) / last_w) * 100, 2) if this_w and last_w else 0
+
+    
     declining_sites = []
     overloaded_sites = []
     revenue_at_risk = 0.0
+    users_lost      = 0.0
+    users_at_start  = 0.0
 
     for row in site_rows:
-        growth_pct = 0.0
-        if row["users"] and avg_users:
-            growth_pct = round(((row["users"] - avg_users) / avg_users) * 100, 2)
+        u_now  = row["users"]
+        u_prev = users_7d_ago.get(row["site_id"])
+        if u_now and u_prev:
+            growth_pct = round(((u_now - u_prev) / u_prev) * 100, 2)
+            users_at_start += u_prev
+            if growth_pct < 0:
+                users_lost += (u_prev - u_now)
+        else:
+            growth_pct = 0.0
         item = {**row, "growth": growth_pct}
         if growth_pct < 0:
             declining_sites.append(item)
@@ -2957,31 +3132,72 @@ def cto_business_kpi():
         if growth_pct < 0 or row["utilization"] > 80:
             revenue_at_risk += row["users"] * arpu
 
-    top_sites = sorted(site_rows, key=lambda row: (row["revenue"], row["users"]), reverse=True)[:10]
-    declining_sites = sorted(declining_sites, key=lambda row: row["growth"])[:10]
+    total_sites = max(len(site_rows), 1)
+
+    top_sites        = sorted(site_rows,       key=lambda row: (row["revenue"], row["users"]), reverse=True)[:10]
+    declining_sites  = sorted(declining_sites,  key=lambda row: row["growth"])[:10]
     overloaded_sites = sorted(overloaded_sites, key=lambda row: row["utilization"], reverse=True)[:10]
 
+    # ── KPI 1: Churn Rate — Users Lost / Total Users at Start × 100 ───────────
+    churn_rate = round((users_lost / users_at_start) * 100, 2) if users_at_start else 0.0
+
+    # ── KPI 2: Network ROI ────────────────────────────────────────────────────
+    baseline_cost = total_sites * 5000.0
+    network_roi   = round(((total_revenue - baseline_cost) / baseline_cost) * 100, 2) if baseline_cost else 0.0
+
+    # ── Trend + ARPU Trend (30 days) ──────────────────────────────────────────
     trend = []
-    revenue_by_day = {row["date"]: row["value"] for row in revenue_series}
     for row in users_series[-30:]:
         trend.append({
-            "date": row["date"],
-            "users": row["value"],
+            "date":    row["date"],
+            "users":   row["value"],
             "revenue": revenue_by_day.get(row["date"], 0),
         })
 
+    # ── KPI 3: ARPU Trend ────────────────────────────────────────────────────
+    arpu_trend = []
+    for row in users_series[-30:]:
+        d_users = row["value"]
+        d_rev   = revenue_by_day.get(row["date"], 0)
+        arpu_trend.append({
+            "date": row["date"],
+            "arpu": round(d_rev / d_users, 4) if d_users else 0,
+        })
+
+    # ── KPI 4: Site Health Score ──────────────────────────────────────────────
+    max_users_v   = max((r["users"]   for r in site_rows), default=1) or 1
+    max_revenue_v = max((r["revenue"] for r in site_rows), default=1) or 1
+
+    site_health = []
+    for row in site_rows:
+        util_score = max(0.0, 1.0 - row["utilization"] / 100.0)
+        user_score = row["users"]   / max_users_v
+        rev_score  = row["revenue"] / max_revenue_v
+        health     = round((util_score * 0.4 + user_score * 0.3 + rev_score * 0.3) * 100, 2)
+        site_health.append({**row, "health_score": health})
+
+    avg_health_score = round(
+        sum(s["health_score"] for s in site_health) / len(site_health), 2
+    ) if site_health else 0.0
+    worst_sites = sorted(site_health, key=lambda r: r["health_score"])[:10]
+
     return jsonify({
         "summary": {
-            "total_users": total_users,
-            "avg_users": avg_users,
-            "growth": growth,
-            "arpu": arpu,
-            "revenue_at_risk": round(revenue_at_risk, 2),
+            "total_users":      total_users,
+            "avg_users":        avg_users,
+            "growth":           growth,
+            "arpu":             arpu,
+            "revenue_at_risk":  round(revenue_at_risk, 2),
+            "churn_rate":       churn_rate,
+            "network_roi":      network_roi,
+            "avg_health_score": avg_health_score,
         },
-        "top_sites": top_sites,
+        "top_sites":       top_sites,
         "declining_sites": declining_sites,
         "overloaded_sites": overloaded_sites,
-        "trend": trend,
+        "trend":           trend,
+        "arpu_trend":      arpu_trend,
+        "site_health":     worst_sites,
     })
 
 
@@ -3016,10 +3232,51 @@ def cto_operational_kpi():
     ).outerjoin(Ticket, Ticket.assigned_to == User.id).filter(User.role == "human_agent").group_by(User.name).all()
     workload_data = [{"agent": name or "Unassigned", "tickets": count} for name, count in agent_workload]
 
-    escalated_count = len([t for t in tickets if t.status == "escalated"])
+    escalated_count = len([t for t in tickets if t.status in ("escalated", "manager_escalated")])
     escalation_rate = round((escalated_count / total_tickets) * 100, 1) if total_tickets else 0
 
     breach_alerts = SlaAlert.query.filter_by(recipient_role="cto").count()
+
+    # ── Critical incidents: active tickets sorted by SLA urgency ────────────
+    now_utc = datetime.now(timezone.utc)
+
+    def _sla_remaining(t):
+        dl = t.sla_deadline
+        if dl.tzinfo is None:
+            dl = dl.replace(tzinfo=timezone.utc)
+        return (dl - now_utc).total_seconds()
+
+    active_with_sla = [t for t in tickets if t.status not in ("resolved",) and t.sla_deadline]
+    critical_sorted = sorted(active_with_sla, key=_sla_remaining)[:10]
+
+    critical_incidents = []
+    for t in critical_sorted:
+        rem = _sla_remaining(t)
+        abs_s = abs(rem)
+        h = int(abs_s // 3600)
+        m = int((abs_s % 3600) // 60)
+        s_val = int(abs_s % 60)
+        sign = "-" if rem < 0 else ""
+        critical_incidents.append({
+            "id": t.reference_number,
+            "service": t.category or "General",
+            "priority": t.priority or "low",
+            "sla_clock": f"{sign}{h:02d}:{m:02d}:{s_val:02d}",
+            "sla_remaining": round(rem),
+            "status": t.status or "pending",
+        })
+
+    # ── Escalation trend: last 7 days daily escalated-ticket counts ─────────
+    escalation_trend = []
+    for i in range(7):
+        day_start = (now_utc - timedelta(days=6 - i)).replace(hour=0, minute=0, second=0, microsecond=0)
+        day_end = day_start + timedelta(days=1)
+        count = sum(
+            1 for t in tickets
+            if t.status in ("escalated", "manager_escalated") and t.created_at and
+            day_start <= (t.created_at.replace(tzinfo=timezone.utc) if t.created_at.tzinfo is None else t.created_at) < day_end
+        )
+        escalation_trend.append(count)
 
     return jsonify({
         "summary": {
@@ -3033,6 +3290,8 @@ def cto_operational_kpi():
         },
         "status_breakdown": status_data,
         "agent_workload": workload_data,
+        "critical_incidents": critical_incidents,
+        "escalation_trend": escalation_trend,
     })
 
 
@@ -4096,6 +4355,19 @@ def admin_delete_shared_site_workbook():
     return jsonify({"deleted": count})
 
 
+@app.route("/api/admin/debug-upload", methods=["POST", "OPTIONS"])
+def debug_upload():
+    """Debug endpoint — no auth, logs everything received."""
+    print(f"\n[DEBUG] Method: {request.method}")
+    print(f"[DEBUG] Headers: {dict(request.headers)}")
+    print(f"[DEBUG] Files: {list(request.files.keys())}")
+    print(f"[DEBUG] Form: {list(request.form.keys())}")
+    if 'file' in request.files:
+        f = request.files['file']
+        print(f"[DEBUG] File name: {f.filename}, size: {len(f.read())} bytes")
+    return jsonify({"status": "ok", "files": list(request.files.keys()), "method": request.method})
+
+
 @app.route("/api/admin/upload-kpi-cell-level", methods=["POST"])
 @jwt_required()
 def admin_upload_kpi_cell_level():
@@ -4252,6 +4524,331 @@ def admin_uploaded_kpis():
         "cell_kpis": [{"name": r[0], "rows": r[1]} for r in cell_kpis],
         "site_count": site_count,
     })
+
+
+# ─── Flexible KPI Upload (Core / Revenue) ─────────────────────────────────────
+
+# Known display labels for Core KPI columns (case-insensitive key → label)
+_CORE_KPI_DISPLAY_LABELS = {
+    "authentication success rate": "Auth Success Rate",
+    "auth success rate":           "Auth Success Rate",
+    "cpu utilization":             "CPU Usage",
+    "cpu usage":                   "CPU Usage",
+    "attach success rate":         "4G Attach Success",
+    "4g attach success":           "4G Attach Success",
+    "pdp bearer setup success rate": "4G Bearer Success",
+    "pdp bearer sr":               "4G Bearer Success",
+    "4g bearer success":           "4G Bearer Success",
+}
+
+def _flex_display_label(kpi_type, raw_name):
+    """Return a human-friendly display label for a flexible KPI column."""
+    if kpi_type == "core":
+        return _CORE_KPI_DISPLAY_LABELS.get(raw_name.lower().strip(), raw_name)
+    return raw_name
+
+
+def _detect_col_type(values):
+    """Given a list of raw cell values, return 'numeric', 'date', or 'text'."""
+    import numbers
+    numeric_count = 0
+    for v in values:
+        if v is None or v == "":
+            continue
+        if isinstance(v, numbers.Number):
+            numeric_count += 1
+        elif isinstance(v, str):
+            try:
+                float(v.replace(",", ""))
+                numeric_count += 1
+            except ValueError:
+                pass
+    return "numeric" if numeric_count >= max(1, len([v for v in values if v not in (None, "")]) * 0.5) else "text"
+
+
+@app.route("/api/admin/upload-flexible-kpi", methods=["POST"])
+@jwt_required()
+def admin_upload_flexible_kpi():
+    """Flexible KPI upload for Core or Revenue data.
+    ?type=core | revenue
+    Only Site_ID is mandatory; all other columns are auto-detected.
+    Each upload replaces previous data for the same kpi_type.
+    """
+    import uuid, io, datetime as _dt
+
+    user = User.query.get(int(get_jwt_identity()))
+    if not user or user.role != "admin":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    kpi_type = request.args.get("type", "").strip().lower()
+    if kpi_type not in ("core", "revenue"):
+        return jsonify({"error": "Invalid type. Use ?type=core or ?type=revenue"}), 400
+
+    if "file" not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+
+    file = request.files["file"]
+    fname = file.filename.lower()
+
+    def to_float(v):
+        if v is None or v == "":
+            return None
+        if isinstance(v, (int, float)):
+            return float(v)
+        try:
+            return float(str(v).replace(",", "").strip())
+        except ValueError:
+            return None
+
+    def parse_date_header(h):
+        if h is None:
+            return None
+        if isinstance(h, (_dt.datetime, _dt.date)):
+            return h.date() if isinstance(h, _dt.datetime) else h
+        s = str(h).strip()[:10]
+        for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y"):
+            try:
+                return _dt.datetime.strptime(s, fmt).date()
+            except ValueError:
+                continue
+        return None
+
+    try:
+        raw_bytes = file.read()
+
+        if fname.endswith(".csv"):
+            import csv as csv_mod
+            text = raw_bytes.decode("utf-8-sig", errors="replace")
+            reader = csv_mod.DictReader(io.StringIO(text))
+            headers = reader.fieldnames or []
+            rows = list(reader)
+
+        elif fname.endswith((".xlsx", ".xls", ".xlsm")):
+            import openpyxl
+            wb = openpyxl.load_workbook(io.BytesIO(raw_bytes), data_only=True)
+            sheet_names = wb.sheetnames
+
+            if kpi_type == "core" and len(sheet_names) > 1:
+                # Multi-sheet format: sheet name = KPI metric, col 0 = Site_ID, col 1+ = dates
+                deleted = FlexibleKpiUpload.query.filter_by(kpi_type=kpi_type).delete()
+                db.session.flush()
+                batch_id = str(uuid.uuid4())
+                records = []
+                skipped = 0
+                unique_sites = set()
+                all_kpi_cols = []
+
+                for sheet_name in sheet_names:
+                    ws = wb[sheet_name]
+                    sheet_rows = list(ws.iter_rows(values_only=True))
+                    if not sheet_rows:
+                        continue
+                    kpi_col_name = sheet_name.strip()
+                    display_label = _flex_display_label(kpi_type, kpi_col_name)
+                    all_kpi_cols.append(kpi_col_name)
+
+                    header_row = sheet_rows[0]
+                    date_headers = [parse_date_header(h) for h in header_row[1:]]
+
+                    for row in sheet_rows[1:]:
+                        if not row or row[0] is None:
+                            skipped += 1
+                            continue
+                        site_id = str(row[0]).strip()
+                        if not site_id:
+                            skipped += 1
+                            continue
+                        unique_sites.add(site_id)
+                        for i, date_val in enumerate(date_headers):
+                            if date_val is None:
+                                continue
+                            raw_val = row[i + 1] if (i + 1) < len(row) else None
+                            num = to_float(raw_val)
+                            if num is None:
+                                continue
+                            records.append(FlexibleKpiUpload(
+                                kpi_type=kpi_type,
+                                upload_batch=batch_id,
+                                site_id=site_id,
+                                column_name=kpi_col_name,
+                                column_type="numeric",
+                                num_value=num,
+                                str_value=display_label,
+                                row_date=date_val,
+                            ))
+
+                wb.close()
+                db.session.bulk_save_objects(records)
+                db.session.commit()
+                return jsonify({
+                    "rows_in_file": len(records),
+                    "records_inserted": len(records),
+                    "unique_sites": len(unique_sites),
+                    "columns_detected": all_kpi_cols,
+                    "deleted_previous": deleted,
+                    "skipped_rows": skipped,
+                })
+
+            else:
+                # Single-sheet fallback
+                ws = wb.active
+                all_rows = list(ws.iter_rows(values_only=True))
+                wb.close()
+                if not all_rows:
+                    return jsonify({"error": "Empty file"}), 400
+                raw_headers = all_rows[0]
+                headers = [str(h).strip() if h is not None else "" for h in raw_headers]
+                rows = []
+                for r in all_rows[1:]:
+                    rows.append({headers[i]: (r[i] if i < len(r) else None) for i in range(len(headers))})
+        else:
+            return jsonify({"error": "Unsupported file format. Use .xlsx, .xls or .csv"}), 400
+
+    except Exception as e:
+        return jsonify({"error": f"Failed to read file: {e}"}), 400
+
+    # --- single-sheet path ---
+    # Find Site_ID column (case-insensitive)
+    site_col = next(
+        (h for h in headers if h.strip().lower() in ("site_id", "site id", "siteid")),
+        None
+    )
+    if not site_col:
+        return jsonify({"error": "Missing required column: Site_ID"}), 400
+
+    # KPI columns = everything except the site id column
+    kpi_cols = [h for h in headers if h and h != site_col]
+    if not kpi_cols:
+        return jsonify({"error": "No KPI columns found besides Site_ID"}), 400
+
+    # Detect column types from sample values
+    col_type_map = {}
+    for col in kpi_cols:
+        sample = [r.get(col) for r in rows[:50]]
+        col_type_map[col] = _detect_col_type(sample)
+
+    # Delete all previous records for this kpi_type
+    deleted = FlexibleKpiUpload.query.filter_by(kpi_type=kpi_type).delete()
+    db.session.flush()
+
+    batch_id = str(uuid.uuid4())
+    records = []
+    skipped = 0
+
+    for row in rows:
+        site_id = str(row.get(site_col, "") or "").strip()
+        if not site_id:
+            skipped += 1
+            continue
+        for col in kpi_cols:
+            raw_val = row.get(col)
+            ctype = col_type_map[col]
+            col_norm = col.strip()
+            label = _flex_display_label(kpi_type, col_norm)
+            if ctype == "numeric":
+                num = to_float(raw_val)
+                records.append(FlexibleKpiUpload(
+                    kpi_type=kpi_type,
+                    upload_batch=batch_id,
+                    site_id=site_id,
+                    column_name=col_norm,
+                    column_type="numeric",
+                    num_value=num,
+                    str_value=label,   # reuse str_value to store display label
+                ))
+            else:
+                records.append(FlexibleKpiUpload(
+                    kpi_type=kpi_type,
+                    upload_batch=batch_id,
+                    site_id=site_id,
+                    column_name=col_norm,
+                    column_type="text",
+                    num_value=None,
+                    str_value=str(raw_val) if raw_val is not None else None,
+                ))
+
+    db.session.bulk_save_objects(records)
+    db.session.commit()
+
+    return jsonify({
+        "rows_in_file": len(rows),
+        "records_inserted": len(records),
+        "unique_sites": len({r.get(site_col, "") for r in rows if r.get(site_col)}),
+        "columns_detected": kpi_cols,
+        "deleted_previous": deleted,
+        "skipped_rows": skipped,
+    })
+
+
+@app.route("/api/admin/flexible-kpi-status", methods=["GET"])
+@jwt_required()
+def admin_flexible_kpi_status():
+    """Return record counts + column list for a flexible KPI type."""
+    from sqlalchemy import func as sa_func
+
+    user = User.query.get(int(get_jwt_identity()))
+    if not user or user.role != "admin":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    kpi_type = request.args.get("type", "").strip().lower()
+    if kpi_type not in ("core", "revenue"):
+        return jsonify({"error": "Invalid type"}), 400
+
+    total = FlexibleKpiUpload.query.filter_by(kpi_type=kpi_type).count()
+    if total == 0:
+        return jsonify({"unique_sites": 0, "total_rows": 0, "unique_columns": 0, "columns": []})
+
+    unique_sites = db.session.query(sa_func.count(sa_func.distinct(FlexibleKpiUpload.site_id))).filter_by(kpi_type=kpi_type).scalar()
+
+    col_rows = db.session.query(
+        FlexibleKpiUpload.column_name,
+        FlexibleKpiUpload.column_type,
+        FlexibleKpiUpload.str_value,
+    ).filter_by(kpi_type=kpi_type).distinct(
+        FlexibleKpiUpload.column_name
+    ).order_by(FlexibleKpiUpload.column_name, FlexibleKpiUpload.id.desc()).all()
+
+    seen = {}
+    for col_name, col_type, str_val in col_rows:
+        if col_name not in seen:
+            label = _flex_display_label(kpi_type, col_name)
+            if col_type == "numeric" and str_val and str_val != col_name:
+                label = str_val  # stored display label
+            seen[col_name] = {"column_name": col_name, "column_label": label, "column_type": col_type}
+
+    date_range = {}
+    if kpi_type == "core":
+        min_d = db.session.query(sa_func.min(FlexibleKpiUpload.row_date)).filter_by(kpi_type=kpi_type).scalar()
+        max_d = db.session.query(sa_func.max(FlexibleKpiUpload.row_date)).filter_by(kpi_type=kpi_type).scalar()
+        date_range = {
+            "from": min_d.isoformat() if min_d and hasattr(min_d, 'isoformat') else str(min_d) if min_d else None,
+            "to": max_d.isoformat() if max_d and hasattr(max_d, 'isoformat') else str(max_d) if max_d else None,
+        }
+
+    return jsonify({
+        "unique_sites": unique_sites,
+        "total_rows": total,
+        "unique_columns": len(seen),
+        "date_range": date_range,
+        "columns": list(seen.values()),
+    })
+
+
+@app.route("/api/admin/delete-flexible-kpi", methods=["DELETE"])
+@jwt_required()
+def admin_delete_flexible_kpi():
+    """Delete all flexible KPI records for a given type."""
+    user = User.query.get(int(get_jwt_identity()))
+    if not user or user.role != "admin":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    kpi_type = request.args.get("type", "").strip().lower()
+    if kpi_type not in ("core", "revenue"):
+        return jsonify({"error": "Invalid type"}), 400
+
+    deleted = FlexibleKpiUpload.query.filter_by(kpi_type=kpi_type).delete()
+    db.session.commit()
+    return jsonify({"deleted": deleted, "kpi_type": kpi_type})
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -5813,6 +6410,23 @@ with app.app_context():
                     conn.execute(sa_text(sql))
                     conn.commit()
                     print(f">>> Added {col} column to change_requests")
+
+    # ── Migrate: add new columns to chat_sessions if missing ────────────────
+    if insp.has_table("chat_sessions"):
+        existing_cols = [c["name"] for c in insp.get_columns("chat_sessions")]
+        with db.engine.connect() as conn:
+            if "diagnosis_ran" not in existing_cols:
+                conn.execute(sa_text("ALTER TABLE chat_sessions ADD COLUMN diagnosis_ran BOOLEAN NOT NULL DEFAULT FALSE"))
+                conn.commit()
+                print(">>> Added diagnosis_ran column to chat_sessions")
+            if "current_step" not in existing_cols:
+                conn.execute(sa_text("ALTER TABLE chat_sessions ADD COLUMN current_step VARCHAR(50) DEFAULT 'greeting'"))
+                conn.commit()
+                print(">>> Added current_step column to chat_sessions")
+            if "last_message_at" not in existing_cols:
+                conn.execute(sa_text("ALTER TABLE chat_sessions ADD COLUMN last_message_at TIMESTAMP"))
+                conn.commit()
+                print(">>> Added last_message_at column to chat_sessions")
 
     # Seed default admin if none exists
     if not User.query.filter_by(role="admin").first():

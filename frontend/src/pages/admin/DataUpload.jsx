@@ -31,6 +31,13 @@ export default function DataUpload() {
   const [coreKpiStatus, setCoreKpiStatus] = useState(null);
   const [revenueKpiStatus, setRevenueKpiStatus] = useState(null);
 
+  // ── Business KPI upload (Site Users + Site Revenue)
+  const [businessKpiFile, setBusinessKpiFile] = useState(null);
+  const [businessKpiResult, setBusinessKpiResult] = useState(null);
+  const [uploadingBusiness, setUploadingBusiness] = useState(false);
+  const [deletingBusiness, setDeletingBusiness] = useState(false);
+  const [businessKpiStatus, setBusinessKpiStatus] = useState(null);
+
   // ── Transport KPI upload (inside Core section)
   const [transportFile, setTransportFile] = useState(null);
   const [transportResult, setTransportResult] = useState(null);
@@ -78,6 +85,54 @@ export default function DataUpload() {
     fetchFlexStatus('core', setCoreKpiStatus);
     fetchFlexStatus('revenue', setRevenueKpiStatus);
   }, [fetchFlexStatus]);
+
+  const fetchBusinessKpiStatus = useCallback(async () => {
+    try {
+      const resp = await fetch(`${API_BASE}/api/admin/shared-site-workbook-summary`, {
+        headers: { Authorization: `Bearer ${getToken()}` },
+      });
+      if (resp.ok) setBusinessKpiStatus(await resp.json());
+    } catch { /* ignore */ }
+  }, []);
+
+  useEffect(() => { fetchBusinessKpiStatus(); }, [fetchBusinessKpiStatus]);
+
+  const uploadBusinessKpi = async () => {
+    if (!businessKpiFile) return;
+    setUploadingBusiness(true);
+    setBusinessKpiResult(null); setError(''); setSuccess('');
+    try {
+      const form = new FormData();
+      form.append('file', businessKpiFile);
+      const resp = await fetch(`${API_BASE}/api/admin/upload-shared-site-workbook`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${getToken()}` },
+        body: form,
+      });
+      const d = await resp.json();
+      if (resp.ok) {
+        setBusinessKpiResult(d);
+        setBusinessKpiFile(null);
+        fetchBusinessKpiStatus();
+      } else { setError(d.error || 'Upload failed'); }
+    } catch (e) { setError('Upload failed: ' + e.message); }
+    setUploadingBusiness(false);
+  };
+
+  const deleteBusinessKpi = async () => {
+    if (!window.confirm('Delete all Site Users & Site Revenue data? This cannot be undone.')) return;
+    setDeletingBusiness(true); setError(''); setSuccess('');
+    try {
+      const resp = await fetch(`${API_BASE}/api/admin/delete-shared-site-workbook`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${getToken()}` },
+      });
+      const d = await resp.json();
+      if (resp.ok) { setSuccess(`Deleted ${d.deleted} records.`); setBusinessKpiResult(null); fetchBusinessKpiStatus(); }
+      else { setError(d.error || 'Delete failed'); }
+    } catch (e) { setError('Delete failed: ' + e.message); }
+    setDeletingBusiness(false);
+  };
 
   // ── Transport KPI helpers ─────────────────────────────────────────────────
   const fetchTransportStatus = useCallback(async () => {
@@ -645,6 +700,7 @@ export default function DataUpload() {
                 { label: 'Unique Sites', value: coreKpiStatus.unique_sites ?? 0, color: '#7c3aed' },
                 { label: 'Columns Detected', value: coreKpiStatus.unique_columns ?? 0, color: '#6d28d9' },
                 { label: 'Total Records', value: (coreKpiStatus.total_rows ?? 0).toLocaleString(), color: '#059669' },
+                ...(coreKpiStatus.date_range?.from ? [{ label: 'Date Range', value: `${coreKpiStatus.date_range.from} → ${coreKpiStatus.date_range.to}`, color: '#0369a1' }] : []),
               ].map((s, i) => (
                 <div key={i} style={{ background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 8, padding: '10px 16px' }}>
                   <div style={{ fontSize: 11, color: '#64748b' }}>{s.label}</div>
@@ -912,6 +968,185 @@ export default function DataUpload() {
           )}
         </div>
       </div>
+
+      {/* ── Core KPI Upload (flexible — only Site_ID mandatory) ── */}
+      <div className="section-card" style={{ marginTop: 24, borderTop: '3px solid #6366f1' }}>
+        <div className="section-card-header" style={{ background: 'linear-gradient(135deg, #eef2ff 0%, #e0e7ff 100%)' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <span style={{ fontSize: 18 }}>🖥️</span>
+            <h3 style={{ color: '#4338ca', margin: 0 }}>Core KPI Upload</h3>
+            <span style={{ marginLeft: 8, background: '#6366f1', color: '#fff', fontSize: 10, fontWeight: 700, padding: '2px 8px', borderRadius: 20 }}>FLEXIBLE</span>
+          </div>
+        </div>
+        <div className="section-card-body">
+          <p style={{ fontSize: 13, color: '#64748b', marginBottom: 12 }}>
+            Upload your Core Network KPI file (Excel or CSV) for the <strong>CORE tab</strong> in the
+            Technical KPI dashboard. Only <code>Site_ID</code> is mandatory — all other columns
+            (Auth Success Rate, CPU Utilization, Attach Success Rate, PDP Bearer SR, or any custom columns)
+            are <strong>auto-detected, typed and stored</strong>. Each upload replaces the previous data.
+          </p>
+          <div style={{ background: '#eef2ff', border: '1px solid #c7d2fe', borderRadius: 8, padding: '10px 14px', marginBottom: 14, fontSize: 12, color: '#3730a3' }}>
+            <strong>Only mandatory column:</strong> <code>Site_ID</code> (case-insensitive).
+            Known aliases auto-recognised: <em>Authentication Success Rate → Auth Success Rate, CPU Utilization → CPU Usage, Attach Success Rate → 4G Attach Success, PDP Bearer Setup Success Rate → 4G Bearer Success.</em>
+          </div>
+
+          {/* Status row */}
+          {coreKpiStatus && (
+            <div style={{ display: 'flex', gap: 12, marginBottom: 14, flexWrap: 'wrap' }}>
+              {[
+                { label: 'Unique Sites',    value: coreKpiStatus.unique_sites ?? 0,                    color: '#4338ca' },
+                { label: 'Columns Detected', value: coreKpiStatus.unique_columns ?? 0,                 color: '#059669' },
+                { label: 'Total Records',   value: (coreKpiStatus.total_rows ?? 0).toLocaleString(),   color: '#7c3aed' },
+                ...(coreKpiStatus.date_range?.from ? [{ label: 'Date Range', value: `${coreKpiStatus.date_range.from} → ${coreKpiStatus.date_range.to}`, color: '#0369a1' }] : []),
+              ].map((s, i) => (
+                <div key={i} style={{ background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 8, padding: '10px 16px' }}>
+                  <div style={{ fontSize: 11, color: '#64748b' }}>{s.label}</div>
+                  <div style={{ fontSize: 20, fontWeight: 700, color: s.color }}>{s.value}</div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Detected column badges */}
+          {coreKpiStatus?.columns?.length > 0 && (
+            <div style={{ background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 8, padding: '10px 14px', marginBottom: 14 }}>
+              <div style={{ fontSize: 11, color: '#64748b', fontWeight: 700, marginBottom: 8, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Stored Columns</div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+                {coreKpiStatus.columns.map((c, i) => (
+                  <span key={i} style={{ display: 'inline-flex', alignItems: 'center', gap: 4, padding: '2px 8px', borderRadius: 12, fontSize: 11, fontWeight: 600, background: '#e0e7ff', border: '1px solid #c7d2fe', color: '#3730a3' }}>
+                    {c.column_label || c.column_name}
+                    <span style={{ fontSize: 9, padding: '0 4px', borderRadius: 6, background: c.column_type === 'numeric' ? '#e0f2fe' : '#fef3c7', color: c.column_type === 'numeric' ? '#0369a1' : '#92400e', fontWeight: 700 }}>{c.column_type}</span>
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+            <input type="file" accept=".xlsx,.xls,.csv"
+              onChange={e => { setCoreKpiFile(e.target.files[0]); setCoreKpiResult(null); setError(''); setSuccess(''); }}
+              style={{ fontSize: 13 }} />
+            <button className="btn btn-primary btn-sm"
+              onClick={() => uploadFlexKpi('core', coreKpiFile, setCoreKpiFile, setCoreKpiResult, setCoreKpiStatus)}
+              disabled={!coreKpiFile || uploadingFlex.core}
+              style={{ background: '#6366f1', borderColor: '#6366f1' }}>
+              {uploadingFlex.core ? 'Uploading…' : '⬆ Upload Core KPI Data'}
+            </button>
+            <button className="btn btn-sm"
+              onClick={() => deleteFlexKpi('core', setCoreKpiResult, setCoreKpiStatus)}
+              disabled={deletingFlex.core || !coreKpiStatus?.unique_sites}
+              style={{ background: '#dc2626', color: '#fff', border: 'none', borderRadius: 6, padding: '6px 14px', fontSize: 12, fontWeight: 600, cursor: !coreKpiStatus?.unique_sites ? 'not-allowed' : 'pointer', opacity: !coreKpiStatus?.unique_sites ? 0.5 : 1 }}>
+              {deletingFlex.core ? 'Deleting…' : 'Delete All'}
+            </button>
+          </div>
+
+          {coreKpiResult && (
+            <div style={{ marginTop: 14, background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: 8, padding: 12, fontSize: 13 }}>
+              <strong style={{ color: '#16a34a' }}>✅ Upload Successful</strong>
+              <div style={{ marginTop: 8, display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(160px, 1fr))', gap: 8 }}>
+                {[
+                  { label: 'Rows in File',       value: coreKpiResult.rows_in_file ?? 0 },
+                  { label: 'Records Inserted',   value: coreKpiResult.records_inserted ?? 0 },
+                  { label: 'Unique Sites',        value: coreKpiResult.unique_sites ?? 0 },
+                  { label: 'Columns Found',       value: (coreKpiResult.columns_detected ?? []).length },
+                ].map((s, i) => (
+                  <div key={i} style={{ background: '#fff', border: '1px solid #e2e8f0', borderRadius: 6, padding: '8px 12px' }}>
+                    <div style={{ fontSize: 11, color: '#64748b' }}>{s.label}</div>
+                    <div style={{ fontSize: 18, fontWeight: 700, color: '#6366f1' }}>{typeof s.value === 'number' ? s.value.toLocaleString() : s.value}</div>
+                  </div>
+                ))}
+              </div>
+              {coreKpiResult.columns_detected?.length > 0 && (
+                <div style={{ marginTop: 10, fontSize: 12, color: '#475569' }}>
+                  <strong>Auto-detected columns:</strong> {coreKpiResult.columns_detected.join(', ')}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* ── Business KPI Upload (Site Users + Site Revenue) ── */}
+      <div className="section-card" style={{ marginTop: 24 }}>
+        <div className="section-card-header">
+          <h3>Business KPI Upload</h3>
+          <p style={{ margin: 0, fontSize: 13, color: 'var(--text-muted)' }}>
+            Upload an Excel workbook with sheets named <strong>Site Users</strong> and <strong>Site Revenue</strong>.
+            Each sheet: one Site ID column + date columns with values.
+          </p>
+        </div>
+        <div className="section-card-body">
+
+          {/* Status */}
+          <div style={{ display: 'flex', gap: 12, marginBottom: 16, flexWrap: 'wrap' }}>
+            {[
+              { label: 'Records in DB', value: businessKpiStatus?.total_records ?? 0, color: '#00338D' },
+              { label: 'Sites with Data', value: businessKpiStatus?.total_sites ?? 0, color: '#10b981' },
+            ].map((s, i) => (
+              <div key={i} style={{ background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 8, padding: '10px 18px', minWidth: 140 }}>
+                <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 2 }}>{s.label}</div>
+                <div style={{ fontSize: 22, fontWeight: 700, color: s.color }}>{s.value.toLocaleString()}</div>
+              </div>
+            ))}
+          </div>
+
+          {/* File format hint */}
+          <div style={{ background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 8, padding: '10px 14px', marginBottom: 16, fontSize: 12, color: 'var(--text-muted)' }}>
+            <strong style={{ color: 'var(--text)' }}>Required Excel format:</strong>
+            <ul style={{ margin: '6px 0 0 16px', lineHeight: 1.8 }}>
+              <li>Sheet 1 name: <code style={{ background: 'var(--border)', padding: '1px 5px', borderRadius: 3 }}>Site Users</code></li>
+              <li>Sheet 2 name: <code style={{ background: 'var(--border)', padding: '1px 5px', borderRadius: 3 }}>Site Revenue</code></li>
+              <li>Columns: <code style={{ background: 'var(--border)', padding: '1px 5px', borderRadius: 3 }}>Site_ID</code> + date columns (e.g. 2024-03-01, 2024-03-02…)</li>
+            </ul>
+          </div>
+
+          {/* Upload controls */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+            <input type="file" accept=".xlsx,.xlsm"
+              onChange={e => setBusinessKpiFile(e.target.files[0] || null)}
+              style={{ fontSize: 13 }} />
+            <button className="btn btn-primary btn-sm" onClick={uploadBusinessKpi}
+              disabled={!businessKpiFile || uploadingBusiness}>
+              {uploadingBusiness ? 'Uploading…' : 'Upload Business KPI'}
+            </button>
+            <button className="btn btn-sm"
+              onClick={deleteBusinessKpi}
+              disabled={deletingBusiness || !businessKpiStatus?.total_records}
+              style={{ background: '#dc2626', color: '#fff', border: 'none', borderRadius: 6, padding: '6px 14px', fontSize: 12, fontWeight: 600, cursor: !businessKpiStatus?.total_records ? 'not-allowed' : 'pointer', opacity: !businessKpiStatus?.total_records ? 0.5 : 1 }}>
+              {deletingBusiness ? 'Deleting…' : 'Delete All'}
+            </button>
+          </div>
+
+          {/* Result */}
+          {businessKpiResult && (
+            <div style={{ marginTop: 14, background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: 8, padding: 12, fontSize: 13 }}>
+              <strong style={{ color: '#16a34a' }}>✅ Upload Successful</strong>
+              <div style={{ marginTop: 8, display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(160px, 1fr))', gap: 8 }}>
+                {[
+                  { label: 'Records Inserted', value: businessKpiResult.inserted ?? 0 },
+                  { label: 'KPIs Processed', value: businessKpiResult.kpis_processed ?? 0 },
+                ].map((s, i) => (
+                  <div key={i} style={{ background: '#fff', border: '1px solid #e2e8f0', borderRadius: 6, padding: '8px 12px' }}>
+                    <div style={{ fontSize: 11, color: '#64748b' }}>{s.label}</div>
+                    <div style={{ fontSize: 18, fontWeight: 700, color: '#059669' }}>{s.value.toLocaleString()}</div>
+                  </div>
+                ))}
+              </div>
+              {businessKpiResult.kpi_summary?.map((k, i) => (
+                <div key={i} style={{ marginTop: 6, fontSize: 12, color: '#475569' }}>
+                  <strong>{k.name}:</strong> {k.rows.toLocaleString()} rows
+                </div>
+              ))}
+              {businessKpiResult.errors?.length > 0 && (
+                <div style={{ marginTop: 8, color: '#dc2626', fontSize: 12 }}>
+                  {businessKpiResult.errors.map((e, i) => <div key={i}>{e}</div>)}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+
     </div>
   );
 }
