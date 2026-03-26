@@ -12,6 +12,7 @@ const links = [
   { path: '/cto/tracking', label: 'Issue Tracking', icon: ICON("M12 20V10M18 20V4M6 20v-4") },
   { path: '/cto/alerts', label: 'Alert Box', icon: ICON("M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0zM12 9v4M12 17h.01") },
   { path: '/cto/roster', label: 'Duty Roster', icon: ICON("M8 2v4M16 2v4M3 8h18M5 12h4M10 12h4M15 12h4M5 16h4M10 16h4M15 16h4") },
+  { path: '/cto/change-workflow', label: 'Change Workflow', icon: ICON("M16 3l5 0 0 5M4 20l17-17M21 16l0 5-5 0M15 15l6 6M4 4l5 5") },
 ];
 
 export default function CTOLayout() {

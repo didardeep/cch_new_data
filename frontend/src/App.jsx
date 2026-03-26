@@ -36,6 +36,8 @@ import AgentTicketBucket from './pages/agent/AgentTicketBucket';
 import AgentChatView from './pages/agent/AgentChatView';
 import NetworkAnalyticsDashboard from './pages/agent/NetworkAnalyticsDashboard';
 import NetworkIssues from './pages/agent/NetworkIssues';
+import AgentChangeWorkflow from './pages/agent/ChangeWorkflow';
+import CTOChangeWorkflow from './pages/cto/CTOChangeWorkflow';
 
 function ProtectedRoute({ children, roles }) {
   const { user, loading } = useAuth();
@@ -95,6 +97,8 @@ export default function App() {
         <Route path="chat-detail/:id" element={<ChatDetail />} />
         <Route path="alerts" element={<CTOAlertBox />} />
         <Route path="roster" element={<CTODutyRoster />} />
+        <Route path="change-workflow" element={<CTOChangeWorkflow />} />
+        <Route path="settings" element={<SettingsPage />} />
       </Route>
 
       {/* Admin Routes */}
@@ -117,6 +121,7 @@ export default function App() {
         <Route path="chat/:sessionId" element={<AgentChatView />} />
         <Route path="network" element={<NetworkAnalyticsDashboard />} />
         <Route path="network-issues" element={<NetworkIssues />} />
+        <Route path="change-workflow" element={<AgentChangeWorkflow />} />
       </Route>
 
       <Route path="*" element={<Navigate to="/" />} />

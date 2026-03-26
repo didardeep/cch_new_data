@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { apiGet, apiCall } from '../../api';
+import CRFormModal from './CRFormModal';
 
 /* ── Icons ──────────────────────────────────────────────────────────────────── */
 const IC = {
@@ -443,6 +444,358 @@ export default function NetworkIssues() {
   const [paramTicket, setParamTicket] = useState(null);
   const [triggering, setTriggering] = useState(false);
   const [resolving, setResolving] = useState(null);
+  const [pdfLoading, setPdfLoading] = useState(null); // ticket id being downloaded
+  const [showRouting, setShowRouting] = useState(false);
+  const [routingData, setRoutingData] = useState([]);
+  const [routingLoading, setRoutingLoading] = useState(false);
+
+  /* ── PDF Trend Chart Helper ────────────────────────────────────────────────── */
+  const drawTrendChart = (doc, { x, y, w, h, title, points, color = [0, 51, 141] }) => {
+    const vals = points.map(p => Number(p?.avg)).filter(v => Number.isFinite(v));
+    if (vals.length < 2) return;
+    const min = Math.min(...vals);
+    const max = Math.max(...vals);
+    const span = Math.max(max - min, 1e-6);
+    const px = 8, py = 8;
+    const plotX = x + px, plotY = y + py, plotW = w - px * 2, plotH = h - py * 2;
+
+    doc.setDrawColor(226, 232, 240);
+    doc.roundedRect(x, y, w, h, 1.5, 1.5, 'S');
+    doc.setFontSize(8.5);
+    doc.setTextColor(30, 41, 59);
+    doc.text(title.length > 28 ? `${title.slice(0, 28)}...` : title, x + 2, y + 5);
+
+    doc.setDrawColor(203, 213, 225);
+    doc.line(plotX, plotY + plotH, plotX + plotW, plotY + plotH);
+    doc.line(plotX, plotY, plotX, plotY + plotH);
+
+    doc.setDrawColor(...color);
+    for (let i = 1; i < vals.length; i++) {
+      const x1 = plotX + ((i - 1) / (vals.length - 1)) * plotW;
+      const x2 = plotX + (i / (vals.length - 1)) * plotW;
+      const y1 = plotY + (1 - (vals[i - 1] - min) / span) * plotH;
+      const y2 = plotY + (1 - (vals[i] - min) / span) * plotH;
+      doc.line(x1, y1, x2, y2);
+    }
+    doc.setFontSize(7.5);
+    doc.setTextColor(71, 85, 105);
+    doc.text(`min ${min.toFixed(2)}`, x + 2, y + h - 2);
+    doc.text(`max ${max.toFixed(2)}`, x + w - 18, y + h - 2);
+  };
+
+  /* ── PDF RCA/Recommendation Section Helper ─────────────────────────────────── */
+  const drawRcaSectionPdf = (doc, sectionTitle, text, startY, pageW) => {
+    let y = startY;
+    if (y > 220) { doc.addPage(); y = 15; }
+    doc.setFontSize(14);
+    doc.setFont(undefined, 'bold');
+    doc.setTextColor(0, 51, 141);
+    doc.text(sectionTitle, 14, y);
+    doc.setTextColor(0);
+    y += 8;
+
+    const lines = (text || '').split('\n').map(l => l.trim()).filter(Boolean);
+    lines.forEach((rawLine, idx) => {
+      if (y > 275) { doc.addPage(); y = 15; }
+      const stripped = rawLine.replace(/^\d+[\.\)]\s*/, '').replace(/\*\*([^*]+)\*\*/g, '$1').trim();
+      const colonIdx = stripped.indexOf(':');
+      const hasTitle = colonIdx > 0 && colonIdx < 70;
+      const titlePart = hasTitle ? stripped.slice(0, colonIdx).trim() : '';
+      const bodyPart = hasTitle ? stripped.slice(colonIdx + 1).trim() : stripped;
+      const prefix = `${idx + 1}.  `;
+
+      if (hasTitle && titlePart) {
+        doc.setFont(undefined, 'bold');
+        doc.setFontSize(10.5);
+        doc.setTextColor(15, 23, 42);
+        const tw = doc.splitTextToSize(`${prefix}${titlePart}`, pageW - 28);
+        doc.text(tw, 14, y);
+        y += tw.length * 5.5;
+        if (bodyPart) {
+          if (y > 278) { doc.addPage(); y = 15; }
+          doc.setFont(undefined, 'normal');
+          doc.setFontSize(10);
+          doc.setTextColor(51, 65, 85);
+          const bw = doc.splitTextToSize(bodyPart, pageW - 32);
+          doc.text(bw, 18, y);
+          y += bw.length * 5.2;
+        }
+      } else {
+        doc.setFont(undefined, 'normal');
+        doc.setFontSize(10);
+        doc.setTextColor(51, 65, 85);
+        const wrapped = doc.splitTextToSize(`${prefix}${bodyPart}`, pageW - 28);
+        doc.text(wrapped, 14, y);
+        y += wrapped.length * 5.2;
+      }
+      y += 4;
+    });
+    return y;
+  };
+
+  /* ── Download PDF Report ───────────────────────────────────────────────────── */
+  const downloadPdf = async (ticket) => {
+    setPdfLoading(ticket.id);
+    try {
+      const { default: jsPDF } = await import('jspdf');
+      const { default: autoTable } = await import('jspdf-autotable');
+      const doc = new jsPDF('p', 'mm', 'a4');
+      let y = 15;
+      const pageW = doc.internal.pageSize.getWidth();
+
+      // Fetch PDF data, trends, RCA, recommendations in parallel
+      const cells = (ticket.cells_affected || '').split(',').filter(Boolean);
+      const firstCell = cells[0] || null;
+      const [pdfData, siteTrends, cellTrends, siteRca, cellRca] = await Promise.all([
+        apiGet(`/api/network-issues/${ticket.id}/pdf-data`),
+        apiGet(`/api/network-issues/${ticket.id}/trends?target=site&period=day`),
+        firstCell ? apiGet(`/api/network-issues/${ticket.id}/trends?target=${firstCell}&period=day`) : Promise.resolve(null),
+        apiCall(`/api/network-issues/${ticket.id}/rca`, { method: 'POST', body: JSON.stringify({ target: 'site' }) }).catch(() => null),
+        firstCell ? apiCall(`/api/network-issues/${ticket.id}/rca`, { method: 'POST', body: JSON.stringify({ target: firstCell }) }).catch(() => null) : Promise.resolve(null),
+      ]);
+
+      // Get recommendations (needs RCA)
+      const siteRcaText = siteRca?.root_cause || pdfData?.ticket?.root_cause || '';
+      const cellRcaText = cellRca?.root_cause || '';
+      const [siteRec, cellRec] = await Promise.all([
+        siteRcaText ? apiCall(`/api/network-issues/${ticket.id}/recommendations`, { method: 'POST', body: JSON.stringify({ target: 'site', root_cause: siteRcaText }) }).catch(() => null) : Promise.resolve(null),
+        firstCell && cellRcaText ? apiCall(`/api/network-issues/${ticket.id}/recommendations`, { method: 'POST', body: JSON.stringify({ target: firstCell, root_cause: cellRcaText }) }).catch(() => null) : Promise.resolve(null),
+      ]);
+
+      const tkt = pdfData?.ticket || ticket;
+      const siteInfo = pdfData?.site_info;
+      const cellsInfo = pdfData?.cells_info || [];
+      const cellKpis = pdfData?.cell_kpis || [];
+      const cellSiteIds = (ticket.cell_site_ids || '').split(',').filter(Boolean);
+
+      // ── Header ──────────────────────────────────────────────────────────────
+      doc.setFillColor(0, 51, 141);
+      doc.rect(0, 0, pageW, 32, 'F');
+      doc.setTextColor(255);
+      doc.setFontSize(18);
+      doc.text('Network Issue Diagnosis Report', 14, 14);
+      doc.setFontSize(10);
+      doc.text(`Site: ${tkt.site_id} | ${tkt.category} | Zone: ${tkt.zone || 'N/A'}`, 14, 22);
+      doc.text(`Priority: ${tkt.priority?.toUpperCase()} | Generated: ${new Date().toLocaleString()}`, 14, 28);
+      y = 40;
+      doc.setTextColor(0);
+
+      // ── Section 1: Site Information ──────────────────────────────────────────
+      doc.setFontSize(14);
+      doc.setFont(undefined, 'bold');
+      doc.setTextColor(0, 51, 141);
+      doc.text('1. Site Information', 14, y);
+      doc.setTextColor(0);
+      y += 6;
+      doc.setFont(undefined, 'normal');
+
+      if (siteInfo) {
+        autoTable(doc, {
+          startY: y,
+          head: [['Property', 'Value']],
+          body: [
+            ['Site ID', siteInfo.site_id],
+            ['Location', `${siteInfo.latitude?.toFixed(5)}, ${siteInfo.longitude?.toFixed(5)}`],
+            ['Zone / Cluster', siteInfo.zone || 'N/A'],
+            ['City', siteInfo.city || 'N/A'],
+            ['State', siteInfo.state || 'N/A'],
+            ['Status', siteInfo.site_status || 'on_air'],
+            ['Alarms', siteInfo.alarms || 'No active alarms'],
+            ['Bandwidth (MHz)', siteInfo.bandwidth_mhz != null ? String(siteInfo.bandwidth_mhz) : 'N/A'],
+            ['Antenna Gain (dBi)', siteInfo.antenna_gain_dbi != null ? String(siteInfo.antenna_gain_dbi) : 'N/A'],
+            ['RF Power EIRP (dBm)', siteInfo.rf_power_eirp_dbm != null ? String(siteInfo.rf_power_eirp_dbm) : 'N/A'],
+            ['Antenna Height AGL (m)', siteInfo.antenna_height_agl_m != null ? String(siteInfo.antenna_height_agl_m) : 'N/A'],
+            ['E-Tilt (deg)', siteInfo.e_tilt_degree != null ? String(siteInfo.e_tilt_degree) : 'N/A'],
+            ['CRS Gain', siteInfo.crs_gain != null ? String(siteInfo.crs_gain) : 'N/A'],
+          ],
+          styles: { fontSize: 9 },
+          headStyles: { fillColor: [0, 51, 141] },
+          columnStyles: { 0: { fontStyle: 'bold', cellWidth: 55 } },
+          margin: { left: 14, right: 14 },
+        });
+        y = (doc.lastAutoTable?.finalY || y) + 10;
+      }
+
+      // Site-level KPIs summary
+      if (y > 240) { doc.addPage(); y = 15; }
+      doc.setFontSize(11);
+      doc.setFont(undefined, 'bold');
+      doc.setTextColor(0, 51, 141);
+      doc.text('Site KPI Summary (7-day avg)', 14, y);
+      doc.setTextColor(0);
+      y += 5;
+      doc.setFont(undefined, 'normal');
+      autoTable(doc, {
+        startY: y,
+        head: [['E-RAB Drop Rate %', 'CSSR %', 'DL Throughput Mbps', 'Avg RRC Users', 'Max RRC Users', 'Revenue (L)']],
+        body: [[
+          f(tkt.avg_drop_rate, 2) + '%',
+          f(tkt.avg_cssr, 1) + '%',
+          f(tkt.avg_tput, 1),
+          f(tkt.avg_rrc, 0),
+          f(tkt.max_rrc, 0),
+          f(tkt.revenue_total, 0) + 'L',
+        ]],
+        styles: { fontSize: 9, halign: 'center' },
+        headStyles: { fillColor: [0, 51, 141] },
+        margin: { left: 14, right: 14 },
+      });
+      y = (doc.lastAutoTable?.finalY || y) + 10;
+
+      // ── Section 2: Cell Information ─────────────────────────────────────────
+      if (cells.length > 0) {
+        if (y > 230) { doc.addPage(); y = 15; }
+        doc.setFontSize(14);
+        doc.setFont(undefined, 'bold');
+        doc.setTextColor(0, 51, 141);
+        doc.text(`2. Cell Information (${cells.length} affected cells)`, 14, y);
+        doc.setTextColor(0);
+        y += 6;
+        doc.setFont(undefined, 'normal');
+
+        // Cell KPI table
+        if (cellKpis.length > 0) {
+          autoTable(doc, {
+            startY: y,
+            head: [['#', 'Cell ID', 'Cell Site ID', 'Drop Rate %', 'CSSR %', 'DL Tput Mbps', 'RRC Users']],
+            body: cellKpis.map((ck, i) => [
+              i + 1,
+              ck.cell_id,
+              cellSiteIds[cells.indexOf(ck.cell_id)] || 'N/A',
+              ck.drop_rate + '%',
+              ck.cssr + '%',
+              ck.tput,
+              ck.rrc,
+            ]),
+            styles: { fontSize: 8.5, halign: 'center' },
+            headStyles: { fillColor: [0, 51, 141] },
+            columnStyles: { 1: { halign: 'left' }, 2: { halign: 'left' } },
+            margin: { left: 14, right: 14 },
+          });
+          y = (doc.lastAutoTable?.finalY || y) + 8;
+        } else {
+          // Fallback: just list cell IDs
+          autoTable(doc, {
+            startY: y,
+            head: [['#', 'Cell ID', 'Cell Site ID']],
+            body: cells.map((c, i) => [i + 1, c, cellSiteIds[i] || 'N/A']),
+            styles: { fontSize: 9 },
+            headStyles: { fillColor: [0, 51, 141] },
+            margin: { left: 14, right: 14 },
+          });
+          y = (doc.lastAutoTable?.finalY || y) + 8;
+        }
+
+        // Cell RF parameters table (if available)
+        const affectedCellsInfo = cellsInfo.filter(ci => cells.includes(ci.cell_id));
+        if (affectedCellsInfo.length > 0 && affectedCellsInfo.some(ci => ci.bandwidth_mhz != null)) {
+          if (y > 240) { doc.addPage(); y = 15; }
+          doc.setFontSize(11);
+          doc.setFont(undefined, 'bold');
+          doc.text('Cell RF Parameters', 14, y);
+          y += 5;
+          doc.setFont(undefined, 'normal');
+          autoTable(doc, {
+            startY: y,
+            head: [['Cell ID', 'BW MHz', 'Gain dBi', 'EIRP dBm', 'Height m', 'E-Tilt', 'CRS']],
+            body: affectedCellsInfo.map(ci => [
+              ci.cell_id,
+              ci.bandwidth_mhz ?? 'N/A',
+              ci.antenna_gain_dbi ?? 'N/A',
+              ci.rf_power_eirp_dbm ?? 'N/A',
+              ci.antenna_height_agl_m ?? 'N/A',
+              ci.e_tilt_degree ?? 'N/A',
+              ci.crs_gain ?? 'N/A',
+            ]),
+            styles: { fontSize: 8, halign: 'center' },
+            headStyles: { fillColor: [100, 116, 139] },
+            margin: { left: 14, right: 14 },
+          });
+          y = (doc.lastAutoTable?.finalY || y) + 10;
+        }
+      }
+
+      // ── Section 3: Trend Analysis (Site + Cell Daily Charts) ─────────────────
+      const sectionNum = cells.length > 0 ? 3 : 2;
+      const siteTrendData = siteTrends?.trends || {};
+      const cellTrendData = cellTrends?.trends || {};
+      const hasTrends = Object.values(siteTrendData).some(d => d?.length > 1) ||
+                        Object.values(cellTrendData).some(d => d?.length > 1);
+
+      if (hasTrends) {
+        if (y > 220) { doc.addPage(); y = 15; }
+        doc.setFontSize(14);
+        doc.setFont(undefined, 'bold');
+        doc.setTextColor(0, 51, 141);
+        doc.text(`${sectionNum}. Trend Analysis (Daily KPI Charts)`, 14, y);
+        doc.setTextColor(0);
+        y += 6;
+        doc.setFont(undefined, 'normal');
+
+        for (const [level, data] of [['Site', siteTrendData], ['Cell', cellTrendData]]) {
+          const chartEntries = Object.entries(data).filter(([, pts]) => Array.isArray(pts) && pts.length > 1);
+          if (chartEntries.length === 0) continue;
+
+          if (y > 245) { doc.addPage(); y = 15; }
+          doc.setFontSize(11);
+          doc.setFont(undefined, 'bold');
+          doc.setTextColor(30, 41, 59);
+          doc.text(`${level} Level - Daily${level === 'Cell' && firstCell ? ` (${cellSiteIds[0] || firstCell})` : ''}`, 14, y);
+          doc.setTextColor(0);
+          y += 5;
+          doc.setFont(undefined, 'normal');
+
+          const chartW = (pageW - 14 * 2 - 6) / 2;
+          const chartH = 34;
+          for (let idx = 0; idx < chartEntries.length; idx += 2) {
+            if (y + chartH > 285) { doc.addPage(); y = 15; }
+            const [name1, pts1] = chartEntries[idx];
+            drawTrendChart(doc, { x: 14, y, w: chartW, h: chartH, title: name1, points: pts1, color: level === 'Cell' ? [124, 58, 237] : [0, 51, 141] });
+            if (chartEntries[idx + 1]) {
+              const [name2, pts2] = chartEntries[idx + 1];
+              drawTrendChart(doc, { x: 14 + chartW + 6, y, w: chartW, h: chartH, title: name2, points: pts2, color: level === 'Cell' ? [124, 58, 237] : [0, 51, 141] });
+            }
+            y += chartH + 5;
+          }
+          y += 3;
+        }
+      }
+
+      // ── Section 4: Root Cause Analysis (Site + Cell) ─────────────────────────
+      const rcaSectionNum = sectionNum + 1;
+      if (siteRcaText || cellRcaText) {
+        if (siteRcaText) {
+          y = drawRcaSectionPdf(doc, `${rcaSectionNum}. Root Cause Analysis - Site (${tkt.site_id})`, siteRcaText, y, pageW);
+          y += 4;
+        }
+        if (cellRcaText) {
+          y = drawRcaSectionPdf(doc, `${rcaSectionNum}${siteRcaText ? 'b' : ''}. Root Cause Analysis - Cell (${cellSiteIds[0] || firstCell})`, cellRcaText, y, pageW);
+          y += 4;
+        }
+      }
+
+      // ── Section 5: Recommendations (Site + Cell) ────────────────────────────
+      const recSectionNum = rcaSectionNum + 1;
+      const siteRecText = siteRec?.recommendation || pdfData?.ticket?.recommendation || '';
+      const cellRecText = cellRec?.recommendation || '';
+      if (siteRecText || cellRecText) {
+        if (siteRecText) {
+          y = drawRcaSectionPdf(doc, `${recSectionNum}. Recommendations - Site (${tkt.site_id})`, siteRecText, y, pageW);
+          y += 4;
+        }
+        if (cellRecText) {
+          y = drawRcaSectionPdf(doc, `${recSectionNum}${siteRecText ? 'b' : ''}. Recommendations - Cell (${cellSiteIds[0] || firstCell})`, cellRecText, y, pageW);
+        }
+      }
+
+      doc.save(`NetworkIssue_${tkt.site_id}_${tkt.id}.pdf`);
+      alert('Report has been downloaded successfully');
+    } catch (e) {
+      console.error('PDF generation failed:', e);
+      alert('PDF generation failed: ' + e.message);
+    }
+    setPdfLoading(null);
+  };
 
   const fetchAll = useCallback(async () => {
     try {
@@ -472,13 +825,26 @@ export default function NetworkIssues() {
     setResolving(null);
   };
 
-  const filtered = filter === 'All' ? tickets
-    : filter === 'Pending' ? tickets.filter(t => t.status === 'open')
-    : filter === 'In Progress' ? tickets.filter(t => t.status === 'in_progress')
-    : tickets.filter(t => t.status === 'resolved');
+  // Only show tickets assigned to this agent
+  const myTickets = tickets.filter(t => t.is_mine);
 
-  const openCount = tickets.filter(t => t.status === 'open').length;
-  const resolvedCount = tickets.filter(t => t.status === 'resolved').length;
+  const filtered = filter === 'All' ? myTickets
+    : filter === 'Pending' ? myTickets.filter(t => t.status === 'open')
+    : filter === 'In Progress' ? myTickets.filter(t => t.status === 'in_progress')
+    : myTickets.filter(t => t.status === 'resolved');
+
+  const openCount = myTickets.filter(t => t.status === 'open').length;
+  const resolvedCount = myTickets.filter(t => t.status === 'resolved').length;
+
+  const fetchRouting = async () => {
+    setRoutingLoading(true);
+    try {
+      const d = await apiGet('/api/network-issues/todays-routing');
+      setRoutingData(d.routing || []);
+    } catch (_) {}
+    setRoutingLoading(false);
+    setShowRouting(true);
+  };
 
   if (loading) return <div style={{display:'flex',alignItems:'center',justifyContent:'center',height:400}}><div className="spinner"/></div>;
 
@@ -491,11 +857,15 @@ export default function NetworkIssues() {
             <span style={{width:4,height:28,background:'#00338D',borderRadius:2,display:'inline-block'}}/>
             Network Issues — Worst Cell Offenders
           </h2>
-          <p style={{margin:'4px 0 0',fontSize:12,color:'#64748b'}}>{openCount} open · {resolvedCount} resolved · {tickets.length} total</p>
+          <p style={{margin:'4px 0 0',fontSize:12,color:'#64748b'}}>{openCount} open · {resolvedCount} resolved · {myTickets.length} total</p>
         </div>
         <div style={{display:'flex',gap:8}}>
+          <button onClick={fetchRouting} style={{display:'flex',alignItems:'center',gap:5,padding:'7px 14px',borderRadius:8,fontSize:12,fontWeight:600,background:'#f8fafc',color:'#475569',border:'1px solid #e2e8f0',cursor:'pointer'}}>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8.5" cy="7" r="4"/><line x1="20" y1="8" x2="20" y2="14"/><line x1="23" y1="11" x2="17" y2="11"/></svg>
+            Today's Routing
+          </button>
           <button onClick={triggerJob} disabled={triggering} style={{display:'flex',alignItems:'center',gap:5,padding:'7px 16px',borderRadius:8,fontSize:12,fontWeight:600,background:'#00338D',color:'#fff',border:'none',cursor:'pointer'}}>
-            {triggering?' Running...':' Detect & Create Tickets'}
+            {triggering?' Scanning...':' Refresh Worst Cells'}
           </button>
           <button onClick={fetchAll} style={{display:'flex',alignItems:'center',gap:5,padding:'7px 12px',borderRadius:8,fontSize:12,fontWeight:600,background:'#f8fafc',color:'#475569',border:'1px solid #e2e8f0',cursor:'pointer'}}>
             {IC.refresh} Refresh
@@ -524,27 +894,6 @@ export default function NetworkIssues() {
         </div>
       ) : filtered.map(t => {
         const pc = P_CFG[t.priority] || P_CFG.Low;
-        const isMine = t.is_mine;
-        const isUnassigned = !t.assigned_agent;
-
-        // For tickets assigned to OTHER agents — show compact note only
-        if (!isMine && !isUnassigned) {
-          return (
-            <div key={t.id} style={{background:'#f8fafc',borderRadius:10,border:'1px solid #e2e8f0',marginBottom:8,borderLeft:`4px solid ${pc.bar}`,padding:'12px 18px',display:'flex',alignItems:'center',justifyContent:'space-between'}}>
-              <div style={{display:'flex',alignItems:'center',gap:12}}>
-                <span style={{padding:'3px 10px',borderRadius:12,fontSize:10,fontWeight:700,background:pc.bar+'18',color:pc.bar}}>{t.priority}</span>
-                <span style={{fontWeight:700,color:'#0f172a',fontSize:13}}>{t.site_id}</span>
-                <span style={{fontSize:10,color:'#64748b'}}>{t.cell_count} cells · {t.category}</span>
-              </div>
-              <div style={{display:'flex',alignItems:'center',gap:10}}>
-                <SlaTimer deadline={t.deadline_time} slaHours={t.sla_hours} status={t.status}/>
-                <span style={{fontSize:11,color:'#475569',fontWeight:600,padding:'4px 12px',borderRadius:8,background:'#f1f5f9',border:'1px solid #e2e8f0'}}>
-                  Assigned to <b style={{color:'#00338D'}}>{t.agent_name}</b> ({t.agent_eid})
-                </span>
-              </div>
-            </div>
-          );
-        }
 
         return (
           <div key={t.id} style={{background:'#fff',borderRadius:10,border:'1px solid #e2e8f0',marginBottom:12,borderLeft:`4px solid ${pc.bar}`,boxShadow:'0 1px 3px rgba(0,0,0,.04)'}}>
@@ -620,14 +969,15 @@ export default function NetworkIssues() {
                   {IC.check} {resolving===t.id?'Resolving...':'Mark Resolved'}
                 </button>
               )}
-              {t.agent_name ? (
-                <span style={{fontSize:10,color:isMine?'#16a34a':'#64748b',fontWeight:600,padding:'3px 10px',borderRadius:12,background:isMine?'#dcfce7':'#f1f5f9'}}>
-                  {isMine ? ' Assigned to you' : `Assigned to ${t.agent_name} (${t.agent_eid})`}
-                </span>
-              ) : (
-                <span style={{fontSize:10,color:'#dc2626',fontWeight:600,padding:'3px 10px',borderRadius:12,background:'#fef2f2'}}>Unassigned</span>
-              )}
-              <span style={{marginLeft:'auto',fontSize:10,color:'#94a3b8'}}>Created {t.created_at ? new Date(t.created_at).toLocaleString() : '—'}</span>
+              <span style={{fontSize:10,color:'#16a34a',fontWeight:600,padding:'3px 10px',borderRadius:12,background:'#dcfce7'}}>
+                Assigned to you
+              </span>
+              <span style={{marginLeft:'auto',fontSize:10,color:'#94a3b8',textAlign:'right',lineHeight:'1.5'}}>
+                Created {t.created_at ? new Date(t.created_at).toLocaleString() : '—'}
+                {t.updated_at && t.created_at && t.updated_at !== t.created_at && (
+                  <><br/>Updated {new Date(t.updated_at).toLocaleString()}</>
+                )}
+              </span>
             </div>
           </div>
         );
@@ -635,7 +985,62 @@ export default function NetworkIssues() {
 
       {/* AI Diagnosis Modal */}
       {diagTicket && <AIDiagnosisModal ticket={diagTicket} onClose={()=>setDiagTicket(null)}/>}
-      {paramTicket && <ParamChangeModal ticket={paramTicket} onClose={()=>{setParamTicket(null);fetchAll();}}/>}
+      {paramTicket && <CRFormModal open={!!paramTicket} networkIssue={paramTicket} onClose={()=>{setParamTicket(null);fetchAll();}}/>}
+
+      {/* Today's Routing Modal */}
+      {showRouting && (
+        <div style={{position:'fixed',inset:0,background:'rgba(15,23,42,0.45)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:1000}} onClick={()=>setShowRouting(false)}>
+          <div onClick={e=>e.stopPropagation()} style={{background:'#fff',borderRadius:12,width:700,maxWidth:'95vw',maxHeight:'80vh',overflowY:'auto',boxShadow:'0 20px 60px rgba(0,0,0,.15)'}}>
+            <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',padding:'16px 24px',borderBottom:'1px solid #e2e8f0'}}>
+              <div>
+                <h3 style={{margin:0,fontSize:16,fontWeight:700,color:'#0f172a'}}>Today's Ticket Routing</h3>
+                <p style={{margin:'2px 0 0',fontSize:11,color:'#64748b'}}>Created & updated tickets today</p>
+              </div>
+              <button onClick={()=>setShowRouting(false)} style={{border:'none',background:'#f1f5f9',borderRadius:6,width:28,height:28,cursor:'pointer',display:'flex',alignItems:'center',justifyContent:'center'}}>{IC.x}</button>
+            </div>
+            <div style={{padding:20}}>
+              {routingLoading ? (
+                <div style={{textAlign:'center',padding:40,color:'#94a3b8'}}>Loading...</div>
+              ) : routingData.length === 0 ? (
+                <div style={{textAlign:'center',padding:40,color:'#94a3b8',fontSize:13}}>No tickets routed today.</div>
+              ) : (
+                <table style={{width:'100%',borderCollapse:'collapse',fontSize:12}}>
+                  <thead>
+                    <tr style={{borderBottom:'2px solid #e2e8f0'}}>
+                      <th style={{textAlign:'left',padding:'8px 10px',fontWeight:700,color:'#475569',fontSize:11,textTransform:'uppercase'}}>Ticket ID</th>
+                      <th style={{textAlign:'left',padding:'8px 10px',fontWeight:700,color:'#475569',fontSize:11,textTransform:'uppercase'}}>Type</th>
+                      <th style={{textAlign:'left',padding:'8px 10px',fontWeight:700,color:'#475569',fontSize:11,textTransform:'uppercase'}}>Site</th>
+                      <th style={{textAlign:'left',padding:'8px 10px',fontWeight:700,color:'#475569',fontSize:11,textTransform:'uppercase'}}>Priority</th>
+                      <th style={{textAlign:'left',padding:'8px 10px',fontWeight:700,color:'#475569',fontSize:11,textTransform:'uppercase'}}>Status</th>
+                      <th style={{textAlign:'left',padding:'8px 10px',fontWeight:700,color:'#475569',fontSize:11,textTransform:'uppercase'}}>Assigned Agent</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {routingData.map((r,i) => {
+                      const prc = P_CFG[r.priority] || P_CFG.Low;
+                      return (
+                        <tr key={r.ticket_id||i} style={{borderBottom:'1px solid #f1f5f9',background:i%2===0?'#fff':'#f8fafc'}}>
+                          <td style={{padding:'8px 10px',fontWeight:700,color:'#00338D',fontFamily:'monospace'}}>#{r.ticket_id}</td>
+                          <td style={{padding:'8px 10px'}}><span style={{padding:'2px 8px',borderRadius:10,fontSize:10,fontWeight:700,
+                            background:r.type==='created'?'#16A34A18':'#0091DA18',color:r.type==='created'?'#16A34A':'#0091DA'}}>
+                            {r.type==='created'?'New':'Updated'}</span></td>
+                          <td style={{padding:'8px 10px',fontWeight:600,color:'#0f172a'}}>{r.site_id}</td>
+                          <td style={{padding:'8px 10px'}}><span style={{padding:'2px 8px',borderRadius:10,fontSize:10,fontWeight:700,background:prc.bar+'18',color:prc.bar}}>{r.priority}</span></td>
+                          <td style={{padding:'8px 10px'}}><span style={{padding:'2px 8px',borderRadius:10,fontSize:10,fontWeight:700,
+                            background:r.status==='resolved'?'#16A34A18':r.status==='in_progress'?'#F59E0B18':'#00338D18',
+                            color:r.status==='resolved'?'#16A34A':r.status==='in_progress'?'#F59E0B':'#00338D'}}>
+                            {(r.status||'open').replace('_',' ')}</span></td>
+                          <td style={{padding:'8px 10px',fontWeight:600,color:'#0f172a'}}>{r.agent_name || 'Unassigned'}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -35,11 +35,19 @@ const ICON_ALERT = (
   </svg>
 );
 
+const ICON_WORKFLOW = (
+  <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <polyline points="16 3 21 3 21 8" /><line x1="4" y1="20" x2="21" y2="3" />
+    <polyline points="21 16 21 21 16 21" /><line x1="15" y1="15" x2="21" y2="21" />
+    <line x1="4" y1="4" x2="9" y2="9" />
+  </svg>
+);
 const navLinks = [
-  { path: '/agent/dashboard', label: 'Dashboard',              icon: ICON_GRID    },
-  { path: '/agent/tickets',   label: 'Assigned Ticket Bucket', icon: ICON_TICKET  },
+  { path: '/agent/dashboard', label: 'My Dashboard',           icon: ICON_GRID    },
+  { path: '/agent/tickets',   label: 'Customer Complaints',    icon: ICON_TICKET  },
   { path: '/agent/network',   label: 'Network Analysis',       icon: ICON_NETWORK },
-  { path: '/agent/network-issues', label: 'Network Issues',    icon: ICON_ALERT   },
+  { path: '/agent/network-issues', label: 'AI Tickets',        icon: ICON_ALERT   },
+  { path: '/agent/change-workflow', label: 'Change Workflow',   icon: ICON_WORKFLOW },
 ];
 
 export default function AgentLayout() {

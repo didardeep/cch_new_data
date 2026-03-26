@@ -65,6 +65,7 @@ a { text-decoration: none; color: inherit; }
   display: flex;
   flex-direction: column;
   background: linear-gradient(160deg, #f8faff 0%, #eef2ff 50%, #f5f7fa 100%);
+  position: relative;
 }
 
 .home-nav {
@@ -103,6 +104,8 @@ a { text-decoration: none; color: inherit; }
   align-items: center;
   justify-content: center;
   padding: 80px 48px;
+  position: relative;
+  z-index: 1;
 }
 
 .home-hero-content {
@@ -139,7 +142,8 @@ a { text-decoration: none; color: inherit; }
 
 .home-hero p {
   font-size: 16px;
-  color: var(--text-secondary);
+  color: #1e293b;
+  font-weight: 500;
   line-height: 1.7;
   margin-bottom: 36px;
   max-width: 560px;
@@ -276,16 +280,19 @@ a { text-decoration: none; color: inherit; }
   justify-content: center;
   background: linear-gradient(160deg, #f8faff 0%, #eef2ff 100%);
   padding: 24px;
+  position: relative;
 }
 
 .auth-card {
   width: 100%;
   max-width: 440px;
-  background: var(--bg-white);
+  background: #ffffff;
   border-radius: var(--radius-lg);
-  box-shadow: var(--shadow-lg);
+  box-shadow: 0 8px 32px rgba(0,0,0,0.12);
   border: 1px solid var(--border);
   padding: 40px;
+  position: relative;
+  z-index: 2;
 }
 
 .auth-header {

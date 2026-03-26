@@ -11,7 +11,13 @@ export default function HomePage() {
 
   return (
     <div className="home-page">
-      <nav className="home-nav">
+      {/* Background — save your image as frontend/public/image2.jpeg */}
+      <div style={{position:'absolute',top:0,left:0,right:0,bottom:0,overflow:'hidden',pointerEvents:'none',zIndex:0}}>
+        <img src={`${process.env.PUBLIC_URL}/image2.jpeg`} alt=""
+          style={{width:'100%',height:'100%',objectFit:'cover',opacity:0.35}}
+          onError={e=>{e.target.style.display='none'}}/>
+      </div>
+      <nav className="home-nav" style={{position:'relative',zIndex:1}}>
         <div className="home-logo">
           <img src="https://upload.wikimedia.org/wikipedia/commons/d/db/KPMG_blue_logo.svg" alt="KPMG" style={{ height: 32, filter: 'brightness(0) invert(1)' }} />
           Customer Handling

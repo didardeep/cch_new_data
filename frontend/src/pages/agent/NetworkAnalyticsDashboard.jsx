@@ -799,33 +799,46 @@ function OverviewPage({T,data,mapSites}) {
         </CC>
       </div>
 
-      {/* Worst Cells / Best / Low Margin */}
+      {/* Worst Cells (Last 7 Days) — populated from daily pre-scan */}
       <div style={{marginBottom:10}}>
-        <CC T={T} title=" Worst Cells (Last 7 Days)">
-          {worstCells.length>0?(
-            <div style={{maxHeight:220,overflowY:'auto'}}>
-              <table style={{width:'100%',borderCollapse:'collapse',fontSize:10.5}}>
-                <thead>
-                  <tr>{['Cell','Site','Zone','Drop%','CSSR%','Tput(Mbps)','Flags'].map(h=><th key={h} style={{padding:'4px 6px',textAlign:'left',borderBottom:`2px solid ${T.border}`,color:T.muted,fontWeight:700,fontSize:9,textTransform:'uppercase'}}>{h}</th>)}</tr>
-                </thead>
-                <tbody>
-                  {worstCells.map((s,i)=>(
-                    <tr key={i} style={{borderBottom:`1px solid ${T.border}`,background:i%2===0?T.surface2:'transparent'}}>
-                      <td style={{padding:'4px 6px',fontWeight:700,color:T.kpmgBlue,fontSize:9.5,fontFamily:"'IBM Plex Mono',monospace"}}>{s.cell_id}</td>
-                      <td style={{padding:'4px 6px',color:T.textSub,fontSize:9.5}}>{s.site_id}</td>
-                      <td style={{padding:'4px 6px',color:T.textSub,fontSize:9.5}}>{s.cluster||'—'}</td>
-                      <td style={{padding:'4px 6px',fontFamily:"'IBM Plex Mono',monospace",fontSize:9.5,color:parseFloat(s.call_drop_rate||0)>1.5?T.red:T.green,fontWeight:700}}>{s.call_drop_rate??'—'}</td>
-                      <td style={{padding:'4px 6px',fontFamily:"'IBM Plex Mono',monospace",fontSize:9.5,color:parseFloat(s.lte_cssr||100)<98.5?T.red:T.green,fontWeight:700}}>{s.lte_cssr??'—'}</td>
-                      <td style={{padding:'4px 6px',fontFamily:"'IBM Plex Mono',monospace",fontSize:9.5,color:parseFloat(s.dl_usr_tput||999)<8?T.red:T.green,fontWeight:700}}>{s.dl_usr_tput??'—'}</td>
-                      <td style={{padding:'4px 6px',fontSize:9.5,fontWeight:700,color:T.red}}>{s.violations}/3</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          ):<Empty T={T}/>}
+        <CC T={T} title=" Worst Cells (Last 7 Days)" action={
+          preScanTime&&<span style={{fontSize:9,color:T.muted}}>Updated: {new Date(preScanTime).toLocaleString()}</span>
+        }>
+          {(()=>{
+            // Flatten pre-scan site data into cell-level rows; fallback to summary worst_cells
+            const rows = preScanCells.length > 0
+              ? preScanCells.flatMap(s => (s.cells||[]).map(c => ({
+                  cell_id: c, site_id: s.site_id, zone: s.zone || '—',
+                  call_drop_rate: f(s.avg_drop,2), lte_cssr: f(s.avg_cssr,2),
+                  dl_usr_tput: f(s.avg_tput,2), violations: 3,
+                })))
+              : worstCells;
+            return rows.length>0?(
+              <div style={{maxHeight:220,overflowY:'auto'}}>
+                <table style={{width:'100%',borderCollapse:'collapse',fontSize:10.5}}>
+                  <thead>
+                    <tr>{['Cell','Site','Zone','Drop%','CSSR%','Tput(Mbps)','Flags'].map(h=><th key={h} style={{padding:'4px 6px',textAlign:'left',borderBottom:`2px solid ${T.border}`,color:T.muted,fontWeight:700,fontSize:9,textTransform:'uppercase'}}>{h}</th>)}</tr>
+                  </thead>
+                  <tbody>
+                    {rows.map((s,i)=>(
+                      <tr key={i} style={{borderBottom:`1px solid ${T.border}`,background:i%2===0?T.surface2:'transparent'}}>
+                        <td style={{padding:'4px 6px',fontWeight:700,color:T.kpmgBlue,fontSize:9.5,fontFamily:"'IBM Plex Mono',monospace"}}>{s.cell_id}</td>
+                        <td style={{padding:'4px 6px',color:T.textSub,fontSize:9.5}}>{s.site_id}</td>
+                        <td style={{padding:'4px 6px',color:T.textSub,fontSize:9.5}}>{s.zone||s.cluster||'—'}</td>
+                        <td style={{padding:'4px 6px',fontFamily:"'IBM Plex Mono',monospace",fontSize:9.5,color:parseFloat(s.call_drop_rate||0)>1.5?T.red:T.green,fontWeight:700}}>{s.call_drop_rate??'—'}</td>
+                        <td style={{padding:'4px 6px',fontFamily:"'IBM Plex Mono',monospace",fontSize:9.5,color:parseFloat(s.lte_cssr||100)<98.5?T.red:T.green,fontWeight:700}}>{s.lte_cssr??'—'}</td>
+                        <td style={{padding:'4px 6px',fontFamily:"'IBM Plex Mono',monospace",fontSize:9.5,color:parseFloat(s.dl_usr_tput||999)<8?T.red:T.green,fontWeight:700}}>{s.dl_usr_tput??'—'}</td>
+                        <td style={{padding:'4px 6px',fontSize:9.5,fontWeight:700,color:T.red}}>{s.violations}/3</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ):<Empty T={T}/>;
+          })()}
         </CC>
       </div>
+
       <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,alignItems:'start'}}>
         <CC T={T} title=" Best Sites (Throughput)">
           {best.length>0?(

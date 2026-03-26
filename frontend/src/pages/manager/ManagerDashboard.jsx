@@ -92,39 +92,10 @@ export default function ManagerDashboard() {
         <p>Welcome back, {user?.name}. Here's your operational overview.</p>
       </div>
 
-      {/* ── Pending Escalations Banner ──────────────────────────────── */}
-      {pendingEscalations > 0 && (
-        <div style={ESCALATION_BANNER_STYLE}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-            <span style={{
-              width: 36, height: 36, borderRadius: 8, background: '#f3e8ff',
-              display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
-            }}>
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#7e22ce" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/>
-              </svg>
-            </span>
-            <div>
-              <div style={{ fontSize: 14, fontWeight: 700, color: '#3b0764' }}>
-                {pendingEscalations} escalation{pendingEscalations > 1 ? 's' : ''} awaiting your review
-              </div>
-              <div style={{ fontSize: 12, color: '#7e22ce', marginTop: 2 }}>
-                Expert-escalated tickets need your approval to proceed
-              </div>
-            </div>
-          </div>
-          <button
-            className="btn btn-sm"
-            style={{ background: '#7e22ce', color: '#fff', border: 'none', whiteSpace: 'nowrap' }}
-            onClick={() => navigate('/manager/tickets')}
-          >
-            Review Now
-          </button>
-        </div>
-      )}
+      {/* Escalation banner removed — escalations are now in Change Workflow */}
 
-      {/* ── SLA Alerts Section ──────────────────────────────────────── */}
-      {unreadAlerts.length > 0 && (
+      {/* SLA Alerts removed from dashboard — available in Alert Box */}
+      {false && unreadAlerts.length > 0 && (
         <div style={{
           background: '#fff', border: '1px solid #e2e8f0', borderRadius: 12,
           marginBottom: 24, overflow: 'hidden', boxShadow: '0 1px 4px rgba(0,0,0,0.05)',

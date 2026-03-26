@@ -78,6 +78,8 @@ class ChatSession(db.Model):
     latitude = db.Column(db.Float, nullable=True)
     longitude = db.Column(db.Float, nullable=True)
     location_description = db.Column(db.Text, nullable=True)
+    state_province = db.Column(db.String(200), nullable=True)   # State/Province/Region
+    country = db.Column(db.String(100), nullable=True)          # Country name
     customer_present = db.Column(db.Boolean, default=False)
     diagnosis_ran = db.Column(db.Boolean, default=False, nullable=False)
     current_step = db.Column(db.String(50), default="greeting")
@@ -105,6 +107,8 @@ class ChatSession(db.Model):
             "latitude": self.latitude,
             "longitude": self.longitude,
             "location_description": self.location_description,
+            "state_province": self.state_province,
+            "country": self.country,
             "customer_present": self.customer_present,
             "diagnosis_ran": bool(self.diagnosis_ran),
             "current_step": self.current_step or "greeting",
@@ -201,14 +205,14 @@ class Ticket(db.Model):
             "assignee_domain": self.assignee.domain if self.assignee else None,
             "assignee_location": self.assignee.location if self.assignee else None,
             "resolution_notes": self.resolution_notes,
-            "created_at": self.created_at.isoformat() if self.created_at else None,
-            "resolved_at": self.resolved_at.isoformat() if self.resolved_at else None,
+            "created_at": (self.created_at.isoformat() + "Z") if self.created_at else None,
+            "resolved_at": (self.resolved_at.isoformat() + "Z") if self.resolved_at else None,
             "sla_hours": self.sla_hours,
-            "sla_deadline": self.sla_deadline.isoformat() if self.sla_deadline else None,
+            "sla_deadline": (self.sla_deadline.isoformat() + "Z") if self.sla_deadline else None,
             "sla_breached": self.sla_breached,
             "escalated_by": self.escalated_by,
             "escalated_by_name": self.escalator.name if self.escalator else None,
-            "escalated_at": self.escalated_at.isoformat() if self.escalated_at else None,
+            "escalated_at": (self.escalated_at.isoformat() + "Z") if self.escalated_at else None,
             "escalation_note": self.escalation_note or "",
         }
 
@@ -364,6 +368,7 @@ class ParameterChange(db.Model):
         return {
             "id": self.id,
             "ticket_id": self.ticket_id,
+            "network_issue_id": self.network_issue_id,
             "agent_id": self.agent_id,
             "agent_name": self.agent.name if self.agent else "",
             "proposed_change": self.proposed_change,
@@ -380,15 +385,17 @@ class ParameterChange(db.Model):
 class ChangeRequest(db.Model):
     """
     ITIL-aligned Change Request lifecycle:
-    created → validated → classified → approved → implementing → implemented → closed
+    created → classified → validated → approved → [pending_cto] → implementing → implemented → closed
     Rejection at validation resets to 'invalid' (max 2 times → auto_rejected).
     Rejection at approval → 'rejected'. Failed implementation → 'failed' → 'rolled_back'.
+    For urgent/emergency: after manager approval → pending_cto → cto_approved/cto_rejected.
     """
     __tablename__ = "change_requests"
 
     id          = db.Column(db.Integer, primary_key=True)
-    cr_number   = db.Column(db.String(30), unique=True, nullable=False)          # CR-20260320-A3F7
+    cr_number   = db.Column(db.String(30), unique=True, nullable=False)          # PCR-XXXX
     ticket_id   = db.Column(db.Integer, db.ForeignKey("tickets.id"), nullable=True)
+    network_issue_id = db.Column(db.Integer, nullable=True)  # links to network_issue_tickets
     parameter_change_id = db.Column(db.Integer, db.ForeignKey("parameter_changes.id"), nullable=True)
     raised_by   = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
 
@@ -397,11 +404,49 @@ class ChangeRequest(db.Model):
     description        = db.Column(db.Text,        nullable=False)
     impact_assessment  = db.Column(db.Text, default="")
     rollback_plan      = db.Column(db.Text, default="")
+    justification      = db.Column(db.Text, default="")
 
-    # Status: created|invalid|auto_rejected|validated|classified|approved|rejected|
-    #         implementing|implemented|failed|rolled_back|closed
+    # ── Complaint classification ────────────────────────────────────────────
+    category           = db.Column(db.String(200), default="")
+    subcategory        = db.Column(db.String(200), default="")
+    telecom_domain_primary   = db.Column(db.String(50), default="")      # RAN/Core/Transport/Transmission/IMS
+    telecom_domain_secondary = db.Column(db.String(200), default="")     # comma-separated
+
+    # ── Location / Customer ─────────────────────────────────────────────────
+    zone               = db.Column(db.String(100), default="")
+    location           = db.Column(db.String(200), default="")
+    nearest_site_id    = db.Column(db.String(50), default="")
+    customer_type      = db.Column(db.String(20), default="")           # platinum/gold/silver/bronze
+
+    # ── RF Parameters (current + proposed) ──────────────────────────────────
+    rf_bandwidth_current     = db.Column(db.Float, nullable=True)
+    rf_bandwidth_proposed    = db.Column(db.Float, nullable=True)
+    rf_antenna_gain_current  = db.Column(db.Float, nullable=True)
+    rf_antenna_gain_proposed = db.Column(db.Float, nullable=True)
+    rf_eirp_current          = db.Column(db.Float, nullable=True)
+    rf_eirp_proposed         = db.Column(db.Float, nullable=True)
+    rf_antenna_height_current  = db.Column(db.Float, nullable=True)
+    rf_antenna_height_proposed = db.Column(db.Float, nullable=True)
+    rf_etilt_current         = db.Column(db.Float, nullable=True)
+    rf_etilt_proposed        = db.Column(db.Float, nullable=True)
+    rf_crs_gain_current      = db.Column(db.Float, nullable=True)
+    rf_crs_gain_proposed     = db.Column(db.Float, nullable=True)
+
+    # ── PDF upload ──────────────────────────────────────────────────────────
+    pdf_filename       = db.Column(db.String(300), default="")
+    pdf_path           = db.Column(db.String(500), default="")
+
+    # Status: created|classified|invalid|auto_rejected|validated|approved|rejected|
+    #         pending_cto|cto_approved|cto_rejected|implementing|implemented|failed|rolled_back|closed
     status      = db.Column(db.String(30), default="created")
-    change_type = db.Column(db.String(20), nullable=True)   # standard|normal|emergency
+    change_type = db.Column(db.String(20), nullable=True)   # standard|normal|urgent|emergency
+
+    # ── CR SLA ──────────────────────────────────────────────────────────────
+    cr_sla_hours       = db.Column(db.Float, nullable=True)
+    cr_sla_deadline    = db.Column(db.DateTime, nullable=True)
+
+    # ── Manager assignment ──────────────────────────────────────────────────
+    assigned_manager_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=True)
 
     # ── Validation ──────────────────────────────────────────────────────────
     rejection_count    = db.Column(db.Integer, default=0)
@@ -409,7 +454,7 @@ class ChangeRequest(db.Model):
     validated_by       = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=True)
     validated_at       = db.Column(db.DateTime, nullable=True)
 
-    # ── Classification ───────────────────────────────────────────────────────
+    # ── Classification (by agent at creation time) ──────────────────────────
     classification_note = db.Column(db.Text, default="")
     classified_by       = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=True)
     classified_at       = db.Column(db.DateTime, nullable=True)
@@ -418,6 +463,14 @@ class ChangeRequest(db.Model):
     approval_remark = db.Column(db.Text, default="")
     approved_by     = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=True)
     approved_at     = db.Column(db.DateTime, nullable=True)
+    manager_proposed_changes = db.Column(db.Text, default="")   # JSON: manager's proposed RF modifications
+
+    # ── CTO Approval (urgent/emergency only) ─────────────────────────────────
+    cto_approval_required = db.Column(db.Boolean, default=False)
+    cto_approved_by       = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=True)
+    cto_approved_at       = db.Column(db.DateTime, nullable=True)
+    cto_status            = db.Column(db.String(20), default="")   # pending_cto|cto_approved|cto_rejected
+    cto_remark            = db.Column(db.Text, default="")
 
     # ── Implementation ───────────────────────────────────────────────────────
     implementation_notes = db.Column(db.Text, default="")
@@ -439,10 +492,13 @@ class ChangeRequest(db.Model):
     ticket            = db.relationship("Ticket",          foreign_keys=[ticket_id],   backref="change_requests")
     parameter_change  = db.relationship("ParameterChange", foreign_keys=[parameter_change_id], backref="change_request", uselist=False)
     raiser            = db.relationship("User", foreign_keys=[raised_by],     backref="raised_crs")
+    assigned_manager  = db.relationship("User", foreign_keys=[assigned_manager_id], backref="assigned_crs")
     validator         = db.relationship("User", foreign_keys=[validated_by],  backref="validated_crs")
     classifier        = db.relationship("User", foreign_keys=[classified_by], backref="classified_crs")
     approver          = db.relationship("User", foreign_keys=[approved_by],   backref="approved_crs")
+    cto_approver      = db.relationship("User", foreign_keys=[cto_approved_by], backref="cto_approved_crs")
     implementer       = db.relationship("User", foreign_keys=[implemented_by],backref="implemented_crs")
+    audit_entries     = db.relationship("CRAuditTrail", backref="change_request", order_by="CRAuditTrail.created_at")
 
     def to_dict(self):
         t = self.ticket
@@ -450,6 +506,7 @@ class ChangeRequest(db.Model):
             "id":                   self.id,
             "cr_number":            self.cr_number,
             "ticket_id":            self.ticket_id,
+            "network_issue_id":     self.network_issue_id,
             "ticket_ref":           t.reference_number if t else "",
             "ticket_priority":      t.priority         if t else "medium",
             "ticket_domain":        t.domain           if t else "",
@@ -460,11 +517,34 @@ class ChangeRequest(db.Model):
             "raised_by":            self.raised_by,
             "raised_by_name":       self.raiser.name   if self.raiser else "",
             "title":                self.title,
-            "description":          self.description,
+            "description":          self.description or "",
+            "justification":        self.justification or "",
             "impact_assessment":    self.impact_assessment  or "",
             "rollback_plan":        self.rollback_plan       or "",
+            "category":             self.category or "",
+            "subcategory":          self.subcategory or "",
+            "telecom_domain_primary":   self.telecom_domain_primary or "",
+            "telecom_domain_secondary": self.telecom_domain_secondary or "",
+            "zone":                 self.zone or "",
+            "location":             self.location or "",
+            "nearest_site_id":      self.nearest_site_id or "",
+            "customer_type":        self.customer_type or "",
+            "rf_params": {
+                "bandwidth":     {"current": round(self.rf_bandwidth_current, 1) if self.rf_bandwidth_current else None,     "proposed": round(self.rf_bandwidth_proposed, 1) if self.rf_bandwidth_proposed else None},
+                "antenna_gain":  {"current": round(self.rf_antenna_gain_current, 1) if self.rf_antenna_gain_current else None,  "proposed": round(self.rf_antenna_gain_proposed, 1) if self.rf_antenna_gain_proposed else None},
+                "eirp":          {"current": round(self.rf_eirp_current, 1) if self.rf_eirp_current else None,          "proposed": round(self.rf_eirp_proposed, 1) if self.rf_eirp_proposed else None},
+                "antenna_height":{"current": round(self.rf_antenna_height_current, 1) if self.rf_antenna_height_current else None,"proposed": round(self.rf_antenna_height_proposed, 1) if self.rf_antenna_height_proposed else None},
+                "etilt":         {"current": round(self.rf_etilt_current, 1) if self.rf_etilt_current else None,         "proposed": round(self.rf_etilt_proposed, 1) if self.rf_etilt_proposed else None},
+                "crs_gain":      {"current": round(self.rf_crs_gain_current, 1) if self.rf_crs_gain_current else None,      "proposed": round(self.rf_crs_gain_proposed, 1) if self.rf_crs_gain_proposed else None},
+            },
+            "pdf_filename":         self.pdf_filename or "",
             "status":               self.status,
             "change_type":          self.change_type,
+            "cr_sla_hours":         self.cr_sla_hours,
+            "cr_sla_deadline":      self.cr_sla_deadline.isoformat() if self.cr_sla_deadline else None,
+            "assigned_manager_id":  self.assigned_manager_id,
+            "assigned_manager_name": self.assigned_manager.name if self.assigned_manager else "",
+            "assigned_manager_email": self.assigned_manager.email if self.assigned_manager else "",
             "rejection_count":      self.rejection_count,
             "validation_remark":    self.validation_remark   or "",
             "validated_by_name":    self.validator.name  if self.validator  else None,
@@ -475,6 +555,12 @@ class ChangeRequest(db.Model):
             "approval_remark":      self.approval_remark     or "",
             "approved_by_name":     self.approver.name   if self.approver   else None,
             "approved_at":          self.approved_at.isoformat()   if self.approved_at   else None,
+            "manager_proposed_changes": self.manager_proposed_changes or "",
+            "cto_approval_required": self.cto_approval_required,
+            "cto_status":           self.cto_status or "",
+            "cto_remark":           self.cto_remark or "",
+            "cto_approved_by_name": self.cto_approver.name if self.cto_approver else None,
+            "cto_approved_at":      self.cto_approved_at.isoformat() if self.cto_approved_at else None,
             "implementation_notes": self.implementation_notes or "",
             "implemented_by_name":  self.implementer.name if self.implementer else None,
             "implemented_at":       self.implemented_at.isoformat() if self.implemented_at else None,
@@ -484,6 +570,35 @@ class ChangeRequest(db.Model):
             "closed_at":            self.closed_at.isoformat()      if self.closed_at      else None,
             "created_at":           self.created_at.isoformat()     if self.created_at     else None,
             "updated_at":           self.updated_at.isoformat()     if self.updated_at     else None,
+        }
+
+
+class CRAuditTrail(db.Model):
+    """Tracks every status change on a ChangeRequest with timestamps and actor."""
+    __tablename__ = "cr_audit_trail"
+
+    id          = db.Column(db.Integer, primary_key=True)
+    cr_id       = db.Column(db.Integer, db.ForeignKey("change_requests.id"), nullable=False, index=True)
+    action      = db.Column(db.String(50), nullable=False)     # created, classified, validated, approved, etc.
+    performed_by = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
+    old_status  = db.Column(db.String(30), default="")
+    new_status  = db.Column(db.String(30), default="")
+    notes       = db.Column(db.Text, default="")
+    created_at  = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+
+    performer   = db.relationship("User", foreign_keys=[performed_by])
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "cr_id": self.cr_id,
+            "action": self.action,
+            "performed_by": self.performed_by,
+            "performed_by_name": self.performer.name if self.performer else "",
+            "old_status": self.old_status,
+            "new_status": self.new_status,
+            "notes": self.notes,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
         }
 
 
