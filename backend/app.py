@@ -2128,7 +2128,7 @@ def customer_dashboard():
         ChatSession.user_id == user_id
     ).options(
         joinedload(ChatSession.user)
-    ).order_by(ChatSession.created_at.desc()).limit(50).all()
+    ).order_by(ChatSession.created_at.desc()).all()
 
     sessions_data = []
     for s, rating in recent_sessions:
@@ -5921,4 +5921,4 @@ schedule_daily_job(app)
 
 if __name__ == "__main__":
     run_sla_checks()
-    app.run(debug=True, host="0.0.0.0", port=5500, use_reloader=False)
+    socketio.run(app, debug=True, host="0.0.0.0", port=5500, use_reloader=False)

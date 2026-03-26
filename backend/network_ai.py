@@ -23,6 +23,7 @@ from sqlalchemy import text as sa_text
 from models import db, User, NetworkAiSession, NetworkAiMessage
 
 _LOG = logging.getLogger("network_ai")
+NETWORK_AI_VERSION = "2025-03-26-v5"  # bump this to confirm new file is loaded
 
 # ─────────────────────────────────────────────────────────────────────────────
 network_ai_bp = Blueprint("network_ai", __name__)
@@ -64,6 +65,7 @@ def ai_query():
     if not user:
         return jsonify({"error": "Forbidden"}), 403
 
+    _LOG.info("network_ai version: %s", NETWORK_AI_VERSION)
     body    = request.get_json(silent=True) or {}
     prompt  = str(body.get("prompt", "")).strip()
     context = body.get("context", {})
@@ -96,13 +98,10 @@ def ai_query():
                         "content": m.content,
                     })
                 else:
-                    # Enrich assistant messages with structured context so the LLM
-                    # understands what was previously shown and can handle follow-ups.
                     cj = m.content_json or {}
                     context_parts = [m.content]
 
                     if cj.get("chart_type") == "multi_chart" and cj.get("charts"):
-                        # Summarise each sub-chart
                         for i, ch in enumerate(cj["charts"], 1):
                             ch_sql = ch.get("sql", "")
                             context_parts.append(
@@ -113,7 +112,6 @@ def ai_query():
                             if ch_sql:
                                 context_parts.append(f"[Chart {i} SQL: {ch_sql[:400]}]")
                     else:
-                        # Single chart — include key fields
                         if cj.get("title"):
                             context_parts.append(f"[Chart title: {cj['title']}]")
                         if cj.get("chart_type"):
@@ -142,7 +140,6 @@ def ai_query():
     provider = None
     ai_result = None
 
-    # ── Comprehensive KPI mapping for accurate NL→SQL ─────────────────────────
     SCHEMA_HINT = """
 Tables:
 1. kpi_data(id, site_id, kpi_name, value, date, hour, data_level, cell_id, cell_site_id)
@@ -187,32 +184,21 @@ Tables:
    - kpi_type = 'revenue' for revenue data
 
 === Natural Language → KPI Mapping Guide ===
-User says "call drop" / "drop rate" / "CDR" / "call failure" / "कॉल ड्रॉप" → 'E-RAB Call Drop Rate_1'
-User says "throughput" / "speed" / "download speed" / "स्पीड" / "थ्रूपुट" → 'LTE DL - Usr Ave Throughput' (user) or 'LTE DL - Cell Ave Throughput' (cell)
-User says "PRB" / "congestion" / "load" / "utilization" / "भीड़" / "लोड" → 'DL PRB Utilization (1BH)'
-User says "availability" / "uptime" / "downtime" / "उपलब्धता" → 'Availability'
-User says "connected users" / "RRC users" / "active users" / "यूजर्स" → 'Ave RRC Connected Ue'
-User says "handover" / "HO" / "हैंडओवर" → 'LTE Intra-Freq HO Success Rate' (or specific HO type)
-User says "VoLTE" / "voice" / "वॉइस" → 'VoLTE Traffic Erlang'
-User says "latency" / "delay" / "ping" / "लेटेंसी" → 'Average Latency Downlink'
-User says "data volume" / "traffic volume" / "डेटा वॉल्यूम" → 'DL Data Total Volume'
+User says "call drop" / "drop rate" / "CDR" / "call failure" → 'E-RAB Call Drop Rate_1'
+User says "throughput" / "speed" / "download speed" → 'LTE DL - Usr Ave Throughput' (user) or 'LTE DL - Cell Ave Throughput' (cell)
+User says "PRB" / "congestion" / "load" / "utilization" → 'DL PRB Utilization (1BH)'
+User says "availability" / "uptime" / "downtime" → 'Availability'
+User says "connected users" / "RRC users" / "active users" → 'Ave RRC Connected Ue'
+User says "handover" / "HO" → 'LTE Intra-Freq HO Success Rate'
+User says "VoLTE" / "voice" → 'VoLTE Traffic Erlang'
+User says "latency" / "delay" / "ping" → 'Average Latency Downlink'
+User says "data volume" / "traffic volume" → 'DL Data Total Volume'
 User says "call setup" / "CSSR" → 'LTE Call Setup Success Rate'
 User says "RRC" / "accessibility" / "access" → 'LTE RRC Setup Success Rate'
 User says "noise" / "interference" → 'Average NI of Carrier-'
-User says "sabse kharab" / "worst" / "bottom" → ORDER ASC + LIMIT N
-User says "sabse accha" / "best" / "top" → ORDER DESC + LIMIT N
-User says "last 7 days" / "पिछले 7 दिन" → AND k.date >= CURRENT_DATE - INTERVAL '7 days' AND k.date <= CURRENT_DATE
-User says "last month" / "पिछला महीना" → AND k.date >= CURRENT_DATE - INTERVAL '1 month' AND k.date <= CURRENT_DATE
-User says "today" / "आज" → AND k.date = CURRENT_DATE
+User says "last 7 days" → AND k.date >= CURRENT_DATE - INTERVAL '7 days' AND k.date <= CURRENT_DATE
+User says "last month" → AND k.date >= CURRENT_DATE - INTERVAL '1 month' AND k.date <= CURRENT_DATE
 ALWAYS add AND k.date <= CURRENT_DATE when any date range is used, to exclude future data.
-
-Example CASE WHEN pivot pattern (ALWAYS use this for multi-KPI queries):
-  SELECT k.site_id, ts.zone,
-    AVG(CASE WHEN k.kpi_name='DL PRB Utilization (1BH)' THEN k.value END) AS dl_prb,
-    AVG(CASE WHEN k.kpi_name='LTE DL - Usr Ave Throughput' THEN k.value END) AS dl_tput
-  FROM kpi_data k JOIN telecom_sites ts ON k.site_id=ts.site_id
-  WHERE k.data_level='site' AND k.value IS NOT NULL
-  GROUP BY k.site_id, ts.zone ORDER BY dl_prb DESC LIMIT 10
 """
 
     LLM_SYSTEM = f"""You are a telecom network analytics SQL generator. Your ONLY job is to convert the user's natural-language query into an EXACT, STRICT SQL query that fetches PRECISELY what was asked — nothing more, nothing less.
@@ -231,8 +217,8 @@ You will receive the full conversation history. Each assistant message contains:
 - The plain text response
 - [Chart title: ...] — what was shown
 - [Chart type: ...] — chart type used
-- [SQL used: ...] — the exact SQL that was run
-- [x_axis: ...], [y_axes: ...] — axes used
+- [SQL used: ...] — the exact SQL that was run (for single charts)
+- [Chart N SQL: ...] — the SQL for each sub-chart (for multi-chart responses)
 
 **You MUST use this history to handle follow-up queries correctly.**
 
@@ -242,9 +228,13 @@ Follow-up patterns and how to handle them:
    → User wants the SAME site and time range as the previous chart, but a DIFFERENT KPI.
    → Extract site_id and INTERVAL from the previous SQL, swap the kpi_name.
 
-2. SITE SWITCH — "show the same for GUR_LTE_1400"
-   → User wants the SAME KPI and time range, but a DIFFERENT site.
-   → Extract kpi_name and INTERVAL from previous SQL, swap the site_id.
+2. SITE SWITCH — "show the same for GUR_LTE_1400" / "i want to see for site id GUR_LTE_0001" / "what about site X" / "now show for X"
+   → ANY prompt that names a new site ID WITHOUT specifying a new KPI = site switch.
+   → Keep the EXACT same KPI(s) and INTERVAL from the previous SQL/charts. Only swap the site_id.
+   → "i want to see for site id GUR_LTE_0001" with no new KPI = show same KPIs for GUR_LTE_0001.
+   → If the previous response was multi_chart (multiple sites), generate a SINGLE composed chart
+     for just the new site, preserving ALL the same KPIs and INTERVAL from the previous charts.
+   → CRITICAL: NEVER default to PRB or any other KPI when the user only switches the site.
 
 3. TIME RANGE CHANGE — "extend to 30 days" / "show last 10 days instead"
    → Keep everything the same, only change the INTERVAL value in the SQL.
@@ -261,8 +251,9 @@ Follow-up patterns and how to handle them:
 **IMPORTANT RULES for follow-ups:**
 - ALWAYS inherit site_id from previous SQL if the user doesn't mention a new one.
 - ALWAYS inherit the time range (INTERVAL) from previous SQL if not specified.
-- ALWAYS inherit kpi_name from previous SQL if the user doesn't mention a new KPI.
-- If the current prompt is completely self-contained (has a site ID + KPI + time range), treat it as a FRESH query — do NOT mix in previous context.
+- ALWAYS inherit kpi_name(s) from previous SQL if the user doesn't mention a new KPI.
+- If the current prompt is completely self-contained (has site ID + KPI + time range), treat it as a FRESH query.
+- A prompt like "i want to see for site id X" with NO new KPI mentioned = SITE SWITCH → inherit all KPIs.
 
 ═══════════════════════════════════════════════════════════
 CRITICAL RULE #0 — MULTI-PART / COMPOUND QUERIES:
@@ -271,180 +262,91 @@ CRITICAL RULE #0 — MULTI-PART / COMPOUND QUERIES:
 Users often ask for MULTIPLE things in ONE query. You MUST handle ALL parts.
 
 **How to detect multi-part queries:**
-- Words like "and", "also", "along with", "as well as", "plus", "both"
 - Multiple site IDs mentioned: "site A ... and site B ..."
 - Multiple KPIs mentioned: "CSSR ... and throughput ..."
-- Multiple time ranges: "last 18 days ... last 10 days ..."
-- Separate clauses: "show X for Y" + "and Z for W"
+- Words like "and", "also", "along with", "as well as", "plus", "both"
 
-**How to handle multi-part queries with DIFFERENT sites/time ranges:**
-Use UNION ALL to combine separate sub-queries into one result set.
+**MULTIPLE SITES with SAME KPI(s) → one chart PER SITE:**
+When the user asks for the same KPI(s) across multiple sites, generate multi_chart with
+one entry per site. Each site gets its own chart containing all the requested KPIs.
 
-Example: "trend of CSSR for GUR_LTE_1500 last 18 days AND throughput for GUR_LTE_1400 last 10 days"
-→ This is asking for TWO SEPARATE trends. Use UNION ALL:
+Example: "show E-RAB drop rate and CSSR last 18 days for GUR_LTE_1500 and GUR_LTE_0001"
+→ TWO CHARTS: Chart 1 = GUR_LTE_1500 (both KPIs), Chart 2 = GUR_LTE_0001 (both KPIs)
+→ Each chart: composed chart_type, UNION ALL SQL filtering by that site.
 
-SELECT k.date::text AS date, k.site_id,
-       AVG(k.value) AS value,
-       'LTE Call Setup Success Rate' AS kpi_name
-FROM kpi_data k
-WHERE k.kpi_name = 'LTE Call Setup Success Rate'
-  AND k.site_id = 'GUR_LTE_1500'
-  AND k.data_level = 'site' AND k.value IS NOT NULL
-  AND k.date >= CURRENT_DATE - INTERVAL '18 days' AND k.date <= CURRENT_DATE
+Example SQL for one site with two KPIs:
+SELECT k.date::text AS date, k.site_id, AVG(k.value) AS value, 'E-RAB Call Drop Rate_1' AS kpi_name
+FROM kpi_data k WHERE k.kpi_name = 'E-RAB Call Drop Rate_1' AND k.site_id = 'GUR_LTE_1500'
+  AND k.data_level='site' AND k.value IS NOT NULL AND k.date >= CURRENT_DATE - INTERVAL '18 days' AND k.date <= CURRENT_DATE
 GROUP BY k.date, k.site_id
 UNION ALL
-SELECT k.date::text AS date, k.site_id,
-       AVG(k.value) AS value,
-       'LTE DL - Cell Ave Throughput' AS kpi_name
-FROM kpi_data k
-WHERE k.kpi_name = 'LTE DL - Cell Ave Throughput'
-  AND k.site_id = 'GUR_LTE_1400'
-  AND k.data_level = 'site' AND k.value IS NOT NULL
-  AND k.date >= CURRENT_DATE - INTERVAL '10 days' AND k.date <= CURRENT_DATE
+SELECT k.date::text AS date, k.site_id, AVG(k.value) AS value, 'LTE Call Setup Success Rate' AS kpi_name
+FROM kpi_data k WHERE k.kpi_name = 'LTE Call Setup Success Rate' AND k.site_id = 'GUR_LTE_1500'
+  AND k.data_level='site' AND k.value IS NOT NULL AND k.date >= CURRENT_DATE - INTERVAL '18 days' AND k.date <= CURRENT_DATE
 GROUP BY k.date, k.site_id
 ORDER BY date
 
-For such multi-part queries:
-- chart_type: "composed" (if 2 metrics) or "line" (if same metric, different sites)
-- y_axes: ["value"] and use kpi_name/site_id to differentiate series
-- title: mention BOTH parts
-- response: describe BOTH parts
-
-**How to handle multi-part queries with SAME site/time range but different KPIs:**
-Use CASE WHEN pivot pattern (already described in schema hint).
-
-**NEVER ignore part of the user's query. If they ask for 2 things, return BOTH.**
+**NEVER ignore part of the user's query. If they ask for 2 sites, return charts for BOTH.**
 
 ═══════════════════════════════════════════════════════════
 STRICTNESS RULES — FOLLOW THESE EXACTLY:
 ═══════════════════════════════════════════════════════════
 
 1. ONLY query the EXACT KPI(s) the user asked about. Do NOT add extra KPIs.
-   - User asks "throughput for site X" → query ONLY throughput, NOT PRB or drop rate
-   - User asks "PRB and drop rate" → query ONLY those two, nothing else
-
-2. ONLY filter by what the user specified:
-   - User says "site GUR_LTE_1400" → WHERE k.site_id = 'GUR_LTE_1400'  (exact match)
-   - User says "last 7 days" → AND k.date >= CURRENT_DATE - INTERVAL '7 days' AND k.date <= CURRENT_DATE
-   - User says "last 18 days" → AND k.date >= CURRENT_DATE - INTERVAL '18 days' AND k.date <= CURRENT_DATE
-   - User says "last N days" → AND k.date >= CURRENT_DATE - INTERVAL 'N days' AND k.date <= CURRENT_DATE
-   - User says "last month" → AND k.date >= CURRENT_DATE - INTERVAL '1 month' AND k.date <= CURRENT_DATE
-   - IMPORTANT: TODAY's date is {datetime.now().strftime('%Y-%m-%d')}. ALWAYS cap date ranges with AND k.date <= CURRENT_DATE to exclude future data.
-   - User says "zone CBD" → AND ts.zone ILIKE '%CBD%'
-   - User says NO date filter → do NOT add date filter, query all available data
-   - User says NO site filter → do NOT filter by site
-   - EXTRACT THE EXACT NUMBER OF DAYS mentioned. "last 18 days" = 18 days, NOT 7 or 30.
-
-3. ONLY return the number of results asked:
-   - User says "top 5" → LIMIT 5
-   - User says "worst 10" → LIMIT 10
-   - User does NOT specify a number → use sensible default: 10 for rankings, all dates for trends
-
-4. SQL PERFORMANCE — MANDATORY:
-   - ALWAYS: WHERE k.data_level='site' AND k.value IS NOT NULL
-   - ALWAYS: AND k.kpi_name IN ('exact_name_1', 'exact_name_2') or = 'exact_name'
-   - For single KPI + single site trend: use WHERE k.kpi_name = 'X' directly (no CASE WHEN needed)
-   - For multiple KPIs: use CASE WHEN pivot pattern or UNION ALL
-   - LIMIT max 100 rows
-
-5. KPI names are CASE-SENSITIVE — copy EXACTLY from the list above. Never modify them.
-
-6. Site IDs are EXACT — copy every character from the user's query into the SQL, no exceptions.
-   - 'GUR_LTE_1400' in SQL must be 'GUR_LTE_1400' — NEVER 'GUR_LTE_140' or any truncated form.
-   - The 60-char title limit applies ONLY to the "title" field. NEVER shorten a site ID in SQL.
-   - Wrong site ID = 0 rows returned. Always double-check you copied the full ID.
-   - If the user mentions multiple site IDs, copy ALL of them exactly as typed.
-
-7. JOIN telecom_sites only when you need zone/geo data. Skip it for simple single-site queries.
+2. ONLY filter by what the user specified (site, date range, zone).
+3. TODAY's date is {datetime.now().strftime('%Y-%m-%d')}. ALWAYS cap with AND k.date <= CURRENT_DATE.
+4. EXTRACT THE EXACT NUMBER OF DAYS mentioned. "last 18 days" = 18, NOT 7 or 30.
+5. KPI names are CASE-SENSITIVE — copy EXACTLY from the list above.
+6. Site IDs are EXACT — copy every character. NEVER truncate in SQL (only title has 60-char limit).
+7. ALWAYS: WHERE k.data_level='site' AND k.value IS NOT NULL
+8. JOIN telecom_sites only when you need zone/geo data.
 
 ═══════════════════════════════════════════════════════════
 CHART TYPE — MUST MATCH THE DATA SHAPE:
 ═══════════════════════════════════════════════════════════
 
-Pick the chart that BEST fits the query type. This is critical — wrong chart = useless visual.
-
-- "line"     → Time series for 1 site or network average over dates (x=date, y=metric)
-                USE THIS for: "trend of X", "X over time", "X for site Y last N days"
-- "bar"      → Ranking/comparison of sites (x=site_id, y=metric value)
-                USE THIS for: "top N sites", "worst N sites", "compare sites"
-- "composed" → Two different metrics on same time axis (e.g. PRB + throughput over time)
-                USE THIS for: "show X and Y together over time", "two metrics for two sites"
-                ALSO USE THIS for: multi-part queries combining 2 different KPIs/sites on same date axis
-- "area"     → Network-wide aggregated trend (x=date, y=avg metric across all sites)
-                USE THIS for: "network average trend", "overall X over time"
-- "pie"      → Distribution/proportion (max 8 slices)
-                USE THIS for: "distribution by zone", "breakdown by category"
-- "scatter"  → Correlation between 2 numeric KPIs (x=metric1, y=metric2)
-                USE THIS for: "correlation between X and Y", "X vs Y"
-- "radar"    → Multi-KPI profile for comparing a FEW sites (max 5)
-                USE THIS for: "compare all KPIs of site A vs B"
-
-COMMON MISTAKES TO AVOID:
-- Do NOT use "area" for a single site trend → use "line"
-- Do NOT use "bar" for time series → use "line" or "area"
-- Do NOT add KPIs the user didn't ask about
-- Do NOT add date filters the user didn't specify
-- Do NOT use CASE WHEN for single-KPI queries — just use WHERE kpi_name = 'X'
-- Do NOT ignore any part of the user query — if they ask for 2 trends, show BOTH
-- Do NOT change "last 18 days" to "last 7 days" — use the EXACT number the user said
-- If user mentions specific site IDs, use those EXACT IDs, do NOT return all sites
-- NEVER truncate site IDs in SQL. 'GUR_LTE_1400' is NOT the same as 'GUR_LTE_140'.
-  The title has a 60-char limit — the SQL site_id value has NO limit. Copy it in full.
+- "line"     → Time series, 1 site, 1 KPI
+- "composed" → Multiple KPIs or multiple series on same time axis
+- "bar"      → Ranking/comparison of sites (x=site_id)
+- "area"     → Network-wide aggregated trend
+- "pie"      → Distribution/proportion
+- "scatter"  → Correlation between 2 KPIs
+- "radar"    → Multi-KPI profile, few sites
 
 ═══════════════════════════════════════════════════════════
-RESPONSE FORMAT — READ CAREFULLY:
+RESPONSE FORMAT:
 ═══════════════════════════════════════════════════════════
 
-**For SINGLE chart queries**, respond with this JSON:
+**For SINGLE chart:**
 {{
   "sql": "SELECT ...",
-  "title": "Short title describing exactly what is shown (max 60 chars)",
-  "response": "1-2 sentence description in the user's language of EXACTLY what this shows",
+  "title": "Short title (max 60 chars)",
+  "response": "1-2 sentence description",
   "chart_type": "line|bar|composed|area|pie|scatter|radar",
-  "x_axis": "column_name_for_x_axis",
-  "y_axes": ["metric_col_1"],
-  "chart_config": {{
-    "x_label": "human readable x label",
-    "y_label": "human readable y label with unit",
-    "threshold": null,
-    "threshold_dir": "above|below",
-    "color_scheme": "sequential"
-  }},
+  "x_axis": "column_name",
+  "y_axes": ["metric_col"],
+  "chart_config": {{"x_label":"","y_label":"","threshold":null,"threshold_dir":"above|below","color_scheme":"sequential"}},
   "filter_update": {{}}
 }}
 
-**For MULTI-PART queries** (user asks for 2+ separate charts with different sites, KPIs, or time ranges), respond with this JSON instead:
+**For MULTI-PART queries (different sites, or incompatible time ranges/units):**
 {{
   "multi_chart": true,
-  "title": "Overall title describing both charts (max 80 chars)",
-  "response": "1-2 sentences describing what both charts show",
+  "title": "Overall title (max 80 chars)",
+  "response": "1-2 sentences describing all charts",
   "charts": [
-    {{
-      "sql": "SELECT ... (complete query for chart 1)",
-      "title": "Chart 1 title",
-      "chart_type": "line",
-      "x_axis": "date",
-      "y_axes": ["metric1"]
-    }},
-    {{
-      "sql": "SELECT ... (complete query for chart 2)",
-      "title": "Chart 2 title",
-      "chart_type": "line",
-      "x_axis": "date",
-      "y_axes": ["metric2"]
-    }}
+    {{"sql":"...","title":"Chart 1 title","chart_type":"line|composed","x_axis":"date","y_axes":["metric"]}},
+    {{"sql":"...","title":"Chart 2 title","chart_type":"line|composed","x_axis":"date","y_axes":["metric"]}}
   ],
   "filter_update": {{}}
 }}
 
-**When to use multi_chart vs single chart:**
-- Use multi_chart when: user asks for 2 different KPIs for 2 different sites, OR 2 different time ranges, OR "and" clearly separates two distinct chart requests with incompatible scales/units
-- Use single composed chart when: two KPIs for the SAME site and SAME time range, OR two sites with the SAME KPI on the same time axis
+**Use multi_chart when:** user mentions 2+ site IDs (one chart per site), OR 2 incompatible time ranges.
+**Use single composed chart when:** two KPIs for the SAME site on the same time axis.
 
 Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
 
     def _strip_json(raw):
-        """Extract JSON from LLM response, stripping markdown fences and extra text."""
         raw = raw.strip()
         if "```" in raw:
             parts = raw.split("```")
@@ -471,15 +373,12 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
         return raw.strip()
 
     def _parse_ai_result(raw_text):
-        """Parse LLM response into dict, normalise fields, fill defaults."""
         parsed = json.loads(_strip_json(raw_text))
-        # Handle multi_chart responses — no normalisation needed beyond detecting the flag
         if parsed.get("multi_chart") and parsed.get("charts"):
             if "title" not in parsed:
                 parsed["title"] = prompt[:70]
             if "response" not in parsed:
                 parsed["response"] = parsed.get("title", "Results")
-            # Fix site IDs in every chart's SQL
             for chart in parsed["charts"]:
                 if chart.get("sql"):
                     chart["sql"] = _fix_site_ids_in_sql(chart["sql"])
@@ -497,55 +396,38 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
             parsed["y_axes"] = []
         if "chart_config" not in parsed:
             parsed["chart_config"] = {}
-        # Fix site IDs in single chart SQL
         if parsed.get("sql"):
             parsed["sql"] = _fix_site_ids_in_sql(parsed["sql"])
         return parsed
 
     def _fix_site_ids_in_sql(sql: str) -> str:
-        """
-        Extract all site IDs from the original user prompt and fix any truncated
-        versions the LLM may have written in the SQL.
-
-        e.g. user typed 'GUR_LTE_1400' but LLM wrote 'GUR_LTE_140' → corrected.
-        """
         import re
-        # Extract all site IDs exactly as the user typed them
         prompt_site_ids = re.findall(r'[A-Za-z]{2,}[_\-][A-Za-z]{2,}[_\-]\d{3,}', prompt)
         if not prompt_site_ids:
             return sql
-
-        # For each site ID in the user prompt, find any prefix/truncation of it in the SQL
         for correct_id in prompt_site_ids:
-            # Build all possible truncations (missing last 1, 2, 3 chars)
             for trim in range(1, 4):
                 truncated = correct_id[:-trim]
                 if len(truncated) < 6:
                     break
-                # Replace only inside SQL string literals (between single quotes)
-                # Use word-boundary-like approach: truncated must be followed by ' not more alphanumeric
                 pattern = r"(site_id\s*=\s*')(" + re.escape(truncated) + r")(')"
                 replacement = r"\g<1>" + correct_id + r"\g<3>"
                 fixed = re.sub(pattern, replacement, sql, flags=re.IGNORECASE)
                 if fixed != sql:
                     _LOG.info("Fixed truncated site ID in SQL: '%s' → '%s'", truncated, correct_id)
                     sql = fixed
-
         return sql
 
-    # Build user prompt with active filters
     user_prompt = f"User query: {prompt}"
     if filters.get("cluster"):
         user_prompt += f"\nActive filter — Zone: {filters['cluster']}"
     if filters.get("time_range") and filters["time_range"] != "24h":
         user_prompt += f"\nActive filter — Time range: {filters['time_range']}"
 
-    # Build LLM messages with optional conversation history
     llm_messages = [{"role": "system", "content": LLM_SYSTEM}]
     llm_messages.extend(conversation_history)
     llm_messages.append({"role": "user", "content": user_prompt})
 
-    # ── Auto-detect available LLM providers from .env config ──────────────────
     _cfg = lambda k, default="": current_app.config.get(k, "") or os.environ.get(k, "") or default
 
     azure_key        = _cfg("AZURE_OPENAI_API_KEY")
@@ -565,6 +447,52 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
         _providers.append(("openai", openai_key))
 
     _LOG.info("AI providers available: %s", [p[0] for p in _providers])
+
+    # ── PRE-LLM INTERCEPTOR ────────────────────────────────────────────────────
+    # Handle certain query patterns with rule-based logic BEFORE calling the LLM.
+    # This ensures follow-ups (site switch, time change, chart type) and
+    # multi-site trend queries are handled correctly and consistently,
+    # regardless of which LLM provider is configured.
+    import re as _re_pre
+
+    def _get_prev_context_for_intercept():
+        """Load the most recent assistant message's content_json from the session."""
+        if not (ai_session and session_id):
+            return None
+        try:
+            last_asst = (NetworkAiMessage.query
+                         .filter_by(session_id=session_id, role="assistant")
+                         .order_by(NetworkAiMessage.created_at.desc())
+                         .first())
+            return last_asst.content_json if last_asst else None
+        except Exception:
+            return None
+
+    _p_lower = prompt.lower().strip()
+    _prompt_sites = _re_pre.findall(r'[A-Za-z]{2,}[_\-][A-Za-z]{2,}[_\-]\d{3,}', prompt)
+    _prompt_days  = _re_pre.search(r'last\s+(\d+)\s*days?', _p_lower)
+
+    # 1. Follow-up detection — run rule-based BEFORE LLM so context is never lost
+    if _is_followup(_p_lower):
+        _prev_ctx = _get_prev_context_for_intercept()
+        if _prev_ctx:
+            _fu = _handle_followup(prompt, _p_lower, _prev_ctx, time_filter)
+            if _fu:
+                ai_result = _fu
+                provider  = {"provider": "rule-based-followup"}
+                _LOG.info("Follow-up intercepted before LLM: site-switch / chart-change / time-change")
+
+    # 2. Multi-site trend queries — rule-based reliably generates one chart per site
+    #    with ALL requested KPIs, which LLMs often get wrong.
+    if not ai_result and len(_prompt_sites) >= 2:
+        _is_trend_pre = (
+            bool(_prompt_days) or
+            any(w in _p_lower for w in ('trend', 'over time', 'history', 'daily', 'last'))
+        )
+        if _is_trend_pre:
+            ai_result = _rule_based_query(prompt, time_filter, prev_context=None)
+            provider  = {"provider": "rule-based-multisite"}
+            _LOG.info("Multi-site trend intercepted before LLM: %s", _prompt_sites)
 
     for _prov in _providers:
         if ai_result:
@@ -637,7 +565,6 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
 
     # ── Fallback: rule-based query engine ─────────────────────────────────────
     if not ai_result:
-        # Extract previous context from session for follow-up detection
         prev_context = None
         if ai_session and session_id:
             try:
@@ -656,7 +583,6 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
 
     # ── Helper functions ──────────────────────────────────────────────────────
     def _sql_with_timeout(query, timeout_sec=10):
-        """Execute SQL with a statement timeout to prevent long-running queries."""
         with db.engine.connect() as conn:
             conn.execute(sa_text(f"SET LOCAL statement_timeout = '{timeout_sec * 1000}'"))
             result = conn.execute(sa_text(query))
@@ -679,7 +605,6 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
             c_rows = []
             try:
                 c_rows = _sql_with_timeout(c_sql, timeout_sec=15)
-                # If SQL ran but returned nothing, log it so we can debug
                 if not c_rows:
                     _LOG.warning("Multi-chart SQL returned 0 rows — SQL: %s", c_sql[:300])
                     c_error = "Query returned no data. The site ID or KPI may not exist in the database."
@@ -768,7 +693,6 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
         if c not in ("lat", "lng", "latitude", "longitude", "site_id", "cell_id", "cluster", "region", "technology")
     ]
 
-    # ── Persist assistant message to session ────────────────────────────────────
     resp_text = ai_result.get("response", f"Found {len(rows)} results.")
     resp_title = ai_result.get("title", prompt[:70])
     resp_chart = ai_result.get("chart_type", ai_result.get("query_type", "bar"))
@@ -824,15 +748,13 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
 # Follow-up / Conversation Context Handling
 # ─────────────────────────────────────────────────────────────────────────────
 
-# KPI keywords used for follow-up detection (same as in _rule_based_query)
 _FU_KPI_WORDS = {
-    'cssr', 'call setup', 'rrc', 'drop', 'cdr', 'throughput', 'tput',
-    'dl throughput', 'speed', 'prb', 'congestion', 'availability',
-    'latency', 'delay', 'volte', 'handover', 'volume', 'traffic',
-    'connected', 'users',
+    'cssr', 'call setup', 'rrc', 'drop', 'cdr', 'erab', 'e-rab', 'e rab',
+    'throughput', 'tput', 'dl throughput', 'speed', 'prb', 'congestion',
+    'availability', 'latency', 'delay', 'volte', 'handover', 'volume',
+    'traffic', 'connected', 'users',
 }
 
-# Strong new-query keywords — if the prompt matches these AND has substance, it's NOT a follow-up
 _NEW_QUERY_WORDS = {
     'top', 'bottom', 'worst', 'best', 'compare zones', 'zone wise',
     'overall', 'network wide', 'all sites', 'show me', 'give me',
@@ -840,88 +762,126 @@ _NEW_QUERY_WORDS = {
 
 
 def _is_followup(prompt_lower: str) -> bool:
+    """
+    Returns True if this prompt is modifying/extending the previous chart
+    rather than starting a completely new query.
+    """
     import re
     p = prompt_lower.strip()
     words = p.split()
 
-    has_site = bool(re.findall(r'[a-z]{2,}[_\-][a-z]{2,}[_\-]\d{3,}', p))
-    has_days = bool(re.search(r'last\s+\d+\s*days?', p))
-    if has_site and has_days:
+    has_site     = bool(re.findall(r'[a-z]{2,}[_\-][a-z]{2,}[_\-]\d{3,}', p))
+    has_kpi      = any(kw in p for kw in _FU_KPI_WORDS)
+    has_days     = bool(re.search(r'last\s+\d+\s*days?', p))
+    has_time_ref = has_days or bool(re.search(
+        r'last\s+(year|month|week|quarter|6\s*months?|3\s*months?)'
+        r'|\d+\s*(month|year|week)s?|this\s+(year|month|week)', p
+    ))
+
+    # 1. Truly self-contained: site + explicit time reference → always fresh
+    if has_site and has_time_ref:
         return False
 
+    # 2. Explicit ranking/network-wide → always fresh
     if re.search(r'(top|bottom|worst|best)\s+\d+', p):
         return False
 
-    has_kpi = any(kw in p for kw in _FU_KPI_WORDS)
-    if has_site and has_kpi and len(words) > 8:
+    # 3. Multiple different site IDs → multi-site fresh query
+    #    (handled separately by the pre-LLM interceptor)
+    _all_sites = re.findall(r'[a-z]{2,}[_\-][a-z]{2,}[_\-]\d{3,}', p)
+    if len(_all_sites) >= 2:
         return False
 
-    ref_words = [
+    # 4. Explicit modification keywords → definitely follow-up
+    #    Covers: "not cssr", "instead of", "only line", "switch to erab", etc.
+    mod_keywords = [
+        ' not ', 'instead', 'rather than', 'in place of',
+        'only line', 'only bar', 'only area', 'just line', 'just bar',
+        'switch to', 'change to', 'show as', 'display as', 'convert to',
         'the graph', 'the chart', 'this graph', 'this chart', 'that chart',
-        'same', 'previous', 'last one', 'above', 'earlier', 'the data',
-        'the result', 'it', 'these', 'instead', 'rather', 'in place',
+        'same', 'previous', 'last one', 'above', 'earlier',
+        'the data', 'the result', 'instead', 'rather', 'in place',
         'swap', 'replace', 'for this', 'for that',
-    ]
-    if any(w in p for w in ref_words):
-        return True
-
-    mod_words = [
-        'scale', 'zoom', 'resize', 'bigger', 'smaller', 'enlarge', 'expand',
-        'change', 'modify', 'update', 'adjust', 'convert', 'switch',
-        'make it', 'turn it', 'show as', 'display as',
+        'scale', 'zoom', 'resize', 'bigger', 'smaller',
+        'enlarge', 'expand', 'more days', 'fewer days', 'extend', 'shorten',
+        'add', 'also show', 'overlay', 'combine',
+        'remove', 'hide', 'exclude', 'colour', 'color',
         'bar chart', 'line chart', 'pie chart', 'area chart',
-        'more days', 'fewer days', 'extend', 'shorten',
-        'difference', 'interval', 'step', 'tick',
-        'add', 'include', 'also show', 'overlay', 'combine',
-        'remove', 'hide', 'exclude',
-        'different color', 'colour', 'color',
+        'line graph', 'bar graph',
+        'make it', 'turn it',
     ]
-    if any(w in p for w in mod_words):
+    if any(kw in p for kw in mod_keywords):
         return True
 
+    # 5. Site-only (no KPI, no time) → site-switch follow-up
+    #    e.g. "show me GUR_LTE_0001" / "i want to see for site id GUR_LTE_0001"
+    _SITE_SWITCH_BLOCKERS = {'top', 'bottom', 'worst', 'best', 'compare', 'zone', 'all sites', 'network'}
+    if has_site and not has_kpi and not has_time_ref:
+        if not any(nw in p for nw in _SITE_SWITCH_BLOCKERS):
+            return True
+
+    # 6. Very short prompts with no site and no KPI → vague continuation
+    if len(words) <= 5 and not has_kpi and not has_site:
+        return True
+
+    # 7. Polite one-word confirmations
     if p in ('yes', 'ok', 'sure', 'do it', 'go ahead', 'please do',
              'please', 'thanks', 'thank you', 'good', 'nice', 'great'):
         return True
 
-    if len(words) <= 5 and not has_kpi and not has_site:
-        return True
-
-    if has_kpi and not has_site and not has_days and len(words) <= 8:
-        only_kpi = True
-        for nw in _NEW_QUERY_WORDS:
-            if nw in p:
-                only_kpi = False
-                break
-        if only_kpi:
+    # 8. KPI-only prompt (no site, no time) → KPI switch on same site
+    if has_kpi and not has_site and not has_time_ref and len(words) <= 10:
+        _NEW_QUERY_BLOCKERS = {'top', 'bottom', 'worst', 'best', 'compare', 'zone', 'all sites', 'network wide', 'overall'}
+        if not any(nw in p for nw in _NEW_QUERY_BLOCKERS):
             return True
 
     return False
 
 
+
 def _handle_followup(prompt_orig: str, p: str, prev: dict, time_filter: str) -> dict:
     import re
 
-    prev_sql = prev.get("sql", "")
-    prev_title = prev.get("title", "")
-    prev_chart = prev.get("chart_type", "bar")
-    prev_y = prev.get("y_axes", [])
-    prev_x = prev.get("x_axis", "date")
+    prev_sql    = prev.get("sql", "")
+    prev_title  = prev.get("title", "")
+    prev_chart  = prev.get("chart_type", "bar")
+    prev_y      = prev.get("y_axes", [])
+    prev_x      = prev.get("x_axis", "date")
     prev_response = prev.get("response", "")
-    prev_cfg = prev.get("chart_config", {}) or {}
+    prev_cfg    = prev.get("chart_config", {}) or {}
     prev_charts = prev.get("charts", [])
 
     if not prev_sql and not prev_charts:
         return None
 
-    prev_sites = re.findall(r"site_id\s*=\s*'([^']+)'", prev_sql)
+    # Extract context from main SQL
+    prev_sites    = re.findall(r"site_id\s*=\s*'([^']+)'", prev_sql)
     prev_kpi_names = re.findall(r"kpi_name\s*=\s*'([^']+)'", prev_sql)
-    prev_days_m = re.search(r"INTERVAL\s+'(\d+)\s+days?'", prev_sql)
-    prev_days = int(prev_days_m.group(1)) if prev_days_m else None
+    prev_days_m   = re.search(r"INTERVAL\s+'(\d+)\s+days?'", prev_sql)
+    prev_days     = int(prev_days_m.group(1)) if prev_days_m else None
+
+    # ── FIX: When prev was multi_chart, harvest KPIs, sites, and days from ALL sub-charts ──
+    if prev_charts:
+        for ch in prev_charts:
+            ch_sql = ch.get("sql", "")
+            for kpi in re.findall(r"kpi_name\s*=\s*'([^']+)'", ch_sql):
+                if kpi not in prev_kpi_names:
+                    prev_kpi_names.append(kpi)
+            for site in re.findall(r"site_id\s*=\s*'([^']+)'", ch_sql):
+                if site not in prev_sites:
+                    prev_sites.append(site)
+            if not prev_days:
+                m = re.search(r"INTERVAL\s+'(\d+)\s+days?'", ch_sql)
+                if m:
+                    prev_days = int(m.group(1))
 
     KPI_MAP = {
         'cssr': ('LTE Call Setup Success Rate', 'cssr'),
         'call setup': ('LTE Call Setup Success Rate', 'cssr'),
         'rrc': ('LTE RRC Setup Success Rate', 'rrc_sr'),
+        'erab': ('E-RAB Call Drop Rate_1', 'drop_rate'),
+        'e-rab': ('E-RAB Call Drop Rate_1', 'drop_rate'),
+        'e rab': ('E-RAB Call Drop Rate_1', 'drop_rate'),
         'drop': ('E-RAB Call Drop Rate_1', 'drop_rate'),
         'cdr': ('E-RAB Call Drop Rate_1', 'drop_rate'),
         'throughput': ('LTE DL - Cell Ave Throughput', 'dl_tput'),
@@ -940,22 +900,80 @@ def _handle_followup(prompt_orig: str, p: str, prev: dict, time_filter: str) -> 
         'connected': ('Ave RRC Connected Ue', 'avg_rrc_ue'),
         'users': ('Ave RRC Connected Ue', 'avg_rrc_ue'),
     }
+
     def _detect_kpi(text):
         t = text.lower()
+        import re as _re_dk
+        # First, identify KPIs the user wants to EXCLUDE ("not cssr", "instead of cssr")
+        excluded_kpis = set()
+        for kw, (kn, al) in KPI_MAP.items():
+            if (_re_dk.search(r'\bnot\s+' + _re_dk.escape(kw), t) or
+                    _re_dk.search(r'instead\s+of\s+' + _re_dk.escape(kw), t) or
+                    _re_dk.search(r'not\s+this\s+' + _re_dk.escape(kw), t)):
+                excluded_kpis.add(kn)
+        # Return the first KPI that is NOT excluded
         for kw in sorted(KPI_MAP.keys(), key=len, reverse=True):
-            if kw in t:
+            if kw in t and KPI_MAP[kw][0] not in excluded_kpis:
                 return KPI_MAP[kw]
         return None
 
-    new_sites = re.findall(r'[A-Za-z]{2,}[_\-][A-Za-z]{2,}[_\-]\d{3,}', prompt_orig)
-    new_kpi = _detect_kpi(p)
+    new_sites  = re.findall(r'[A-Za-z]{2,}[_\-][A-Za-z]{2,}[_\-]\d{3,}', prompt_orig)
+    new_kpi    = _detect_kpi(p)
     new_days_m = re.search(r'(?:last|past|recent)\s+(\d+)\s*days?', p)
-    new_days = int(new_days_m.group(1)) if new_days_m else None
+    new_days   = int(new_days_m.group(1)) if new_days_m else None
     if not new_days:
         dm = re.search(r'(\d+)\s*days?', p)
         if dm and not re.search(r'(top|bottom|worst|best)\s+' + dm.group(1), p):
             new_days = int(dm.group(1))
 
+    # ── FIX: Site switch — new site mentioned, no new KPI → inherit ALL previous KPIs ──
+    # This handles: "i want to see for site id GUR_LTE_0001" after a multi-chart response.
+    if new_sites and not new_kpi and prev_kpi_names:
+        site = new_sites[0]
+        days = new_days or prev_days or 14
+        date_clause = f"AND k.date >= CURRENT_DATE - INTERVAL '{days} days' AND k.date <= CURRENT_DATE"
+
+        if len(prev_kpi_names) == 1:
+            kpi_name = prev_kpi_names[0]
+            alias = 'value'
+            for kw, (kn, al) in KPI_MAP.items():
+                if kn == kpi_name:
+                    alias = al
+                    break
+            return {
+                "sql": f"""SELECT k.date::text AS date, AVG(k.value) AS {alias}
+                    FROM kpi_data k
+                    WHERE k.kpi_name = '{kpi_name}' AND k.site_id = '{site}'
+                      AND k.data_level = 'site' AND k.value IS NOT NULL {date_clause}
+                    GROUP BY k.date ORDER BY k.date""",
+                "query_type": "line", "chart_type": "line",
+                "title": f"{kpi_name} — {site} (last {days}d)",
+                "x_axis": "date", "y_axes": [alias],
+                "response": f"Showing {kpi_name} for site {site} over last {days} days.",
+            }
+        else:
+            # Multiple inherited KPIs → composed chart with UNION ALL
+            parts_sql = []
+            for kpi_name in prev_kpi_names[:3]:
+                parts_sql.append(f"""SELECT k.date::text AS date, k.site_id,
+                       AVG(k.value) AS value, '{kpi_name}' AS kpi_name
+                FROM kpi_data k
+                WHERE k.kpi_name = '{kpi_name}' AND k.site_id = '{site}'
+                  AND k.data_level = 'site' AND k.value IS NOT NULL {date_clause}
+                GROUP BY k.date, k.site_id""")
+            kpi_short = " & ".join(
+                k.replace("LTE ", "").replace("E-RAB ", "")[:18]
+                for k in prev_kpi_names[:3]
+            )
+            return {
+                "sql": "\nUNION ALL\n".join(parts_sql) + "\nORDER BY date",
+                "query_type": "composed", "chart_type": "composed",
+                "title": f"{site} — {kpi_short} (last {days}d)",
+                "x_axis": "date", "y_axes": ["value"],
+                "response": f"Showing {', '.join(prev_kpi_names[:3])} for site {site} over last {days} days.",
+            }
+
+    # KPI switch — new KPI, same site
     if new_kpi and not new_sites and prev_sites:
         kpi_name, alias = new_kpi
         days = new_days or prev_days or 14
@@ -973,28 +991,7 @@ def _handle_followup(prompt_orig: str, p: str, prev: dict, time_filter: str) -> 
             "response": f"Switched to {kpi_name} for site {site} over last {days} days.",
         }
 
-    if new_sites and prev_kpi_names and not new_kpi:
-        site = new_sites[0]
-        kpi_name = prev_kpi_names[0]
-        alias = 'value'
-        for kw, (kn, al) in KPI_MAP.items():
-            if kn == kpi_name:
-                alias = al
-                break
-        days = new_days or prev_days or 14
-        date_clause = f"AND k.date >= CURRENT_DATE - INTERVAL '{days} days' AND k.date <= CURRENT_DATE"
-        return {
-            "sql": f"""SELECT k.date::text AS date, AVG(k.value) AS {alias}
-                FROM kpi_data k
-                WHERE k.kpi_name = '{kpi_name}' AND k.site_id = '{site}'
-                  AND k.data_level = 'site' AND k.value IS NOT NULL {date_clause}
-                GROUP BY k.date ORDER BY k.date""",
-            "query_type": "line", "chart_type": "line",
-            "title": f"{kpi_name} — {site} (last {days}d)",
-            "x_axis": "date", "y_axes": [alias],
-            "response": f"Showing {kpi_name} for site {site} over last {days} days.",
-        }
-
+    # Chart type switch
     new_chart = None
     if 'bar' in p and ('chart' in p or 'graph' in p or 'as bar' in p):
         new_chart = 'bar'
@@ -1015,8 +1012,9 @@ def _handle_followup(prompt_orig: str, p: str, prev: dict, time_filter: str) -> 
             "response": f"Changed chart to {new_chart} view.",
         }
 
+    # Time range change
     if new_days and prev_sql:
-        updated_sql = re.sub(r"INTERVAL\s+'(\d+)\s+days?'", f"INTERVAL '{new_days} days'", prev_sql)
+        updated_sql   = re.sub(r"INTERVAL\s+'(\d+)\s+days?'", f"INTERVAL '{new_days} days'", prev_sql)
         updated_title = re.sub(r'\(last \d+d\)', f'(last {new_days}d)', prev_title)
         if updated_title == prev_title:
             updated_title = prev_title + f" (last {new_days}d)"
@@ -1024,7 +1022,7 @@ def _handle_followup(prompt_orig: str, p: str, prev: dict, time_filter: str) -> 
         if prev_charts:
             new_charts = []
             for ch in prev_charts:
-                ch_sql = re.sub(r"INTERVAL\s+'(\d+)\s+days?'", f"INTERVAL '{new_days} days'", ch.get("sql", ""))
+                ch_sql   = re.sub(r"INTERVAL\s+'(\d+)\s+days?'", f"INTERVAL '{new_days} days'", ch.get("sql", ""))
                 ch_title = re.sub(r'\(last \d+d\)', f'(last {new_days}d)', ch.get("title", ""))
                 new_charts.append({**ch, "sql": ch_sql, "title": ch_title})
             return {
@@ -1042,6 +1040,7 @@ def _handle_followup(prompt_orig: str, p: str, prev: dict, time_filter: str) -> 
             "response": f"Updated to show last {new_days} days.",
         }
 
+    # Y-axis scale change
     if any(w in p for w in ['scale', 'zoom', 'resize', 'bigger', 'smaller',
                              'enlarge', 'expand', 'y axis', 'y-axis', 'range',
                              'difference', 'interval', 'step', 'tick']):
@@ -1080,6 +1079,7 @@ def _handle_followup(prompt_orig: str, p: str, prev: dict, time_filter: str) -> 
             "chart_config": cfg, "response": resp_msg,
         }
 
+    # Add/overlay a KPI
     if any(w in p for w in ['add', 'include', 'also show', 'overlay', 'combine']):
         add_kpi = _detect_kpi(p)
         if add_kpi and prev_sites and prev_kpi_names:
@@ -1088,7 +1088,7 @@ def _handle_followup(prompt_orig: str, p: str, prev: dict, time_filter: str) -> 
             days = prev_days or 14
             date_clause = f"AND k.date >= CURRENT_DATE - INTERVAL '{days} days' AND k.date <= CURRENT_DATE"
             prev_alias = prev_y[0] if prev_y else 'value'
-            prev_kpi = prev_kpi_names[0]
+            prev_kpi   = prev_kpi_names[0]
             new_sql = f"""SELECT k.date::text AS date, k.site_id,
                        AVG(k.value) AS value, '{prev_kpi}' AS kpi_name
                 FROM kpi_data k
@@ -1111,6 +1111,7 @@ def _handle_followup(prompt_orig: str, p: str, prev: dict, time_filter: str) -> 
                 "response": f"Added {kpi_name} alongside {prev_kpi} for {site}.",
             }
 
+    # Default: re-show previous result
     if prev_charts:
         return {
             "multi_chart": True, "charts": prev_charts,
@@ -1143,27 +1144,30 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
     site_ids = list(dict.fromkeys(site_ids))
 
     KPI_MAP = {
-        'cssr':       ('LTE Call Setup Success Rate', 'cssr'),
-        'call setup': ('LTE Call Setup Success Rate', 'cssr'),
-        'rrc':        ('LTE RRC Setup Success Rate', 'rrc_sr'),
-        'drop':       ('E-RAB Call Drop Rate_1', 'drop_rate'),
-        'cdr':        ('E-RAB Call Drop Rate_1', 'drop_rate'),
-        'throughput':  ('LTE DL - Cell Ave Throughput', 'dl_tput'),
-        'tput':       ('LTE DL - Cell Ave Throughput', 'dl_tput'),
+        'cssr':          ('LTE Call Setup Success Rate', 'cssr'),
+        'call setup':    ('LTE Call Setup Success Rate', 'cssr'),
+        'rrc':           ('LTE RRC Setup Success Rate', 'rrc_sr'),
+        'erab':          ('E-RAB Call Drop Rate_1', 'drop_rate'),
+        'e-rab':         ('E-RAB Call Drop Rate_1', 'drop_rate'),
+        'e rab':         ('E-RAB Call Drop Rate_1', 'drop_rate'),
+        'drop':          ('E-RAB Call Drop Rate_1', 'drop_rate'),
+        'cdr':           ('E-RAB Call Drop Rate_1', 'drop_rate'),
+        'throughput':    ('LTE DL - Cell Ave Throughput', 'dl_tput'),
+        'tput':          ('LTE DL - Cell Ave Throughput', 'dl_tput'),
         'dl throughput': ('LTE DL - Cell Ave Throughput', 'dl_tput'),
-        'speed':      ('LTE DL - Cell Ave Throughput', 'dl_tput'),
-        'prb':        ('DL PRB Utilization (1BH)', 'dl_prb'),
-        'congestion': ('DL PRB Utilization (1BH)', 'dl_prb'),
-        'availability': ('Availability', 'availability'),
-        'availab':    ('Availability', 'availability'),
-        'latency':    ('Average Latency Downlink', 'latency'),
-        'delay':      ('Average Latency Downlink', 'latency'),
-        'volte':      ('VoLTE Traffic Erlang', 'volte_erl'),
-        'handover':   ('LTE Intra-Freq HO Success Rate', 'ho_sr'),
-        'volume':     ('DL Data Total Volume', 'dl_volume'),
-        'traffic':    ('DL Data Total Volume', 'dl_volume'),
-        'connected':  ('Ave RRC Connected Ue', 'avg_rrc_ue'),
-        'users':      ('Ave RRC Connected Ue', 'avg_rrc_ue'),
+        'speed':         ('LTE DL - Cell Ave Throughput', 'dl_tput'),
+        'prb':           ('DL PRB Utilization (1BH)', 'dl_prb'),
+        'congestion':    ('DL PRB Utilization (1BH)', 'dl_prb'),
+        'availability':  ('Availability', 'availability'),
+        'availab':       ('Availability', 'availability'),
+        'latency':       ('Average Latency Downlink', 'latency'),
+        'delay':         ('Average Latency Downlink', 'latency'),
+        'volte':         ('VoLTE Traffic Erlang', 'volte_erl'),
+        'handover':      ('LTE Intra-Freq HO Success Rate', 'ho_sr'),
+        'volume':        ('DL Data Total Volume', 'dl_volume'),
+        'traffic':       ('DL Data Total Volume', 'dl_volume'),
+        'connected':     ('Ave RRC Connected Ue', 'avg_rrc_ue'),
+        'users':         ('Ave RRC Connected Ue', 'avg_rrc_ue'),
     }
 
     def _detect_kpis(text):
@@ -1180,24 +1184,7 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
         m = re.search(r'last\s+(\d+)\s*days?', text.lower())
         return int(m.group(1)) if m else None
 
-    def _try_split_compound(prompt_text):
-        for sep in [' and ', ' also ', ' plus ', ' along with ']:
-            if sep not in prompt_text.lower():
-                continue
-            idx = prompt_text.lower().index(sep)
-            part1 = prompt_text[:idx].strip()
-            part2 = prompt_text[idx+len(sep):].strip()
-            kpis1 = _detect_kpis(part1)
-            kpis2 = _detect_kpis(part2)
-            sites1 = re.findall(r'[A-Za-z]{2,}[_\-][A-Za-z]{2,}[_\-]\d{3,}', part1)
-            sites2 = re.findall(r'[A-Za-z]{2,}[_\-][A-Za-z]{2,}[_\-]\d{3,}', part2)
-            if kpis1 and kpis2 and (sites1 or sites2):
-                if not sites1 and sites2:
-                    sites1 = site_ids[:1] if site_ids else sites2[:1]
-                elif not sites2 and sites1:
-                    sites2 = site_ids[:1] if site_ids else sites1[:1]
-                return [(part1, kpis1, sites1), (part2, kpis2, sites2)]
-        return None
+    # _try_split_compound REMOVED — caused incorrect KPI-site pairing on "and" keyword
 
     try:
         cnt = _sql("SELECT COUNT(*) AS n FROM kpi_data")
@@ -1210,57 +1197,93 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
 
     GEO_JOIN = "LEFT JOIN telecom_sites ts ON LOWER(k.site_id) = LOWER(ts.site_id)"
 
-    compound = _try_split_compound(prompt)
-    if compound and len(compound) >= 2:
+    detected_kpis = _detect_kpis(p)
+    days          = _extract_days(p)
+    is_trend      = (bool(days) or 'trend' in p or 'over time' in p or
+                     'history' in p or 'daily' in p or 'last' in p)
+
+    # ── FIX: Multiple sites + trend → multi_chart (one chart per site, each with ALL KPIs) ──
+    # Previously this incorrectly paired kpi[i] with site[i].
+    if len(site_ids) >= 2 and is_trend:
+        date_clause = (
+            f"AND k.date >= CURRENT_DATE - INTERVAL '{days} days' AND k.date <= CURRENT_DATE"
+            if days else "AND k.date <= CURRENT_DATE"
+        )
         charts = []
-        for part_text, part_kpis, part_sites in compound:
-            days = _extract_days(part_text)
-            kpi = part_kpis[0] if part_kpis else ('DL PRB Utilization (1BH)', 'dl_prb')
-            site = part_sites[0] if part_sites else None
-            date_clause = f"AND k.date >= CURRENT_DATE - INTERVAL '{days} days' AND k.date <= CURRENT_DATE" if days else "AND k.date <= CURRENT_DATE"
-            site_clause = f"AND k.site_id = '{site}'" if site else ""
+        for site in site_ids[:4]:
+            if not detected_kpis:
+                # Default KPIs when none specified
+                use_kpis = [
+                    ('E-RAB Call Drop Rate_1', 'drop_rate'),
+                    ('LTE Call Setup Success Rate', 'cssr'),
+                ]
+            else:
+                use_kpis = detected_kpis[:3]
 
-            chart_title = kpi[0]
-            if site:
-                chart_title += f" — {site}"
-            if days:
-                chart_title += f" (last {days}d)"
-
-            charts.append({
-                "sql": f"""SELECT k.date::text AS date, AVG(k.value) AS {kpi[1]}
-                    FROM kpi_data k
-                    WHERE k.kpi_name = '{kpi[0]}'
-                      AND k.data_level = 'site' AND k.value IS NOT NULL
-                      {site_clause} {date_clause}
-                    GROUP BY k.date ORDER BY k.date""",
-                "chart_type": "line",
-                "title": chart_title,
-                "x_axis": "date",
-                "y_axes": [kpi[1]],
-            })
+            if len(use_kpis) == 1:
+                kpi_name, alias = use_kpis[0]
+                charts.append({
+                    "sql": f"""SELECT k.date::text AS date, AVG(k.value) AS {alias}
+                        FROM kpi_data k
+                        WHERE k.kpi_name = '{kpi_name}' AND k.site_id = '{site}'
+                          AND k.data_level = 'site' AND k.value IS NOT NULL {date_clause}
+                        GROUP BY k.date ORDER BY k.date""",
+                    "chart_type": "line",
+                    "title": f"{kpi_name} — {site}" + (f" (last {days}d)" if days else ""),
+                    "x_axis": "date",
+                    "y_axes": [alias],
+                })
+            else:
+                # Multiple KPIs per site → composed chart using UNION ALL
+                parts_sql = []
+                for kpi_name, alias in use_kpis:
+                    parts_sql.append(
+                        f"""SELECT k.date::text AS date, k.site_id,
+                               AVG(k.value) AS value, '{kpi_name}' AS kpi_name
+                        FROM kpi_data k
+                        WHERE k.kpi_name = '{kpi_name}' AND k.site_id = '{site}'
+                          AND k.data_level = 'site' AND k.value IS NOT NULL {date_clause}
+                        GROUP BY k.date, k.site_id"""
+                    )
+                kpi_labels = " & ".join(
+                    kpi[0].replace("LTE ", "").replace("E-RAB ", "")[:18]
+                    for kpi in use_kpis
+                )
+                charts.append({
+                    "sql": "\nUNION ALL\n".join(parts_sql) + "\nORDER BY date",
+                    "chart_type": "composed",
+                    "title": f"{site} — {kpi_labels}" + (f" (last {days}d)" if days else ""),
+                    "x_axis": "date",
+                    "y_axes": ["value"],
+                })
 
         chart_labels = [c["title"] for c in charts]
         return {
             "multi_chart": True,
-            "charts": charts,
-            "sql": charts[0]["sql"],
-            "query_type": "multi_chart",
-            "chart_type": "multi_chart",
-            "title": " & ".join(chart_labels)[:80],
-            "x_axis": "date",
-            "y_axes": ["value"],
-            "response": f"Here are {len(charts)} charts as requested: {', '.join(chart_labels)}.",
+            "charts":      charts,
+            "sql":         charts[0]["sql"],
+            "query_type":  "multi_chart",
+            "chart_type":  "multi_chart",
+            "title":       " & ".join(chart_labels)[:80],
+            "x_axis":      "date",
+            "y_axes":      ["value"],
+            "response": (
+                f"Here are {len(charts)} charts as requested: {', '.join(chart_labels)}"
+                + (f" (last {days}d)." if days else ".")
+            ),
         }
 
-    detected_kpis = _detect_kpis(p)
-    days = _extract_days(p)
+    # compound split removed
 
-    is_trend = bool(days) or 'trend' in p or 'over time' in p or 'history' in p or 'daily' in p or 'last' in p
+    # ── Single site, single KPI ───────────────────────────────────────────────
     if site_ids and detected_kpis and is_trend:
         if len(site_ids) == 1 and len(detected_kpis) == 1:
             kpi_name, alias = detected_kpis[0]
-            site = site_ids[0]
-            date_clause = f"AND k.date >= CURRENT_DATE - INTERVAL '{days} days' AND k.date <= CURRENT_DATE" if days else "AND k.date <= CURRENT_DATE"
+            site        = site_ids[0]
+            date_clause = (
+                f"AND k.date >= CURRENT_DATE - INTERVAL '{days} days' AND k.date <= CURRENT_DATE"
+                if days else "AND k.date <= CURRENT_DATE"
+            )
             return {
                 "sql": f"""SELECT k.date::text AS date, AVG(k.value) AS {alias}
                     FROM kpi_data k
@@ -1273,9 +1296,13 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
                 "response": f"Trend of {kpi_name} for site {site}" + (f" over last {days} days." if days else "."),
             }
 
+        # Single site, multiple KPIs
         if len(site_ids) == 1 and len(detected_kpis) >= 2:
-            site = site_ids[0]
-            date_clause = f"AND k.date >= CURRENT_DATE - INTERVAL '{days} days' AND k.date <= CURRENT_DATE" if days else "AND k.date <= CURRENT_DATE"
+            site        = site_ids[0]
+            date_clause = (
+                f"AND k.date >= CURRENT_DATE - INTERVAL '{days} days' AND k.date <= CURRENT_DATE"
+                if days else "AND k.date <= CURRENT_DATE"
+            )
             parts_sql = []
             for kpi_name, alias in detected_kpis[:3]:
                 parts_sql.append(f"""SELECT k.date::text AS date, k.site_id,
@@ -1292,29 +1319,8 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
                 "response": f"Showing {', '.join(k[0] for k in detected_kpis[:3])} for {site}.",
             }
 
-        if len(site_ids) >= 2:
-            parts_sql = []
-            titles = []
-            for i, site in enumerate(site_ids[:4]):
-                kpi = detected_kpis[min(i, len(detected_kpis)-1)]
-                date_clause = f"AND k.date >= CURRENT_DATE - INTERVAL '{days} days' AND k.date <= CURRENT_DATE" if days else "AND k.date <= CURRENT_DATE"
-                parts_sql.append(f"""SELECT k.date::text AS date, k.site_id,
-                       AVG(k.value) AS value, '{kpi[0]}' AS kpi_name
-                FROM kpi_data k
-                WHERE k.kpi_name = '{kpi[0]}' AND k.site_id = '{site}'
-                  AND k.data_level = 'site' AND k.value IS NOT NULL {date_clause}
-                GROUP BY k.date, k.site_id""")
-                titles.append(f"{kpi[1]} {site}")
-            return {
-                "sql": "\nUNION ALL\n".join(parts_sql) + "\nORDER BY date",
-                "query_type": "composed", "chart_type": "composed",
-                "title": " & ".join(titles)[:60],
-                "x_axis": "date", "y_axes": ["value"],
-                "response": f"Comparing trends for {', '.join(site_ids[:4])}.",
-            }
-
     if site_ids and detected_kpis and not is_trend:
-        site = site_ids[0]
+        site  = site_ids[0]
         cases = ", ".join(f"AVG(CASE WHEN k.kpi_name = '{kn}' THEN k.value END) AS {al}" for kn, al in detected_kpis[:5])
         in_cl = ", ".join(f"'{kn}'" for kn, _ in detected_kpis[:5])
         return {
@@ -1331,7 +1337,10 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
 
     if is_trend and detected_kpis:
         kpi_name, alias = detected_kpis[0]
-        date_clause = f"AND k.date >= CURRENT_DATE - INTERVAL '{days} days' AND k.date <= CURRENT_DATE" if days else "AND k.date <= CURRENT_DATE"
+        date_clause = (
+            f"AND k.date >= CURRENT_DATE - INTERVAL '{days} days' AND k.date <= CURRENT_DATE"
+            if days else "AND k.date <= CURRENT_DATE"
+        )
         return {
             "sql": f"""SELECT k.date::text AS date, AVG(k.value) AS {alias},
                        MIN(k.value) AS min_val, MAX(k.value) AS max_val
@@ -1345,18 +1354,18 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
             "response": f"Daily trend of {kpi_name} across the network.",
         }
 
-    N = 10
+    N    = 10
     nums = re.findall(r'\b(\d+)\b', p)
     if nums:
         N = min(int(nums[0]), 100)
 
     def _kd_site_query(kpi_names_and_aliases, order_col, order_dir="DESC"):
-        case_parts = []
+        case_parts      = []
         kpi_names_for_in = []
         for kpi_name, alias in kpi_names_and_aliases:
             case_parts.append(f"AVG(CASE WHEN k.kpi_name = '{kpi_name}' THEN k.value END) AS {alias}")
             kpi_names_for_in.append(f"'{kpi_name}'")
-        cases = ",\n                   ".join(case_parts)
+        cases     = ",\n                   ".join(case_parts)
         in_clause = ", ".join(kpi_names_for_in)
         return f"""SELECT k.site_id, MAX(ts.zone) AS cluster,
                        AVG(ts.latitude) AS lat, AVG(ts.longitude) AS lng,
@@ -1431,11 +1440,11 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
 def _rule_based_legacy(p: str, time_filter: str) -> dict:
     """Legacy fallback using network_kpi_timeseries table."""
     import re
-    N = 10
+    N    = 10
     nums = re.findall(r'\b(\d+)\b', p)
     if nums:
         N = min(int(nums[0]), 100)
-    TBL = "network_kpi_timeseries"
+    TBL  = "network_kpi_timeseries"
     base = f"FROM {TBL} WHERE {time_filter}"
 
     if 'rrc' in p or 'accessibility' in p or 'access' in p:
