@@ -74,6 +74,8 @@ def _ensure_kpi_indexes():
                 "CREATE INDEX IF NOT EXISTS idx_kpi_name_date ON kpi_data (kpi_name, date)",
                 "CREATE INDEX IF NOT EXISTS idx_kpi_site_kpi ON kpi_data (site_id, kpi_name)",
                 "CREATE INDEX IF NOT EXISTS idx_kpi_site_id ON kpi_data (site_id)",
+                "CREATE INDEX IF NOT EXISTS idx_kpi_level_name_date ON kpi_data (data_level, kpi_name, date)",
+                "CREATE INDEX IF NOT EXISTS idx_kpi_level_date ON kpi_data (data_level, date)",
                 "CREATE INDEX IF NOT EXISTS idx_ts_site_id ON telecom_sites (site_id)",
                 "CREATE INDEX IF NOT EXISTS idx_ts_zone ON telecom_sites (zone)",
             ]:
@@ -126,6 +128,36 @@ def _get_filters():
         "country": country or "", "state": state or "", "city": city or "",
         "zone": zone or cluster, "kpi_filter": kpi_filter,
     }
+
+
+# ── Precomputed max date from kpi_data (cached, refreshed every 5 min) ────────
+_KPI_MAX_DATE = None
+_KPI_MAX_DATE_TS = None
+
+def _get_kpi_max_date():
+    """Return the latest date that has full KPI data (not sparse partial uploads).
+    Uses E-RAB Call Drop Rate_1 as the reference KPI since it's present in every
+    complete site-level upload. Cached for 5 minutes."""
+    global _KPI_MAX_DATE, _KPI_MAX_DATE_TS
+    now = datetime.utcnow()
+    if _KPI_MAX_DATE and _KPI_MAX_DATE_TS and (now - _KPI_MAX_DATE_TS).total_seconds() < 300:
+        return _KPI_MAX_DATE
+    try:
+        # Use a core KPI as reference — sparse future dates with only 1-2 KPIs are excluded
+        r = _sql("""SELECT MAX(date) AS md FROM kpi_data
+                     WHERE data_level='site' AND kpi_name='E-RAB Call Drop Rate_1'""")
+        _KPI_MAX_DATE = r[0]["md"] if r and r[0]["md"] else None
+        if not _KPI_MAX_DATE:
+            # Fallback: use any max date
+            r2 = _sql("SELECT MAX(date) AS md FROM kpi_data")
+            _KPI_MAX_DATE = r2[0]["md"] if r2 and r2[0]["md"] else None
+        _KPI_MAX_DATE_TS = now
+        if _KPI_MAX_DATE:
+            print(f"[NETWORK ANALYTICS] kpi_data reference max date: {_KPI_MAX_DATE}")
+            _LOG.info("kpi_data reference max date: %s", _KPI_MAX_DATE)
+    except Exception:
+        pass
+    return _KPI_MAX_DATE
 
 
 def _kpi_filter_clause(filters: dict, k_alias: str = "k", ts_alias: str = "ts"):
@@ -184,10 +216,23 @@ def _kpi_filter_clause(filters: dict, k_alias: str = "k", ts_alias: str = "ts"):
         parts.append(f"LOWER({k_alias}.site_id) = LOWER(:_fs)")
         params["_fs"] = site
     if tr and tr != "all":
-        days_map = {"1h": 3, "6h": 3, "24h": 3, "7d": 7, "30d": 30}
+        days_map = {"1h": 1, "6h": 1, "24h": 7, "7d": 7, "30d": 30}
         days = days_map.get(tr, 30)
-        parts.append(f"{k_alias}.date >= CURRENT_DATE - INTERVAL '{days} days'")
-        parts.append(f"{k_alias}.date <= CURRENT_DATE")
+        # Use precomputed max date as reference (not CURRENT_DATE) so queries
+        # work even when uploaded KPI data dates are older than today.
+        # Falls back to CURRENT_DATE if max date not available.
+        max_date = _get_kpi_max_date()
+        if max_date:
+            from datetime import timedelta as _td
+            start_date = max_date - _td(days=days)
+            parts.append(f"{k_alias}.date >= :_fdate_start")
+            parts.append(f"{k_alias}.date <= :_fdate_end")
+            params["_fdate_start"] = start_date
+            params["_fdate_end"] = max_date
+        else:
+            # Fallback: no data in kpi_data yet, use CURRENT_DATE
+            parts.append(f"{k_alias}.date >= CURRENT_DATE - INTERVAL '{days} days'")
+            parts.append(f"{k_alias}.date <= CURRENT_DATE")
 
     extra_where = (" AND " + " AND ".join(parts)) if parts else ""
     return extra_where, params, needs_ts
@@ -1956,13 +2001,21 @@ def core_analytics():
         _geo_parts.append(f"LOWER(technology) IN ({','.join([chr(39)+v.strip().lower()+chr(39) for v in _te.split(',') if v.strip()])})" if "," in _te else f"LOWER(technology) = '{_te.lower()}'")
     if _geo_parts:
         _c_sub = f"AND LOWER(site_id) IN (SELECT LOWER(site_id) FROM telecom_sites WHERE {' AND '.join(_geo_parts)})"
-    # Time filter for column_name date strings
+    # Time filter for column_name date strings — use max column_name as reference
     _c_time = ""
     _ctr = (filters or {}).get("time_range", "all")
     if _ctr and _ctr != "all":
-        _cdays = {"1h": 1, "6h": 1, "24h": 1, "7d": 7, "30d": 30}.get(_ctr, 30)
-        _c_cutoff = (datetime.utcnow() - timedelta(days=_cdays)).strftime("%Y_%m_%d")
-        _c_time = f"AND column_name >= '{_c_cutoff}'"
+        _cdays = {"1h": 7, "6h": 7, "24h": 7, "7d": 7, "30d": 30}.get(_ctr, 30)
+        try:
+            _max_col = _sql("SELECT MAX(column_name) AS mx FROM flexible_kpi_uploads WHERE kpi_type='core' AND column_type='numeric'")
+            if _max_col and _max_col[0]["mx"]:
+                # Parse date from column_name like "2026_03_11_000000"
+                _mx_str = _max_col[0]["mx"][:10]  # "2026_03_11"
+                _mx_dt = datetime.strptime(_mx_str, "%Y_%m_%d")
+                _c_cutoff = (_mx_dt - timedelta(days=_cdays)).strftime("%Y_%m_%d")
+                _c_time = f"AND column_name >= '{_c_cutoff}'"
+        except Exception:
+            pass
 
     # ── 1. flexible_kpi_uploads (type='core') ─────────────────────────────────
     # The core KPI file may be structured two ways:
@@ -4520,7 +4573,12 @@ def overview_stats():
     _geo_only["time_range"] = "all"  # remove time filter for worst cells
     _wfw, _wfp, _w_needs_ts = _kpi_filter_clause(_geo_only, "k", "ts")
     worst_sites = []
-    _worst_params = {**_wfp, "drop": _DROP, "cssr": _CSSR, "usr_tput": _USR_TPUT}
+    _max_d = _get_kpi_max_date()
+    from datetime import timedelta as _td
+    _worst_end = _max_d if _max_d else _date_type.today()
+    _worst_start = _worst_end - _td(days=7)
+    _worst_params = {**_wfp, "drop": _DROP, "cssr": _CSSR, "usr_tput": _USR_TPUT,
+                     "_worst_start": _worst_start, "_worst_end": _worst_end}
     try:
         wrows = _sql(f"""
             SELECT k.site_id, ts.zone,
@@ -4532,8 +4590,7 @@ def overview_stats():
             JOIN telecom_sites ts ON k.site_id = ts.site_id
             WHERE k.value IS NOT NULL AND k.data_level = 'site'
               AND k.kpi_name IN (:drop, :cssr, :usr_tput)
-              AND k.date >= CURRENT_DATE - INTERVAL '7 days'
-              AND k.date <= CURRENT_DATE {_wfw}
+              AND k.date >= :_worst_start AND k.date <= :_worst_end {_wfw}
             GROUP BY k.site_id, ts.zone
             HAVING AVG(CASE WHEN k.kpi_name=:drop     THEN k.value END) > 1.5
                 OR AVG(CASE WHEN k.kpi_name=:cssr     THEN k.value END) < 98.5
@@ -4573,8 +4630,7 @@ def overview_stats():
             JOIN telecom_sites ts ON k.site_id = ts.site_id
             WHERE k.value IS NOT NULL AND k.data_level = 'cell'
               AND k.kpi_name IN (:drop, :cssr, :usr_tput)
-              AND k.date >= CURRENT_DATE - INTERVAL '7 days'
-              AND k.date <= CURRENT_DATE {_wfw}
+              AND k.date >= :_worst_start AND k.date <= :_worst_end {_wfw}
             GROUP BY k.site_id, k.cell_id, ts.zone
             HAVING AVG(CASE WHEN k.kpi_name=:drop     THEN k.value END) > 1.5
                 OR AVG(CASE WHEN k.kpi_name=:cssr     THEN k.value END) < 98.5
@@ -4687,9 +4743,16 @@ def overview_stats():
     _time_sub = ""
     _tr = (filters or {}).get("time_range", "all")
     if _tr and _tr != "all":
-        _days = {"1h": 1, "6h": 1, "24h": 1, "7d": 7, "30d": 30}.get(_tr, 30)
-        _cutoff_str = (datetime.utcnow() - timedelta(days=_days)).strftime("%Y_%m_%d")
-        _time_sub = f"AND column_name >= '{_cutoff_str}'"
+        _days = {"1h": 7, "6h": 7, "24h": 7, "7d": 7, "30d": 30}.get(_tr, 30)
+        try:
+            _mx = _sql("SELECT MAX(column_name) AS mx FROM flexible_kpi_uploads WHERE kpi_type='core' AND column_type='numeric'")
+            if _mx and _mx[0]["mx"]:
+                _mx_str = _mx[0]["mx"][:10]
+                _mx_dt = datetime.strptime(_mx_str, "%Y_%m_%d")
+                _cutoff_str = (_mx_dt - timedelta(days=_days)).strftime("%Y_%m_%d")
+                _time_sub = f"AND column_name >= '{_cutoff_str}'"
+        except Exception:
+            pass
     try:
         core_rows = _sql(f"""
             SELECT kpi_name, AVG(num_value) AS avg_val

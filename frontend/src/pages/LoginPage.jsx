@@ -70,7 +70,13 @@ export default function LoginPage() {
   };
 
   return (
-    <div className="auth-page">
+    <div className="auth-page" style={{position:'relative'}}>
+      <div style={{position:'absolute',inset:0,
+        overflow:'hidden',pointerEvents:'none',zIndex:0}}>
+        <img src={`${process.env.PUBLIC_URL}/slider_telecom_01_flextower.jpg`} alt=""
+          style={{width:'100%',height:'100%',objectFit:'cover',opacity:0.35}}
+          onError={e=>{e.target.style.display='none'}}/>
+      </div>
       <div className="auth-card">
         <div className="auth-header">
           <img src="https://upload.wikimedia.org/wikipedia/commons/d/db/KPMG_blue_logo.svg" alt="KPMG" style={{ height: 40 }} />

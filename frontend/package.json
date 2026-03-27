@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "dependencies": {
+    "framer-motion": "^12.38.0",
     "html2canvas": "^1.4.1",
     "jspdf": "^4.1.0",
     "jspdf-autotable": "^5.0.7",
@@ -14,6 +15,7 @@
     "react-leaflet-cluster": "^3.1.1",
     "react-router-dom": "^6.28.0",
     "react-scripts": "5.0.1",
+    "react-simple-maps": "^3.0.0",
     "recharts": "^3.7.0",
     "socket.io-client": "^4.8.3"
   },

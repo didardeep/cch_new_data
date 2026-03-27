@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { apiGet, apiCall } from '../../api';
+import CRFormModal from './CRFormModal';
 
 /* ── Icons ──────────────────────────────────────────────────────────────────── */
 const IC = {
@@ -444,6 +445,9 @@ export default function NetworkIssues() {
   const [triggering, setTriggering] = useState(false);
   const [resolving, setResolving] = useState(null);
   const [pdfLoading, setPdfLoading] = useState(null); // ticket id being downloaded
+  const [showRouting, setShowRouting] = useState(false);
+  const [routingData, setRoutingData] = useState([]);
+  const [routingLoading, setRoutingLoading] = useState(false);
 
   /* ── PDF Trend Chart Helper ────────────────────────────────────────────────── */
   const drawTrendChart = (doc, { x, y, w, h, title, points, color = [0, 51, 141] }) => {
@@ -821,13 +825,26 @@ export default function NetworkIssues() {
     setResolving(null);
   };
 
-  const filtered = filter === 'All' ? tickets
-    : filter === 'Pending' ? tickets.filter(t => t.status === 'open')
-    : filter === 'In Progress' ? tickets.filter(t => t.status === 'in_progress')
-    : tickets.filter(t => t.status === 'resolved');
+  // Only show tickets assigned to this agent
+  const myTickets = tickets.filter(t => t.is_mine);
 
-  const openCount = tickets.filter(t => t.status === 'open').length;
-  const resolvedCount = tickets.filter(t => t.status === 'resolved').length;
+  const filtered = filter === 'All' ? myTickets
+    : filter === 'Pending' ? myTickets.filter(t => t.status === 'open')
+    : filter === 'In Progress' ? myTickets.filter(t => t.status === 'in_progress')
+    : myTickets.filter(t => t.status === 'resolved');
+
+  const openCount = myTickets.filter(t => t.status === 'open').length;
+  const resolvedCount = myTickets.filter(t => t.status === 'resolved').length;
+
+  const fetchRouting = async () => {
+    setRoutingLoading(true);
+    try {
+      const d = await apiGet('/api/network-issues/todays-routing');
+      setRoutingData(d.routing || []);
+    } catch (_) {}
+    setRoutingLoading(false);
+    setShowRouting(true);
+  };
 
   if (loading) return <div style={{display:'flex',alignItems:'center',justifyContent:'center',height:400}}><div className="spinner"/></div>;
 
@@ -840,11 +857,15 @@ export default function NetworkIssues() {
             <span style={{width:4,height:28,background:'#00338D',borderRadius:2,display:'inline-block'}}/>
             Network Issues — Worst Cell Offenders
           </h2>
-          <p style={{margin:'4px 0 0',fontSize:12,color:'#64748b'}}>{openCount} open · {resolvedCount} resolved · {tickets.length} total</p>
+          <p style={{margin:'4px 0 0',fontSize:12,color:'#64748b'}}>{openCount} open · {resolvedCount} resolved · {myTickets.length} total</p>
         </div>
         <div style={{display:'flex',gap:8}}>
+          <button onClick={fetchRouting} style={{display:'flex',alignItems:'center',gap:5,padding:'7px 14px',borderRadius:8,fontSize:12,fontWeight:600,background:'#f8fafc',color:'#475569',border:'1px solid #e2e8f0',cursor:'pointer'}}>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8.5" cy="7" r="4"/><line x1="20" y1="8" x2="20" y2="14"/><line x1="23" y1="11" x2="17" y2="11"/></svg>
+            Today's Routing
+          </button>
           <button onClick={triggerJob} disabled={triggering} style={{display:'flex',alignItems:'center',gap:5,padding:'7px 16px',borderRadius:8,fontSize:12,fontWeight:600,background:'#00338D',color:'#fff',border:'none',cursor:'pointer'}}>
-            {triggering?' Running...':' Detect & Create Tickets'}
+            {triggering?' Scanning...':' Refresh Worst Cells'}
           </button>
           <button onClick={fetchAll} style={{display:'flex',alignItems:'center',gap:5,padding:'7px 12px',borderRadius:8,fontSize:12,fontWeight:600,background:'#f8fafc',color:'#475569',border:'1px solid #e2e8f0',cursor:'pointer'}}>
             {IC.refresh} Refresh
@@ -873,27 +894,6 @@ export default function NetworkIssues() {
         </div>
       ) : filtered.map(t => {
         const pc = P_CFG[t.priority] || P_CFG.Low;
-        const isMine = t.is_mine;
-        const isUnassigned = !t.assigned_agent;
-
-        // For tickets assigned to OTHER agents — show compact note only
-        if (!isMine && !isUnassigned) {
-          return (
-            <div key={t.id} style={{background:'#f8fafc',borderRadius:10,border:'1px solid #e2e8f0',marginBottom:8,borderLeft:`4px solid ${pc.bar}`,padding:'12px 18px',display:'flex',alignItems:'center',justifyContent:'space-between'}}>
-              <div style={{display:'flex',alignItems:'center',gap:12}}>
-                <span style={{padding:'3px 10px',borderRadius:12,fontSize:10,fontWeight:700,background:pc.bar+'18',color:pc.bar}}>{t.priority}</span>
-                <span style={{fontWeight:700,color:'#0f172a',fontSize:13}}>{t.site_id}</span>
-                <span style={{fontSize:10,color:'#64748b'}}>{t.cell_count} cells · {t.category}</span>
-              </div>
-              <div style={{display:'flex',alignItems:'center',gap:10}}>
-                <SlaTimer deadline={t.deadline_time} slaHours={t.sla_hours} status={t.status}/>
-                <span style={{fontSize:11,color:'#475569',fontWeight:600,padding:'4px 12px',borderRadius:8,background:'#f1f5f9',border:'1px solid #e2e8f0'}}>
-                  Assigned to <b style={{color:'#00338D'}}>{t.agent_name}</b> ({t.agent_eid})
-                </span>
-              </div>
-            </div>
-          );
-        }
 
         return (
           <div key={t.id} style={{background:'#fff',borderRadius:10,border:'1px solid #e2e8f0',marginBottom:12,borderLeft:`4px solid ${pc.bar}`,boxShadow:'0 1px 3px rgba(0,0,0,.04)'}}>
@@ -973,14 +973,15 @@ export default function NetworkIssues() {
                   {IC.check} {resolving===t.id?'Resolving...':'Mark Resolved'}
                 </button>
               )}
-              {t.agent_name ? (
-                <span style={{fontSize:10,color:isMine?'#16a34a':'#64748b',fontWeight:600,padding:'3px 10px',borderRadius:12,background:isMine?'#dcfce7':'#f1f5f9'}}>
-                  {isMine ? ' Assigned to you' : `Assigned to ${t.agent_name} (${t.agent_eid})`}
-                </span>
-              ) : (
-                <span style={{fontSize:10,color:'#dc2626',fontWeight:600,padding:'3px 10px',borderRadius:12,background:'#fef2f2'}}>Unassigned</span>
-              )}
-              <span style={{marginLeft:'auto',fontSize:10,color:'#94a3b8'}}>Created {t.created_at ? new Date(t.created_at).toLocaleString() : '—'}</span>
+              <span style={{fontSize:10,color:'#16a34a',fontWeight:600,padding:'3px 10px',borderRadius:12,background:'#dcfce7'}}>
+                Assigned to you
+              </span>
+              <span style={{marginLeft:'auto',fontSize:10,color:'#94a3b8',textAlign:'right',lineHeight:'1.5'}}>
+                Created {t.created_at ? new Date(t.created_at).toLocaleString() : '—'}
+                {t.updated_at && t.created_at && t.updated_at !== t.created_at && (
+                  <><br/>Updated {new Date(t.updated_at).toLocaleString()}</>
+                )}
+              </span>
             </div>
           </div>
         );
@@ -988,7 +989,62 @@ export default function NetworkIssues() {
 
       {/* AI Diagnosis Modal */}
       {diagTicket && <AIDiagnosisModal ticket={diagTicket} onClose={()=>setDiagTicket(null)}/>}
-      {paramTicket && <ParamChangeModal ticket={paramTicket} onClose={()=>{setParamTicket(null);fetchAll();}}/>}
+      {paramTicket && <CRFormModal open={!!paramTicket} networkIssue={paramTicket} onClose={()=>{setParamTicket(null);fetchAll();}}/>}
+
+      {/* Today's Routing Modal */}
+      {showRouting && (
+        <div style={{position:'fixed',inset:0,background:'rgba(15,23,42,0.45)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:1000}} onClick={()=>setShowRouting(false)}>
+          <div onClick={e=>e.stopPropagation()} style={{background:'#fff',borderRadius:12,width:700,maxWidth:'95vw',maxHeight:'80vh',overflowY:'auto',boxShadow:'0 20px 60px rgba(0,0,0,.15)'}}>
+            <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',padding:'16px 24px',borderBottom:'1px solid #e2e8f0'}}>
+              <div>
+                <h3 style={{margin:0,fontSize:16,fontWeight:700,color:'#0f172a'}}>Today's Ticket Routing</h3>
+                <p style={{margin:'2px 0 0',fontSize:11,color:'#64748b'}}>Created & updated tickets today</p>
+              </div>
+              <button onClick={()=>setShowRouting(false)} style={{border:'none',background:'#f1f5f9',borderRadius:6,width:28,height:28,cursor:'pointer',display:'flex',alignItems:'center',justifyContent:'center'}}>{IC.x}</button>
+            </div>
+            <div style={{padding:20}}>
+              {routingLoading ? (
+                <div style={{textAlign:'center',padding:40,color:'#94a3b8'}}>Loading...</div>
+              ) : routingData.length === 0 ? (
+                <div style={{textAlign:'center',padding:40,color:'#94a3b8',fontSize:13}}>No tickets routed today.</div>
+              ) : (
+                <table style={{width:'100%',borderCollapse:'collapse',fontSize:12}}>
+                  <thead>
+                    <tr style={{borderBottom:'2px solid #e2e8f0'}}>
+                      <th style={{textAlign:'left',padding:'8px 10px',fontWeight:700,color:'#475569',fontSize:11,textTransform:'uppercase'}}>Ticket ID</th>
+                      <th style={{textAlign:'left',padding:'8px 10px',fontWeight:700,color:'#475569',fontSize:11,textTransform:'uppercase'}}>Type</th>
+                      <th style={{textAlign:'left',padding:'8px 10px',fontWeight:700,color:'#475569',fontSize:11,textTransform:'uppercase'}}>Site</th>
+                      <th style={{textAlign:'left',padding:'8px 10px',fontWeight:700,color:'#475569',fontSize:11,textTransform:'uppercase'}}>Priority</th>
+                      <th style={{textAlign:'left',padding:'8px 10px',fontWeight:700,color:'#475569',fontSize:11,textTransform:'uppercase'}}>Status</th>
+                      <th style={{textAlign:'left',padding:'8px 10px',fontWeight:700,color:'#475569',fontSize:11,textTransform:'uppercase'}}>Assigned Agent</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {routingData.map((r,i) => {
+                      const prc = P_CFG[r.priority] || P_CFG.Low;
+                      return (
+                        <tr key={r.ticket_id||i} style={{borderBottom:'1px solid #f1f5f9',background:i%2===0?'#fff':'#f8fafc'}}>
+                          <td style={{padding:'8px 10px',fontWeight:700,color:'#00338D',fontFamily:'monospace'}}>#{r.ticket_id}</td>
+                          <td style={{padding:'8px 10px'}}><span style={{padding:'2px 8px',borderRadius:10,fontSize:10,fontWeight:700,
+                            background:r.type==='created'?'#16A34A18':'#0091DA18',color:r.type==='created'?'#16A34A':'#0091DA'}}>
+                            {r.type==='created'?'New':'Updated'}</span></td>
+                          <td style={{padding:'8px 10px',fontWeight:600,color:'#0f172a'}}>{r.site_id}</td>
+                          <td style={{padding:'8px 10px'}}><span style={{padding:'2px 8px',borderRadius:10,fontSize:10,fontWeight:700,background:prc.bar+'18',color:prc.bar}}>{r.priority}</span></td>
+                          <td style={{padding:'8px 10px'}}><span style={{padding:'2px 8px',borderRadius:10,fontSize:10,fontWeight:700,
+                            background:r.status==='resolved'?'#16A34A18':r.status==='in_progress'?'#F59E0B18':'#00338D18',
+                            color:r.status==='resolved'?'#16A34A':r.status==='in_progress'?'#F59E0B':'#00338D'}}>
+                            {(r.status||'open').replace('_',' ')}</span></td>
+                          <td style={{padding:'8px 10px',fontWeight:600,color:'#0f172a'}}>{r.agent_name || 'Unassigned'}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

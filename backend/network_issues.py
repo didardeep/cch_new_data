@@ -15,6 +15,9 @@ from sqlalchemy import text as sa_text
 from models import db, User
 
 _LOG = logging.getLogger("network_issues")
+_LOG.setLevel(logging.INFO)
+if not _LOG.handlers:
+    _LOG.addHandler(logging.StreamHandler())
 
 network_issues_bp = Blueprint("network_issues", __name__)
 
@@ -92,52 +95,64 @@ def _calc_priority(category, revenue_total, avg_rrc_60d, max_rrc_60d):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Worst cells detection (ALL 3 thresholds must fail)
+# Worst cells detection
+# A cell is "worst" if ALL 3 conditions fail on 7-day average:
+#   1. E-RAB Call Drop Rate_1 > 1.5%
+#   2. LTE Call Setup Success Rate < 98.5%
+#   3. LTE DL - Usr Ave Throughput < 8 Mbps
 # ─────────────────────────────────────────────────────────────────────────────
+_DROP_KPI = "E-RAB Call Drop Rate_1"
+_CSSR_KPI = "LTE Call Setup Success Rate"
+_TPUT_KPI = "LTE DL - Usr Ave Throughput"
+
+
 def _get_worst_cells_by_site():
-    """Get worst cells grouped by site. Only cells failing ALL 3 thresholds (3/3).
-    Limited to top 10 worst cells ranked by severity, then grouped by site.
-    Only sites matching the dashboard worst cells list are included."""
+    """Find worst cells: every cell_site_id where ALL 3 KPI thresholds fail
+    on last 7 days average from CURRENT DATE. Groups results by site_id."""
+
+    # Last 7 days counted from today (CURRENT_DATE)
+    today = _date.today()
+    start_date = today - timedelta(days=7)
+    print(f"[WORST CELLS] Scanning cells from {start_date} to {today} (last 7 days from today)")
+
     try:
-        # Get cells meeting ALL 3 conditions, ranked by impact
         rows = _sql("""
             SELECT k.site_id, k.cell_id, k.cell_site_id, ts.zone, ts.city, ts.state,
-                   AVG(CASE WHEN k.kpi_name='E-RAB Call Drop Rate_1' THEN k.value END) AS avg_drop,
-                   AVG(CASE WHEN k.kpi_name='LTE Call Setup Success Rate' THEN k.value END) AS avg_cssr,
-                   AVG(CASE WHEN k.kpi_name='LTE DL - Usr Ave Throughput' THEN k.value END) AS avg_tput
+                   AVG(CASE WHEN k.kpi_name=:drop THEN k.value END) AS avg_drop,
+                   AVG(CASE WHEN k.kpi_name=:cssr THEN k.value END) AS avg_cssr,
+                   AVG(CASE WHEN k.kpi_name=:tput THEN k.value END) AS avg_tput
             FROM kpi_data k
             JOIN telecom_sites ts ON k.site_id = ts.site_id
             WHERE k.value IS NOT NULL AND k.data_level = 'cell'
-              AND k.kpi_name IN ('E-RAB Call Drop Rate_1','LTE Call Setup Success Rate','LTE DL - Usr Ave Throughput')
-              AND k.date >= CURRENT_DATE - INTERVAL '7 days' AND k.date <= CURRENT_DATE
+              AND k.kpi_name IN (:drop, :cssr, :tput)
+              AND k.date >= :start_date AND k.date <= :end_date
             GROUP BY k.site_id, k.cell_id, k.cell_site_id, ts.zone, ts.city, ts.state
-            HAVING (AVG(CASE WHEN k.kpi_name='E-RAB Call Drop Rate_1' THEN k.value END) > 1.5
-               AND AVG(CASE WHEN k.kpi_name='LTE Call Setup Success Rate' THEN k.value END) < 98.5
-               AND AVG(CASE WHEN k.kpi_name='LTE DL - Usr Ave Throughput' THEN k.value END) < 8)
-            ORDER BY AVG(CASE WHEN k.kpi_name='E-RAB Call Drop Rate_1' THEN k.value END) DESC
-            LIMIT 10
-        """)
+            HAVING AVG(CASE WHEN k.kpi_name=:drop THEN k.value END) > 1.5
+               AND AVG(CASE WHEN k.kpi_name=:cssr THEN k.value END) < 98.5
+               AND AVG(CASE WHEN k.kpi_name=:tput THEN k.value END) < 8
+            ORDER BY AVG(CASE WHEN k.kpi_name=:drop THEN k.value END) DESC
+        """, {"drop": _DROP_KPI, "cssr": _CSSR_KPI, "tput": _TPUT_KPI,
+              "start_date": start_date, "end_date": today})
     except Exception as e:
+        print(f"[WORST CELLS] Query failed: {e}")
         _LOG.error("Failed to get worst cells: %s", e)
         return {}
 
+    print(f"[WORST CELLS] Found {len(rows)} cells failing ALL 3 thresholds")
+
+    # Group cells by site
     sites = {}
     for r in rows:
         sid = r["site_id"]
-        drop = float(r.get("avg_drop") or 0)
-        cssr = float(r.get("avg_cssr") or 100)
-        tput = float(r.get("avg_tput") or 999)
-        violations = sum([1 if drop > 1.5 else 0, 1 if cssr < 98.5 else 0, 1 if tput < 8 else 0])
         if sid not in sites:
             sites[sid] = {"cells": [], "cell_site_ids": [], "zone": r.get("zone") or "",
                           "city": r.get("city") or "", "state": r.get("state") or "",
-                          "drops": [], "cssrs": [], "tputs": [], "max_violations": 0}
+                          "drops": [], "cssrs": [], "tputs": []}
         sites[sid]["cells"].append(r["cell_id"] or "")
         sites[sid]["cell_site_ids"].append(r.get("cell_site_id") or r["cell_id"] or "")
-        sites[sid]["drops"].append(drop)
-        sites[sid]["cssrs"].append(cssr)
-        sites[sid]["tputs"].append(tput)
-        sites[sid]["max_violations"] = max(sites[sid]["max_violations"], violations)
+        sites[sid]["drops"].append(float(r.get("avg_drop") or 0))
+        sites[sid]["cssrs"].append(float(r.get("avg_cssr") or 100))
+        sites[sid]["tputs"].append(float(r.get("avg_tput") or 999))
 
     result = {}
     for sid, d in sites.items():
@@ -146,20 +161,22 @@ def _get_worst_cells_by_site():
             "cells": d["cells"], "cell_site_ids": d["cell_site_ids"],
             "zone": d["zone"], "city": d["city"], "state": d["state"],
             "avg_drop": _f(sum(d["drops"])/n, 2), "avg_cssr": _f(sum(d["cssrs"])/n, 2),
-            "avg_tput": _f(sum(d["tputs"])/n, 2), "violations": d["max_violations"],
-            "category": "Severe Worst" if d["max_violations"] >= 2 else "Worst",
+            "avg_tput": _f(sum(d["tputs"])/n, 2), "violations": 3,
+            "category": "Severe Worst",  # All 3 thresholds fail → always Severe Worst
         }
+    print(f"[WORST CELLS] Grouped into {len(result)} sites: {list(result.keys())}")
     return result
 
 
 def _get_site_rrc_and_revenue(site_id):
+    """Get RRC and revenue data for priority calculation."""
     avg_rrc = max_rrc = revenue = 0
     try:
-        r = _sql("""SELECT AVG(CASE WHEN kpi_name='Ave RRC Connected Ue' THEN value END) AS avg_rrc,
+        r = _sql(f"""SELECT AVG(CASE WHEN kpi_name='Ave RRC Connected Ue' THEN value END) AS avg_rrc,
                            MAX(CASE WHEN kpi_name='Max RRC Connected Ue' THEN value END) AS max_rrc
                     FROM kpi_data WHERE site_id=:sid AND data_level='site' AND value IS NOT NULL
                       AND kpi_name IN ('Ave RRC Connected Ue','Max RRC Connected Ue')
-                      AND date >= CURRENT_DATE - INTERVAL '60 days' AND date <= CURRENT_DATE""", {"sid": site_id})
+                      AND date >= CURRENT_DATE - INTERVAL '60 days'""", {"sid": site_id})
         if r: avg_rrc = float(r[0].get("avg_rrc") or 0); max_rrc = float(r[0].get("max_rrc") or 0)
     except: pass
     try:
@@ -171,72 +188,75 @@ def _get_site_rrc_and_revenue(site_id):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Pre-scan: keeps worst cells fresh for the dashboard (runs every 30 min)
+# Pre-scan: keeps worst cells fresh for the dashboard
 # ─────────────────────────────────────────────────────────────────────────────
 def run_pre_scan():
     global _LATEST_WORST_CELLS, _LATEST_SCAN_TIME
-    _LOG.info("Running pre-scan for worst cells...")
+    print("[NETWORK ISSUES] Running pre-scan for worst cells...")
     try:
         _LATEST_WORST_CELLS = _get_worst_cells_by_site()
-        _LATEST_SCAN_TIME = datetime.utcnow()
-        _LOG.info("Pre-scan complete: %d sites with worst cells", len(_LATEST_WORST_CELLS))
+        # Always show 08:00 AM today as the scan time (daily schedule time)
+        _LATEST_SCAN_TIME = datetime.combine(_date.today(), datetime.min.time()).replace(hour=8)
+        print(f"[NETWORK ISSUES] Pre-scan complete: {len(_LATEST_WORST_CELLS)} sites with worst cells")
     except Exception as e:
+        print(f"[NETWORK ISSUES] Pre-scan failed: {e}")
         _LOG.error("Pre-scan failed: %s", e)
 
 
-def _get_yesterday_cells():
-    """Get yesterday's ticket cells per site.
-    Returns { site_id: { 'ticket': NetworkIssueTicket, 'cells': set(cell_ids) } }"""
-    yesterday = _date.today() - timedelta(days=1)
+def _get_existing_open_tickets():
+    """Get all open/in_progress tickets grouped by site_id.
+    Returns { site_id: NetworkIssueTicket } — the most recent ticket per site."""
     tickets = NetworkIssueTicket.query.filter(
-        db.func.date(NetworkIssueTicket.created_at) == yesterday,
-    ).all()
+        NetworkIssueTicket.status.in_(["open", "in_progress"])
+    ).order_by(NetworkIssueTicket.updated_at.desc()).all()
     result = {}
     for t in tickets:
-        cells = set(t.cells_affected.split(",")) if t.cells_affected else set()
-        result[t.site_id] = {"ticket": t, "cells": cells}
+        if t.site_id not in result:  # keep most recent per site
+            result[t.site_id] = t
     return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Daily job
+# Daily job — runs at 08:00 IST or on startup if missed
+#
+# Logic:
+# 1. Find all cells where ALL 3 KPIs fail on 7-day average
+# 2. Group by site
+# 3. For each site:
+#    - If an open/in_progress ticket exists for this site with SAME cells
+#      → UPDATE the existing ticket (refresh KPIs, set updated_at = today 08:00)
+#    - If cells changed OR no existing ticket
+#      → CREATE a new ticket, assign to agent
+# 4. Timestamp is always 08:00 AM today (even if server runs later)
 # ─────────────────────────────────────────────────────────────────────────────
 def run_daily_network_issue_job():
     global _LAST_JOB_DATE
-    _LOG.info("Running daily network issue ticket creation...")
 
     worst_sites = _get_worst_cells_by_site()
     if not worst_sites:
-        _LOG.info("No worst cells found.")
+        print("[NETWORK ISSUES] No worst cells found — no tickets to create/update.")
         _LAST_JOB_DATE = _date.today()
         return 0
 
-    yesterday_data = _get_yesterday_cells()
+    # Today at 08:00 AM — the official daily timestamp
+    today_08 = datetime.combine(_date.today(), datetime.min.time()).replace(hour=8, minute=0, second=0)
+
+    # Get all existing open/in_progress tickets
+    existing_tickets = _get_existing_open_tickets()
 
     created = updated = 0
     for site_id, data in worst_sites.items():
         avg_rrc, max_rrc, revenue = _get_site_rrc_and_revenue(site_id)
         score, priority, sla_hours = _calc_priority(data["category"], revenue, avg_rrc, max_rrc)
-
-        from datetime import date as _dt
-        now_08 = datetime.combine(_dt.today(), datetime.min.time()).replace(hour=8, minute=0, second=0)
-        now_real = datetime.now()
         location = f"{data['city']}, {data['state']}" if data['city'] else data['zone']
         today_cells = set(data["cells"])
 
-        # Compare with yesterday's cells for this site
-        yesterday_info = yesterday_data.get(site_id)
-        same_as_yesterday = yesterday_info and yesterday_info["cells"] == today_cells
-
-        if same_as_yesterday:
-            # Same cells as yesterday -- find existing open ticket and update it
-            existing = NetworkIssueTicket.query.filter(
-                NetworkIssueTicket.site_id == site_id,
-                NetworkIssueTicket.status.in_(["open", "in_progress"]),
-            ).first()
-            if existing:
-                existing.cells_affected = ",".join(data["cells"])
-                existing.cell_site_ids = ",".join(data["cell_site_ids"])
+        # Check if we have an existing open ticket for this site
+        existing = existing_tickets.get(site_id)
+        if existing:
+            existing_cells = set(existing.cells_affected.split(",")) if existing.cells_affected else set()
+            if existing_cells == today_cells:
+                # SAME cells → UPDATE existing ticket
                 existing.category = data["category"]
                 existing.priority = priority
                 existing.priority_score = score
@@ -250,13 +270,17 @@ def run_daily_network_issue_job():
                 existing.violations = data["violations"]
                 existing.zone = data["zone"]
                 existing.location = location
-                existing.updated_at = now_real
+                existing.updated_at = today_08
                 updated += 1
+                print(f"  [UPDATE] {site_id}: {len(today_cells)} cells (same as before), priority={priority}")
                 continue
-            # If no open ticket found, fall through to create a new one
+            else:
+                # DIFFERENT cells → close old ticket, create new one below
+                existing.status = "closed"
+                existing.updated_at = today_08
+                print(f"  [CLOSE] {site_id}: cells changed ({len(existing_cells)}→{len(today_cells)}), closing old ticket #{existing.id}")
 
-        # Different cells from yesterday OR no previous ticket -- create new ticket
-        # Assign agent based on expertise/capacity (no online requirement)
+        # CREATE new ticket — either no existing ticket or cells changed
         agent = None
         try:
             from app import _find_best_expert, _open_ticket_count
@@ -272,7 +296,7 @@ def run_daily_network_issue_job():
             else:
                 agent = _find_best_expert("mobile", data["zone"], priority.lower())
         except Exception as e:
-            _LOG.warning("Agent routing failed: %s", e)
+            _LOG.warning("Agent routing failed for %s: %s", site_id, e)
 
         ticket = NetworkIssueTicket(
             site_id=site_id,
@@ -285,15 +309,16 @@ def run_daily_network_issue_job():
             violations=data["violations"], status="open",
             assigned_agent=agent.id if agent else None,
             zone=data["zone"], location=location,
-            created_at=now_08, updated_at=now_real,
-            deadline_time=now_08 + timedelta(hours=sla_hours),
+            created_at=today_08, updated_at=today_08,
+            deadline_time=today_08 + timedelta(hours=sla_hours),
         )
         db.session.add(ticket)
         created += 1
+        print(f"  [CREATE] {site_id}: {len(today_cells)} cells, priority={priority}, agent={agent.name if agent else 'none'}")
 
     db.session.commit()
     _LAST_JOB_DATE = _date.today()
-    _LOG.info("Network issue job: %d created, %d updated", created, updated)
+    print(f"[NETWORK ISSUES] Daily job complete: {created} created, {updated} updated")
     return created + updated
 
 
@@ -307,52 +332,81 @@ def schedule_daily_job(app):
         """Return current datetime in IST (UTC+5:30)."""
         return datetime.utcnow() + timedelta(hours=5, minutes=30)
 
+    # Track whether today's 07:30 pre-scan and 08:00 ticket job have run
+    _prescan_done_date = None   # date of last 07:30 pre-scan
+    _ticket_done_date = None    # date of last 08:00 ticket job
+
+    def _tickets_already_processed_today():
+        """Check if daily job already ran today by looking at updated_at = today 08:00."""
+        today_08 = datetime.combine(_date.today(), datetime.min.time()).replace(hour=8)
+        count = NetworkIssueTicket.query.filter(
+            NetworkIssueTicket.updated_at == today_08
+        ).count()
+        return count > 0
+
     def _job_loop():
         global _LAST_JOB_DATE
+        nonlocal _prescan_done_date, _ticket_done_date
         time.sleep(8)  # wait for app to start
         last_prescan = 0  # epoch seconds of last pre-scan
 
-        # Startup: run pre-scan immediately
         with app.app_context():
+            # Step 1: Run pre-scan to populate dashboard worst cells
             try:
                 run_pre_scan()
-                last_prescan = time.time()
             except Exception as e:
-                _LOG.error("Startup pre-scan failed: %s", e)
+                print(f"[NETWORK ISSUES] Startup pre-scan failed: {e}")
 
-            # If today's job hasn't run yet AND it's past 08:00 IST, run now
+            # Step 2: Check if daily job needs to run
             ist = _ist_now()
-            if _LAST_JOB_DATE != _date.today() and ist.hour >= 8:
-                _LOG.info("Startup: running network issue job for today (missed 08:00 IST)")
+            if _LAST_JOB_DATE == _date.today():
+                print("[NETWORK ISSUES] Daily job already ran today (in-memory flag).")
+            elif _tickets_already_processed_today():
+                _LAST_JOB_DATE = _date.today()
+                _ticket_done_date = _date.today()
+                print("[NETWORK ISSUES] Daily job already ran today (DB check — tickets have today 08:00).")
+            else:
+                # Job hasn't run today — run it now (catch-up for missed 08:00)
+                print(f"[NETWORK ISSUES] Running daily job (IST: {ist.strftime('%H:%M:%S')}, timestamp will be 08:00 AM)")
                 try:
-                    run_daily_network_issue_job()
+                    count = run_daily_network_issue_job()
+                    _ticket_done_date = _date.today()
+                    print(f"[NETWORK ISSUES] Daily job done: {count} tickets processed")
                 except Exception as e:
-                    _LOG.error("Startup job failed: %s", e)
+                    print(f"[NETWORK ISSUES] Daily job FAILED: {e}")
+                    import traceback; traceback.print_exc()
+
+            if ist.hour >= 7 and ist.minute >= 30 or ist.hour >= 8:
+                _prescan_done_date = _date.today()
 
         while True:
             ist = _ist_now()
+            today = _date.today()
 
-            # Pre-scan every 30 minutes to keep dashboard worst cells fresh
-            if time.time() - last_prescan >= 1800:
+            # ── 07:30 IST: Daily pre-scan to refresh dashboard worst cells ──
+            if (ist.hour > 7 or (ist.hour == 7 and ist.minute >= 30)) and _prescan_done_date != today:
+                _LOG.info("07:30 IST daily pre-scan: refreshing worst cells for dashboard (IST: %s)", ist.strftime("%Y-%m-%d %H:%M:%S"))
                 try:
                     with app.app_context():
                         run_pre_scan()
-                    last_prescan = time.time()
+                    _prescan_done_date = today
                 except Exception as e:
-                    _LOG.error("Pre-scan failed: %s", e)
+                    _LOG.error("07:30 pre-scan failed: %s", e)
 
-            # Run daily ticket job at or after 08:00 IST
-            if ist.hour >= 8 and _LAST_JOB_DATE != _date.today():
-                _LOG.info("Scheduled: running network issue job (IST: %s)", ist.strftime("%Y-%m-%d %H:%M:%S"))
+            # ── 08:00 IST: Daily ticket creation/update (ONLY at 8 AM, never on restart) ──
+            if ist.hour == 8 and ist.minute < 30 and _LAST_JOB_DATE != today:
+                _LOG.info("08:00 IST daily job: creating/updating network issue tickets (IST: %s)", ist.strftime("%Y-%m-%d %H:%M:%S"))
                 try:
                     with app.app_context():
                         run_daily_network_issue_job()
+                    _ticket_done_date = today
                 except Exception as e:
                     _LOG.error("Daily job failed: %s", e)
+
             time.sleep(30)
 
     threading.Thread(target=_job_loop, daemon=True).start()
-    _LOG.info("Network issue scheduler started (08:00 IST daily + pre-scan every 30 min)")
+    _LOG.info("Network issue scheduler started (pre-scan at 07:30 IST, tickets at 08:00 IST daily)")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # API Endpoints
@@ -361,21 +415,18 @@ def schedule_daily_job(app):
 @network_issues_bp.route("/api/network-issues/worst-cells", methods=["GET"])
 @jwt_required()
 def get_worst_cells():
-    """Return worst cells — always queries DB fresh for up-to-date data."""
+    """Return worst cells for the dashboard. Uses cached data or fetches live if cache is empty."""
     user_id = int(get_jwt_identity())
     user = db.session.get(User, user_id)
     if not user or user.role != "human_agent":
         return jsonify({"error": "Unauthorized"}), 403
-
-    # Always query DB for fresh data
-    try:
-        fresh = _get_worst_cells_by_site()
-    except Exception as e:
-        _LOG.error("worst-cells live query failed, falling back to cache: %s", e)
-        fresh = _LATEST_WORST_CELLS
-
+    # If cache is empty, try a live fetch
+    source_data = _LATEST_WORST_CELLS
+    if not source_data:
+        _LOG.info("Worst cells cache empty, running live query")
+        source_data = _get_worst_cells_by_site()
     sites = []
-    for site_id, data in fresh.items():
+    for site_id, data in source_data.items():
         sites.append({
             "site_id": site_id,
             "cells": data.get("cells", []),
@@ -434,6 +485,42 @@ def list_network_issues():
             "deadline_time": t.deadline_time.isoformat() if t.deadline_time else None,
         })
     return jsonify({"tickets": result, "total": len(result)})
+
+
+@network_issues_bp.route("/api/network-issues/todays-routing", methods=["GET"])
+@jwt_required()
+def todays_routing():
+    """Return today's ticket routing: created + updated tickets today."""
+    from datetime import date as _date_cls
+    today = _date_cls.today()
+    # Get tickets created OR updated today
+    tickets = NetworkIssueTicket.query.filter(
+        db.or_(
+            db.func.date(NetworkIssueTicket.created_at) == today,
+            db.func.date(NetworkIssueTicket.updated_at) == today,
+        )
+    ).order_by(NetworkIssueTicket.id.asc()).all()
+
+    routing = []
+    for t in tickets:
+        agent_name = agent_email = ""
+        if t.assigned_agent:
+            ag = db.session.get(User, t.assigned_agent)
+            if ag:
+                agent_name = ag.name or ""
+                agent_email = ag.email or ""
+        created_today = t.created_at and t.created_at.date() == today
+        routing.append({
+            "ticket_id": t.id,
+            "site_id": t.site_id,
+            "priority": t.priority,
+            "status": t.status or "open",
+            "date": t.created_at.strftime("%Y-%m-%d") if t.created_at else today.isoformat(),
+            "agent_name": agent_name,
+            "agent_email": agent_email,
+            "type": "created" if created_today else "updated",
+        })
+    return jsonify({"routing": routing, "date": today.isoformat()})
 
 
 @network_issues_bp.route("/api/network-issues/<int:ticket_id>", methods=["GET"])
@@ -938,8 +1025,10 @@ Write exactly 4 parameter change recommendations with **bold titles**, specific 
 @network_issues_bp.route("/api/network-issues/trigger-job", methods=["POST"])
 @jwt_required()
 def trigger_network_issue_job():
+    """Manual trigger: refreshes worst-cell pre-scan AND creates/updates tickets."""
+    run_pre_scan()
     count = run_daily_network_issue_job()
-    return jsonify({"success": True, "tickets_processed": count})
+    return jsonify({"success": True, "message": f"Worst cells refreshed. {count} ticket(s) created/updated.", "tickets_processed": count})
 
 
 @network_issues_bp.route("/api/network-issues/stats", methods=["GET"])

@@ -472,6 +472,8 @@ def find_nearest_sites(lat, lon, n=3):
             "site_name": site.site_name or site.site_id,
             "cell_id": site.cell_id or "",
             "zone": site.zone or "",
+            "city": site.city or "",
+            "state": site.state or "",
             "latitude": site.latitude,
             "longitude": site.longitude,
             "site_status": status,
@@ -558,15 +560,30 @@ Keep your response concise and actionable."""
         ticket = _db.session.get(Ticket, ticket_id)
         if not ticket:
             return jsonify({"error": "Ticket not found"}), 404
+
+        # Include customer's tier so the CR form can auto-fill customer_type
+        customer_user = _db.session.get(User, ticket.user_id) if ticket.user_id else None
+        customer_type = (customer_user.user_type or "bronze") if customer_user else "bronze"
+
         session = _db.session.get(ChatSession, ticket.chat_session_id) if ticket.chat_session_id else None
-        if not session or not session.latitude or not session.longitude:
-            return jsonify({"error": "Customer location not available"}), 400
-        ranked = find_nearest_sites(session.latitude, session.longitude, n=3)
+        lat = session.latitude if session and session.latitude else None
+        lon = session.longitude if session and session.longitude else None
+
+        # Fallback: default to Gurgaon coordinates if customer location unavailable
+        DEFAULT_LAT, DEFAULT_LON = 28.4595, 77.0266
+        location_source = "customer"
+        if lat is None or lon is None:
+            lat, lon = DEFAULT_LAT, DEFAULT_LON
+            location_source = "default"
+
+        ranked = find_nearest_sites(lat, lon, n=3)
         if not ranked:
             return jsonify({"error": "No site data available for nearest-site lookup."}), 400
         return jsonify({
-            "customer": {"latitude": session.latitude, "longitude": session.longitude},
+            "customer": {"latitude": lat, "longitude": lon},
             "nearest_sites": ranked,
+            "customer_type": customer_type,
+            "location_source": location_source,
         })
 
     @app.route("/api/agent/sites/<site_id>/kpi-trends", methods=["GET"])

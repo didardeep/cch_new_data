@@ -1,6 +1,7 @@
 ﻿import { useState, useEffect, useCallback, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { apiGet, apiPost, apiPut } from '../../api';
+import CRFormModal from './CRFormModal';
 
 /* ── SVG Icons ─────────────────────────────────────────────────────────────────── */
 const IC = {
@@ -1716,7 +1717,7 @@ export default function AgentTicketBucket() {
       {/* Modals */}
       {modal?.type === 'c360'     && <Customer360Modal    customerId={modal.customerId} onClose={() => setModal(null)} />}
       {modal?.type === 'diagnose' && <DiagnoseModal        ticket={modal.ticket}         onClose={() => setModal(null)} />}
-      {modal?.type === 'param'    && <ParameterChangeModal ticket={modal.ticket}         onClose={() => setModal(null)} />}
+      {modal?.type === 'param'    && <CRFormModal open={true} ticket={modal.ticket} onClose={() => setModal(null)} />}
       {modal?.type === 'resolve'  && <ResolveModal         ticket={modal.ticket}         onClose={() => setModal(null)} onResolved={handleResolved} />}
     </div>
   );

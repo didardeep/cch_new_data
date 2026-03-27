@@ -628,6 +628,8 @@ function OverviewPage({T,data,mapSites}) {
   const best=d.best_sites||[];
   const lowMargin=d.low_margin_sites||[];
   const trend=d.tput_trend||[];
+  const preScanTime=d.pre_scan_time||null;
+  const preScanCells=d.pre_scan_cells||[];
 
   return (
     <div style={{animation:'fadeIn .3s ease'}}>
@@ -734,68 +736,45 @@ function OverviewPage({T,data,mapSites}) {
         </CC>
       </div>
 
-      {/* Worst Cells / Best / Low Margin */}
+      {/* Worst Cells (Last 7 Days) — populated from daily pre-scan */}
       <div style={{marginBottom:10}}>
-        <CC T={T} title=" Worst Cells (Last 7 Days)">
-          {worstCells.length>0?(
-            <div style={{maxHeight:220,overflowY:'auto'}}>
-              <table style={{width:'100%',borderCollapse:'collapse',fontSize:10.5}}>
-                <thead>
-                  <tr>{['Cell','Site','Zone','Drop%','CSSR%','Tput(Mbps)','Flags'].map(h=><th key={h} style={{padding:'4px 6px',textAlign:'left',borderBottom:`2px solid ${T.border}`,color:T.muted,fontWeight:700,fontSize:9,textTransform:'uppercase'}}>{h}</th>)}</tr>
-                </thead>
-                <tbody>
-                  {worstCells.map((s,i)=>(
-                    <tr key={i} style={{borderBottom:`1px solid ${T.border}`,background:i%2===0?T.surface2:'transparent'}}>
-                      <td style={{padding:'4px 6px',fontWeight:700,color:T.kpmgBlue,fontSize:9.5,fontFamily:"'IBM Plex Mono',monospace"}}>{s.cell_id}</td>
-                      <td style={{padding:'4px 6px',color:T.textSub,fontSize:9.5}}>{s.site_id}</td>
-                      <td style={{padding:'4px 6px',color:T.textSub,fontSize:9.5}}>{s.cluster||'—'}</td>
-                      <td style={{padding:'4px 6px',fontFamily:"'IBM Plex Mono',monospace",fontSize:9.5,color:parseFloat(s.call_drop_rate||0)>1.5?T.red:T.green,fontWeight:700}}>{s.call_drop_rate??'—'}</td>
-                      <td style={{padding:'4px 6px',fontFamily:"'IBM Plex Mono',monospace",fontSize:9.5,color:parseFloat(s.lte_cssr||100)<98.5?T.red:T.green,fontWeight:700}}>{s.lte_cssr??'—'}</td>
-                      <td style={{padding:'4px 6px',fontFamily:"'IBM Plex Mono',monospace",fontSize:9.5,color:parseFloat(s.dl_usr_tput||999)<8?T.red:T.green,fontWeight:700}}>{s.dl_usr_tput??'—'}</td>
-                      <td style={{padding:'4px 6px',fontSize:9.5,fontWeight:700,color:T.red}}>{s.violations}/3</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          ):<Empty T={T}/>}
+        <CC T={T} title=" Worst Cells (Last 7 Days)" action={
+          preScanTime&&<span style={{fontSize:9,color:T.muted}}>Updated: {new Date(preScanTime).toLocaleString()}</span>
+        }>
+          {(()=>{
+            // Flatten pre-scan site data into cell-level rows; fallback to summary worst_cells
+            const rows = preScanCells.length > 0
+              ? preScanCells.flatMap(s => (s.cells||[]).map(c => ({
+                  cell_id: c, site_id: s.site_id, zone: s.zone || '—',
+                  call_drop_rate: f(s.avg_drop,2), lte_cssr: f(s.avg_cssr,2),
+                  dl_usr_tput: f(s.avg_tput,2), violations: 3,
+                })))
+              : worstCells;
+            return rows.length>0?(
+              <div style={{maxHeight:220,overflowY:'auto'}}>
+                <table style={{width:'100%',borderCollapse:'collapse',fontSize:10.5}}>
+                  <thead>
+                    <tr>{['Cell','Site','Zone','Drop%','CSSR%','Tput(Mbps)','Flags'].map(h=><th key={h} style={{padding:'4px 6px',textAlign:'left',borderBottom:`2px solid ${T.border}`,color:T.muted,fontWeight:700,fontSize:9,textTransform:'uppercase'}}>{h}</th>)}</tr>
+                  </thead>
+                  <tbody>
+                    {rows.map((s,i)=>(
+                      <tr key={i} style={{borderBottom:`1px solid ${T.border}`,background:i%2===0?T.surface2:'transparent'}}>
+                        <td style={{padding:'4px 6px',fontWeight:700,color:T.kpmgBlue,fontSize:9.5,fontFamily:"'IBM Plex Mono',monospace"}}>{s.cell_id}</td>
+                        <td style={{padding:'4px 6px',color:T.textSub,fontSize:9.5}}>{s.site_id}</td>
+                        <td style={{padding:'4px 6px',color:T.textSub,fontSize:9.5}}>{s.zone||s.cluster||'—'}</td>
+                        <td style={{padding:'4px 6px',fontFamily:"'IBM Plex Mono',monospace",fontSize:9.5,color:parseFloat(s.call_drop_rate||0)>1.5?T.red:T.green,fontWeight:700}}>{s.call_drop_rate??'—'}</td>
+                        <td style={{padding:'4px 6px',fontFamily:"'IBM Plex Mono',monospace",fontSize:9.5,color:parseFloat(s.lte_cssr||100)<98.5?T.red:T.green,fontWeight:700}}>{s.lte_cssr??'—'}</td>
+                        <td style={{padding:'4px 6px',fontFamily:"'IBM Plex Mono',monospace",fontSize:9.5,color:parseFloat(s.dl_usr_tput||999)<8?T.red:T.green,fontWeight:700}}>{s.dl_usr_tput??'—'}</td>
+                        <td style={{padding:'4px 6px',fontSize:9.5,fontWeight:700,color:T.red}}>{s.violations}/3</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ):<Empty T={T}/>;
+          })()}
         </CC>
       </div>
-      {/* Pre-Scan Worst Cells (auto-updated every 30 min) */}
-      {preScanCells.length>0&&(
-        <div style={{marginBottom:10}}>
-          <CC T={T} title="Worst Cell Scan (Auto-Updated)" action={
-            preScanTime&&<span style={{fontSize:9,color:T.muted}}>Last scan: {new Date(preScanTime).toLocaleTimeString()}</span>
-          }>
-            <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fill,minmax(260px,1fr))',gap:8}}>
-              {preScanCells.map((s,i)=>(
-                <div key={i} style={{background:T.surface2,border:`1px solid ${T.border}`,borderRadius:10,padding:'10px 12px',borderLeft:`4px solid ${s.category==='Severe Worst'?T.red:T.amber}`}}>
-                  <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:6}}>
-                    <span style={{fontSize:11,fontWeight:800,color:T.kpmgBlue,fontFamily:"'IBM Plex Mono',monospace"}}>{s.site_id}</span>
-                    <Bdg color={s.category==='Severe Worst'?T.red:T.amber}>{s.category}</Bdg>
-                  </div>
-                  <div style={{fontSize:9.5,color:T.muted,marginBottom:6}}>Cells: {(s.cells||[]).join(', ')}</div>
-                  <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:5}}>
-                    <div style={{background:T.surface,borderRadius:6,padding:'4px 6px',textAlign:'center'}}>
-                      <div style={{fontSize:8,color:T.muted,fontWeight:600}}>Drop Rate</div>
-                      <div style={{fontSize:12,fontWeight:800,color:T.red,fontFamily:"'IBM Plex Mono',monospace"}}>{f(s.avg_drop,2)}%</div>
-                    </div>
-                    <div style={{background:T.surface,borderRadius:6,padding:'4px 6px',textAlign:'center'}}>
-                      <div style={{fontSize:8,color:T.muted,fontWeight:600}}>CSSR</div>
-                      <div style={{fontSize:12,fontWeight:800,color:T.amber,fontFamily:"'IBM Plex Mono',monospace"}}>{f(s.avg_cssr,2)}%</div>
-                    </div>
-                    <div style={{background:T.surface,borderRadius:6,padding:'4px 6px',textAlign:'center'}}>
-                      <div style={{fontSize:8,color:T.muted,fontWeight:600}}>Throughput</div>
-                      <div style={{fontSize:12,fontWeight:800,color:T.teal,fontFamily:"'IBM Plex Mono',monospace"}}>{f(s.avg_tput,2)}</div>
-                    </div>
-                  </div>
-                  {s.zone&&<div style={{fontSize:9,color:T.muted,marginTop:5}}>Zone: {s.zone}{s.city?` | ${s.city}`:''}</div>}
-                </div>
-              ))}
-            </div>
-          </CC>
-        </div>
-      )}
 
       <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,alignItems:'start'}}>
         <CC T={T} title=" Best Sites (Throughput)">
@@ -1889,7 +1868,7 @@ export default function NetworkAnalyticsDashboard() {
     }).catch(()=>{});
   },[qs,fetchWithTimeout]);
 
-  useEffect(()=>{fetchAll(false,true);},[]);// eslint-disable-line — fresh=true on mount
+  useEffect(()=>{fetchAll(false,true);},[]);// eslint-disable-line 
   const mounted=useRef(false);
   // Keep refs so filter-change effect can see current page/selKpi without stale closure
   const pageRef=useRef('overview');

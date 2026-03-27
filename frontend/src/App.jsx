@@ -37,6 +37,8 @@ import AgentChatView from './pages/agent/AgentChatView';
 import NetworkAnalyticsDashboard from './pages/agent/NetworkAnalyticsDashboard';
 import SettingsPage from './pages/SettingsPage';
 import NetworkIssues from './pages/agent/NetworkIssues';
+import AgentChangeWorkflow from './pages/agent/ChangeWorkflow';
+import CTOChangeWorkflow from './pages/cto/CTOChangeWorkflow';
 import NetworkAiChat from './pages/agent/NetworkAiChat';
 
 function ProtectedRoute({ children, roles }) {
@@ -101,6 +103,7 @@ export default function App() {
         <Route path="chat-detail/:id" element={<ChatDetail />} />
         <Route path="alerts" element={<CTOAlertBox />} />
         <Route path="roster" element={<CTODutyRoster />} />
+        <Route path="change-workflow" element={<CTOChangeWorkflow />} />
         <Route path="settings" element={<SettingsPage />} />
       </Route>
 
@@ -129,6 +132,7 @@ export default function App() {
         <Route path="network-ai" element={<NetworkAiChat />} />
         <Route path="settings" element={<SettingsPage />} />
         <Route path="network-issues" element={<NetworkIssues />} />
+        <Route path="change-workflow" element={<AgentChangeWorkflow />} />
       </Route>
 
       <Route path="*" element={<Navigate to="/" replace />} />

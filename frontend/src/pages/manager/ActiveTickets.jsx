@@ -215,27 +215,36 @@ export default function ActiveTickets() {
   };
 
   /* ── Escalation review ────────────────────────────────────────────────────── */
-  const openReview = (ticketId, decision, ticketRef = '', escalationNote = '') => {
-    setReviewDialog({ open: true, ticketId, decision, ticketRef, escalationNote });
+  const openReview = (ticketId, decision, ticketRef = '', escalationNote = '', changeId = null) => {
+    setReviewDialog({ open: true, ticketId, decision, ticketRef, escalationNote, changeId });
     setReviewNote('');
     setReviewMsg('');
   };
 
   const closeReview = () => {
-    setReviewDialog({ open: false, ticketId: null, decision: null, ticketRef: '', escalationNote: '' });
+    setReviewDialog({ open: false, ticketId: null, decision: null, ticketRef: '', escalationNote: '', changeId: null });
     setReviewNote('');
     setReviewMsg('');
   };
 
   const submitReview = async () => {
-    if (!reviewDialog.ticketId || !reviewDialog.decision) return;
+    if (!reviewDialog.decision) return;
     setReviewLoading(true);
     setReviewMsg('');
     try {
-      await apiPut(`/api/manager/tickets/${reviewDialog.ticketId}/escalation-review`, {
-        decision: reviewDialog.decision,
-        note: reviewNote.trim(),
-      });
+      if (reviewDialog.changeId) {
+        // Network issue parameter change — use parameter-changes review endpoint
+        await apiPut(`/api/manager/parameter-changes/${reviewDialog.changeId}/review`, {
+          decision: reviewDialog.decision === 'approved' ? 'approved' : 'disapproved',
+          note: reviewNote.trim(),
+        });
+      } else if (reviewDialog.ticketId) {
+        // Regular ticket escalation review
+        await apiPut(`/api/manager/tickets/${reviewDialog.ticketId}/escalation-review`, {
+          decision: reviewDialog.decision,
+          note: reviewNote.trim(),
+        });
+      }
       closeReview();
       loadChanges();
       loadTickets();
@@ -368,14 +377,14 @@ export default function ActiveTickets() {
                     <button
                       className="btn btn-success btn-sm"
                       style={{ width: '100%' }}
-                      onClick={() => openReview(c.ticket_id, 'approved', t.reference_number, c.proposed_change)}
+                      onClick={() => openReview(c.ticket_id || c.network_issue_id, 'approved', t.reference_number, c.proposed_change, c.network_issue_id ? c.id : null)}
                     >
                       Approve
                     </button>
                     <button
                       className="btn btn-outline btn-sm"
                       style={{ width: '100%', borderColor: '#fca5a5', color: '#dc2626' }}
-                      onClick={() => openReview(c.ticket_id, 'rejected', t.reference_number, c.proposed_change)}
+                      onClick={() => openReview(c.ticket_id || c.network_issue_id, 'rejected', t.reference_number, c.proposed_change, c.network_issue_id ? c.id : null)}
                     >
                       Reject
                     </button>

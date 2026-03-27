@@ -20,7 +20,7 @@ from flask_jwt_extended import (
 )
 from flask_mail import Mail, Message
 from flask_socketio import SocketIO, join_room, emit
-from openai import AzureOpenAI
+from openai import AzureOpenAI, OpenAI
 from dotenv import load_dotenv
 from types import SimpleNamespace
 import urllib.request
@@ -29,13 +29,13 @@ import urllib.error
 
 from sqlalchemy import case as sql_case, text
 from sqlalchemy.orm import joinedload
-from models import db, bcrypt, User, ChatSession, ChatMessage, Ticket, Feedback, SystemSetting, SlaAlert, TelecomSite, KpiData, ParameterChange, ChangeRequest
+from models import db, bcrypt, User, ChatSession, ChatMessage, Ticket, Feedback, SystemSetting, SlaAlert, TelecomSite, KpiData, ParameterChange, ChangeRequest, FlexibleKpiUpload
 # Add this import after other imports
 from whatsapp_integration import send_whatsapp_message, format_chat_summary_for_whatsapp, format_ticket_alert_for_whatsapp
 import network_prompts
 import broadband_prompts
 import network_diagnosis
-load_dotenv()
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 # ─── App Setup ────────────────────────────────────────────────────────────────
 def _get_jwt_secret():
@@ -57,7 +57,7 @@ app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get(
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 app.config["JWT_SECRET_KEY"] = os.environ.get("JWT_SECRET", "super-secret-jwt-key-change-in-prod")
 app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(hours=24)
-app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024  # 200MB max for large Excel uploads
+app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024  # 500MB max for large Excel uploads
 
 # Flask-Mail Configuration
 app.config["MAIL_SERVER"] = os.environ.get("MAIL_SERVER", "smtp.gmail.com")
@@ -76,7 +76,7 @@ socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 # Dev default: localhost:3000. Production: set CORS_ORIGINS=https://yourdomain.com
 _cors_origins = [
     o.strip()
-    for o in os.environ.get("CORS_ORIGINS", "http://localhost:3000,http://localhost:3001").split(",")
+    for o in os.environ.get("CORS_ORIGINS", "http://localhost:3000,http://localhost:3001,http://127.0.0.1:3000").split(",")
     if o.strip()
 ]
 CORS(
@@ -179,20 +179,22 @@ def _build_duty_roster(target_date):
 
     resources = managers + agents
     total = len(resources)
-    if total % 3 != 0:
-        return None, "Total resources must be divisible by 3 to keep equal team size and two-day-off rotation"
 
     day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
     weekday_idx = target_date.weekday()  # Mon=0
 
+    # Assign off-days in groups of 3 (extra members get last group's off-days)
     off_days_map = {}
-    group_count = total // 3
+    group_count = max(total // 3, 1)
     for g in range(group_count):
         off1 = (g * 2) % 7
         off2 = (off1 + 3) % 7
         names = [day_names[off1], day_names[off2]]
         for member in resources[g * 3:(g + 1) * 3]:
             off_days_map[member.id] = names
+    # Assign any remaining members to the last group's off-days
+    for member in resources[group_count * 3:]:
+        off_days_map[member.id] = off_days_map.get(resources[group_count * 3 - 1].id, [])
 
     available = [u for u in resources if day_names[weekday_idx] not in off_days_map.get(u.id, [])]
     managers_available = [u for u in available if u.role == "manager"]
@@ -200,9 +202,6 @@ def _build_duty_roster(target_date):
         return None, "Not enough managers available today to cover 3 shifts. Adjust admin resources."
 
     total_available = len(available)
-    if total_available % 3 != 0:
-        return None, "Available resources today are not divisible by 3. Adjust admin resources."
-
     team_size = total_available // 3
     rotation = target_date.timetuple().tm_yday % len(managers_available)
     rotated = managers_available[rotation:] + managers_available[:rotation]
@@ -255,6 +254,18 @@ def _build_duty_roster(target_date):
     }, None
 
 
+@app.route("/api/cto/duty-roster")
+@jwt_required()
+def cto_duty_roster():
+    date_str = request.args.get("date")
+    try:
+        target_date = datetime.strptime(date_str, "%Y-%m-%d").date() if date_str else datetime.utcnow().date()
+    except ValueError:
+        return jsonify({"error": "Invalid date format, use YYYY-MM-DD"}), 400
+    roster, err = _build_duty_roster(target_date)
+    if err:
+        return jsonify({"error": err}), 400
+    return jsonify(roster)
 
 
 # ─── Nearest-Tower Lookup (loaded once at startup) ────────────────────────────
@@ -681,7 +692,7 @@ def find_nearest_sites(lat, lon, n=3):
     try:
         from sqlalchemy import text as sa_text
         rows = db.session.execute(sa_text("""
-            SELECT site_id, zone, site_status, alarms, solution, standard_solution_step,
+            SELECT site_id, zone, city, state, site_status, alarms, solution, standard_solution_step,
                    AVG(latitude) AS latitude, AVG(longitude) AS longitude,
                    ROUND(AVG(bandwidth_mhz)::numeric, 1) AS bandwidth_mhz,
                    ROUND(AVG(antenna_gain_dbi)::numeric, 1) AS antenna_gain_dbi,
@@ -691,7 +702,7 @@ def find_nearest_sites(lat, lon, n=3):
                    ROUND(AVG(crs_gain)::numeric, 1) AS crs_gain
             FROM telecom_sites
             WHERE latitude IS NOT NULL AND longitude IS NOT NULL
-            GROUP BY site_id, zone, site_status, alarms, solution, standard_solution_step
+            GROUP BY site_id, zone, city, state, site_status, alarms, solution, standard_solution_step
         """)).fetchall()
     except Exception:
         return []
@@ -711,6 +722,8 @@ def find_nearest_sites(lat, lon, n=3):
         results.append({
             "site_id": r.site_id,
             "zone": r.zone or "",
+            "city": r.city or "",
+            "state": r.state or "",
             "latitude": float(r.latitude or 0),
             "longitude": float(r.longitude or 0),
             "site_status": status,
@@ -1720,6 +1733,10 @@ def save_session_location(session_id):
     data = request.json or {}
     if data.get("location_description"):
         session.location_description = data.get("location_description")
+    if data.get("state_province"):
+        session.state_province = data.get("state_province")
+    if data.get("country"):
+        session.country = data.get("country")
 
     # ── Default coordinates (Gurgaon, Haryana) ────────────────────────────────
     DEFAULT_LATITUDE  = 28.4595
@@ -1734,6 +1751,8 @@ def save_session_location(session_id):
         "latitude":  session.latitude,
         "longitude": session.longitude,
         "location_description": session.location_description,
+        "state_province": session.state_province,
+        "country": session.country,
     }), 200
 
 
@@ -2761,8 +2780,8 @@ def update_ticket(ticket_id):
         ticket.status = data["status"]
         if data["status"] == "resolved":
             ticket.resolved_at = datetime.now(timezone.utc)
-        # Track reopens: resolved/closed → pending/in_progress
-        if old_status == "resolved" and data["status"] in ("pending", "in_progress"):
+        # Track reopening: resolved/closed → any open state
+        if old_status in ("resolved", "closed") and data["status"] in ("pending", "in_progress"):
             ticket.reopened_count = (ticket.reopened_count or 0) + 1
             ticket.last_reopened_at = datetime.now(timezone.utc)
     if "priority" in data:
@@ -2861,6 +2880,20 @@ def _latest_site_values_for_kpi(kpi_name):
         if row.site_id not in latest and row.value is not None:
             latest[row.site_id] = {"date": row.date, "value": float(row.value)}
     return latest
+
+
+def _site_values_near_date(kpi_name, target_date):
+    """Return {site_id: value} for the closest date <= target_date per site."""
+    rows = KpiData.query.filter(
+        KpiData.data_level == "site",
+        KpiData.kpi_name == kpi_name,
+        KpiData.date <= target_date,
+    ).order_by(KpiData.site_id, KpiData.date.desc()).all()
+    result = {}
+    for row in rows:
+        if row.site_id not in result and row.value is not None:
+            result[row.site_id] = float(row.value)
+    return result
 
 
 def _series_for_kpi_patterns(patterns):
@@ -3013,6 +3046,129 @@ def cto_technical_kpi():
     })
 
 
+@app.route("/api/cto/core-kpi", methods=["GET"])
+@jwt_required()
+def cto_core_kpi():
+    """Return Core Network KPI data from the flexible upload table."""
+    from sqlalchemy import func as sa_func
+
+    user = User.query.get(int(get_jwt_identity()))
+    if not user or user.role not in ("cto", "admin"):
+        return jsonify({"error": "Unauthorized"}), 403
+
+    # Check if any core data exists
+    total = FlexibleKpiUpload.query.filter_by(kpi_type="core").count()
+    if total == 0:
+        return jsonify({"available": False, "message": "No Core KPI data uploaded yet."})
+
+    # Get all distinct numeric KPI columns (with display labels)
+    col_rows = db.session.query(
+        FlexibleKpiUpload.column_name,
+        FlexibleKpiUpload.str_value,
+    ).filter_by(kpi_type="core", column_type="numeric").distinct(
+        FlexibleKpiUpload.column_name
+    ).order_by(FlexibleKpiUpload.column_name, FlexibleKpiUpload.id.desc()).all()
+
+    # Build column metadata
+    cols_meta = {}
+    for col_name, str_val in col_rows:
+        label = str_val if (str_val and str_val != col_name) else col_name
+        cols_meta[col_name] = label
+
+    # Date range
+    latest_date = db.session.query(
+        sa_func.max(FlexibleKpiUpload.row_date)
+    ).filter_by(kpi_type="core").scalar()
+    min_date = db.session.query(
+        sa_func.min(FlexibleKpiUpload.row_date)
+    ).filter_by(kpi_type="core").scalar()
+
+    def _iso(d):
+        return d.isoformat() if d and hasattr(d, 'isoformat') else (str(d) if d else None)
+
+    # Summary: avg over all time + avg for latest date
+    summary = {}
+    for col_name, label in cols_meta.items():
+        avg_all = db.session.query(
+            sa_func.avg(FlexibleKpiUpload.num_value)
+        ).filter_by(kpi_type="core", column_name=col_name).scalar()
+        avg_latest = None
+        if latest_date is not None:
+            avg_latest = db.session.query(
+                sa_func.avg(FlexibleKpiUpload.num_value)
+            ).filter(
+                FlexibleKpiUpload.kpi_type == "core",
+                FlexibleKpiUpload.column_name == col_name,
+                FlexibleKpiUpload.row_date == latest_date,
+            ).scalar()
+        summary[col_name] = {
+            "label": label,
+            "avg": round(float(avg_all), 2) if avg_all is not None else None,
+            "latest_avg": round(float(avg_latest), 2) if avg_latest is not None else None,
+        }
+
+    # Trend: per-date averages across all sites for each KPI
+    trend_rows = db.session.query(
+        FlexibleKpiUpload.column_name,
+        FlexibleKpiUpload.row_date,
+        sa_func.avg(FlexibleKpiUpload.num_value).label("avg_val"),
+    ).filter_by(kpi_type="core", column_type="numeric").filter(
+        FlexibleKpiUpload.row_date.isnot(None)
+    ).group_by(
+        FlexibleKpiUpload.column_name,
+        FlexibleKpiUpload.row_date,
+    ).order_by(FlexibleKpiUpload.row_date).all()
+
+    trend_pivot = {}
+    for col_name, row_date, avg_val in trend_rows:
+        if col_name not in cols_meta:
+            continue
+        d_str = _iso(row_date)
+        if d_str not in trend_pivot:
+            trend_pivot[d_str] = {"date": d_str}
+        trend_pivot[d_str][col_name] = round(float(avg_val), 2) if avg_val is not None else None
+    trend = sorted(trend_pivot.values(), key=lambda x: x["date"])
+
+    # Per-site table: latest date only
+    site_rows_q = db.session.query(
+        FlexibleKpiUpload.site_id,
+        FlexibleKpiUpload.column_name,
+        FlexibleKpiUpload.num_value,
+    ).filter(
+        FlexibleKpiUpload.kpi_type == "core",
+        FlexibleKpiUpload.column_type == "numeric",
+        FlexibleKpiUpload.row_date == latest_date,
+    ).order_by(FlexibleKpiUpload.site_id).all()
+
+    pivot = {}
+    for site_id, col_name, num_value in site_rows_q:
+        if col_name not in cols_meta:
+            continue
+        if site_id not in pivot:
+            pivot[site_id] = {}
+        if col_name not in pivot[site_id]:
+            pivot[site_id][col_name] = num_value
+
+    site_ids = sorted(pivot.keys())
+    site_table = []
+    for site_id in site_ids:
+        row = {"site_id": site_id}
+        for col_name in cols_meta:
+            val = pivot[site_id].get(col_name)
+            row[col_name] = round(float(val), 2) if val is not None else None
+        site_table.append(row)
+
+    return jsonify({
+        "available": True,
+        "total_sites": len(site_ids),
+        "date_range": {"from": _iso(min_date), "to": _iso(latest_date)},
+        "columns": [{"key": k, "label": v} for k, v in cols_meta.items()],
+        "summary": summary,
+        "trend": trend,
+        "sites": site_table,
+    })
+
+
 @app.route("/api/cto/business-kpi", methods=["GET"])
 @jwt_required()
 def cto_business_kpi():
@@ -3022,7 +3178,15 @@ def cto_business_kpi():
 
     users_latest = _latest_site_values_for_kpi("Site Users")
     revenue_latest = _latest_site_values_for_kpi("Site Revenue")
-    prb_latest = _latest_site_values_for_kpi("PRB Utilization")
+    prb_latest = _latest_site_values_for_kpi("DL PRB Utilization (1BH)")
+
+    # Per-site users 7 days before the latest date → for WoW decline detection
+    if users_latest:
+        _latest_date_val = max(v["date"] for v in users_latest.values())
+        _date_7d_ago = _latest_date_val - timedelta(days=7)
+        users_7d_ago = _site_values_near_date("Site Users", _date_7d_ago)
+    else:
+        users_7d_ago = {}
 
     users_series = _series_for_kpi_patterns(["Site Users"])
     revenue_series = _series_for_kpi_patterns(["Site Revenue"])
@@ -3042,24 +3206,55 @@ def cto_business_kpi():
             "arpu": round(arpu, 2),
         })
 
-    total_users = round(sum(row["users"] for row in site_rows), 2)
-    avg_users = round(total_users / len(site_rows), 2) if site_rows else 0
+    # ── Weekly helpers ────────────────────────────────────────────────────────
+    revenue_by_day = {row["date"]: row["value"] for row in revenue_series}
+
+    def _week_avg(series, offset=0):
+        if offset == 0:
+            window = series[-7:]
+        else:
+            end   = -(offset * 7)
+            start = end - 7
+            window = series[start:end]
+        return sum(p["value"] for p in window) / len(window) if window else None
+
+    # Total Users → weekly avg of daily totals (per-site avg × site count), integer
+    num_sites = len(site_rows) or 1
+    this_week_users_vals = [p["value"] * num_sites for p in users_series[-7:]]
+    total_users = int(round(sum(this_week_users_vals) / len(this_week_users_vals), 0)) if this_week_users_vals else 0
+
+    # Avg Users per Site → weekly avg (integer)
+    avg_users = int(round(total_users / num_sites, 0)) if num_sites else 0
+
     total_revenue = round(sum(row["revenue"] for row in site_rows), 2)
-    arpu = round(total_revenue / total_users, 2) if total_users else 0
 
-    if len(users_series) >= 2 and users_series[-2]["value"]:
-        growth = round(((users_series[-1]["value"] - users_series[-2]["value"]) / users_series[-2]["value"]) * 100, 2)
-    else:
-        growth = 0
+    # ARPU → weekly avg revenue (total) / weekly avg users (total)
+    this_week_rev_vals = [revenue_by_day.get(p["date"], 0) * num_sites for p in users_series[-7:]]
+    avg_weekly_revenue = sum(this_week_rev_vals) / len(this_week_rev_vals) if this_week_rev_vals else 0
+    arpu = round(avg_weekly_revenue / total_users, 4) if total_users else 0
 
+    # Growth → week-over-week
+    this_w = _week_avg(users_series, 0)
+    last_w = _week_avg(users_series, 1)
+    growth = round(((this_w - last_w) / last_w) * 100, 2) if this_w and last_w else 0
+
+    
     declining_sites = []
     overloaded_sites = []
     revenue_at_risk = 0.0
+    users_lost      = 0.0
+    users_at_start  = 0.0
 
     for row in site_rows:
-        growth_pct = 0.0
-        if row["users"] and avg_users:
-            growth_pct = round(((row["users"] - avg_users) / avg_users) * 100, 2)
+        u_now  = row["users"]
+        u_prev = users_7d_ago.get(row["site_id"])
+        if u_now and u_prev:
+            growth_pct = round(((u_now - u_prev) / u_prev) * 100, 2)
+            users_at_start += u_prev
+            if growth_pct < 0:
+                users_lost += (u_prev - u_now)
+        else:
+            growth_pct = 0.0
         item = {**row, "growth": growth_pct}
         if growth_pct < 0:
             declining_sites.append(item)
@@ -3068,31 +3263,72 @@ def cto_business_kpi():
         if growth_pct < 0 or row["utilization"] > 80:
             revenue_at_risk += row["users"] * arpu
 
-    top_sites = sorted(site_rows, key=lambda row: (row["revenue"], row["users"]), reverse=True)[:10]
-    declining_sites = sorted(declining_sites, key=lambda row: row["growth"])[:10]
+    total_sites = max(len(site_rows), 1)
+
+    top_sites        = sorted(site_rows,       key=lambda row: (row["revenue"], row["users"]), reverse=True)[:10]
+    declining_sites  = sorted(declining_sites,  key=lambda row: row["growth"])[:10]
     overloaded_sites = sorted(overloaded_sites, key=lambda row: row["utilization"], reverse=True)[:10]
 
+    # ── KPI 1: Churn Rate — Users Lost / Total Users at Start × 100 ───────────
+    churn_rate = round((users_lost / users_at_start) * 100, 2) if users_at_start else 0.0
+
+    # ── KPI 2: Network ROI ────────────────────────────────────────────────────
+    baseline_cost = total_sites * 5000.0
+    network_roi   = round(((total_revenue - baseline_cost) / baseline_cost) * 100, 2) if baseline_cost else 0.0
+
+    # ── Trend + ARPU Trend (30 days) ──────────────────────────────────────────
     trend = []
-    revenue_by_day = {row["date"]: row["value"] for row in revenue_series}
     for row in users_series[-30:]:
         trend.append({
-            "date": row["date"],
-            "users": row["value"],
+            "date":    row["date"],
+            "users":   row["value"],
             "revenue": revenue_by_day.get(row["date"], 0),
         })
 
+    # ── KPI 3: ARPU Trend ────────────────────────────────────────────────────
+    arpu_trend = []
+    for row in users_series[-30:]:
+        d_users = row["value"]
+        d_rev   = revenue_by_day.get(row["date"], 0)
+        arpu_trend.append({
+            "date": row["date"],
+            "arpu": round(d_rev / d_users, 4) if d_users else 0,
+        })
+
+    # ── KPI 4: Site Health Score ──────────────────────────────────────────────
+    max_users_v   = max((r["users"]   for r in site_rows), default=1) or 1
+    max_revenue_v = max((r["revenue"] for r in site_rows), default=1) or 1
+
+    site_health = []
+    for row in site_rows:
+        util_score = max(0.0, 1.0 - row["utilization"] / 100.0)
+        user_score = row["users"]   / max_users_v
+        rev_score  = row["revenue"] / max_revenue_v
+        health     = round((util_score * 0.4 + user_score * 0.3 + rev_score * 0.3) * 100, 2)
+        site_health.append({**row, "health_score": health})
+
+    avg_health_score = round(
+        sum(s["health_score"] for s in site_health) / len(site_health), 2
+    ) if site_health else 0.0
+    worst_sites = sorted(site_health, key=lambda r: r["health_score"])[:10]
+
     return jsonify({
         "summary": {
-            "total_users": total_users,
-            "avg_users": avg_users,
-            "growth": growth,
-            "arpu": arpu,
-            "revenue_at_risk": round(revenue_at_risk, 2),
+            "total_users":      total_users,
+            "avg_users":        avg_users,
+            "growth":           growth,
+            "arpu":             arpu,
+            "revenue_at_risk":  round(revenue_at_risk, 2),
+            "churn_rate":       churn_rate,
+            "network_roi":      network_roi,
+            "avg_health_score": avg_health_score,
         },
-        "top_sites": top_sites,
+        "top_sites":       top_sites,
         "declining_sites": declining_sites,
         "overloaded_sites": overloaded_sites,
-        "trend": trend,
+        "trend":           trend,
+        "arpu_trend":      arpu_trend,
+        "site_health":     worst_sites,
     })
 
 
@@ -3127,10 +3363,51 @@ def cto_operational_kpi():
     ).outerjoin(Ticket, Ticket.assigned_to == User.id).filter(User.role == "human_agent").group_by(User.name).all()
     workload_data = [{"agent": name or "Unassigned", "tickets": count} for name, count in agent_workload]
 
-    escalated_count = len([t for t in tickets if t.status == "escalated"])
+    escalated_count = len([t for t in tickets if t.status in ("escalated", "manager_escalated")])
     escalation_rate = round((escalated_count / total_tickets) * 100, 1) if total_tickets else 0
 
     breach_alerts = SlaAlert.query.filter_by(recipient_role="cto").count()
+
+    # ── Critical incidents: active tickets sorted by SLA urgency ────────────
+    now_utc = datetime.now(timezone.utc)
+
+    def _sla_remaining(t):
+        dl = t.sla_deadline
+        if dl.tzinfo is None:
+            dl = dl.replace(tzinfo=timezone.utc)
+        return (dl - now_utc).total_seconds()
+
+    active_with_sla = [t for t in tickets if t.status not in ("resolved",) and t.sla_deadline]
+    critical_sorted = sorted(active_with_sla, key=_sla_remaining)[:10]
+
+    critical_incidents = []
+    for t in critical_sorted:
+        rem = _sla_remaining(t)
+        abs_s = abs(rem)
+        h = int(abs_s // 3600)
+        m = int((abs_s % 3600) // 60)
+        s_val = int(abs_s % 60)
+        sign = "-" if rem < 0 else ""
+        critical_incidents.append({
+            "id": t.reference_number,
+            "service": t.category or "General",
+            "priority": t.priority or "low",
+            "sla_clock": f"{sign}{h:02d}:{m:02d}:{s_val:02d}",
+            "sla_remaining": round(rem),
+            "status": t.status or "pending",
+        })
+
+    # ── Escalation trend: last 7 days daily escalated-ticket counts ─────────
+    escalation_trend = []
+    for i in range(7):
+        day_start = (now_utc - timedelta(days=6 - i)).replace(hour=0, minute=0, second=0, microsecond=0)
+        day_end = day_start + timedelta(days=1)
+        count = sum(
+            1 for t in tickets
+            if t.status in ("escalated", "manager_escalated") and t.created_at and
+            day_start <= (t.created_at.replace(tzinfo=timezone.utc) if t.created_at.tzinfo is None else t.created_at) < day_end
+        )
+        escalation_trend.append(count)
 
     return jsonify({
         "summary": {
@@ -3144,6 +3421,8 @@ def cto_operational_kpi():
         },
         "status_breakdown": status_data,
         "agent_workload": workload_data,
+        "critical_incidents": critical_incidents,
+        "escalation_trend": escalation_trend,
     })
 
 
@@ -4207,6 +4486,19 @@ def admin_delete_shared_site_workbook():
     return jsonify({"deleted": count})
 
 
+@app.route("/api/admin/debug-upload", methods=["POST", "OPTIONS"])
+def debug_upload():
+    """Debug endpoint — no auth, logs everything received."""
+    print(f"\n[DEBUG] Method: {request.method}")
+    print(f"[DEBUG] Headers: {dict(request.headers)}")
+    print(f"[DEBUG] Files: {list(request.files.keys())}")
+    print(f"[DEBUG] Form: {list(request.form.keys())}")
+    if 'file' in request.files:
+        f = request.files['file']
+        print(f"[DEBUG] File name: {f.filename}, size: {len(f.read())} bytes")
+    return jsonify({"status": "ok", "files": list(request.files.keys()), "method": request.method})
+
+
 @app.route("/api/admin/upload-kpi-cell-level", methods=["POST"])
 @jwt_required()
 def admin_upload_kpi_cell_level():
@@ -4363,6 +4655,331 @@ def admin_uploaded_kpis():
         "cell_kpis": [{"name": r[0], "rows": r[1]} for r in cell_kpis],
         "site_count": site_count,
     })
+
+
+# ─── Flexible KPI Upload (Core / Revenue) ─────────────────────────────────────
+
+# Known display labels for Core KPI columns (case-insensitive key → label)
+_CORE_KPI_DISPLAY_LABELS = {
+    "authentication success rate": "Auth Success Rate",
+    "auth success rate":           "Auth Success Rate",
+    "cpu utilization":             "CPU Usage",
+    "cpu usage":                   "CPU Usage",
+    "attach success rate":         "4G Attach Success",
+    "4g attach success":           "4G Attach Success",
+    "pdp bearer setup success rate": "4G Bearer Success",
+    "pdp bearer sr":               "4G Bearer Success",
+    "4g bearer success":           "4G Bearer Success",
+}
+
+def _flex_display_label(kpi_type, raw_name):
+    """Return a human-friendly display label for a flexible KPI column."""
+    if kpi_type == "core":
+        return _CORE_KPI_DISPLAY_LABELS.get(raw_name.lower().strip(), raw_name)
+    return raw_name
+
+
+def _detect_col_type(values):
+    """Given a list of raw cell values, return 'numeric', 'date', or 'text'."""
+    import numbers
+    numeric_count = 0
+    for v in values:
+        if v is None or v == "":
+            continue
+        if isinstance(v, numbers.Number):
+            numeric_count += 1
+        elif isinstance(v, str):
+            try:
+                float(v.replace(",", ""))
+                numeric_count += 1
+            except ValueError:
+                pass
+    return "numeric" if numeric_count >= max(1, len([v for v in values if v not in (None, "")]) * 0.5) else "text"
+
+
+@app.route("/api/admin/upload-flexible-kpi", methods=["POST"])
+@jwt_required()
+def admin_upload_flexible_kpi():
+    """Flexible KPI upload for Core or Revenue data.
+    ?type=core | revenue
+    Only Site_ID is mandatory; all other columns are auto-detected.
+    Each upload replaces previous data for the same kpi_type.
+    """
+    import uuid, io, datetime as _dt
+
+    user = User.query.get(int(get_jwt_identity()))
+    if not user or user.role != "admin":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    kpi_type = request.args.get("type", "").strip().lower()
+    if kpi_type not in ("core", "revenue"):
+        return jsonify({"error": "Invalid type. Use ?type=core or ?type=revenue"}), 400
+
+    if "file" not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+
+    file = request.files["file"]
+    fname = file.filename.lower()
+
+    def to_float(v):
+        if v is None or v == "":
+            return None
+        if isinstance(v, (int, float)):
+            return float(v)
+        try:
+            return float(str(v).replace(",", "").strip())
+        except ValueError:
+            return None
+
+    def parse_date_header(h):
+        if h is None:
+            return None
+        if isinstance(h, (_dt.datetime, _dt.date)):
+            return h.date() if isinstance(h, _dt.datetime) else h
+        s = str(h).strip()[:10]
+        for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y"):
+            try:
+                return _dt.datetime.strptime(s, fmt).date()
+            except ValueError:
+                continue
+        return None
+
+    try:
+        raw_bytes = file.read()
+
+        if fname.endswith(".csv"):
+            import csv as csv_mod
+            text = raw_bytes.decode("utf-8-sig", errors="replace")
+            reader = csv_mod.DictReader(io.StringIO(text))
+            headers = reader.fieldnames or []
+            rows = list(reader)
+
+        elif fname.endswith((".xlsx", ".xls", ".xlsm")):
+            import openpyxl
+            wb = openpyxl.load_workbook(io.BytesIO(raw_bytes), data_only=True)
+            sheet_names = wb.sheetnames
+
+            if kpi_type == "core" and len(sheet_names) > 1:
+                # Multi-sheet format: sheet name = KPI metric, col 0 = Site_ID, col 1+ = dates
+                deleted = FlexibleKpiUpload.query.filter_by(kpi_type=kpi_type).delete()
+                db.session.flush()
+                batch_id = str(uuid.uuid4())
+                records = []
+                skipped = 0
+                unique_sites = set()
+                all_kpi_cols = []
+
+                for sheet_name in sheet_names:
+                    ws = wb[sheet_name]
+                    sheet_rows = list(ws.iter_rows(values_only=True))
+                    if not sheet_rows:
+                        continue
+                    kpi_col_name = sheet_name.strip()
+                    display_label = _flex_display_label(kpi_type, kpi_col_name)
+                    all_kpi_cols.append(kpi_col_name)
+
+                    header_row = sheet_rows[0]
+                    date_headers = [parse_date_header(h) for h in header_row[1:]]
+
+                    for row in sheet_rows[1:]:
+                        if not row or row[0] is None:
+                            skipped += 1
+                            continue
+                        site_id = str(row[0]).strip()
+                        if not site_id:
+                            skipped += 1
+                            continue
+                        unique_sites.add(site_id)
+                        for i, date_val in enumerate(date_headers):
+                            if date_val is None:
+                                continue
+                            raw_val = row[i + 1] if (i + 1) < len(row) else None
+                            num = to_float(raw_val)
+                            if num is None:
+                                continue
+                            records.append(FlexibleKpiUpload(
+                                kpi_type=kpi_type,
+                                upload_batch=batch_id,
+                                site_id=site_id,
+                                column_name=kpi_col_name,
+                                column_type="numeric",
+                                num_value=num,
+                                str_value=display_label,
+                                row_date=date_val,
+                            ))
+
+                wb.close()
+                db.session.bulk_save_objects(records)
+                db.session.commit()
+                return jsonify({
+                    "rows_in_file": len(records),
+                    "records_inserted": len(records),
+                    "unique_sites": len(unique_sites),
+                    "columns_detected": all_kpi_cols,
+                    "deleted_previous": deleted,
+                    "skipped_rows": skipped,
+                })
+
+            else:
+                # Single-sheet fallback
+                ws = wb.active
+                all_rows = list(ws.iter_rows(values_only=True))
+                wb.close()
+                if not all_rows:
+                    return jsonify({"error": "Empty file"}), 400
+                raw_headers = all_rows[0]
+                headers = [str(h).strip() if h is not None else "" for h in raw_headers]
+                rows = []
+                for r in all_rows[1:]:
+                    rows.append({headers[i]: (r[i] if i < len(r) else None) for i in range(len(headers))})
+        else:
+            return jsonify({"error": "Unsupported file format. Use .xlsx, .xls or .csv"}), 400
+
+    except Exception as e:
+        return jsonify({"error": f"Failed to read file: {e}"}), 400
+
+    # --- single-sheet path ---
+    # Find Site_ID column (case-insensitive)
+    site_col = next(
+        (h for h in headers if h.strip().lower() in ("site_id", "site id", "siteid")),
+        None
+    )
+    if not site_col:
+        return jsonify({"error": "Missing required column: Site_ID"}), 400
+
+    # KPI columns = everything except the site id column
+    kpi_cols = [h for h in headers if h and h != site_col]
+    if not kpi_cols:
+        return jsonify({"error": "No KPI columns found besides Site_ID"}), 400
+
+    # Detect column types from sample values
+    col_type_map = {}
+    for col in kpi_cols:
+        sample = [r.get(col) for r in rows[:50]]
+        col_type_map[col] = _detect_col_type(sample)
+
+    # Delete all previous records for this kpi_type
+    deleted = FlexibleKpiUpload.query.filter_by(kpi_type=kpi_type).delete()
+    db.session.flush()
+
+    batch_id = str(uuid.uuid4())
+    records = []
+    skipped = 0
+
+    for row in rows:
+        site_id = str(row.get(site_col, "") or "").strip()
+        if not site_id:
+            skipped += 1
+            continue
+        for col in kpi_cols:
+            raw_val = row.get(col)
+            ctype = col_type_map[col]
+            col_norm = col.strip()
+            label = _flex_display_label(kpi_type, col_norm)
+            if ctype == "numeric":
+                num = to_float(raw_val)
+                records.append(FlexibleKpiUpload(
+                    kpi_type=kpi_type,
+                    upload_batch=batch_id,
+                    site_id=site_id,
+                    column_name=col_norm,
+                    column_type="numeric",
+                    num_value=num,
+                    str_value=label,   # reuse str_value to store display label
+                ))
+            else:
+                records.append(FlexibleKpiUpload(
+                    kpi_type=kpi_type,
+                    upload_batch=batch_id,
+                    site_id=site_id,
+                    column_name=col_norm,
+                    column_type="text",
+                    num_value=None,
+                    str_value=str(raw_val) if raw_val is not None else None,
+                ))
+
+    db.session.bulk_save_objects(records)
+    db.session.commit()
+
+    return jsonify({
+        "rows_in_file": len(rows),
+        "records_inserted": len(records),
+        "unique_sites": len({r.get(site_col, "") for r in rows if r.get(site_col)}),
+        "columns_detected": kpi_cols,
+        "deleted_previous": deleted,
+        "skipped_rows": skipped,
+    })
+
+
+@app.route("/api/admin/flexible-kpi-status", methods=["GET"])
+@jwt_required()
+def admin_flexible_kpi_status():
+    """Return record counts + column list for a flexible KPI type."""
+    from sqlalchemy import func as sa_func
+
+    user = User.query.get(int(get_jwt_identity()))
+    if not user or user.role != "admin":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    kpi_type = request.args.get("type", "").strip().lower()
+    if kpi_type not in ("core", "revenue"):
+        return jsonify({"error": "Invalid type"}), 400
+
+    total = FlexibleKpiUpload.query.filter_by(kpi_type=kpi_type).count()
+    if total == 0:
+        return jsonify({"unique_sites": 0, "total_rows": 0, "unique_columns": 0, "columns": []})
+
+    unique_sites = db.session.query(sa_func.count(sa_func.distinct(FlexibleKpiUpload.site_id))).filter_by(kpi_type=kpi_type).scalar()
+
+    col_rows = db.session.query(
+        FlexibleKpiUpload.column_name,
+        FlexibleKpiUpload.column_type,
+        FlexibleKpiUpload.str_value,
+    ).filter_by(kpi_type=kpi_type).distinct(
+        FlexibleKpiUpload.column_name
+    ).order_by(FlexibleKpiUpload.column_name, FlexibleKpiUpload.id.desc()).all()
+
+    seen = {}
+    for col_name, col_type, str_val in col_rows:
+        if col_name not in seen:
+            label = _flex_display_label(kpi_type, col_name)
+            if col_type == "numeric" and str_val and str_val != col_name:
+                label = str_val  # stored display label
+            seen[col_name] = {"column_name": col_name, "column_label": label, "column_type": col_type}
+
+    date_range = {}
+    if kpi_type == "core":
+        min_d = db.session.query(sa_func.min(FlexibleKpiUpload.row_date)).filter_by(kpi_type=kpi_type).scalar()
+        max_d = db.session.query(sa_func.max(FlexibleKpiUpload.row_date)).filter_by(kpi_type=kpi_type).scalar()
+        date_range = {
+            "from": min_d.isoformat() if min_d and hasattr(min_d, 'isoformat') else str(min_d) if min_d else None,
+            "to": max_d.isoformat() if max_d and hasattr(max_d, 'isoformat') else str(max_d) if max_d else None,
+        }
+
+    return jsonify({
+        "unique_sites": unique_sites,
+        "total_rows": total,
+        "unique_columns": len(seen),
+        "date_range": date_range,
+        "columns": list(seen.values()),
+    })
+
+
+@app.route("/api/admin/delete-flexible-kpi", methods=["DELETE"])
+@jwt_required()
+def admin_delete_flexible_kpi():
+    """Delete all flexible KPI records for a given type."""
+    user = User.query.get(int(get_jwt_identity()))
+    if not user or user.role != "admin":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    kpi_type = request.args.get("type", "").strip().lower()
+    if kpi_type not in ("core", "revenue"):
+        return jsonify({"error": "Invalid type"}), 400
+
+    deleted = FlexibleKpiUpload.query.filter_by(kpi_type=kpi_type).delete()
+    db.session.commit()
+    return jsonify({"deleted": deleted, "kpi_type": kpi_type})
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -4968,10 +5585,25 @@ def agent_dashboard():
     my_tickets = Ticket.query.filter(
         or_(Ticket.assigned_to == user_id, Ticket.escalated_by == user_id)
     ).all()
+
+    # Backfill first_response_at from first agent chat message (one-time)
+    backfilled = False
+    for t in my_tickets:
+        if not t.first_response_at and t.chat_session_id:
+            first_agent_msg = ChatMessage.query.filter(
+                ChatMessage.session_id == t.chat_session_id,
+                ChatMessage.sender == 'agent'
+            ).order_by(ChatMessage.created_at.asc()).first()
+            if first_agent_msg and first_agent_msg.created_at:
+                t.first_response_at = first_agent_msg.created_at
+                backfilled = True
+    if backfilled:
+        db.session.commit()
+
     resolved = [t for t in my_tickets if t.status == "resolved"]
     total = len(my_tickets)
     resolved_count = len(resolved)
-    open_count = len([t for t in my_tickets if t.status in ("pending", "in_progress", "manager_escalated", "escalated")])
+    open_count = len([t for t in my_tickets if t.status not in ("resolved", "closed")])
 
     # MTTR – Mean Time To Resolve (hours)
     resolve_times = []
@@ -5003,34 +5635,76 @@ def agent_dashboard():
     csat = round(sum(f.rating for f in feedbacks) / max(len(feedbacks), 1), 2) if feedbacks else 0
     csat_pct = round((len([f for f in feedbacks if f.rating >= 4]) / max(len(feedbacks), 1)) * 100, 1)
 
-    # Reopen Rate
-    reopen_rate = 0.0
+    # ── Reopen Rate ────────────────────────────────────────────────────────
+    # Check reopened_count field AND last_reopened_at as secondary indicator
+    reopened_tickets = [t for t in resolved
+                        if (getattr(t, 'reopened_count', 0) or 0) > 0
+                        or getattr(t, 'last_reopened_at', None) is not None]
+    reopen_rate = round((len(reopened_tickets) / max(resolved_count, 1)) * 100, 1)
 
-    # High Severity Incident Resolution Time (avg hours for critical/high resolved tickets)
-    hs_times = []
-    for t in resolved:
-        if t.priority in ("critical", "high"):
+    # ── H/S Incident Resolution Time ────────────────────────────────────
+    # Priority order: critical/high → medium → all resolved
+    hs_resolution_time = 0.0
+    for prio_filter in [("critical", "high"), ("medium",), None]:
+        hs_times = []
+        pool = resolved if prio_filter is not None else resolved
+        for t in pool:
+            if prio_filter is not None and t.priority not in prio_filter:
+                continue
             ra = _utc(t.resolved_at)
             ca = _utc(t.created_at)
             if ra and ca:
                 hs_times.append(max(0, (ra - ca).total_seconds() / 3600))
-    hs_resolution_time = round(sum(hs_times) / len(hs_times), 2) if hs_times else 0
+        if hs_times:
+            hs_resolution_time = round(sum(hs_times) / len(hs_times), 2)
+            break
+    # Absolute fallback: use MTTR which is known to be computed
+    if hs_resolution_time == 0 and mttr > 0:
+        hs_resolution_time = mttr
 
-    # High Severity Response Time
-    hs_response_time = round(hs_resolution_time * 0.15, 2) if hs_resolution_time else 0
+    # ── H/S Incident Response Time ──────────────────────────────────────
+    # Try first_response_at, then estimate from first chat message, then from MTTR
+    hs_response_time = 0.0
+    # Method 1: Use first_response_at if populated
+    resp_times = []
+    for t in my_tickets:
+        fra = _utc(getattr(t, 'first_response_at', None))
+        ca = _utc(t.created_at)
+        if fra and ca:
+            resp_times.append(max(0, (fra - ca).total_seconds() / 3600))
+    if resp_times:
+        hs_response_time = round(sum(resp_times) / len(resp_times), 2)
+    else:
+        # Method 2: Estimate from first agent message in chat session
+        est_resp_times = []
+        for t in my_tickets:
+            if t.chat_session_id and t.created_at:
+                first_agent_msg = ChatMessage.query.filter(
+                    ChatMessage.session_id == t.chat_session_id,
+                    ChatMessage.sender == 'agent'
+                ).order_by(ChatMessage.created_at.asc()).first()
+                if first_agent_msg and first_agent_msg.created_at:
+                    ca = _utc(t.created_at)
+                    fra = _utc(first_agent_msg.created_at)
+                    if ca and fra and fra >= ca:
+                        est_resp_times.append(max(0, (fra - ca).total_seconds() / 3600))
+        if est_resp_times:
+            hs_response_time = round(sum(est_resp_times) / len(est_resp_times), 2)
+        else:
+            # Method 3: Estimate as 15% of resolution time
+            hs_response_time = round(hs_resolution_time * 0.15, 2)
 
-    # Complaint Resolution Time (avg hours for ALL priority tickets)
+    # ── Complaint Resolution Time ────────────────────────────────────────
     complaint_resolution_time = mttr
 
-    # RCA Timely Completion – show % of high/critical resolved within SLA
+    # ── RCA Timely Completion ────────────────────────────────────────────
     rca_completion = sla_compliance
 
-    # Aging – avg age in hours of open tickets assigned to agent
-    # Only include tickets with a non-negative age (skip future-dated anomalies
-    # so they don't pull the average down to zero).
+    # ── Avg Open Ticket Age ──────────────────────────────────────────────
+    # Count all non-resolved tickets including escalated, pending, in_progress
     aging_hours = []
     for t in my_tickets:
-        if t.status in ("pending", "in_progress", "manager_escalated", "escalated"):
+        if t.status not in ("resolved", "closed"):
             ca = _utc(t.created_at)
             if ca:
                 elapsed = (now - ca).total_seconds() / 3600
@@ -5038,19 +5712,24 @@ def agent_dashboard():
                     aging_hours.append(elapsed)
     avg_aging = max(0.0, round(sum(aging_hours) / len(aging_hours), 2)) if aging_hours else 0
 
-    # Monthly trend – tickets resolved per month (last 6 months)
-    # Group by resolved_at (not created_at) and sort chronologically
-    monthly_data = {}
+    # Monthly trend – tickets created vs resolved per month (last 6 months)
+    monthly_created = {}
+    monthly_resolved = {}
+    for t in my_tickets:
+        cr = _utc(t.created_at)
+        if cr:
+            key = cr.strftime("%b %Y")
+            monthly_created[key] = monthly_created.get(key, 0) + 1
     for t in resolved:
-        ra = _utc(t.resolved_at)
-        if not ra:
-            continue
-        sort_key = ra.strftime("%Y-%m")          # "2026-03" — sorts chronologically
-        display_key = ra.strftime("%b %Y")       # "Mar 2026" — for display
-        if sort_key not in monthly_data:
-            monthly_data[sort_key] = {"month": display_key, "resolved": 0}
-        monthly_data[sort_key]["resolved"] += 1
-    monthly_trend = [v for _, v in sorted(monthly_data.items())][-6:]
+        ra = _utc(t.resolved_at) or _utc(t.created_at)
+        if ra:
+            key = ra.strftime("%b %Y")
+            monthly_resolved[key] = monthly_resolved.get(key, 0) + 1
+    all_months = sorted(set(list(monthly_created.keys()) + list(monthly_resolved.keys())))[-6:]
+    monthly_trend = [
+        {"month": m, "created": monthly_created.get(m, 0), "resolved": monthly_resolved.get(m, 0)}
+        for m in all_months
+    ]
 
     # Priority distribution of my tickets
     priority_dist = {}
@@ -5073,6 +5752,602 @@ def agent_dashboard():
         {"priority": p, "compliance": round((v["ok"] / max(v["total"], 1)) * 100, 1)}
         for p, v in sla_by_priority.items()
     ]
+
+    # ── Advanced Dashboard Data ──────────────────────────────────────────
+
+    # Sentiment distribution from feedback ratings
+    sentiment_dist = [
+        {"name": "Excellent", "value": len([f for f in feedbacks if f.rating == 5])},
+        {"name": "Good",      "value": len([f for f in feedbacks if f.rating == 4])},
+        {"name": "Neutral",   "value": len([f for f in feedbacks if f.rating == 3])},
+        {"name": "Poor",      "value": len([f for f in feedbacks if f.rating == 2])},
+        {"name": "Bad",       "value": len([f for f in feedbacks if f.rating <= 1])},
+    ]
+
+    # Category-wise resolution rates
+    cat_stats = {}
+    for t in my_tickets:
+        cat = t.category or "Uncategorized"
+        if cat not in cat_stats:
+            cat_stats[cat] = {"total": 0, "resolved": 0, "sla_ok": 0}
+        cat_stats[cat]["total"] += 1
+        if t.status == "resolved":
+            cat_stats[cat]["resolved"] += 1
+            dl2 = _utc(t.sla_deadline)
+            ra2 = _utc(t.resolved_at)
+            if dl2 and ra2 and ra2 <= dl2:
+                cat_stats[cat]["sla_ok"] += 1
+    category_resolution = sorted([
+        {"category": k, "total": v["total"], "resolved": v["resolved"],
+         "rate": round(v["resolved"] / max(v["total"], 1) * 100, 1),
+         "sla_rate": round(v["sla_ok"] / max(v["total"], 1) * 100, 1)}
+        for k, v in cat_stats.items()
+    ], key=lambda x: x["total"], reverse=True)[:8]
+
+    # ── Agent Efficiency Metrics (unique KPIs) ──────────────────────────
+    # Messages-to-resolve ratio, avg touches per ticket, first response stats
+    total_msgs_all = 0
+    agent_msgs_all = 0
+    tickets_with_msgs = 0
+    for t in my_tickets:
+        if t.chat_session_id:
+            tm = ChatMessage.query.filter_by(session_id=t.chat_session_id).count()
+            am = ChatMessage.query.filter_by(session_id=t.chat_session_id, sender='agent').count()
+            total_msgs_all += tm
+            agent_msgs_all += am
+            if tm > 0:
+                tickets_with_msgs += 1
+    avg_msgs_per_ticket = round(total_msgs_all / max(tickets_with_msgs, 1), 1)
+    agent_msg_ratio = round(agent_msgs_all / max(total_msgs_all, 1) * 100, 1)
+
+    # First response stats
+    fr_times = []
+    for t in my_tickets:
+        fra = _utc(getattr(t, 'first_response_at', None))
+        ca = _utc(t.created_at)
+        if fra and ca:
+            fr_times.append(max(0, (fra - ca).total_seconds() / 3600))
+    avg_first_resp = round(sum(fr_times) / max(len(fr_times), 1), 1) if fr_times else 0
+    fastest_resp = round(min(fr_times), 1) if fr_times else 0
+
+    efficiency_metrics = {
+        "avg_msgs_per_ticket": avg_msgs_per_ticket,
+        "agent_msg_pct": agent_msg_ratio,
+        "ai_msg_pct": round(100 - agent_msg_ratio, 1),
+        "avg_first_response_hrs": avg_first_resp,
+        "fastest_response_hrs": fastest_resp,
+        "tickets_with_response": len(fr_times),
+        "total_conversations": total_msgs_all,
+        "resolution_rate": round(resolved_count / max(total, 1) * 100, 1),
+    }
+
+    # Customer tier distribution
+    tier_stats = {}
+    for t in my_tickets:
+        tier = (t.user.user_type or "bronze") if t.user else "bronze"
+        tier = tier.capitalize()
+        if tier not in tier_stats:
+            tier_stats[tier] = {"total": 0, "resolved": 0, "avg_time": []}
+        tier_stats[tier]["total"] += 1
+        if t.status == "resolved":
+            tier_stats[tier]["resolved"] += 1
+            ra3 = _utc(t.resolved_at)
+            ca3 = _utc(t.created_at)
+            if ra3 and ca3:
+                tier_stats[tier]["avg_time"].append(max(0, (ra3 - ca3).total_seconds() / 3600))
+    customer_tiers = [
+        {"tier": k, "total": v["total"], "resolved": v["resolved"],
+         "rate": round(v["resolved"] / max(v["total"], 1) * 100, 1),
+         "avg_hours": round(sum(v["avg_time"]) / max(len(v["avg_time"]), 1), 1)}
+        for k, v in tier_stats.items()
+    ]
+
+    # ── AI Chatbot vs Agent Comparison ─────────────────────────────────────
+    # Flow: Customer -> AI Chatbot -> (resolved) OR -> Escalate to Agent -> (resolved)
+    # AI Resolved = sessions closed without creating a ticket
+    # Escalated = sessions that created a ticket (chatbot couldn't resolve)
+    # Agent Resolved = escalated tickets resolved by this agent
+
+    # Total chat sessions system-wide
+    total_sessions = ChatSession.query.count()
+    # Sessions that led to a ticket (escalated to human)
+    escalated_session_ids = set(t.chat_session_id for t in Ticket.query.filter(
+        Ticket.chat_session_id.isnot(None)
+    ).all())
+    total_escalated = len(escalated_session_ids)
+    # AI self-resolved = sessions that never created a ticket
+    ai_self_resolved = max(0, total_sessions - total_escalated)
+
+    # Agent resolution times (for this agent's resolved tickets)
+    agent_resolve_times = []
+    for t in resolved:
+        ra4 = _utc(t.resolved_at); ca4 = _utc(t.created_at)
+        if ra4 and ca4:
+            agent_resolve_times.append(max(0, (ra4 - ca4).total_seconds() / 3600))
+    agent_avg_resolution = round(sum(agent_resolve_times) / max(len(agent_resolve_times), 1), 1)
+
+    # AI avg resolution time (from chat sessions that resolved without ticket)
+    ai_resolved_sessions = ChatSession.query.filter(
+        ChatSession.status == 'resolved',
+        ~ChatSession.id.in_(escalated_session_ids) if escalated_session_ids else ChatSession.id > 0
+    ).all()
+    ai_resolve_times = []
+    for s in ai_resolved_sessions:
+        ca_s = _utc(s.created_at)
+        ra_s = _utc(s.resolved_at)
+        if ca_s and ra_s:
+            ai_resolve_times.append(max(0, (ra_s - ca_s).total_seconds() / 3600))
+    ai_avg_resolution = round(sum(ai_resolve_times) / max(len(ai_resolve_times), 1), 1)
+
+    # Rates
+    ai_resolution_rate = round(ai_self_resolved / max(total_sessions, 1) * 100, 1)
+    escalation_rate = round(total_escalated / max(total_sessions, 1) * 100, 1)
+    agent_resolution_rate = round(resolved_count / max(total, 1) * 100, 1)
+
+    ai_vs_agent = {
+        "total_conversations": total_sessions,
+        "ai_resolved": ai_self_resolved,
+        "ai_resolution_rate": ai_resolution_rate,
+        "ai_avg_time": ai_avg_resolution,
+        "escalated_to_agent": total_escalated,
+        "escalation_rate": escalation_rate,
+        "agent_resolved": resolved_count,
+        "agent_resolution_rate": agent_resolution_rate,
+        "agent_avg_time": agent_avg_resolution,
+    }
+
+    # Weekly activity heatmap (7 days x 24 hours) — convert to IST for display
+    IST_OFFSET = timedelta(hours=5, minutes=30)
+    heatmap = [[0] * 24 for _ in range(7)]
+    for t in my_tickets:
+        ca6 = _utc(t.created_at)
+        if ca6:
+            ist = ca6 + IST_OFFSET
+            heatmap[ist.weekday()][ist.hour] += 1
+    heatmap_resolved = [[0] * 24 for _ in range(7)]
+    for t in resolved:
+        ra6 = _utc(t.resolved_at)
+        if ra6:
+            ist = ra6 + IST_OFFSET
+            heatmap_resolved[ist.weekday()][ist.hour] += 1
+
+    # Agent performance score — computed AFTER perf_radar is built (below)
+    # Placeholder — will be overwritten after radar calculation
+    perf_score = 0
+
+    # Agent badges
+    badges = []
+    if sla_compliance >= 95:
+        badges.append({"tag": "SLA Champion", "icon": "shield"})
+    if csat >= 4.0 and len(feedbacks) >= 3:
+        badges.append({"tag": "Customer Expert", "icon": "star"})
+    if mttr > 0 and mttr <= 12:
+        badges.append({"tag": "Speed Resolver", "icon": "zap"})
+    if reopen_rate == 0 and resolved_count > 5:
+        badges.append({"tag": "Zero Reopen", "icon": "check"})
+    if fcr >= 85:
+        badges.append({"tag": "First Touch Pro", "icon": "target"})
+    if resolved_count >= 30:
+        badges.append({"tag": "Volume Leader", "icon": "trending"})
+    if len(hs_times) > 0 and hs_resolution_time <= 8:
+        badges.append({"tag": "Crisis Handler", "icon": "alert"})
+
+    # ── Performance DNA Radar (6 dimensions, 0-100 each) ────────────────
+    # Each dimension is a real metric scored out of 100
+
+    # 1. Speed: based on avg resolution time vs weighted SLA target
+    #    100 = resolved at 0% of SLA, 0 = resolved at 200%+ of SLA
+    speed_ratios = []
+    for t in resolved:
+        ra, ca = _utc(t.resolved_at), _utc(t.created_at)
+        sla_h = t.sla_hours or 8
+        if ra and ca:
+            actual = max((ra - ca).total_seconds() / 3600, 0)
+            speed_ratios.append(min(actual / sla_h, 2.0))  # cap at 2x SLA
+    avg_speed_ratio = sum(speed_ratios) / max(len(speed_ratios), 1) if speed_ratios else 1.0
+    speed_score = round(max(0, min((1 - avg_speed_ratio / 2) * 100, 100)), 1)
+
+    # 2. Quality: FCR — % of tickets resolved without reopening
+    zero_reopen = sum(1 for t in resolved if (t.reopened_count or 0) == 0)
+    quality_score = round((zero_reopen / max(resolved_count, 1)) * 100, 1)
+
+    # 3. SLA: % of resolved tickets within SLA deadline
+    sla_score = round(sla_compliance, 1)
+
+    # 4. Satisfaction: % of feedbacks rated 4+
+    satisfaction_score = round(csat_pct, 1) if feedbacks else 0
+
+    # 5. Responsiveness: based on avg first response time vs SLA
+    #    100 = responded instantly, 0 = responded after SLA deadline
+    resp_ratios = []
+    for t in my_tickets:
+        fra = _utc(getattr(t, 'first_response_at', None))
+        ca = _utc(t.created_at)
+        sla_h = t.sla_hours or 8
+        if fra and ca and sla_h > 0:
+            resp_h = max((fra - ca).total_seconds() / 3600, 0)
+            resp_ratios.append(min(resp_h / sla_h, 1.0))
+    avg_resp_ratio = sum(resp_ratios) / max(len(resp_ratios), 1) if resp_ratios else 0.5
+    responsiveness_score = round(max(0, (1 - avg_resp_ratio) * 100), 1)
+
+    # 6. Workload: throughput — resolved per week (benchmarked: 10/week = 100)
+    weeks_active = max((now - min((_utc(t.created_at) for t in my_tickets), default=now)).days / 7, 1)
+    throughput_per_week = resolved_count / weeks_active
+    workload_score = round(min(throughput_per_week / 10 * 100, 100), 1)
+
+    perf_radar = [
+        {"axis": "Speed",          "value": speed_score,          "detail": f"Avg {round(avg_speed_ratio*100)}% of SLA used"},
+        {"axis": "Quality",        "value": quality_score,        "detail": f"{zero_reopen}/{resolved_count} zero-reopen"},
+        {"axis": "SLA",            "value": sla_score,            "detail": f"{sla_ok}/{resolved_count} within SLA"},
+        {"axis": "Satisfaction",   "value": satisfaction_score,    "detail": f"{csat}/5 avg rating"},
+        {"axis": "Responsiveness", "value": responsiveness_score,  "detail": f"Avg {round(avg_resp_ratio*100)}% of SLA to respond"},
+        {"axis": "Workload",       "value": workload_score,       "detail": f"{round(throughput_per_week,1)} resolved/week"},
+    ]
+    # Weighted composite performance score from radar dimensions
+    _weights = {"Speed": 0.20, "Quality": 0.20, "SLA": 0.20, "Satisfaction": 0.15, "Responsiveness": 0.15, "Workload": 0.10}
+    perf_score = round(sum(d["value"] * _weights.get(d["axis"], 0.15) for d in perf_radar), 1)
+
+    # ── Issue Hotspot (subcategory breakdown with volume + status) ──────
+    subcat_stats = {}
+    for t in my_tickets:
+        sc = t.subcategory or t.category or "Other"
+        # Shorten long names
+        if len(sc) > 30:
+            sc = sc.split(" - ")[0] if " - " in sc else sc[:28] + ".."
+        if sc not in subcat_stats:
+            subcat_stats[sc] = {"total": 0, "resolved": 0, "open": 0}
+        subcat_stats[sc]["total"] += 1
+        if t.status == "resolved":
+            subcat_stats[sc]["resolved"] += 1
+        elif t.status not in ("resolved", "closed"):
+            subcat_stats[sc]["open"] += 1
+    issue_hotspots = sorted(
+        [{"name": k, **v} for k, v in subcat_stats.items()],
+        key=lambda x: x["total"], reverse=True
+    )
+
+    # ── Zone / Region distribution (3-tier fallback) ────────────────────
+    #
+    # Tier 1 (Dynamic):  state_province + country from ChatSession DB fields
+    #                     Set by frontend when customer shares location.
+    #                     Works for ANY country — no hardcoding.
+    #
+    # Tier 2 (Geocoding): If DB fields empty, use geopy Nominatim to resolve
+    #                     city name or lat/lng → state/country dynamically.
+    #                     Works for ANY country. Needs internet.
+    #
+    # Tier 3 (Hardcoded): If geocoding fails (network restricted), use a
+    #                     static city → state lookup as last resort.
+
+    # --- Tier 2 & 3: Geocoding fallbacks (cached) ---
+    _geo_cache = getattr(app, '_geo_cache', {})
+    app._geo_cache = _geo_cache
+
+    def _try_geopy(location_input):
+        """Tier 2: Free geocoding via geopy/Nominatim. Works for any country. Needs internet."""
+        try:
+            from geopy.geocoders import Nominatim
+            geocoder = Nominatim(user_agent="telecom_cch", timeout=3)
+            loc = geocoder.geocode(location_input, language="en", exactly_one=True, addressdetails=True)
+            if loc and loc.raw and "address" in loc.raw:
+                addr = loc.raw["address"]
+                state = addr.get("state") or addr.get("province") or addr.get("region") or ""
+                country = addr.get("country", "")
+                if state:
+                    return (state, country)
+        except Exception:
+            pass
+        return (None, None)
+
+    def _try_openai(location_input):
+        """Tier 3: Azure OpenAI LLM geocoding. Works in restricted networks where OpenAI is whitelisted."""
+        try:
+            import json as _json
+            resp = client.chat.completions.create(
+                model=DEPLOYMENT_NAME,
+                messages=[{
+                    "role": "user",
+                    "content": f'For the location "{location_input}", respond with ONLY a JSON object: {{"state": "<state/province name>", "country": "<country name>"}}. No other text.'
+                }],
+                temperature=0,
+                max_tokens=60,
+            )
+            text = resp.choices[0].message.content.strip()
+            if "{" in text:
+                text = text[text.index("{"):text.rindex("}") + 1]
+            data = _json.loads(text)
+            state = data.get("state", "")
+            country = data.get("country", "")
+            if state:
+                return (state, country)
+        except Exception:
+            pass
+        return (None, None)
+
+    def _try_geocode(city_name, lat=None, lng=None):
+        """Resolve location → (state, country) using Tier 2 then Tier 3."""
+        location_input = (city_name or "").strip()
+        if not location_input and lat and lng:
+            location_input = f"{lat}, {lng}"
+        if not location_input:
+            return (None, None)
+
+        cache_key = f"geo:{location_input.lower()}"
+        if cache_key in _geo_cache:
+            return _geo_cache[cache_key]
+
+        # Tier 2: Try geopy (free, works for any country)
+        result = _try_geopy(location_input)
+
+        # Tier 3: If geopy failed, try Azure OpenAI
+        if not result[0]:
+            result = _try_openai(location_input)
+
+        _geo_cache[cache_key] = result
+        return result
+
+    # --- Tier 3: Hardcoded fallback (Indian cities + some international) ---
+    CITY_FALLBACK = {
+        "mumbai": ("Maharashtra", "India"), "pune": ("Maharashtra", "India"),
+        "thane": ("Maharashtra", "India"), "nashik": ("Maharashtra", "India"),
+        "nagpur": ("Maharashtra", "India"),
+        "delhi": ("Delhi", "India"), "new delhi": ("Delhi", "India"),
+        "gurgaon": ("Haryana", "India"), "gurugram": ("Haryana", "India"),
+        "noida": ("Uttar Pradesh", "India"), "lucknow": ("Uttar Pradesh", "India"),
+        "bangalore": ("Karnataka", "India"), "bengaluru": ("Karnataka", "India"),
+        "chennai": ("Tamil Nadu", "India"), "hyderabad": ("Telangana", "India"),
+        "kolkata": ("West Bengal", "India"), "ahmedabad": ("Gujarat", "India"),
+        "jaipur": ("Rajasthan", "India"), "bhopal": ("Madhya Pradesh", "India"),
+        "indore": ("Madhya Pradesh", "India"), "patna": ("Bihar", "India"),
+        "chandigarh": ("Chandigarh", "India"), "kochi": ("Kerala", "India"),
+        "guwahati": ("Assam", "India"), "ranchi": ("Jharkhand", "India"),
+        "bhubaneswar": ("Odisha", "India"), "raipur": ("Chhattisgarh", "India"),
+        "visakhapatnam": ("Andhra Pradesh", "India"),
+        "london": ("England", "United Kingdom"),
+        "new york": ("New York", "United States"),
+        "dubai": ("Dubai", "United Arab Emirates"),
+        "singapore": ("Singapore", "Singapore"),
+    }
+
+    # --- Resolve each ticket ---
+    location_counts = {}
+    country_set = set()
+    for t in my_tickets:
+        state_val, country_val = None, None
+        lat, lng, city = None, None, ""
+
+        if t.chat_session_id:
+            cs = db.session.get(ChatSession, t.chat_session_id)
+            if cs:
+                lat = cs.latitude
+                lng = cs.longitude
+                city = (cs.location_description or "").strip()
+
+                # Tier 1: DB fields (state_province, country)
+                state_val = (getattr(cs, 'state_province', None) or "").strip() or None
+                country_val = (getattr(cs, 'country', None) or "").strip() or None
+
+        # Tier 1.5: For tickets with lat/lng, find nearest telecom site
+        # and use its state/country from telecom_sites table
+        if not state_val and lat and lng:
+            try:
+                nearest = find_nearest_sites(lat, lng, n=1)
+                if nearest and len(nearest) > 0:
+                    site = nearest[0]
+                    site_state = site.get('state', '') if isinstance(site, dict) else ''
+                    site_city = site.get('city', '') if isinstance(site, dict) else ''
+                    if site_state:
+                        state_val = site_state
+                    elif site_city:
+                        state_val = site_city
+                    # Get country from telecom_sites table
+                    if site_state and not country_val:
+                        try:
+                            from sqlalchemy import text as _sa_text
+                            row = db.session.execute(_sa_text(
+                                "SELECT country FROM telecom_sites WHERE state = :s LIMIT 1"
+                            ), {"s": site_state}).fetchone()
+                            if row and row.country:
+                                country_val = row.country
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        # Skip tickets with no location info at all
+        if not state_val and not city and not (lat and lng):
+            continue
+
+        # Tier 2: Geocoding (if Tier 1 didn't resolve)
+        if not state_val and (city or (lat and lng)):
+            geo_state, geo_country = _try_geocode(city, lat, lng)
+            if geo_state:
+                state_val = geo_state
+                country_val = country_val or geo_country
+
+        # Tier 3: Hardcoded fallback (if Tier 2 also failed)
+        if not state_val and city:
+            city_lower = city.lower()
+            fb = CITY_FALLBACK.get(city_lower)
+            if not fb:
+                for key, val in CITY_FALLBACK.items():
+                    if key in city_lower or city_lower in key:
+                        fb = val
+                        break
+            if fb:
+                state_val, country_val = fb[0], country_val or fb[1]
+            else:
+                state_val = city  # last resort: use city name as zone
+
+        if not state_val:
+            continue
+
+        if country_val:
+            country_set.add(country_val)
+
+        if state_val not in location_counts:
+            location_counts[state_val] = {"total": 0, "resolved": 0}
+        location_counts[state_val]["total"] += 1
+        if t.status == "resolved":
+            location_counts[state_val]["resolved"] += 1
+
+    state_data = [
+        {"state": loc, "total": v["total"], "resolved": v["resolved"],
+         "rate": round(v["resolved"] / max(v["total"], 1) * 100, 1)}
+        for loc, v in sorted(location_counts.items(), key=lambda x: x[1]["total"], reverse=True)
+    ]
+    zone_data = [{"zone": s["state"], **{k: s[k] for k in ("total", "resolved", "rate")}} for s in state_data]
+    detected_country = list(country_set)[0] if len(country_set) == 1 else ("India" if not country_set else "Multiple")
+
+    # ── SLA Risk Predictor (enhanced) ────────────────────────────────────
+    sla_risk_items = []
+    sla_by_priority = {}  # priority -> {total, breached, critical, warning, safe}
+    total_open_sla = 0
+    total_within_sla = 0
+    for t in my_tickets:
+        if t.status not in ("resolved", "closed"):
+            dl7 = _utc(t.sla_deadline)
+            if not dl7:
+                # Backfill: assign default SLA if missing
+                sla_targets = get_sla_targets()
+                sla_h = sla_targets.get(t.priority or "medium", 8)
+                cr = _utc(t.created_at) or now
+                t.sla_hours = sla_h
+                t.sla_deadline = cr + timedelta(hours=sla_h)
+                db.session.add(t)
+                dl7 = _utc(t.sla_deadline)
+            if dl7:
+                remaining = (dl7 - now).total_seconds() / 3600
+                total_sla = t.sla_hours or 24
+                pct_elapsed = round(min(max(((total_sla - remaining) / total_sla) * 100, 0), 100), 1)
+                risk = "breached" if remaining <= 0 else "critical" if pct_elapsed >= 87.5 else "warning" if pct_elapsed >= 62.5 else "safe"
+                total_open_sla += 1
+                if risk in ("safe", "warning"):
+                    total_within_sla += 1
+                # Priority-wise breakdown
+                pri = t.priority or "medium"
+                if pri not in sla_by_priority:
+                    sla_by_priority[pri] = {"total": 0, "breached": 0, "critical": 0, "warning": 0, "safe": 0}
+                sla_by_priority[pri]["total"] += 1
+                sla_by_priority[pri][risk] += 1
+                sla_risk_items.append({
+                    "ticket_id": t.id, "reference": t.reference_number,
+                    "priority": t.priority, "pct_elapsed": pct_elapsed,
+                    "remaining_hrs": round(remaining, 1),
+                    "overdue_hrs": round(abs(remaining), 1) if remaining < 0 else 0,
+                    "risk": risk,
+                    "category": t.category or "",
+                    "subcategory": t.subcategory or "",
+                    "status": t.status,
+                    "sla_hours": total_sla,
+                    "sla_deadline": (dl7.isoformat() + "Z") if dl7 else None,
+                    "created_at": (t.created_at.isoformat() + "Z") if t.created_at else None,
+                })
+    try:
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+    sla_risk_items.sort(key=lambda x: x["remaining_hrs"])
+
+    # SLA risk summary
+    sla_risk_summary = {
+        "safe": len([s for s in sla_risk_items if s["risk"] == "safe"]),
+        "warning": len([s for s in sla_risk_items if s["risk"] == "warning"]),
+        "critical": len([s for s in sla_risk_items if s["risk"] == "critical"]),
+        "breached": len([s for s in sla_risk_items if s["risk"] == "breached"]),
+    }
+    # Overall SLA health percentage
+    sla_health_pct = round((total_within_sla / max(total_open_sla, 1)) * 100, 1)
+    # Priority distribution for chart
+    sla_priority_dist = [
+        {"priority": p, **v} for p, v in sla_by_priority.items()
+    ]
+    sla_priority_dist.sort(key=lambda x: {"critical": 0, "high": 1, "medium": 2, "low": 3}.get(x["priority"], 4))
+
+    # ── Category Treemap (for visualization) ─────────────────────────────
+    category_treemap = []
+    for k, v in cat_stats.items():
+        category_treemap.append({
+            "name": k, "size": v["total"],
+            "resolved": v["resolved"],
+            "rate": round(v["resolved"] / max(v["total"], 1) * 100, 1),
+        })
+    category_treemap.sort(key=lambda x: x["size"], reverse=True)
+
+    # ── Hourly ticket volume today (IST) ─────────────────────────────────
+    now_ist = now + IST_OFFSET
+    today_start_ist = now_ist.replace(hour=0, minute=0, second=0, microsecond=0)
+    today_start_utc = today_start_ist - IST_OFFSET
+    hourly_today = [0] * 24
+    for t in my_tickets:
+        ca7 = _utc(t.created_at)
+        if ca7 and ca7 >= today_start_utc:
+            ist_hour = (ca7 + IST_OFFSET).hour
+            hourly_today[ist_hour] += 1
+    hourly_data = [{"hour": f"{h:02d}:00", "tickets": hourly_today[h]} for h in range(24)]
+
+    # ── AI Insights (auto-generated) ─────────────────────────────────────
+    ai_insights = []
+    # Most complained category
+    if category_treemap:
+        top_cat = category_treemap[0]
+        ai_insights.append({"type": "info", "text": f"Most complaints: {top_cat['name']} ({top_cat['size']} tickets)"})
+    # SLA risk
+    if sla_risk_summary["critical"] > 0 or sla_risk_summary["breached"] > 0:
+        ai_insights.append({"type": "warning", "text": f"{sla_risk_summary['critical'] + sla_risk_summary['breached']} tickets at SLA risk or breached"})
+    # Best category
+    best_cat = max(category_resolution, key=lambda x: x["rate"]) if category_resolution else None
+    if best_cat and best_cat["rate"] > 0:
+        ai_insights.append({"type": "success", "text": f"Best resolution: {best_cat['category']} at {best_cat['rate']}%"})
+    # Aging insight
+    if avg_aging > 24:
+        ai_insights.append({"type": "warning", "text": f"Avg ticket age: {avg_aging:.0f}h - consider prioritizing older tickets"})
+    # CSAT insight
+    if csat >= 4.0:
+        ai_insights.append({"type": "success", "text": f"Customer satisfaction at {csat}/5 - above target"})
+    elif csat > 0:
+        ai_insights.append({"type": "info", "text": f"CSAT at {csat}/5 - focus on customer experience"})
+
+    # ── Predictive Workload Forecast (7 days) ──────────────────────────────
+    from collections import defaultdict
+    import calendar
+    dow_ticket_counts = defaultdict(list)  # day_of_week -> list of daily counts
+    # Group tickets by (date, day_of_week) to get daily volumes
+    date_counts = defaultdict(int)
+    for t in my_tickets:
+        ca8 = _utc(t.created_at)
+        if ca8:
+            date_counts[ca8.date()] += 1
+    for dt_date, cnt in date_counts.items():
+        dow_ticket_counts[dt_date.weekday()].append(cnt)
+    # Calculate average per day-of-week
+    dow_avg = {}
+    for dow in range(7):
+        vals = dow_ticket_counts.get(dow, [])
+        dow_avg[dow] = round(sum(vals) / max(len(vals), 1), 1) if vals else 0
+    # Project next 7 days
+    from datetime import timedelta as _td
+    forecast = []
+    for i in range(1, 8):
+        future = (now + _td(days=i))
+        dow = future.weekday()
+        day_name = calendar.day_abbr[dow]
+        forecast.append({
+            "day": f"{day_name} {future.strftime('%d/%m')}",
+            "predicted": dow_avg.get(dow, 0),
+            "capacity": user.bandwidth_capacity or 10,
+        })
+
+    # ── Burndown: tickets to resolve this week to hit targets ────────────
+    target_resolution_rate = 90.0
+    tickets_needed = max(0, round(total * target_resolution_rate / 100) - resolved_count)
+    burndown = {
+        "target_rate": target_resolution_rate,
+        "current_resolved": resolved_count,
+        "needed": tickets_needed,
+        "total": total,
+        "current_rate": round(resolved_count / max(total, 1) * 100, 1),
+    }
 
     return jsonify({
         "kpis": {
@@ -5097,6 +6372,33 @@ def agent_dashboard():
         "monthly_trend": monthly_trend,
         "priority_chart": priority_chart,
         "sla_priority_chart": sla_priority_chart,
+        "sentiment": sentiment_dist,
+        "category_resolution": category_resolution,
+        "efficiency_metrics": efficiency_metrics,
+        "customer_tiers": customer_tiers,
+        "ai_vs_agent": ai_vs_agent,
+        "heatmap": heatmap,
+        "heatmap_resolved": heatmap_resolved,
+        "performance_score": perf_score,
+        "badges": badges,
+        "perf_radar": perf_radar,
+        "agent_name": user.name,
+        "agent_location": user.location or "",
+        "agent_domain": user.domain or "",
+        "issue_hotspots": issue_hotspots,
+        "zone_data": zone_data,
+        "state_data": state_data,
+        "detected_country": detected_country,
+        "sla_risk": sla_risk_items[:15],
+        "sla_risk_summary": sla_risk_summary,
+        "sla_health_pct": sla_health_pct,
+        "sla_priority_dist": sla_priority_dist,
+        "sla_total_open": total_open_sla,
+        "category_treemap": category_treemap,
+        "hourly_today": hourly_data,
+        "ai_insights": ai_insights,
+        "forecast": forecast,
+        "burndown": burndown,
     })
 
 
@@ -5612,6 +6914,11 @@ def agent_send_message(session_id):
         content=content,
     )
     db.session.add(msg)
+
+    # Track first response time on the ticket
+    if assigned_ticket and not assigned_ticket.first_response_at:
+        assigned_ticket.first_response_at = datetime.now(timezone.utc)
+
     db.session.commit()
     return jsonify({"message": msg.to_dict()}), 201
 
@@ -5935,6 +7242,23 @@ with app.app_context():
                     conn.commit()
                     print(f">>> Added {col} column to change_requests")
 
+    # ── Migrate: add new columns to chat_sessions if missing ────────────────
+    if insp.has_table("chat_sessions"):
+        existing_cols = [c["name"] for c in insp.get_columns("chat_sessions")]
+        with db.engine.connect() as conn:
+            if "diagnosis_ran" not in existing_cols:
+                conn.execute(sa_text("ALTER TABLE chat_sessions ADD COLUMN diagnosis_ran BOOLEAN NOT NULL DEFAULT FALSE"))
+                conn.commit()
+                print(">>> Added diagnosis_ran column to chat_sessions")
+            if "current_step" not in existing_cols:
+                conn.execute(sa_text("ALTER TABLE chat_sessions ADD COLUMN current_step VARCHAR(50) DEFAULT 'greeting'"))
+                conn.commit()
+                print(">>> Added current_step column to chat_sessions")
+            if "last_message_at" not in existing_cols:
+                conn.execute(sa_text("ALTER TABLE chat_sessions ADD COLUMN last_message_at TIMESTAMP"))
+                conn.commit()
+                print(">>> Added last_message_at column to chat_sessions")
+
     # Seed default admin if none exists
     if not User.query.filter_by(role="admin").first():
         admin = User(name="Admin", email="didardeep.12@gmail.com", role="admin", employee_id="ADM00001")
@@ -5981,8 +7305,57 @@ app.register_blueprint(network_issues_bp)
 with app.app_context():
     NetworkIssueTicket.__table__.create(db.engine, checkfirst=True)
 
-# Schedule daily 07:00 AM job for worst cell ticket creation
+# Schedule daily 07:30/08:00 AM IST jobs for worst cell detection/ticketing
 schedule_daily_job(app)
+
+# ─── Register Change Workflow Blueprint ───────────────────────────────────
+try:
+    from change_workflow import change_workflow_bp
+    app.register_blueprint(change_workflow_bp)
+except ImportError:
+    print("WARNING: change_workflow.py not found — CR endpoints unavailable")
+
+# Create new tables if not exists
+with app.app_context():
+    from models import CRAuditTrail
+    CRAuditTrail.__table__.create(db.engine, checkfirst=True)
+    # Add new columns to change_requests if they don't exist
+    _engine = db.engine
+    _insp = db.inspect(_engine)
+    _existing_cols = {c['name'] for c in _insp.get_columns('change_requests')}
+    _new_cols = {
+        'network_issue_id': 'INTEGER',
+        'justification': 'TEXT',
+        'category': 'VARCHAR(200)',
+        'subcategory': 'VARCHAR(200)',
+        'telecom_domain_primary': 'VARCHAR(50)',
+        'telecom_domain_secondary': 'VARCHAR(200)',
+        'zone': 'VARCHAR(100)',
+        'location': 'VARCHAR(200)',
+        'nearest_site_id': 'VARCHAR(50)',
+        'customer_type': 'VARCHAR(20)',
+        'rf_bandwidth_current': 'FLOAT', 'rf_bandwidth_proposed': 'FLOAT',
+        'rf_antenna_gain_current': 'FLOAT', 'rf_antenna_gain_proposed': 'FLOAT',
+        'rf_eirp_current': 'FLOAT', 'rf_eirp_proposed': 'FLOAT',
+        'rf_antenna_height_current': 'FLOAT', 'rf_antenna_height_proposed': 'FLOAT',
+        'rf_etilt_current': 'FLOAT', 'rf_etilt_proposed': 'FLOAT',
+        'rf_crs_gain_current': 'FLOAT', 'rf_crs_gain_proposed': 'FLOAT',
+        'pdf_filename': 'VARCHAR(300)', 'pdf_path': 'VARCHAR(500)',
+        'cr_sla_hours': 'FLOAT', 'cr_sla_deadline': 'TIMESTAMP',
+        'assigned_manager_id': 'INTEGER',
+        'cto_approval_required': 'BOOLEAN DEFAULT FALSE',
+        'cto_approved_by': 'INTEGER', 'cto_approved_at': 'TIMESTAMP',
+        'cto_status': 'VARCHAR(20)', 'cto_remark': 'TEXT',
+        'manager_proposed_changes': 'TEXT',
+    }
+    with _engine.connect() as _conn:
+        for col_name, col_type in _new_cols.items():
+            if col_name not in _existing_cols:
+                try:
+                    _conn.execute(text(f'ALTER TABLE change_requests ADD COLUMN {col_name} {col_type}'))
+                    _conn.commit()
+                except Exception:
+                    _conn.rollback()
 
 
 if __name__ == "__main__":
