@@ -739,6 +739,7 @@ class FlexibleKpiUpload(db.Model):
     num_value    = db.Column(db.Float, nullable=True)
     str_value    = db.Column(db.String(500), nullable=True)
     row_date     = db.Column(db.Date, nullable=True)
+    kpi_name     = db.Column(db.String(120), nullable=True, index=True)
     uploaded_at  = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
 
     __table_args__ = (
