@@ -596,14 +596,16 @@ export default function ChatSupport() {
     });
   }, []);
 
-  const saveLocationToBackend = useCallback(async (latitude, longitude) => {
+  const saveLocationToBackend = useCallback(async (latitude, longitude, locationDescription) => {
     if (!sessionIdRef.current) return;
     try {
       const token = getToken();
+      const payload = { latitude, longitude };
+      if (locationDescription) payload.location_description = locationDescription;
       await fetch(`${API_BASE}/api/chat/session/${sessionIdRef.current}/location`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
-        body: JSON.stringify({ latitude, longitude }),
+        body: JSON.stringify(payload),
       });
     } catch {}
   }, []);
@@ -821,8 +823,9 @@ export default function ChatSupport() {
         onNo: () => {
           disableGroup(msg.groupId);
           addMessage({ type: 'user', text: 'No, different location' });
-          addMessage({ type: 'system', text: 'Please describe the location of the issue.' });
-          showInput('Describe the location...'); stateRef.current.step = 'location-other';
+          addMessage({ type: 'bot', html: 'No problem! Please <strong>type your area or sector name</strong> (e.g. "DLF Phase 3, Gurgaon").' });
+          showInput('Type your area or sector...');
+          stateRef.current.step = 'location-manual';
         },
       };
       if (msg.type === 'location-prompt') return { ...msg, onShare: () => { disableGroup(msg.groupId); requestLocation(() => afterLocationCaptured(stateRef.current.subprocessName || '')); } };
@@ -1034,10 +1037,16 @@ export default function ChatSupport() {
         addMessage({ type: 'location-prompt', groupId: lpg, onShare: () => { disableGroup(lpg); requestLocation(() => afterLocationCaptured(selectedIssueLabel)); } });
         stateRef.current.step = 'location';
       },
-      onNo: () => {},
+      onNo: () => {
+        disableGroup(locQGroupId);
+        addMessage({ type: 'user', text: 'No, different location' });
+        addMessage({ type: 'bot', html: 'No problem! Please <strong>type your area or sector name</strong> (e.g. "DLF Phase 3, Gurgaon").' });
+        showInput('Type your area or sector...');
+        stateRef.current.step = 'location-manual';
+      },
     });
     stateRef.current.step = 'location-question';
-  }, [addMessage, disableGroup, ensureSession, requestLocation, afterLocationCaptured]);
+  }, [addMessage, disableGroup, ensureSession, requestLocation, afterLocationCaptured, showInput]);
 
   useEffect(() => {
     if (!resumeNeededRef.current) return;
@@ -1190,6 +1199,17 @@ export default function ChatSupport() {
       setIsTyping(true); await new Promise(r => setTimeout(r, 700)); setIsTyping(false);
       addMessage({ type: 'bot', html: `Hi dear ${userName}! Hope you're doing well. I'm your AI-powered telecom support assistant. How can I help you today? Please choose one of the options below to get started:` });
       setTimeout(() => loadSectorMenu(), 600); stateRef.current.step = 'sector'; return;
+    }
+
+    if (stateRef.current.step === 'location-manual') {
+      hideInput();
+      const MANUAL_LAT = 28.4700;
+      const MANUAL_LNG = 77.0920;
+      saveLocationToBackend(MANUAL_LAT, MANUAL_LNG, text);
+      addMessage({ type: 'bot', html: `Your area has been set to <strong>${text}</strong>.` });
+      addMessage({ type: 'location-success', latitude: MANUAL_LAT, longitude: MANUAL_LNG });
+      afterLocationCaptured(stateRef.current.subprocessName || '');
+      return;
     }
 
     if (stateRef.current.step === 'conversation') {

@@ -1100,19 +1100,86 @@ _UPGRADE_TO_MEDIUM = [
 ]
 
 
-def _detect_severity(query_text: str, subprocess_name: str) -> str:
+def _detect_severity_llm(query_text: str, subprocess_name: str, sector_name: str) -> dict | None:
+    """
+    Uses Azure OpenAI to semantically classify ticket severity.
+    Returns {"severity": "...", "reasoning": "..."} or None on failure.
+    """
+    if not query_text or not query_text.strip():
+        return None
+
+    context_parts = []
+    if sector_name:
+        context_parts.append(f"Telecom sector: {sector_name}")
+    if subprocess_name:
+        context_parts.append(f"Issue subcategory: {subprocess_name}")
+    context_block = "\n".join(context_parts)
+
+    system_prompt = (
+        "You are a severity classifier for a telecom customer complaint ticketing system.\n\n"
+        "Given the customer's complaint and its telecom context, determine the urgency/severity level.\n\n"
+        "SEVERITY LEVELS (choose exactly one):\n"
+        "- critical: Complete service outage, safety/fraud/emergency, SLA breach affecting business, "
+        "total loss of connectivity, equipment destroyed/fallen, production/business down\n"
+        "- high: Service significantly impaired but not total outage — e.g. frequent drops, "
+        "SIM/device not working, call/SMS failures, major equipment fault, porting failures\n"
+        "- medium: Degraded service quality — e.g. slow speeds, intermittent issues, billing disputes, "
+        "wrong charges, plan/package problems, minor quality issues\n"
+        "- low: General inquiries, informational requests, minor cosmetic issues, plan comparisons, "
+        "feature questions, non-urgent requests\n\n"
+        f"CONTEXT:\n{context_block}\n\n"
+        "Analyze the customer's complaint semantically — consider the INTENT and IMPACT, "
+        "not just keyword matches.\n\n"
+        'Respond with ONLY valid JSON: {"severity": "<level>", "reasoning": "<one sentence>"}'
+    )
+
+    try:
+        response = client.chat.completions.create(
+            model=DEPLOYMENT_NAME,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": query_text},
+            ],
+            temperature=0,
+            max_tokens=80,
+            timeout=5,
+        )
+        raw = response.choices[0].message.content.strip()
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+            raw = raw.strip()
+        result = json.loads(raw)
+        severity = result.get("severity", "").lower().strip()
+        if severity not in PRIORITY_RANK:
+            print(f"[Severity-LLM] Invalid severity '{severity}' returned, falling back")
+            return None
+        return {"severity": severity, "reasoning": result.get("reasoning", "")}
+    except Exception as e:
+        print(f"[Severity-LLM] Failed: {e}")
+        return None
+
+
+def _detect_severity(query_text: str, subprocess_name: str, sector_name: str = "") -> str:
     """
     Returns one of: critical / high / medium / low.
 
-    Logic:
-    1. Look up subprocess name in SUBPROCESS_BASE_SEVERITY for a base severity.
-    2. Scan query text for upgrade keywords — severity can only go UP, never down.
-    3. Default base is 'low' if subprocess not found.
+    Strategy:
+    1. Try LLM-based semantic classification first.
+    2. If LLM fails, fall back to rule-based logic.
     """
+    # ── Attempt 1: LLM-based semantic classification ──
+    llm_result = _detect_severity_llm(query_text, subprocess_name, sector_name)
+    if llm_result is not None:
+        print(f"[Severity] LLM classified as '{llm_result['severity']}' — {llm_result.get('reasoning', '')}")
+        return llm_result["severity"]
+
+    # ── Attempt 2: Rule-based fallback ──
+    print("[Severity] Using rule-based fallback")
     base = SUBPROCESS_BASE_SEVERITY.get((subprocess_name or "").strip(), "low")
     text = (query_text or "").lower()
 
-    # Determine what the query text alone would rate
     if any(w in text for w in _UPGRADE_TO_CRITICAL):
         text_sev = "critical"
     elif any(w in text for w in _UPGRADE_TO_HIGH):
@@ -1122,7 +1189,6 @@ def _detect_severity(query_text: str, subprocess_name: str) -> str:
     else:
         text_sev = "low"
 
-    # Return whichever is higher
     return base if PRIORITY_RANK.get(base, 1) >= PRIORITY_RANK.get(text_sev, 1) else text_sev
 
 
@@ -1853,7 +1919,7 @@ def escalate_session(session_id):
 
     # --- Priority calculation ---
     # 1. Issue severity from query keywords
-    severity = _detect_severity(session.query_text, session.subprocess_name)
+    severity = _detect_severity(session.query_text, session.subprocess_name, session.sector_name)
     # 2. Customer tier floor (look up the session's owner)
     customer = db.session.get(User, user_id)
     customer_type = (customer.user_type or "bronze") if customer else "bronze"
@@ -2147,7 +2213,7 @@ def customer_dashboard():
         ChatSession.user_id == user_id
     ).options(
         joinedload(ChatSession.user)
-    ).order_by(ChatSession.created_at.desc()).limit(50).all()
+    ).order_by(ChatSession.created_at.desc()).all()
 
     sessions_data = []
     for s, rating in recent_sessions:
@@ -7294,4 +7360,4 @@ with app.app_context():
 
 if __name__ == "__main__":
     run_sla_checks()
-    app.run(debug=True, host="0.0.0.0", port=5500, use_reloader=False)
+    socketio.run(app, debug=True, host="0.0.0.0", port=5500, use_reloader=False)

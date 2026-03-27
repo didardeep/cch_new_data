@@ -103,6 +103,33 @@ with app.app_context():
 
     print("Domain experts seeded!")
 
+    # ── Test Customers (one per tier) ─────────────────────────────────────────
+    CUSTOMERS = [
+        {"name": "Madhav Sharma",   "email": "madhavsharma3@kpmg.com",    "password": "123456",    "user_type": "bronze"},
+        {"name": "Dhanoa",          "email": "dhanoatwk@gmail.com",       "password": "Admin@123", "user_type": "silver"},
+        {"name": "Priyanshi",       "email": "spriyanshi542@gmail.com",   "password": "Admin@123", "user_type": "gold"},
+        {"name": "Manav Verma",     "email": "manav.verma343@gmail.com",  "password": "Admin@123", "user_type": "platinum"},
+    ]
+
+    for c in CUSTOMERS:
+        existing = User.query.filter_by(email=c["email"]).first()
+        if existing:
+            existing.user_type = c["user_type"]
+            existing.set_password(c["password"])
+            print(f"  [UPDATE] {c['email']} -> tier={c['user_type']}")
+        else:
+            cust = User(
+                name=c["name"],
+                email=c["email"],
+                role="customer",
+                user_type=c["user_type"],
+            )
+            cust.set_password(c["password"])
+            db.session.add(cust)
+            print(f"  [CREATE] {c['email']} (tier={c['user_type']})")
+
+    print("Test customers seeded!")
+
     # Add default system settings
     settings = [
         {"key": "bot_name", "value": "TeleBot", "category": "general", "description": "Chatbot display name"},

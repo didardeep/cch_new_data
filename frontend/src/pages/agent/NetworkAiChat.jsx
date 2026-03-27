@@ -611,7 +611,7 @@ export default function NetworkAiChat() {
           <div style={{flex:1,overflowY:'auto',padding:'20px 24px'}}>
             {messages.length===0?(
               <div style={{display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',height:'100%',gap:16}}>
-                <div style={{fontSize:40,opacity:.3}}>🤖</div>
+
                 <div style={{fontSize:20,fontWeight:800,color:T.text,opacity:.7}}>Network AI Assistant</div>
                 <div style={{fontSize:12,color:T.muted,maxWidth:400,textAlign:'center',lineHeight:1.6}}>
                   Ask questions about network performance, site KPIs, and trends. I can generate charts and data analysis.
