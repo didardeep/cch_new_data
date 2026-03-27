@@ -1,5 +1,6 @@
 import { Outlet } from 'react-router-dom';
 import Sidebar from '../../components/Sidebar';
+import { useTheme } from '../../ThemeContext';
 
 const ICON = (d) => <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d={d} /></svg>;
 
@@ -14,8 +15,9 @@ const links = [
 ];
 
 export default function ManagerLayout() {
+  const { theme } = useTheme();
   return (
-    <div className="dashboard-layout">
+    <div className="dashboard-layout" data-theme={theme}>
       <Sidebar links={links} statusToggle={{ endpoint: '/api/manager/status' }} />
       <main className="main-content">
         <Outlet />

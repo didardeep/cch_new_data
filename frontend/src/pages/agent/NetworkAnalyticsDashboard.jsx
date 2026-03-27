@@ -7,6 +7,7 @@ import {
   ScatterChart, Scatter, ZAxis,
 } from 'recharts';
 import { apiGet } from '../../api';
+import { useTheme } from '../../ThemeContext';
 
 // ── Themes ─────────────────────────────────────────────────────────────────
 const T_LIGHT = {
@@ -433,7 +434,7 @@ function AIView({result,T,onClose}) {
       return(
         <ResponsiveContainer width="100%" height={h}>
           <PieChart>
-            <Pie data={pieData} dataKey="value" nameKey="name" cx="50%" cy="50%" outerRadius={100} innerRadius={45} paddingAngle={3} label={({name,percent})=>`${name} ${(percent*100).toFixed(0)}%`} labelLine={false}>
+            <Pie data={pieData} dataKey="value" nameKey="name" cx="50%" cy="50%" outerRadius={100} innerRadius={45} paddingAngle={3} label={({name,percent})=>`${name} ${(percent*100).toFixed(0)}%`} labelLine={false} animationDuration={1000} animationEasing="ease-in-out">
               {pieData.map((_,i)=><Cell key={i} fill={PAL[i%PAL.length]}/>)}
             </Pie>
             <Tooltip formatter={(v)=>f(v,1)}/>
@@ -456,7 +457,7 @@ function AIView({result,T,onClose}) {
           <RadarChart data={radarData}>
             <PolarGrid stroke={T.border}/>
             <PolarAngleAxis dataKey="metric" tick={{fontSize:9,fill:T.muted}}/>
-            {radarKeys.map((k,i)=><Radar key={k} name={data[i]?.[xKey]||k} dataKey={k} stroke={PAL[i%PAL.length]} fill={PAL[i%PAL.length]} fillOpacity={0.15}/>)}
+            {radarKeys.map((k,i)=><Radar key={k} name={data[i]?.[xKey]||k} dataKey={k} stroke={PAL[i%PAL.length]} fill={PAL[i%PAL.length]} fillOpacity={0.15} animationDuration={1000} animationEasing="ease-in-out"/>)}
             <Legend iconType="circle" iconSize={7} wrapperStyle={{fontSize:10}}/>
             <Tooltip/>
           </RadarChart>
@@ -480,7 +481,7 @@ function AIView({result,T,onClose}) {
               return<div style={{...card(T),padding:'7px 10px',fontSize:10}}><b>{d?.name}</b><br/>{yKeys[0]}: {f(d?.x,2)}<br/>{yKeys[1]}: {f(d?.y,2)}</div>;
             }}/>
             {threshold!=null&&<ReferenceLine y={threshold} stroke={T.amber} strokeDasharray="4 2" label={{value:`Threshold ${threshold}`,fontSize:9,fill:T.amber}}/>}
-            <Scatter name="Sites" data={scatterData} fill={T.kpmgBlue} opacity={0.75}/>
+            <Scatter name="Sites" data={scatterData} fill={T.kpmgBlue} opacity={0.75} animationDuration={1000} animationEasing="ease-in-out"/>
           </ScatterChart>
         </ResponsiveContainer>
       );
@@ -493,17 +494,20 @@ function AIView({result,T,onClose}) {
       return(
         <ResponsiveContainer width="100%" height={h+30}>
           <ComposedChart data={data} margin={{top:5,right:20,left:0,bottom:35}}>
-            <defs><linearGradient id="cga" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor={PAL[0]} stopOpacity={.4}/><stop offset="100%" stopColor={PAL[0]} stopOpacity={.03}/></linearGradient></defs>
+            <defs>
+              <linearGradient id="cga" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor={PAL[0]} stopOpacity={.45}/><stop offset="100%" stopColor={PAL[0]} stopOpacity={.03}/></linearGradient>
+              <linearGradient id="cgl" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor={PAL[3]} stopOpacity={.3}/><stop offset="100%" stopColor={PAL[3]} stopOpacity={.02}/></linearGradient>
+            </defs>
             <CartesianGrid strokeDasharray="3 3" stroke={T.border} vertical={false}/>
             <XAxis dataKey={xKey} tick={{fontSize:8,fill:T.muted}} axisLine={false} tickLine={false}
               interval={cTickInterval} angle={-35} textAnchor="end" height={45}
               tickFormatter={v=>{if(typeof v!=='string')return v;if(v.length>10)return v.slice(5,10);return v;}}/>
             <YAxis yAxisId="l" tick={{fontSize:9,fill:T.muted}} axisLine={false} width={35}/>
             <YAxis yAxisId="r" orientation="right" tick={{fontSize:9,fill:T.muted}} axisLine={false} width={35}/>
-            <Tooltip content={<TipC/>}/>
+            <Tooltip content={<TipC/>} cursor={{stroke:T.kpmgBlue,strokeWidth:1,strokeDasharray:'4 2'}}/>
             {threshold!=null&&<ReferenceLine yAxisId="l" y={threshold} stroke={T.amber} strokeDasharray="4 2"/>}
-            <Area yAxisId="l" type="monotone" dataKey={barKey} name={barKey.replace(/_/g,' ')} fill="url(#cga)" stroke={PAL[0]} strokeWidth={2}/>
-            <Line yAxisId="r" type="monotone" dataKey={lineKey} name={lineKey.replace(/_/g,' ')} stroke={PAL[3]} strokeWidth={2.5} dot={false}/>
+            <Area yAxisId="l" type="natural" dataKey={barKey} name={barKey.replace(/_/g,' ')} fill="url(#cga)" stroke={PAL[0]} strokeWidth={2.5} activeDot={{r:5,strokeWidth:2,stroke:'#fff'}} animationDuration={1000} animationEasing="ease-in-out"/>
+            <Line yAxisId="r" type="natural" dataKey={lineKey} name={lineKey.replace(/_/g,' ')} stroke={PAL[3]} strokeWidth={2.5} dot={data.length<=20?{r:2.5,strokeWidth:2,stroke:'#fff'}:false} activeDot={{r:6,strokeWidth:2,stroke:'#fff'}} animationDuration={1200} animationEasing="ease-in-out"/>
             <Legend iconType="circle" iconSize={7} wrapperStyle={{fontSize:10}}/>
           </ComposedChart>
         </ResponsiveContainer>
@@ -516,15 +520,15 @@ function AIView({result,T,onClose}) {
       return(
         <ResponsiveContainer width="100%" height={h+40}>
           <AreaChart data={data} margin={{top:5,right:30,left:5,bottom:45}}>
-            <defs>{yKeys.map((k,i)=><linearGradient key={k} id={`aig${i}`} x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor={PAL[i%10]} stopOpacity={.35}/><stop offset="100%" stopColor={PAL[i%10]} stopOpacity={.02}/></linearGradient>)}</defs>
+            <defs>{yKeys.map((k,i)=><linearGradient key={k} id={`aig${i}`} x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor={PAL[i%10]} stopOpacity={.45}/><stop offset="100%" stopColor={PAL[i%10]} stopOpacity={.03}/></linearGradient>)}</defs>
             <CartesianGrid strokeDasharray="3 3" stroke={T.border} vertical={false}/>
             <XAxis dataKey={xKey} tick={{fontSize:8,fill:T.muted}} axisLine={false} tickLine={false}
               interval={tickInterval} angle={-40} textAnchor="end" height={55}
               tickFormatter={v=>{if(typeof v!=='string')return v;return v.replace(/^20\d{2}-/,'').slice(0,5);}}/>
             <YAxis tick={{fontSize:9,fill:T.muted}} axisLine={false} tickLine={false} width={42}/>
-            <Tooltip content={<TipC/>}/>
+            <Tooltip content={<TipC/>} cursor={{stroke:T.kpmgBlue,strokeWidth:1,strokeDasharray:'4 2'}}/>
             {threshold!=null&&<ReferenceLine y={threshold} stroke={T.amber} strokeDasharray="4 2" label={{value:`${threshold}`,fontSize:9,fill:T.amber}}/>}
-            {yKeys.map((k,i)=><Area key={k} type="monotone" dataKey={k} stroke={PAL[i%10]} fill={`url(#aig${i})`} strokeWidth={2} dot={data.length<=30?{r:2.5}:false} name={k.replace(/_/g,' ')}/>)}
+            {yKeys.map((k,i)=><Area key={k} type="natural" dataKey={k} stroke={PAL[i%10]} fill={`url(#aig${i})`} strokeWidth={2.5} dot={data.length<=30?{r:3,strokeWidth:2,stroke:'#fff'}:false} activeDot={{r:6,strokeWidth:2,stroke:'#fff'}} name={k.replace(/_/g,' ')} animationDuration={1000} animationEasing="ease-in-out"/>)}
             <Legend iconType="circle" iconSize={7} wrapperStyle={{fontSize:10}}/>
           </AreaChart>
         </ResponsiveContainer>
@@ -537,18 +541,19 @@ function AIView({result,T,onClose}) {
       return(
         <ResponsiveContainer width="100%" height={Math.max(h,data.length*18+40)}>
           <BarChart data={data} layout="vertical" margin={{top:5,right:25,left:110,bottom:5}}>
+            <defs>{yKeys.slice(0,3).map((k,i)=><linearGradient key={k} id={`hbg${i}`} x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stopColor={PAL[i%10]} stopOpacity={.85}/><stop offset="100%" stopColor={PAL[(i+1)%10]} stopOpacity={.95}/></linearGradient>)}</defs>
             <CartesianGrid strokeDasharray="3 3" stroke={T.border} horizontal={false}/>
             <XAxis type="number" tick={{fontSize:9,fill:T.muted}} axisLine={false} tickLine={false}/>
             <YAxis type="category" dataKey={xKey} width={105} tick={{fontSize:8.5,fill:T.muted}} tickFormatter={shortLbl} axisLine={false} tickLine={false}/>
-            <Tooltip content={<TipC/>}/>
+            <Tooltip content={<TipC/>} cursor={{fill:T.kpmgBlue+'0a'}}/>
             {threshold!=null&&<ReferenceLine x={threshold} stroke={T.amber} strokeDasharray="4 2"/>}
             {yKeys.slice(0,3).map((k,i)=>(
-              <Bar key={k} dataKey={k} name={k.replace(/_/g,' ')} radius={[0,4,4,0]} barSize={yKeys.length>1?7:12}>
+              <Bar key={k} dataKey={k} name={k.replace(/_/g,' ')} radius={[0,6,6,0]} barSize={yKeys.length>1?8:14} animationDuration={1200} animationEasing="ease-in-out">
                 {yKeys.length===1?data.map((d,di)=>{
                   const v=parseFloat(d[k]);
                   const bad=threshold!=null&&(cfg.threshold_dir==='below'?v<threshold:v>threshold);
-                  return<Cell key={di} fill={bad?T.red:di<3?PAL[0]:PAL[i%10]}/>;
-                }):<Cell fill={PAL[i%10]}/>}
+                  return<Cell key={di} fill={bad?T.red:`url(#hbg${i})`}/>;
+                }):<Cell fill={`url(#hbg${i})`}/>}
               </Bar>
             ))}
             <Legend iconType="circle" iconSize={7} wrapperStyle={{fontSize:10}}/>
@@ -559,12 +564,13 @@ function AIView({result,T,onClose}) {
     return(
       <ResponsiveContainer width="100%" height={h}>
         <BarChart data={data} margin={{top:5,right:10,left:0,bottom:30}}>
+          <defs>{yKeys.slice(0,3).map((k,i)=><linearGradient key={k} id={`vbg${i}`} x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor={PAL[i%10]} stopOpacity={.95}/><stop offset="100%" stopColor={PAL[i%10]} stopOpacity={.6}/></linearGradient>)}</defs>
           <CartesianGrid strokeDasharray="3 3" stroke={T.border} vertical={false}/>
           <XAxis dataKey={xKey} tick={{fontSize:9,fill:T.muted}} axisLine={false} tickLine={false} angle={-35} textAnchor="end" tickFormatter={shortLbl}/>
           <YAxis tick={{fontSize:9,fill:T.muted}} axisLine={false} tickLine={false} width={35}/>
-          <Tooltip content={<TipC/>}/>
+          <Tooltip content={<TipC/>} cursor={{fill:T.kpmgBlue+'0a'}}/>
           {threshold!=null&&<ReferenceLine y={threshold} stroke={T.amber} strokeDasharray="4 2"/>}
-          {yKeys.slice(0,3).map((k,i)=><Bar key={k} dataKey={k} name={k.replace(/_/g,' ')} radius={[4,4,0,0]} fill={PAL[i%10]} barSize={18}/>)}
+          {yKeys.slice(0,3).map((k,i)=><Bar key={k} dataKey={k} name={k.replace(/_/g,' ')} radius={[6,6,0,0]} fill={`url(#vbg${i})`} barSize={20} animationDuration={1200} animationEasing="ease-in-out"/>)}
           <Legend iconType="circle" iconSize={7} wrapperStyle={{fontSize:10}}/>
         </BarChart>
       </ResponsiveContainer>
@@ -634,9 +640,11 @@ function AIView({result,T,onClose}) {
       ):(
         /* Chart + Map */
         <div style={{display:'grid',gridTemplateColumns:hasGeo?'1.4fr 1fr':'1fr',gap:12}}>
-          <CC T={T} title={`${chartIcon} ${cfg.x_label||xKey.replace(/_/g,' ')} → ${(yKeys[0]||'').replace(/_/g,' ')}`}>
-            {data.length>0?renderChart():<Empty T={T}/>}
-          </CC>
+          <div style={{boxShadow:'0 4px 20px rgba(0,51,141,0.08)',borderRadius:12}}>
+            <CC T={T} title={`${chartIcon} ${cfg.x_label||xKey.replace(/_/g,' ')} → ${(yKeys[0]||'').replace(/_/g,' ')}`}>
+              {data.length>0?renderChart():<Empty T={T}/>}
+            </CC>
+          </div>
           {hasGeo&&(
             <CC T={T} title=" Geographic View">
               <LeafletMap sites={data} highlight={data} T={T} height={280}/>
@@ -661,6 +669,15 @@ function OverviewPage({T,data,mapSites}) {
   const d=data||{};
   const TipC=(p)=><Tip T={T} {...p}/>;
   const hs=Math.round(d.network_health_score||0);
+
+  // Pre-scan worst cells (updated every 30 min by backend)
+  const [preScanCells,setPreScanCells]=useState([]);
+  const [preScanTime,setPreScanTime]=useState(null);
+  useEffect(()=>{
+    apiGet('/api/network-issues/worst-cells')
+      .then(r=>{setPreScanCells(r.sites||[]);setPreScanTime(r.scan_time);})
+      .catch(()=>{});
+  },[]);
 
   const kpis=[
     {label:'Total Sites',    value:f(d.total_sites,0),    icon:'', color:T.kpmgBlue},
@@ -1857,7 +1874,7 @@ function KPIFilterPage({T,kpiFilter,data,mapSites:_mapSites}) {
 
 // ── MAIN COMPONENT ─────────────────────────────────────────────────────────────
 export default function NetworkAnalyticsDashboard() {
-  const [dark,setDark]=useState(false);
+  const { isDark: dark, toggleTheme } = useTheme();
   const T=dark?T_DARK:T_LIGHT;
 
   // Data
@@ -2043,8 +2060,9 @@ export default function NetworkAnalyticsDashboard() {
               {(opts.states||[]).map(v=><option key={v} value={v}>{v}</option>)}
             </select>
             <MultiSel T={T} label="All City" options={opts.cities||[]} value={filters.city} onChange={v=>setFilters(p=>({...p,city:v}))}/>
-            <button onClick={()=>setDark(d=>!d)} style={{padding:'5px 10px',borderRadius:18,fontSize:10.5,fontWeight:600,background:dark?'#F59E0B22':'#00338D10',border:`1px solid ${dark?'#F59E0B44':T.border}`,color:dark?'#F59E0B':T.kpmgBlue,cursor:'pointer'}}>
-              {dark?'':''}
+            <button onClick={toggleTheme} style={{padding:'5px 10px',borderRadius:18,fontSize:10.5,fontWeight:600,background:dark?'#F59E0B22':'#00338D10',border:`1px solid ${dark?'#F59E0B44':T.border}`,color:dark?'#F59E0B':T.kpmgBlue,cursor:'pointer',display:'flex',alignItems:'center',gap:4}}>
+              {dark?(<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>):(<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>)}
+              {dark?'Light':'Dark'}
             </button>
             <button onClick={()=>setChatOpen(o=>!o)} style={{padding:'5px 11px',borderRadius:18,fontSize:11,fontWeight:700,background:`linear-gradient(135deg,${T.kpmgBlue},${T.blue3})`,border:'none',color:'#fff',cursor:'pointer'}}> AI</button>
             {aiView&&<button onClick={()=>{setAiView(null);setPage('overview');}} style={{padding:'5px 10px',borderRadius:18,fontSize:10.5,fontWeight:700,background:'transparent',border:`1px solid ${T.red}`,color:T.red,cursor:'pointer'}}> AI</button>}

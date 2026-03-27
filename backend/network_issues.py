@@ -24,6 +24,10 @@ network_issues_bp = Blueprint("network_issues", __name__)
 # Track if today's job has run (reset daily)
 _LAST_JOB_DATE = None
 
+# Pre-scan cache: stores latest worst-cell scan results for dashboard display
+_LATEST_WORST_CELLS = {}
+_LATEST_SCAN_TIME = None
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Model
@@ -344,6 +348,7 @@ def schedule_daily_job(app):
         global _LAST_JOB_DATE
         nonlocal _prescan_done_date, _ticket_done_date
         time.sleep(8)  # wait for app to start
+        last_prescan = 0  # epoch seconds of last pre-scan
 
         with app.app_context():
             # Step 1: Run pre-scan to populate dashboard worst cells
@@ -561,6 +566,106 @@ def update_network_issue_status(ticket_id):
     return jsonify({"success": True, "status": new_status})
 
 
+@network_issues_bp.route("/api/network-issues/<int:ticket_id>/pdf-data", methods=["GET"])
+@jwt_required()
+def network_issue_pdf_data(ticket_id):
+    """Return comprehensive data for PDF report: site/cell info, location, KPIs."""
+    from models import TelecomSite
+    t = db.session.get(NetworkIssueTicket, ticket_id)
+    if not t:
+        return jsonify({"error": "Not found"}), 404
+
+    # Site info from telecom_sites
+    site_rows = TelecomSite.query.filter_by(site_id=t.site_id).all()
+    site_info = None
+    cells_info = []
+    if site_rows:
+        first = site_rows[0]
+        site_info = {
+            "site_id": first.site_id,
+            "latitude": first.latitude,
+            "longitude": first.longitude,
+            "zone": first.zone or "",
+            "city": getattr(first, "city", "") or "",
+            "state": getattr(first, "state", "") or "",
+            "site_status": first.site_status or "on_air",
+            "alarms": first.alarms or "",
+            "bandwidth_mhz": first.bandwidth_mhz,
+            "antenna_gain_dbi": first.antenna_gain_dbi,
+            "rf_power_eirp_dbm": first.rf_power_eirp_dbm,
+            "antenna_height_agl_m": first.antenna_height_agl_m,
+            "e_tilt_degree": first.e_tilt_degree,
+            "crs_gain": first.crs_gain,
+        }
+        for sr in site_rows:
+            if sr.cell_id:
+                cells_info.append({
+                    "cell_id": sr.cell_id,
+                    "latitude": sr.latitude,
+                    "longitude": sr.longitude,
+                    "zone": sr.zone or "",
+                    "site_status": sr.site_status or "on_air",
+                    "alarms": sr.alarms or "",
+                    "bandwidth_mhz": sr.bandwidth_mhz,
+                    "antenna_gain_dbi": sr.antenna_gain_dbi,
+                    "rf_power_eirp_dbm": sr.rf_power_eirp_dbm,
+                    "antenna_height_agl_m": sr.antenna_height_agl_m,
+                    "e_tilt_degree": sr.e_tilt_degree,
+                    "crs_gain": sr.crs_gain,
+                })
+
+    # KPI snapshot per cell from kpi_data (latest date, affected cells only)
+    cell_ids = t.cells_affected.split(",") if t.cells_affected else []
+    cell_kpis = []
+    if cell_ids:
+        try:
+            placeholders = ",".join([f":c{i}" for i in range(len(cell_ids))])
+            params = {f"c{i}": c.strip() for i, c in enumerate(cell_ids)}
+            params["sid"] = t.site_id
+            rows = _sql(f"""
+                SELECT k.cell_id,
+                       AVG(CASE WHEN k.kpi_name='E-RAB Call Drop Rate_1' THEN k.value END) AS drop_rate,
+                       AVG(CASE WHEN k.kpi_name='LTE Call Setup Success Rate' THEN k.value END) AS cssr,
+                       AVG(CASE WHEN k.kpi_name='LTE DL - Usr Ave Throughput' THEN k.value END) AS tput,
+                       AVG(CASE WHEN k.kpi_name='Ave RRC Connected Ue' THEN k.value END) AS rrc
+                FROM kpi_data k
+                WHERE k.site_id = :sid AND k.cell_id IN ({placeholders})
+                  AND k.data_level = 'cell' AND k.value IS NOT NULL
+                  AND k.date >= CURRENT_DATE - INTERVAL '7 days'
+                GROUP BY k.cell_id
+            """, params)
+            for r in rows:
+                cell_kpis.append({
+                    "cell_id": r["cell_id"],
+                    "drop_rate": round(float(r["drop_rate"] or 0), 2),
+                    "cssr": round(float(r["cssr"] or 0), 1),
+                    "tput": round(float(r["tput"] or 0), 1),
+                    "rrc": round(float(r["rrc"] or 0), 0),
+                })
+        except Exception as e:
+            _LOG.error("pdf-data cell_kpis: %s", e)
+
+    return jsonify({
+        "ticket": {
+            "id": t.id, "site_id": t.site_id, "category": t.category,
+            "priority": t.priority, "priority_score": t.priority_score,
+            "status": t.status, "zone": t.zone, "location": t.location,
+            "avg_drop_rate": t.avg_drop_rate, "avg_cssr": t.avg_cssr,
+            "avg_tput": t.avg_tput, "avg_rrc": t.avg_rrc, "max_rrc": t.max_rrc,
+            "revenue_total": t.revenue_total, "violations": t.violations,
+            "sla_hours": t.sla_hours,
+            "cells_affected": t.cells_affected,
+            "cell_site_ids": t.cell_site_ids,
+            "root_cause": t.root_cause or "",
+            "recommendation": t.recommendation or "",
+            "created_at": t.created_at.isoformat() if t.created_at else None,
+        },
+        "site_info": site_info,
+        "cells_info": cells_info,
+        "cell_kpis": cell_kpis,
+    })
+
+
 @network_issues_bp.route("/api/network-issues/<int:ticket_id>/trends", methods=["GET"])
 @jwt_required()
 def network_issue_trends(ticket_id):
@@ -627,8 +732,9 @@ def network_issue_rca(ticket_id):
     data_level = "cell" if target != "site" else "site"
     cell_filter = f"AND k.cell_id = '{target}'" if target != "site" else ""
 
-    # Gather KPI data
+    # ── Gather KPI trend data across 3 time windows ───────────────────────────
     kpi_text = ""
+    windows = {}  # parsed: {period: {kpi: {avg, min, max}}}
     for period_name, days in [("7 days", 7), ("30 days", 30), ("60 days", 60)]:
         try:
             rows = _sql(f"""
@@ -639,29 +745,51 @@ def network_issue_rca(ticket_id):
                 GROUP BY kpi_name
             """, {"sid": t.site_id, "dl": data_level})
             kpi_text += f"\n=== Last {period_name} ({data_level}: {target}) ===\n"
+            windows[period_name] = {}
             for r in rows:
                 kpi_text += f"  {r['kpi_name']}: avg={_f(r['avg'],2)}, min={_f(r['min'],2)}, max={_f(r['max'],2)}\n"
+                windows[period_name][r['kpi_name']] = {
+                    "avg": float(r['avg'] or 0), "min": float(r['min'] or 0), "max": float(r['max'] or 0)
+                }
         except: pass
 
-    rca_system = """You are a senior telecom network engineer performing root cause analysis.
+    # ── Fetch RF parameters from telecom_sites ────────────────────────────────
+    rf = {}
+    try:
+        cell_rf_filter = f"AND cell_id = '{t.site_id}_{target}'" if target != "site" else ""
+        r = _sql(f"""SELECT AVG(bandwidth_mhz) AS bw, AVG(antenna_gain_dbi) AS gain,
+                           AVG(rf_power_eirp_dbm) AS eirp, AVG(e_tilt_degree) AS tilt,
+                           AVG(crs_gain) AS crs, AVG(antenna_height_agl_m) AS height
+                    FROM telecom_sites WHERE site_id=:sid {cell_rf_filter}""", {"sid": t.site_id})
+        if r: rf = r[0]
+    except: pass
+    bw = _f(rf.get("bw"), 1); tilt = _f(rf.get("tilt"), 1); eirp = _f(rf.get("eirp"), 1)
+    crs = _f(rf.get("crs"), 2); height = _f(rf.get("height"), 1)
+    rf_text = f"Bandwidth: {bw} MHz, E-tilt: {tilt}°, EIRP: {eirp} dBm, CRS Gain: {crs}, Antenna Height: {height} m"
 
-STRICT RULES:
-- Output ONLY numbered points (1. 2. 3. etc.) — nothing else
-- Each point identifies ONE specific root cause with actual KPI values from the data
-- Use this format: **[Root Cause Title]**: Explanation with specific KPI numbers
-- Do NOT include any thinking, reasoning, disclaimers, or meta-commentary
-- Do NOT say "I must", "I should", "though", "however", "let me", or explain your thought process
-- Do NOT add summaries, conclusions, headers, or introductory text
-- Each point must be about a DIFFERENT aspect of the degradation"""
+    # ── AI prompt ─────────────────────────────────────────────────────────────
+    rca_system = f"""You are a principal RF optimization engineer. Analyze worst-cell KPI trends and identify physical root causes.
 
-    prompt = f"""Root cause analysis for {'cell '+target if target!='site' else 'site '+t.site_id}.
+The cell/site is already flagged as worst offender. DO NOT restate threshold violations. Explain WHY the KPIs degraded.
 
-Site: {t.site_id} | Zone: {t.zone} | Category: {t.category}
-KPI Violations: Drop={t.avg_drop_rate}% (>1.5%), CSSR={t.avg_cssr}% (<98.5%), Tput={t.avg_tput}Mbps (<8)
+Current RF Parameters: {rf_text}
+
+ANALYSIS METHOD:
+- Compare 7d vs 30d vs 60d averages to find WHEN degradation started
+- Check min/max spread: wide spread = intermittent fault, narrow = persistent
+- Correlate KPIs: Drop+CSSR down = RF interference; Drop+Tput down = DL SINR issue; all down = hardware/antenna fault
+- Link findings to RF parameters (e-tilt, EIRP, antenna height, CRS gain) where relevant
+
+OUTPUT: Exactly 4 numbered points. Each point:
+1. **Bold Title**: Trend evidence (7d vs 60d numbers, min/max) → physical root cause → which RF parameter may be contributing.
+
+NO square brackets. NO headers/summaries. NO threshold restatements. ONLY the 4 numbered points."""
+
+    prompt = f"""Root cause analysis for {'cell '+target if target!='site' else 'site '+t.site_id} (Zone: {t.zone}).
 
 {kpi_text}
 
-Write exactly 3-4 numbered root cause points. Each must cite specific KPI values from the data above."""
+Write exactly 4 points with **bold titles**. Each must compare 7d vs 60d trend, identify the physical cause, and reference RF parameters where relevant."""
 
     root_cause = ""
     try:
@@ -673,40 +801,82 @@ Write exactly 3-4 numbered root cause points. Each must cite specific KPI values
                     {"role": "system", "content": rca_system},
                     {"role": "user", "content": prompt},
                 ],
-                temperature=0.15, max_tokens=1000,
+                temperature=0.2, max_tokens=1200,
             )
             raw = (resp.choices[0].message.content or "").strip()
-            # Strip leaked reasoning lines (start with "I ", "Let me", "Though", etc.)
             import re
             lines = raw.split('\n')
-            clean = []
-            for line in lines:
-                stripped = line.strip()
-                if not stripped:
-                    continue
-                # Skip obvious chain-of-thought leaks
-                if re.match(r'^(I |Let me|Though |However |Note:|Wait|Hmm|Ok |Sure)', stripped, re.IGNORECASE):
-                    continue
-                clean.append(line)
+            clean = [l for l in lines if l.strip() and not re.match(
+                r'^(I |Let me|Though |However |Note:|Wait|Hmm|Ok |Sure|Here)', l.strip(), re.IGNORECASE)]
             root_cause = '\n'.join(clean) if clean else raw
+            # Validate: must have at least 3 numbered points, otherwise use fallback
+            numbered = [l for l in clean if re.match(r'^\d+[\.\)]', l.strip())]
+            if len(numbered) < 3:
+                root_cause = ""  # force fallback
     except Exception as e:
         _LOG.error("RCA AI call failed for ticket %s: %s", ticket_id, e)
-        # Build a meaningful 3-4 point fallback using actual data
+
+    # ── Rule-based fallback (always produces 4 expert points) ─────────────────
+    if not root_cause:
         drop = t.avg_drop_rate or 0
         cssr = t.avg_cssr or 0
         tput = t.avg_tput or 0
         rrc = t.avg_rrc or 0
+        max_rrc = t.max_rrc or 0
+
+        d7 = windows.get("7 days", {})
+        d60 = windows.get("60 days", {})
+        DK = "E-RAB Call Drop Rate_1"
+        CK = "LTE Call Setup Success Rate"
+        TK = "LTE DL - Usr Ave Throughput"
+        RK = "Ave RRC Connected Ue"
+
+        d7_drop = d7.get(DK, {}).get("avg", drop);    d60_drop = d60.get(DK, {}).get("avg", drop)
+        d7_drop_max = d7.get(DK, {}).get("max", drop); d7_drop_min = d7.get(DK, {}).get("min", 0)
+        d7_cssr = d7.get(CK, {}).get("avg", cssr);    d60_cssr = d60.get(CK, {}).get("avg", cssr)
+        d7_cssr_min = d7.get(CK, {}).get("min", cssr); d7_cssr_max = d7.get(CK, {}).get("max", cssr)
+        d7_tput = d7.get(TK, {}).get("avg", tput);    d60_tput = d60.get(TK, {}).get("avg", tput)
+        d7_tput_min = d7.get(TK, {}).get("min", tput); d7_tput_max = d7.get(TK, {}).get("max", tput)
+        d7_rrc = d7.get(RK, {}).get("avg", rrc);      d7_rrc_max = d7.get(RK, {}).get("max", max_rrc)
+
+        drop_spread = d7_drop_max - d7_drop_min
+        cssr_spread = d7_cssr_max - d7_cssr_min
+        tput_spread = d7_tput_max - d7_tput_min
+        drop_spiked = d60_drop > 0 and d7_drop > d60_drop * 1.3
+        cssr_degraded = d7_cssr < d60_cssr - 2
+
         pts = []
-        pts.append(f"1. **Elevated E-RAB Drop Rate**: The {'cell ' + target if target != 'site' else 'site ' + t.site_id} is experiencing a call drop rate of {drop:.2f}%, significantly exceeding the 1.5% threshold. This indicates potential RF interference, overshooting, or hardware issues on the radio unit causing bearer releases during active sessions.")
-        if cssr < 98.5:
-            pts.append(f"2. **Low Call Setup Success Rate**: CSSR has degraded to {cssr:.2f}%, well below the 98.5% benchmark. This suggests RRC connection failures or RACH congestion, possibly due to uplink interference or insufficient PRACH resources preventing new users from establishing connections.")
-        if tput < 8:
-            pts.append(f"3. **Throughput Degradation**: Average DL user throughput is only {tput:.2f} Mbps against an 8 Mbps target. This is likely caused by high PRB utilization from concentrated traffic load, poor SINR conditions, or suboptimal scheduling parameters reducing spectral efficiency.")
-        if rrc > 0:
-            pts.append(f"4. **Traffic Load Correlation**: Average RRC connected users of {rrc:.0f} combined with the above KPI violations suggests the cell is operating near or beyond its capacity envelope, causing resource contention that amplifies both drop rate and throughput degradation.")
-        if len(pts) < 3:
-            pts.append(f"{len(pts)+1}. **Multi-KPI Correlation**: The simultaneous degradation across drop rate ({drop:.2f}%), CSSR ({cssr:.2f}%), and throughput ({tput:.2f} Mbps) points to a systemic issue rather than isolated faults — likely RF coverage or capacity related requiring parameter optimization.")
-        root_cause = '\n'.join(pts[:4])
+
+        # Point 1: Drop Rate trend analysis
+        if drop_spiked:
+            pts.append(f"1. **Recent Interference or Hardware Onset**: E-RAB drop rate increased from {d60_drop:.2f}% (60-day avg) to {d7_drop:.2f}% (7-day avg) — a {((d7_drop-d60_drop)/max(d60_drop,0.01)*100):.0f}% spike. The min/max spread of {d7_drop_min:.2f}%–{d7_drop_max:.2f}% ({'wide — suggesting intermittent fault events like VSWR alarms or TMA failures' if drop_spread > 3 else 'narrow — indicating persistent interference'}). With current E-tilt at {tilt}° and EIRP at {eirp} dBm, the cell may be overshooting into neighbor coverage, picking up co-channel interference on the return path.")
+        else:
+            pts.append(f"1. **Chronic Overshooting or Pilot Pollution**: Drop rate has been persistently elevated at {d7_drop:.2f}% (7-day) vs {d60_drop:.2f}% (60-day), with peaks reaching {d7_drop_max:.2f}%. The stability across time windows rules out a recent trigger — this is an entrenched RF footprint problem. Current E-tilt of {tilt}° with antenna height {height}m is likely causing the cell to overshoot its intended coverage boundary, creating a pilot pollution zone where 3+ cells overlap with similar RSRP, resulting in frequent handover ping-pong and bearer drops.")
+
+        # Point 2: CSSR trend analysis
+        if cssr_degraded:
+            pts.append(f"2. **Accelerating Access Failure**: CSSR declined sharply from {d60_cssr:.2f}% (60-day) to {d7_cssr:.2f}% (7-day) — a {d60_cssr - d7_cssr:.1f} percentage point drop in the recent window. The 7-day minimum of {d7_cssr_min:.2f}% reveals periods of near-total RACH failure. This pattern is consistent with uplink interference in the PRACH band or a degrading TMA/LNA reducing uplink sensitivity. With current EIRP at {eirp} dBm, the DL/UL link budget may be asymmetric — strong downlink signal attracting users who then fail on the weaker uplink path.")
+        elif d7_rrc > 300:
+            pts.append(f"2. **Capacity-Induced RACH Congestion**: CSSR at {d7_cssr:.2f}% with {d7_rrc:.0f} avg connected users (peak {d7_rrc_max:.0f}) indicates PRACH/PUCCH resource exhaustion. The cell is handling more traffic than its configured capacity allows — users compete for limited random access opportunities. Current bandwidth of {bw} MHz may be insufficient for this traffic density, and the E-tilt of {tilt}° is likely pulling in users from beyond the cell's intended coverage radius.")
+        else:
+            pts.append(f"2. **Uplink Coverage Gap**: CSSR at {d7_cssr:.2f}% with only {d7_rrc:.0f} avg users rules out congestion. The 7-day spread of {d7_cssr_min:.2f}%–{d7_cssr_max:.2f}% ({'shows severe intermittent failures — possible external interference source active during specific hours' if cssr_spread > 20 else 'indicates persistent uplink weakness'}). With antenna height at {height}m and EIRP at {eirp} dBm, the DL coverage extends beyond the UL range, causing cell-edge users to camp on this cell but fail RACH due to insufficient uplink power budget.")
+
+        # Point 3: Throughput & SINR analysis
+        if d7_tput < d60_tput * 0.8:
+            pts.append(f"3. **DL SINR Degradation**: Throughput dropped from {d60_tput:.2f} Mbps (60-day) to {d7_tput:.2f} Mbps (7-day) — a {((d60_tput - d7_tput)/max(d60_tput,0.01)*100):.0f}% decline. Min throughput of {d7_tput_min:.2f} Mbps confirms periods of severe quality degradation. This is not a capacity issue (RRC: {d7_rrc:.0f} users) — it is a SINR problem. With CRS Gain at {crs} and E-tilt at {tilt}°, the CRS reference signals may be experiencing interference from co-channel neighbors, degrading channel estimation accuracy and forcing lower MCS (modulation and coding scheme) selection.")
+        elif d7_rrc > 200 and d7_tput < 6:
+            pts.append(f"3. **PRB Congestion Limiting Per-User Throughput**: Throughput at {d7_tput:.2f} Mbps (min {d7_tput_min:.2f} Mbps) with {d7_rrc:.0f} avg users indicates high PRB utilization. The available bandwidth of {bw} MHz provides limited scheduling resources — at this traffic density, each user receives fewer PRBs per TTI, directly reducing achievable throughput. The cell's coverage area (controlled by E-tilt {tilt}° and height {height}m) may be too large, pulling in users that should be served by neighboring cells.")
+        else:
+            pts.append(f"3. **Persistent SINR and Scheduling Inefficiency**: Throughput has been chronically low at {d7_tput:.2f} Mbps (7-day) vs {d60_tput:.2f} Mbps (60-day), with fluctuation between {d7_tput_min:.2f}–{d7_tput_max:.2f} Mbps. With CRS Gain at {crs}, the reference signal quality may be marginal — low CRS SINR forces conservative MCS selection (QPSK instead of 64QAM), capping DL throughput regardless of traffic load. The E-tilt of {tilt}° may need adjustment to optimize the main beam coverage and improve SINR at cell center.")
+
+        # Point 4: Cross-KPI correlation & RF parameter linkage
+        all_worsening = d7_drop > d60_drop and d7_cssr < d60_cssr and d7_tput < d60_tput
+        if all_worsening:
+            pts.append(f"4. **Simultaneous Multi-KPI Collapse — Antenna System Fault Suspected**: All three KPIs worsened in the last 7 days vs 60-day baseline (Drop: {d60_drop:.2f}%→{d7_drop:.2f}%, CSSR: {d60_cssr:.2f}%→{d7_cssr:.2f}%, Tput: {d60_tput:.2f}→{d7_tput:.2f} Mbps). Simultaneous degradation across access, retention, and throughput strongly suggests a single physical root cause — most likely an antenna/feeder system fault (high VSWR, water ingress in connectors, or TMA failure). With current antenna height at {height}m, a physical site inspection should verify feeder cable integrity, connector tightness, and VSWR readings at the antenna port.")
+        else:
+            pts.append(f"4. **RF Parameter Mismatch for Site Environment**: The combination of elevated drops ({d7_drop:.2f}%), degraded CSSR ({d7_cssr:.2f}%), and low throughput ({d7_tput:.2f} Mbps) with current parameters (E-tilt: {tilt}°, EIRP: {eirp} dBm, CRS Gain: {crs}, Height: {height}m) suggests the RF configuration does not match the site's propagation environment. Priority actions: verify E-tilt against coverage planning tool predictions, check if recent construction or vegetation growth has altered the propagation path, and review neighbor cell parameter changes that may have shifted interference patterns in this cluster.")
+
+        root_cause = '\n'.join(pts)
 
     if target == "site":
         t.root_cause = root_cause
@@ -714,7 +884,6 @@ Write exactly 3-4 numbered root cause points. Each must cite specific KPI values
         db.session.commit()
 
     return jsonify({"root_cause": root_cause, "target": target})
-
 
 @network_issues_bp.route("/api/network-issues/<int:ticket_id>/recommendations", methods=["POST"])
 @jwt_required()
@@ -726,43 +895,48 @@ def network_issue_recommendations(ticket_id):
     target = (request.json or {}).get("target", "site")
     root_cause = (request.json or {}).get("root_cause", t.root_cause or "")
 
-    # Get RF parameters
+    # ── Get RF parameters (per-cell if cell target, otherwise site avg) ────────
     rf = {}
     try:
-        r = _sql("""SELECT AVG(bandwidth_mhz) AS bw, AVG(antenna_gain_dbi) AS gain,
+        cell_rf_filter = f"AND cell_id = '{t.site_id}_{target}'" if target != "site" else ""
+        r = _sql(f"""SELECT AVG(bandwidth_mhz) AS bw, AVG(antenna_gain_dbi) AS gain,
                            AVG(rf_power_eirp_dbm) AS eirp, AVG(e_tilt_degree) AS tilt,
                            AVG(crs_gain) AS crs, AVG(antenna_height_agl_m) AS height
-                    FROM telecom_sites WHERE site_id=:sid""", {"sid": t.site_id})
+                    FROM telecom_sites WHERE site_id=:sid {cell_rf_filter}""", {"sid": t.site_id})
         if r: rf = r[0]
     except: pass
 
-    bw = _f(rf.get("bw"), 1); tilt = _f(rf.get("tilt"), 1); eirp = _f(rf.get("eirp"), 1)
-    crs = _f(rf.get("crs"), 1); height = _f(rf.get("height"), 1)
+    def _safe_float(v):
+        try: return float(v) if v is not None else None
+        except (ValueError, TypeError): return None
 
-    system_msg = """You are a senior RF optimization engineer. You give ONLY concrete RF parameter change recommendations.
+    bw_val = _safe_float(rf.get("bw"));     bw = _f(bw_val, 1) if bw_val else "N/A"
+    tilt_val = _safe_float(rf.get("tilt")); tilt = _f(tilt_val, 1) if tilt_val else "N/A"
+    eirp_val = _safe_float(rf.get("eirp")); eirp = _f(eirp_val, 1) if eirp_val else "N/A"
+    crs_val = _safe_float(rf.get("crs"));   crs = _f(crs_val, 2) if crs_val else "N/A"
+    height_val = _safe_float(rf.get("height")); height = _f(height_val, 1) if height_val else "N/A"
 
-STRICT RULES:
-- Output ONLY numbered points (1. 2. 3. etc.) — nothing else
-- Each point changes exactly ONE RF parameter from the Current Parameters list
-- Use this exact format: **[Parameter Name] Adjustment**: The current [parameter] is [value]. Change to [new value] to [reason]. This will improve [KPI] by approximately [X%].
-- Do NOT include any thinking, reasoning, hedging, disclaimers, or meta-commentary
-- Do NOT say "I must", "I should", "though", "however", "let me", or explain your thought process
-- Do NOT add summaries, conclusions, or headers
-- Choose parameters ONLY from: Bandwidth, E-tilt, EIRP, CRS Gain, Antenna Height
-- If a parameter value is N/A, skip it and pick another parameter"""
+    # ── AI prompt ─────────────────────────────────────────────────────────────
+    system_msg = f"""You are a principal RF optimization engineer. Based on root cause analysis, recommend specific RF parameter changes.
 
-    prompt = f"""Provide exactly 3-4 RF parameter change recommendations for {'cell '+target if target!='site' else 'site '+t.site_id}.
+Current RF Parameters: Bandwidth={bw} MHz, E-tilt={tilt}°, EIRP={eirp} dBm, CRS Gain={crs}, Antenna Height={height}m
 
-Root Cause: {root_cause if root_cause else 'KPI degradation detected — high call drop rate and low throughput.'}
+OUTPUT: Exactly 4 numbered points. Each point:
+1. **Parameter Name Adjustment**: Current value is X. Change to Y because [link to root cause]. Expected improvement: [KPI] by ~[X%].
 
-Current Parameters:
-- Bandwidth: {bw} MHz
-- E-tilt: {tilt}°
-- EIRP: {eirp} dBm
-- CRS Gain: {crs}
-- Antenna Height: {height} m
+RULES:
+- Use **bold titles** (NOT square brackets)
+- Each point changes ONE parameter: E-tilt, EIRP, CRS Gain, or Antenna Height
+- Each must explain HOW it fixes the root cause
+- Include current value → new value → expected KPI improvement
+- NO headers, summaries, disclaimers. ONLY the 4 points."""
 
-Write ONLY the numbered recommendations. No other text."""
+    prompt = f"""RF parameter recommendations for {'cell '+target if target!='site' else 'site '+t.site_id}.
+
+Root Cause:
+{root_cause if root_cause else 'Multi-KPI degradation — high drop rate, low CSSR, poor throughput.'}
+
+Write exactly 4 parameter change recommendations with **bold titles**, specific values, and expected KPI improvement."""
 
     recommendation = ""
     try:
@@ -774,61 +948,72 @@ Write ONLY the numbered recommendations. No other text."""
                     {"role": "system", "content": system_msg},
                     {"role": "user", "content": prompt},
                 ],
-                temperature=0.15, max_tokens=800,
+                temperature=0.2, max_tokens=1000,
             )
             raw = (resp.choices[0].message.content or "").strip()
-            # Strip leaked reasoning lines but keep all substantive content
             import re
             lines = raw.split('\n')
-            clean = []
-            for line in lines:
-                stripped = line.strip()
-                if not stripped:
-                    continue
-                if re.match(r'^(I |Let me|Though |However |Note:|Wait|Hmm|Ok |Sure)', stripped, re.IGNORECASE):
-                    continue
-                clean.append(line)
+            clean = [l for l in lines if l.strip() and not re.match(
+                r'^(I |Let me|Though |However |Note:|Wait|Hmm|Ok |Sure|Here)', l.strip(), re.IGNORECASE)]
             recommendation = '\n'.join(clean) if clean else raw
+            # Validate: must have at least 3 numbered points
+            numbered = [l for l in clean if re.match(r'^\d+[\.\)]', l.strip())]
+            if len(numbered) < 3:
+                recommendation = ""  # force fallback
     except Exception as e:
         _LOG.error("Recommendation AI call failed for ticket %s: %s", ticket_id, e)
-        # Fallback: build concrete 4-point parameter recommendations from actual values
-        pts = []
-        try:
-            bw_val = float(bw) if bw and bw != 'N/A' else None
-        except (ValueError, TypeError):
-            bw_val = None
-        try:
-            tilt_val = float(tilt) if tilt and tilt != 'N/A' else None
-        except (ValueError, TypeError):
-            tilt_val = None
-        try:
-            eirp_val = float(eirp) if eirp and eirp != 'N/A' else None
-        except (ValueError, TypeError):
-            eirp_val = None
-        try:
-            crs_val = float(crs) if crs and crs != 'N/A' else None
-        except (ValueError, TypeError):
-            crs_val = None
-        try:
-            height_val = float(height) if height and height != 'N/A' else None
-        except (ValueError, TypeError):
-            height_val = None
 
-        if bw_val is not None:
-            new_bw = bw_val + 5 if bw_val < 20 else bw_val + 10
-            pts.append(f"1. **Bandwidth Expansion**: The current bandwidth is {bw} MHz. Increase to {_f(new_bw,0)} MHz to reduce PRB congestion and improve DL throughput. This will improve DL User Throughput by approximately 15-25%.")
+    # ── Rule-based fallback (always produces 4 expert points) ─────────────────
+    if not recommendation:
+        drop = t.avg_drop_rate or 0
+        cssr = t.avg_cssr or 0
+        tput = t.avg_tput or 0
+        rrc = t.avg_rrc or 0
+        pts = []
+
+        # 1. E-tilt adjustment (addresses overshooting, drop rate, interference)
         if tilt_val is not None:
-            new_tilt = max(tilt_val - 1, 0)
-            pts.append(f"{len(pts)+1}. **E-tilt Optimization**: The current E-tilt is {tilt}°. Adjust to {_f(new_tilt,1)}° to reduce overshooting and minimize inter-cell interference. This will improve E-RAB Drop Rate by approximately 20-30%.")
+            if drop > 2:
+                new_tilt = min(tilt_val + 2, 15)
+                pts.append(f"1. **E-tilt Downtilt Increase**: Current E-tilt is {tilt}°. Increase to {_f(new_tilt,1)}° to pull back the cell's coverage footprint and reduce overshooting into neighbor cells. This directly addresses the high drop rate ({drop:.2f}%) by reducing pilot pollution and handover ping-pong at cell edge. Expected improvement: E-RAB Drop Rate reduction by 25-35%, with secondary improvement in neighbor cell throughput.")
+            else:
+                new_tilt = max(tilt_val - 1, 0)
+                pts.append(f"1. **E-tilt Optimization**: Current E-tilt is {tilt}°. Reduce to {_f(new_tilt,1)}° to extend coverage footprint and improve signal strength at cell edge, where most RACH failures occur. This addresses the low CSSR ({cssr:.2f}%) by ensuring UE at the cell boundary receive sufficient DL RSRP to attempt connection. Expected improvement: CSSR increase by 2-4%.")
+        else:
+            pts.append(f"1. **E-tilt Configuration Required**: E-tilt data is not available in the database for this {'cell' if target != 'site' else 'site'}. Immediate action: perform site audit to record current electrical tilt, then optimize using coverage planning tool targeting 3dB beamwidth at cell edge. Correct E-tilt directly reduces overshooting (drop rate) and improves SINR (throughput).")
+
+        # 2. EIRP adjustment (addresses CSSR, UL/DL balance, coverage)
         if eirp_val is not None:
-            new_eirp = eirp_val + 2
-            pts.append(f"{len(pts)+1}. **EIRP Power Increase**: The current EIRP is {eirp} dBm. Increase to {_f(new_eirp,1)} dBm to strengthen signal coverage in weak spots. This will improve CSSR by approximately 1-2% and reduce edge-user drops.")
+            if cssr < 95:
+                new_eirp = eirp_val + 3
+                pts.append(f"2. **EIRP Power Increase**: Current EIRP is {eirp} dBm. Increase to {_f(new_eirp,1)} dBm to strengthen DL coverage and improve the DL/UL link budget balance. With CSSR at {cssr:.2f}%, users at cell edge are failing RACH because the DL signal is too weak for reliable synchronization. Higher EIRP extends the reliable coverage radius. Expected improvement: CSSR increase by 3-5%, with drop rate reduction of 10-15% from better handover reliability.")
+            else:
+                new_eirp = max(eirp_val - 2, 20)
+                pts.append(f"2. **EIRP Power Reduction**: Current EIRP is {eirp} dBm. Reduce to {_f(new_eirp,1)} dBm to contract the DL coverage footprint and match it to the UL range. This reduces the DL/UL asymmetry that causes users to camp on this cell but fail uplink transmissions. Combined with E-tilt adjustment, this will reduce interference to neighbors. Expected improvement: Drop Rate reduction by 15-20%, neighbor cell throughput improvement.")
+        else:
+            pts.append(f"2. **EIRP Audit Required**: EIRP data is not available in the database. Measure current Tx power at antenna port and verify against licensed EIRP. For the observed CSSR of {cssr:.2f}%, a power increase of 2-3 dB would extend reliable coverage radius by ~15%, directly improving RACH success rates.")
+
+        # 3. CRS Gain adjustment (addresses throughput, SINR, MCS)
         if crs_val is not None:
-            new_crs = round(crs_val + 1)
-            pts.append(f"{len(pts)+1}. **CRS Gain Boost**: The current CRS Gain is {crs}. Increase to {new_crs} to improve reference signal quality and channel estimation accuracy. This will reduce DL retransmissions and improve throughput by 10-15%.")
-        if height_val is not None and len(pts) < 4:
-            pts.append(f"{len(pts)+1}. **Antenna Height Review**: Current antenna height is {height} m. Consider adjusting by +/-2m combined with mechanical tilt to optimize the coverage footprint and reduce pilot pollution in overlapping zones.")
-        recommendation = '\n'.join(pts[:4]) if pts else f"1. **Parameter Review Required**: Site {t.site_id} requires RF parameter audit. Current KPIs (Drop={t.avg_drop_rate}%, CSSR={t.avg_cssr}%) indicate systemic degradation."
+            if tput < 6:
+                new_crs = round(crs_val + 1, 1)
+                pts.append(f"3. **CRS Gain Enhancement**: Current CRS Gain is {crs}. Increase to {_f(new_crs,1)} to boost reference signal power relative to data channels. With throughput at {tput:.2f} Mbps, low CRS SINR is likely forcing conservative MCS selection (QPSK instead of 16/64QAM), severely capping achievable data rates. Higher CRS Gain improves channel estimation accuracy at the UE. Expected improvement: DL throughput increase by 15-25% (higher MCS selection), with secondary improvement in BLER and reduced HARQ retransmissions.")
+            else:
+                new_crs = max(round(crs_val - 0.5, 1), 0)
+                pts.append(f"3. **CRS Gain Rebalance**: Current CRS Gain is {crs}. Reduce to {_f(new_crs,1)} to allocate more power to PDSCH data channels. Since throughput is at {tput:.2f} Mbps with moderate SINR, shifting power from reference signals to data channels will directly improve per-user throughput. Expected improvement: DL throughput increase by 8-12%.")
+        else:
+            pts.append(f"3. **CRS Gain Configuration Required**: CRS Gain data is not available. With throughput at {tput:.2f} Mbps, verify CRS power boosting configuration. A typical optimization is to set CRS Gain 3dB above PDSCH RE power to ensure reliable channel estimation while maintaining data channel capacity.")
+
+        # 4. Antenna Height review (addresses coverage footprint, interference pattern)
+        if height_val is not None:
+            if drop > 2 and tilt_val is not None and tilt_val < 4:
+                pts.append(f"4. **Antenna Height & Mechanical Tilt Review**: Current antenna height is {height}m with E-tilt {tilt}°. At this height with low tilt, the cell overshoots significantly — the main beam travels too far, causing interference and pilot pollution. Options: (a) increase E-tilt to {_f(min(tilt_val+3, 12),1)}° to compensate for height, or (b) if site structure allows, lower antenna to {_f(max(height_val-3, 15),1)}m to naturally reduce coverage radius. Expected improvement: combined Drop Rate reduction of 30-40% and throughput increase of 20% from reduced inter-cell interference.")
+            else:
+                pts.append(f"4. **Antenna Height Verification**: Current antenna height is {height}m. Verify against original site design — if height has changed (antenna repositioned during maintenance) or if new obstructions (buildings, trees) now block the main beam, the effective coverage pattern will differ from planned. Physical site inspection recommended to check antenna orientation (azimuth and mechanical tilt), feeder connections, and VSWR. Expected improvement: correcting any physical misalignment can improve all three KPIs by 10-20%.")
+        else:
+            pts.append(f"4. **Physical Site Audit Required**: Antenna height data is not available. Schedule a physical site visit to document: antenna height AGL, mechanical tilt, azimuth orientation, feeder cable condition, and VSWR readings. Any deviation from planned parameters (common after maintenance or equipment swap) directly impacts all three KPIs. This data is essential for accurate RF planning tool simulations.")
+
+        recommendation = '\n'.join(pts)
 
     if target == "site":
         t.recommendation = recommendation
@@ -836,7 +1021,6 @@ Write ONLY the numbered recommendations. No other text."""
         db.session.commit()
 
     return jsonify({"recommendation": recommendation, "target": target})
-
 
 @network_issues_bp.route("/api/network-issues/trigger-job", methods=["POST"])
 @jwt_required()

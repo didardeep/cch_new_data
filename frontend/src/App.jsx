@@ -35,6 +35,7 @@ import AgentDashboard from './pages/agent/AgentDashboard';
 import AgentTicketBucket from './pages/agent/AgentTicketBucket';
 import AgentChatView from './pages/agent/AgentChatView';
 import NetworkAnalyticsDashboard from './pages/agent/NetworkAnalyticsDashboard';
+import SettingsPage from './pages/SettingsPage';
 import NetworkIssues from './pages/agent/NetworkIssues';
 import AgentChangeWorkflow from './pages/agent/ChangeWorkflow';
 import CTOChangeWorkflow from './pages/cto/CTOChangeWorkflow';
@@ -63,18 +64,21 @@ export default function App() {
   return (
     <Routes>
       <Route path="/" element={<HomePage />} />
-      <Route path="/login" element={<LoginPage />} />
+      <Route path="/login" element={user ? <Navigate to={getDashboardPath()} /> : <LoginPage />} />
       <Route path="/register" element={user ? <Navigate to={getDashboardPath()} /> : <RegisterPage />} />
 
       {/* Customer Routes */}
       <Route path="/customer" element={<ProtectedRoute roles={['customer']}><CustomerLayout /></ProtectedRoute>}>
+        <Route index element={<Navigate to="dashboard" replace />} />
         <Route path="dashboard" element={<CustomerDashboard />} />
         <Route path="chat" element={<ChatSupport />} />
         <Route path="feedback" element={<FeedbackPage />} />
+        <Route path="settings" element={<SettingsPage />} />
       </Route>
 
       {/* Manager Routes */}
       <Route path="/manager" element={<ProtectedRoute roles={['manager']}><ManagerLayout /></ProtectedRoute>}>
+        <Route index element={<Navigate to="dashboard" replace />} />
         <Route path="dashboard" element={<ManagerDashboard />} />
         <Route path="chat" element={<ManagerChatSupport />} />
         <Route path="tickets" element={<ActiveTickets />} />
@@ -88,6 +92,7 @@ export default function App() {
 
       {/* CTO Routes */}
       <Route path="/cto" element={<ProtectedRoute roles={['cto']}><CTOLayout /></ProtectedRoute>}>
+        <Route index element={<Navigate to="dashboard" replace />} />
         <Route path="dashboard" element={<CTODashboard />} />
         <Route path="technical" element={<TechnicalKPI />} />
         <Route path="business" element={<BusinessKPI />} />
@@ -98,10 +103,12 @@ export default function App() {
         <Route path="alerts" element={<CTOAlertBox />} />
         <Route path="roster" element={<CTODutyRoster />} />
         <Route path="change-workflow" element={<CTOChangeWorkflow />} />
+        <Route path="settings" element={<SettingsPage />} />
       </Route>
 
       {/* Admin Routes */}
       <Route path="/admin" element={<ProtectedRoute roles={['admin']}><AdminLayout /></ProtectedRoute>}>
+        <Route index element={<Navigate to="dashboard" replace />} />
         <Route path="dashboard" element={<AdminDashboard />} />
         <Route path="users" element={<UserManagement />} />
         <Route path="tickets" element={<ActiveTickets />} />
@@ -111,19 +118,22 @@ export default function App() {
         <Route path="feedback" element={<AdminFeedback />} />
         <Route path="reports" element={<ReportsPage />} />
         <Route path="data-upload" element={<DataUpload />} />
+        <Route path="settings" element={<SettingsPage />} />
       </Route>
 
       {/* Human Agent Routes */}
       <Route path="/agent" element={<ProtectedRoute roles={['human_agent']}><AgentLayout /></ProtectedRoute>}>
+        <Route index element={<Navigate to="dashboard" replace />} />
         <Route path="dashboard" element={<AgentDashboard />} />
         <Route path="tickets" element={<AgentTicketBucket />} />
         <Route path="chat/:sessionId" element={<AgentChatView />} />
         <Route path="network" element={<NetworkAnalyticsDashboard />} />
+        <Route path="settings" element={<SettingsPage />} />
         <Route path="network-issues" element={<NetworkIssues />} />
         <Route path="change-workflow" element={<AgentChangeWorkflow />} />
       </Route>
 
-      <Route path="*" element={<Navigate to="/" />} />
+      <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
   );
 }

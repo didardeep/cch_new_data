@@ -59,6 +59,10 @@ network_bp = Blueprint("network", __name__)
 
 _CACHE: dict = {}
 CACHE_TTL = 300  # 5 minutes — analytics data changes only on upload
+
+def clear_analytics_cache():
+    """Clear all cached analytics data. Call after data upload/delete."""
+    _CACHE.clear()
 _FLEX_TABLES_ENSURED = False  # run DDL only once per process
 
 def _ensure_kpi_indexes():
@@ -1484,14 +1488,11 @@ def network_summary():
             pass
 
     try:
-        direct = _sql("SELECT COUNT(DISTINCT site_id) AS n FROM kpi_data")
-        n_sites = int(direct[0].get("n") or 0) if direct else 0
+        ts_cnt = _sql("SELECT COUNT(DISTINCT site_id) AS s, COUNT(*) AS c FROM telecom_sites")
+        n_sites = int(ts_cnt[0].get("s") or 0) if ts_cnt else 0
+        n_cells = int(ts_cnt[0].get("c") or 0) if ts_cnt else n_sites
     except Exception:
         n_sites = int(agg.get("total_sites") or 0)
-    try:
-        cell_cnt = _sql("SELECT COUNT(*) AS n FROM telecom_sites")
-        n_cells = int(cell_cnt[0].get("n") or 0) if cell_cnt else n_sites
-    except Exception:
         n_cells = n_sites
 
     r: dict = {}
@@ -3333,7 +3334,7 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text):
 
     azure_key        = _cfg("AZURE_OPENAI_API_KEY")
     azure_endpoint   = _cfg("AZURE_OPENAI_ENDPOINT")
-    azure_deployment = _cfg("AZURE_DEPLOYMENT_NAME", "gpt-4o-mini")
+    azure_deployment = _cfg("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini")
     azure_version    = _cfg("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
     gemini_key       = _cfg("GEMINI_API_KEY")
     gemini_model     = _cfg("OPENAI_MODEL", "gemini-2.0-flash")
@@ -5117,17 +5118,33 @@ def overview_stats():
     _fw, _fp, _needs_ts = _kpi_filter_clause(filters, "k", "ts")
     _TS_JOIN = "JOIN telecom_sites ts ON k.site_id = ts.site_id" if _needs_ts else ""
 
-    # ── 1. Site & cell counts (filtered if zone/tech selected) ────────────────
+    # ── 1. Site & cell counts (from telecom_sites for speed) ──────────────────
     n_sites = n_cells = 0
     try:
-        if _needs_ts:
-            r = _sql(f"""SELECT COUNT(DISTINCT k.site_id) AS s, COUNT(DISTINCT k.site_id) AS c
-                FROM kpi_data k {_TS_JOIN}
-                WHERE k.data_level='site' AND k.value IS NOT NULL
-                  AND k.kpi_name = :prb {_fw}
-            """, {**_fp, "prb": _PRB})[0]
-        else:
-            r = _sql("SELECT COUNT(DISTINCT site_id) AS s, COUNT(*) AS c FROM telecom_sites")[0]
+        # Build a lightweight filter for telecom_sites only (zone/city/state)
+        _ts_parts, _ts_params = [], {}
+        _zone = (filters or {}).get("cluster") or (filters or {}).get("zone") or ""
+        _city_f = (filters or {}).get("city") or ""
+        _state_f = (filters or {}).get("state") or ""
+        if _zone:
+            items = [v.strip() for v in _zone.split(",") if v.strip()]
+            if len(items) == 1:
+                _ts_parts.append("LOWER(zone) = LOWER(:_tz)")
+                _ts_params["_tz"] = items[0]
+            else:
+                phs = []
+                for i, v in enumerate(items):
+                    _ts_params[f"_tz{i}"] = v
+                    phs.append(f"LOWER(:_tz{i})")
+                _ts_parts.append(f"LOWER(zone) IN ({','.join(phs)})")
+        if _city_f:
+            _ts_parts.append("LOWER(city) = LOWER(:_tc)")
+            _ts_params["_tc"] = _city_f
+        if _state_f:
+            _ts_parts.append("LOWER(state) = LOWER(:_tst)")
+            _ts_params["_tst"] = _state_f
+        _ts_where = (" AND " + " AND ".join(_ts_parts)) if _ts_parts else ""
+        r = _sql(f"SELECT COUNT(DISTINCT site_id) AS s, COUNT(*) AS c FROM telecom_sites WHERE 1=1 {_ts_where}", _ts_params)[0]
         n_sites = int(r.get("s") or 0)
         n_cells = int(r.get("c") or 0)
     except Exception as e:

@@ -8,4 +8,4 @@ flask-socketio==5.3.6
 psycopg2-binary==2.9.10
 python-dotenv==1.1.0
 twilio==9.4.0
-openai>=1.0.0
+speedtest-cli==2.1.3

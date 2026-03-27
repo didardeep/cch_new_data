@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { apiGet, apiPut } from '../../api';
 import { useAuth } from '../../AuthContext';
+import { useTheme } from '../../ThemeContext';
 
 const ESCALATION_BANNER_STYLE = {
   background: '#fdf4ff',
@@ -36,6 +37,7 @@ export default function ManagerDashboard() {
   const [loading, setLoading] = useState(true);
   const [alertsExpanded, setAlertsExpanded] = useState(true);
   const { user } = useAuth();
+  const { isDark } = useTheme();
   const navigate = useNavigate();
 
   const fetchAlerts = useCallback(async () => {
@@ -97,8 +99,8 @@ export default function ManagerDashboard() {
       {/* SLA Alerts removed from dashboard — available in Alert Box */}
       {false && unreadAlerts.length > 0 && (
         <div style={{
-          background: '#fff', border: '1px solid #e2e8f0', borderRadius: 12,
-          marginBottom: 24, overflow: 'hidden', boxShadow: '0 1px 4px rgba(0,0,0,0.05)',
+          background: isDark ? '#1e293b' : '#fff', border: `1px solid ${isDark ? '#334155' : '#e2e8f0'}`, borderRadius: 12,
+          marginBottom: 24, overflow: 'hidden', boxShadow: isDark ? '0 1px 4px rgba(0,0,0,0.3)' : '0 1px 4px rgba(0,0,0,0.05)',
         }}>
           {/* Header */}
           <div
@@ -106,15 +108,15 @@ export default function ManagerDashboard() {
             style={{
               display: 'flex', alignItems: 'center', justifyContent: 'space-between',
               padding: '14px 20px', cursor: 'pointer', userSelect: 'none',
-              borderBottom: alertsExpanded ? '1px solid #e2e8f0' : 'none',
-              background: unreadCount > 0 ? '#fef2f2' : '#f8fafc',
+              borderBottom: alertsExpanded ? `1px solid ${isDark ? '#334155' : '#e2e8f0'}` : 'none',
+              background: unreadCount > 0 ? (isDark ? '#451a1a' : '#fef2f2') : (isDark ? '#0f172a' : '#f8fafc'),
             }}
           >
             <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke={unreadCount > 0 ? '#dc2626' : '#64748b'} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                 <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
               </svg>
-              <span style={{ fontSize: 14, fontWeight: 700, color: '#0f172a' }}>SLA Alerts</span>
+              <span style={{ fontSize: 14, fontWeight: 700, color: isDark ? '#e2e8f0' : '#0f172a' }}>SLA Alerts</span>
               {unreadCount > 0 && (
                 <span style={{
                   background: '#dc2626', color: '#fff', fontSize: 11, fontWeight: 700,
@@ -129,8 +131,8 @@ export default function ManagerDashboard() {
                 <button
                   onClick={(e) => { e.stopPropagation(); markAllRead(); }}
                   style={{
-                    background: 'none', border: '1px solid #e2e8f0', borderRadius: 6,
-                    padding: '4px 10px', fontSize: 11, fontWeight: 600, color: '#64748b',
+                    background: 'none', border: `1px solid ${isDark ? '#334155' : '#e2e8f0'}`, borderRadius: 6,
+                    padding: '4px 10px', fontSize: 11, fontWeight: 600, color: isDark ? '#94a3b8' : '#64748b',
                     cursor: 'pointer',
                   }}
                 >
@@ -160,8 +162,8 @@ export default function ManagerDashboard() {
                   <div key={a.id} style={{
                     display: 'flex', alignItems: 'flex-start', gap: 14,
                     padding: '14px 20px',
-                    borderBottom: '1px solid #f1f5f9',
-                    background: '#fffbeb',
+                    borderBottom: `1px solid ${isDark ? '#334155' : '#f1f5f9'}`,
+                    background: isDark ? '#1a1a0e' : '#fffbeb',
                     opacity: 1,
                   }}>
                     {/* Severity badge */}
@@ -176,7 +178,7 @@ export default function ManagerDashboard() {
                     {/* Details */}
                     <div style={{ flex: 1, minWidth: 0 }}>
                       <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 4 }}>
-                        <span style={{ fontSize: 13, fontWeight: 700, color: '#0f172a' }}>{a.reference_number}</span>
+                        <span style={{ fontSize: 13, fontWeight: 700, color: isDark ? '#e2e8f0' : '#0f172a' }}>{a.reference_number}</span>
                         <span style={{
                           fontSize: 10, fontWeight: 700, padding: '2px 6px', borderRadius: 4,
                           background: pb.bg, color: pb.color, border: `1px solid ${pb.border}`,
@@ -190,12 +192,12 @@ export default function ManagerDashboard() {
                           </span>
                         )}
                       </div>
-                      <div style={{ fontSize: 12, color: '#475569', marginBottom: 3 }}>
+                      <div style={{ fontSize: 12, color: isDark ? '#94a3b8' : '#475569', marginBottom: 3 }}>
                         {a.category}{a.subcategory ? ` / ${a.subcategory}` : ''}
                       </div>
-                      <div style={{ display: 'flex', gap: 16, fontSize: 11, color: '#94a3b8', flexWrap: 'wrap' }}>
-                        <span>Agent: <strong style={{ color: '#475569' }}>{a.assignee_name}</strong></span>
-                        <span>SLA: <strong style={{ color: '#475569' }}>{a.sla_hours}h</strong></span>
+                      <div style={{ display: 'flex', gap: 16, fontSize: 11, color: isDark ? '#64748b' : '#94a3b8', flexWrap: 'wrap' }}>
+                        <span>Agent: <strong style={{ color: isDark ? '#cbd5e1' : '#475569' }}>{a.assignee_name}</strong></span>
+                        <span>SLA: <strong style={{ color: isDark ? '#cbd5e1' : '#475569' }}>{a.sla_hours}h</strong></span>
                         <span>{a.created_at ? new Date(a.created_at).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : ''}</span>
                       </div>
                     </div>
@@ -205,9 +207,9 @@ export default function ManagerDashboard() {
                         onClick={() => markRead(a.id)}
                         title="Mark as read"
                         style={{
-                          background: 'none', border: '1px solid #e2e8f0', borderRadius: 6,
+                          background: 'none', border: `1px solid ${isDark ? '#334155' : '#e2e8f0'}`, borderRadius: 6,
                           padding: '4px 8px', cursor: 'pointer', flexShrink: 0, marginTop: 2,
-                          fontSize: 11, color: '#64748b',
+                          fontSize: 11, color: isDark ? '#94a3b8' : '#64748b',
                         }}
                       >
                         ✓
@@ -245,10 +247,10 @@ export default function ManagerDashboard() {
           <div className="stat-card-value">{s.critical_tickets || 0}</div>
           <div className="stat-card-sub">{s.high_tickets || 0} high priority</div>
         </div>
-        <div className="stat-card" style={s.manager_escalated_tickets > 0 ? { borderColor: '#e9d5ff', background: '#fdf4ff' } : {}}>
-          <div className="stat-card-header"><div className="stat-card-icon" style={{ background: '#f3e8ff' }}></div></div>
-          <div className="stat-card-label" style={{ color: '#6d28d9' }}>Needs Review</div>
-          <div className="stat-card-value" style={{ color: '#6d28d9' }}>{s.manager_escalated_tickets || 0}</div>
+        <div className="stat-card" style={s.manager_escalated_tickets > 0 ? { borderColor: isDark ? '#581c87' : '#e9d5ff', background: isDark ? '#2e1065' : '#fdf4ff' } : {}}>
+          <div className="stat-card-header"><div className="stat-card-icon" style={{ background: isDark ? '#581c87' : '#f3e8ff' }}></div></div>
+          <div className="stat-card-label" style={{ color: isDark ? '#c084fc' : '#6d28d9' }}>Needs Review</div>
+          <div className="stat-card-value" style={{ color: isDark ? '#c084fc' : '#6d28d9' }}>{s.manager_escalated_tickets || 0}</div>
           <div className="stat-card-sub">escalated by experts</div>
         </div>
       </div>
@@ -280,9 +282,9 @@ export default function ManagerDashboard() {
           </div>
           <div className="section-card-body">
             {cats.map((c, i) => (
-              <div key={i} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px 0', borderBottom: i < cats.length - 1 ? '1px solid #f0f2f5' : 'none' }}>
-                <span style={{ fontSize: 14, fontWeight: 500 }}>{c.name || 'Uncategorized'}</span>
-                <span style={{ fontSize: 14, fontWeight: 700, color: '#00338D' }}>{c.count}</span>
+              <div key={i} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px 0', borderBottom: i < cats.length - 1 ? `1px solid ${isDark ? '#334155' : '#f0f2f5'}` : 'none' }}>
+                <span style={{ fontSize: 14, fontWeight: 500, color: isDark ? '#e2e8f0' : undefined }}>{c.name || 'Uncategorized'}</span>
+                <span style={{ fontSize: 14, fontWeight: 700, color: isDark ? '#60a5fa' : '#00338D' }}>{c.count}</span>
               </div>
             ))}
           </div>

@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { apiGet, apiPut } from '../../api';
+import { useTheme } from '../../ThemeContext';
 
 /* ── Customer tier config ───────────────────────────────────────────────────── */
 const TIER_CFG = {
@@ -53,7 +54,7 @@ function PriorityBadge({ priority }) {
 }
 
 /* ── Review Dialog ──────────────────────────────────────────────────────────── */
-function ReviewDialog({ dialog, note, setNote, msg, loading, onClose, onSubmit }) {
+function ReviewDialog({ dialog, note, setNote, msg, loading, onClose, onSubmit, isDark }) {
   if (!dialog.open) return null;
   const isApprove = dialog.decision === 'approved';
 
@@ -69,8 +70,8 @@ function ReviewDialog({ dialog, note, setNote, msg, loading, onClose, onSubmit }
       <div
         onClick={e => e.stopPropagation()}
         style={{
-          width: '100%', maxWidth: 520, background: '#fff', borderRadius: 12,
-          boxShadow: '0 20px 40px rgba(15,23,42,0.2)', border: '1px solid #e2e8f0', padding: 24,
+          width: '100%', maxWidth: 520, background: isDark ? '#1e293b' : '#fff', borderRadius: 12,
+          boxShadow: isDark ? '0 20px 40px rgba(0,0,0,0.5)' : '0 20px 40px rgba(15,23,42,0.2)', border: `1px solid ${isDark ? '#334155' : '#e2e8f0'}`, padding: 24,
         }}
       >
         {/* Header */}
@@ -83,18 +84,18 @@ function ReviewDialog({ dialog, note, setNote, msg, loading, onClose, onSubmit }
             {isApprove ? '✓' : '✕'}
           </span>
           <div>
-            <h3 style={{ margin: 0, fontSize: 15, color: '#0f172a' }}>
+            <h3 style={{ margin: 0, fontSize: 15, color: isDark ? '#e2e8f0' : '#0f172a' }}>
               {isApprove ? 'Approve Escalation' : 'Reject Escalation'}
             </h3>
             {dialog.ticketRef && (
-              <span style={{ fontSize: 11, color: '#64748b', fontFamily: 'monospace' }}>
+              <span style={{ fontSize: 11, color: isDark ? '#94a3b8' : '#64748b', fontFamily: 'monospace' }}>
                 {dialog.ticketRef}
               </span>
             )}
           </div>
         </div>
 
-        <p style={{ fontSize: 13, color: '#475569', margin: '0 0 14px', lineHeight: 1.5 }}>
+        <p style={{ fontSize: 13, color: isDark ? '#94a3b8' : '#475569', margin: '0 0 14px', lineHeight: 1.5 }}>
           {isApprove
             ? 'You will take ownership of this ticket and implement the parameter change.'
             : 'The ticket will be returned to the escalating expert with your rejection note.'}
@@ -103,10 +104,10 @@ function ReviewDialog({ dialog, note, setNote, msg, loading, onClose, onSubmit }
         {/* Escalation details if available */}
         {dialog.escalationNote && (
           <div style={{
-            background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 8,
-            padding: '10px 14px', marginBottom: 14, fontSize: 12, color: '#0f172a', lineHeight: 1.5,
+            background: isDark ? '#0f172a' : '#f8fafc', border: `1px solid ${isDark ? '#334155' : '#e2e8f0'}`, borderRadius: 8,
+            padding: '10px 14px', marginBottom: 14, fontSize: 12, color: isDark ? '#e2e8f0' : '#0f172a', lineHeight: 1.5,
           }}>
-            <strong style={{ color: '#64748b', display: 'block', marginBottom: 4 }}>Expert's proposed change:</strong>
+            <strong style={{ color: isDark ? '#94a3b8' : '#64748b', display: 'block', marginBottom: 4 }}>Expert's proposed change:</strong>
             {dialog.escalationNote}
           </div>
         )}
@@ -117,8 +118,9 @@ function ReviewDialog({ dialog, note, setNote, msg, loading, onClose, onSubmit }
           placeholder={isApprove ? 'Optional note for the expert...' : 'Reason for rejection (recommended)...'}
           rows={3}
           style={{
-            width: '100%', borderRadius: 8, border: '1px solid #e2e8f0',
-            padding: '10px 12px', fontSize: 13, color: '#0f172a',
+            width: '100%', borderRadius: 8, border: `1px solid ${isDark ? '#334155' : '#e2e8f0'}`,
+            padding: '10px 12px', fontSize: 13, color: isDark ? '#e2e8f0' : '#0f172a',
+            background: isDark ? '#0f172a' : '#fff',
             resize: 'vertical', outline: 'none', boxSizing: 'border-box',
           }}
         />
@@ -147,6 +149,7 @@ function ReviewDialog({ dialog, note, setNote, msg, loading, onClose, onSubmit }
 
 /* ── Main Component ─────────────────────────────────────────────────────────── */
 export default function ActiveTickets() {
+  const { isDark } = useTheme();
   const [tickets, setTickets]               = useState([]);
   const [pendingChanges, setPendingChanges] = useState([]);
   const [loading, setLoading]               = useState(true);
@@ -267,6 +270,7 @@ export default function ActiveTickets() {
         loading={reviewLoading}
         onClose={closeReview}
         onSubmit={submitReview}
+        isDark={isDark}
       />
 
       {/* ── Section 1: Pending Escalation Requests ─────────────────────────── */}
@@ -305,7 +309,7 @@ export default function ActiveTickets() {
                     gridTemplateColumns: '1fr auto',
                     gap: 20,
                     padding: '18px 20px',
-                    borderBottom: idx < pendingChanges.length - 1 ? '1px solid #f1f5f9' : 'none',
+                    borderBottom: idx < pendingChanges.length - 1 ? `1px solid ${isDark ? '#334155' : '#f1f5f9'}` : 'none',
                     alignItems: 'start',
                   }}
                 >
@@ -338,17 +342,17 @@ export default function ActiveTickets() {
                     </div>
 
                     {/* Customer + category */}
-                    <div style={{ fontSize: 13, fontWeight: 600, color: '#0f172a', marginBottom: 2 }}>
+                    <div style={{ fontSize: 13, fontWeight: 600, color: isDark ? '#e2e8f0' : '#0f172a', marginBottom: 2 }}>
                       {t.user_name || 'Customer'}
                     </div>
-                    <div style={{ fontSize: 12, color: '#64748b', marginBottom: 8 }}>
+                    <div style={{ fontSize: 12, color: isDark ? '#94a3b8' : '#64748b', marginBottom: 8 }}>
                       {t.category || 'General'}{t.subcategory ? ` / ${t.subcategory}` : ''}
                     </div>
 
                     {/* Escalated by + when */}
-                    <div style={{ fontSize: 12, color: '#64748b', marginBottom: 10 }}>
+                    <div style={{ fontSize: 12, color: isDark ? '#94a3b8' : '#64748b', marginBottom: 10 }}>
                       Escalated by{' '}
-                      <strong style={{ color: '#0f172a' }}>
+                      <strong style={{ color: isDark ? '#e2e8f0' : '#0f172a' }}>
                         {t.escalated_by_name || c.agent_name || 'Expert'}
                       </strong>
                       {t.escalated_at && (
@@ -358,10 +362,10 @@ export default function ActiveTickets() {
 
                     {/* Proposed change box */}
                     <div style={{
-                      background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 8,
-                      padding: '10px 14px', fontSize: 12, color: '#0f172a', lineHeight: 1.6,
+                      background: isDark ? '#0f172a' : '#f8fafc', border: `1px solid ${isDark ? '#334155' : '#e2e8f0'}`, borderRadius: 8,
+                      padding: '10px 14px', fontSize: 12, color: isDark ? '#e2e8f0' : '#0f172a', lineHeight: 1.6,
                     }}>
-                      <span style={{ fontSize: 11, fontWeight: 700, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                      <span style={{ fontSize: 11, fontWeight: 700, color: isDark ? '#94a3b8' : '#64748b', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
                         Proposed change
                       </span>
                       <p style={{ margin: '4px 0 0' }}>{c.proposed_change}</p>
@@ -501,7 +505,7 @@ export default function ActiveTickets() {
                     </td>
                     <td style={{ overflow: 'hidden' }}>
                       <div style={{
-                        fontSize: 13, fontWeight: 500, color: '#0f172a',
+                        fontSize: 13, fontWeight: 500, color: isDark ? '#e2e8f0' : '#0f172a',
                         overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
                       }}>
                         {t.category}
@@ -517,7 +521,7 @@ export default function ActiveTickets() {
                     </td>
                     <td style={{ overflow: 'hidden' }}>
                       <div style={{
-                        fontSize: 13, fontWeight: 500, color: '#0f172a',
+                        fontSize: 13, fontWeight: 500, color: isDark ? '#e2e8f0' : '#0f172a',
                         overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
                       }}>
                         {t.assignee_name || '—'}
@@ -533,7 +537,7 @@ export default function ActiveTickets() {
                     </td>
                     <td style={{ overflow: 'hidden' }}>
                       <div style={{
-                        fontSize: 13, color: '#475569',
+                        fontSize: 13, color: isDark ? '#94a3b8' : '#475569',
                         overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
                       }}>
                         {t.description}
@@ -592,8 +596,9 @@ export default function ActiveTickets() {
                             rows={2}
                             style={{
                               width: '100%', minWidth: 160, borderRadius: 6,
-                              border: '1px solid #e2e8f0', padding: '6px 8px',
+                              border: `1px solid ${isDark ? '#334155' : '#e2e8f0'}`, padding: '6px 8px',
                               fontSize: 12, resize: 'vertical', marginBottom: 6,
+                              background: isDark ? '#0f172a' : '#fff', color: isDark ? '#e2e8f0' : '#0f172a',
                             }}
                           />
                           <div style={{ display: 'flex', gap: 4 }}>

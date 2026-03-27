@@ -2,12 +2,14 @@ import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { apiGet } from '../../api';
 import { useAuth } from '../../AuthContext';
+import { useTheme } from '../../ThemeContext';
 
 export default function AdminDashboard() {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const { user } = useAuth();
   const navigate = useNavigate();
+  const { isDark } = useTheme();
 
   useEffect(() => {
     apiGet('/api/admin/dashboard').then(d => {
@@ -87,9 +89,9 @@ export default function AdminDashboard() {
           </div>
           <div className="section-card-body">
             {users.map((u, i) => (
-              <div key={i} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px 0', borderBottom: i < users.length - 1 ? '1px solid #f0f2f5' : 'none' }}>
+              <div key={i} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px 0', borderBottom: i < users.length - 1 ? `1px solid ${isDark ? '#334155' : '#f0f2f5'}` : 'none' }}>
                 <span style={{ fontSize: 14, fontWeight: 500, textTransform: 'capitalize' }}>{u.role}</span>
-                <span style={{ fontSize: 14, fontWeight: 700, color: '#00338D' }}>{u.count}</span>
+                <span style={{ fontSize: 14, fontWeight: 700, color: isDark ? '#60a5fa' : '#00338D' }}>{u.count}</span>
               </div>
             ))}
           </div>
@@ -103,9 +105,9 @@ export default function AdminDashboard() {
           </div>
           <div className="section-card-body">
             {cats.map((c, i) => (
-              <div key={i} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px 0', borderBottom: i < cats.length - 1 ? '1px solid #f0f2f5' : 'none' }}>
+              <div key={i} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px 0', borderBottom: i < cats.length - 1 ? `1px solid ${isDark ? '#334155' : '#f0f2f5'}` : 'none' }}>
                 <span style={{ fontSize: 14, fontWeight: 500 }}>{c.name || 'Uncategorized'}</span>
-                <span style={{ fontSize: 14, fontWeight: 700, color: '#00338D' }}>{c.count}</span>
+                <span style={{ fontSize: 14, fontWeight: 700, color: isDark ? '#60a5fa' : '#00338D' }}>{c.count}</span>
               </div>
             ))}
           </div>
