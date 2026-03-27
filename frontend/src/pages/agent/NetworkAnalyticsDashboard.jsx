@@ -693,6 +693,8 @@ function OverviewPage({T,data,mapSites}) {
   const best=d.best_sites||[];
   const lowMargin=d.low_margin_sites||[];
   const trend=d.tput_trend||[];
+  const preScanTime=d.pre_scan_time||null;
+  const preScanCells=d.pre_scan_cells||[];
 
   return (
     <div style={{animation:'fadeIn .3s ease'}}>

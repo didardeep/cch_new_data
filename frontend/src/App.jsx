@@ -98,7 +98,6 @@ export default function App() {
         <Route path="alerts" element={<CTOAlertBox />} />
         <Route path="roster" element={<CTODutyRoster />} />
         <Route path="change-workflow" element={<CTOChangeWorkflow />} />
-        <Route path="settings" element={<SettingsPage />} />
       </Route>
 
       {/* Admin Routes */}
