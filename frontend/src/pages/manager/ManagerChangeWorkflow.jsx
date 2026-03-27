@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { apiGet, apiPut } from '../../api';
+import { useTheme } from '../../ThemeContext';
 
 /* ── Constants ─────────────────────────────────────────────────────────────── */
 const PRIORITY_STYLE = {
@@ -849,6 +850,7 @@ const FILTER_TABS = [
 ];
 
 export default function ManagerChangeWorkflow() {
+  const { isDark } = useTheme();
   const [crs,     setCrs]     = useState([]);
   const [stats,   setStats]   = useState({ total: 0, needs_action: 0, approved: 0, closed: 0 });
   const [loading, setLoading] = useState(true);
@@ -892,11 +894,16 @@ export default function ManagerChangeWorkflow() {
     closed: activeCRs.filter(c => c.status === 'closed').length,
   };
 
+  const _ic = (d, color = '#94a3b8') => (
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      {Array.isArray(d) ? d.map((p, i) => <path key={i} d={p} />) : <path d={d} />}
+    </svg>
+  );
   const STAT_CARDS = [
-    { label: 'Total CRs',    value: activeStats.total,        color: sectionColor, icon: '\ud83d\udccb' },
-    { label: 'Needs Action', value: activeStats.needs_action, color: '#dc2626', icon: '\u26a1', highlight: activeStats.needs_action > 0 },
-    { label: 'Approved',     value: activeStats.approved,     color: '#16a34a', icon: '\u2713'  },
-    { label: 'Closed',       value: activeStats.closed,       color: '#64748b', icon: '\u2714'  },
+    { label: 'Total CRs',    value: activeStats.total,        color: sectionColor, icon: _ic(["M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z", "M14 2v6h6", "M8 13h8", "M8 17h8", "M8 9h2"], sectionColor) },
+    { label: 'Needs Action', value: activeStats.needs_action, color: '#dc2626', icon: _ic(["M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z", "M12 9v4", "M12 17h.01"], '#dc2626'), highlight: activeStats.needs_action > 0 },
+    { label: 'Approved',     value: activeStats.approved,     color: '#16a34a', icon: _ic(["M22 11.08V12a10 10 0 1 1-5.93-9.14", "M22 4L12 14.01l-3-3"], '#16a34a') },
+    { label: 'Closed',       value: activeStats.closed,       color: '#64748b', icon: _ic(["M9 11l3 3L22 4", "M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"], '#64748b') },
   ];
 
   return (
@@ -949,7 +956,7 @@ export default function ManagerChangeWorkflow() {
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 14, marginBottom: 24 }}>
         {STAT_CARDS.map(s => (
           <div key={s.label} style={{
-            background: '#fff', borderRadius: 12, border: `1px solid ${s.highlight ? '#fecaca' : '#e2e8f0'}`,
+            background: isDark ? '#1e293b' : '#fff', borderRadius: 12, border: `1px solid ${s.highlight ? '#fecaca' : (isDark ? '#334155' : '#e2e8f0')}`,
             padding: '16px 20px', boxShadow: s.highlight ? '0 2px 8px rgba(220,38,38,0.1)' : '0 1px 3px rgba(0,0,0,0.05)',
           }}>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>

@@ -89,6 +89,7 @@ export default function App() {
         <Route path="alerts" element={<ManagerAlertBox />} />
         <Route path="approvals" element={<ManagerApprovals />} />
         <Route path="change-workflow" element={<ManagerChangeWorkflow />} />
+        <Route path="settings" element={<SettingsPage />} />
       </Route>
 
       {/* CTO Routes */}
@@ -99,7 +100,6 @@ export default function App() {
         <Route path="business" element={<BusinessKPI />} />
         <Route path="operational" element={<OperationalKPI />} />
         <Route path="tickets" element={<ActiveTickets />} />
-        <Route path="tracking" element={<IssueTracking />} />
         <Route path="chat-detail/:id" element={<ChatDetail />} />
         <Route path="alerts" element={<CTOAlertBox />} />
         <Route path="roster" element={<CTODutyRoster />} />

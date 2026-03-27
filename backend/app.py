@@ -1492,6 +1492,49 @@ def get_me():
     return jsonify({"user": user.to_dict()})
 
 
+@app.route("/api/user/settings", methods=["PUT"])
+@jwt_required()
+def update_user_settings():
+    """Update user profile (name, email, phone)."""
+    user = db.session.get(User, int(get_jwt_identity()))
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+    data = request.json or {}
+    if "name" in data and data["name"].strip():
+        user.name = data["name"].strip()
+    if "phone_number" in data:
+        user.phone_number = (data["phone_number"] or "").strip() or None
+    if "email" in data and data["email"].strip():
+        new_email = data["email"].strip().lower()
+        if new_email != user.email:
+            existing = User.query.filter_by(email=new_email).first()
+            if existing:
+                return jsonify({"error": "Email already in use"}), 409
+            user.email = new_email
+    db.session.commit()
+    return jsonify({"user": user.to_dict()})
+
+
+@app.route("/api/user/password", methods=["PUT"])
+@jwt_required()
+def update_user_password():
+    """Change user password."""
+    user = db.session.get(User, int(get_jwt_identity()))
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+    data = request.json or {}
+    current_password = data.get("current_password", "")
+    new_password = data.get("new_password", "")
+    if not current_password or not new_password:
+        return jsonify({"error": "Both current and new password are required"}), 400
+    if not user.check_password(current_password):
+        return jsonify({"error": "Current password is incorrect"}), 401
+    if len(new_password) < 6:
+        return jsonify({"error": "New password must be at least 6 characters"}), 400
+    user.set_password(new_password)
+    db.session.commit()
+    return jsonify({"message": "Password updated successfully"})
+
 
 # CHATBOT ROUTES 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2134,10 +2177,12 @@ def send_summary_email(session_id):
 @jwt_required()
 def get_chat_session(session_id):
     user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
     session = db.session.get(ChatSession, session_id)
     if not session:
         return jsonify({"error": "Session not found"}), 404
-    if session.user_id != user_id:
+    # Allow the session owner, managers, CTOs, and admins
+    if session.user_id != user_id and (not user or user.role not in ("manager", "cto", "admin", "human_agent")):
         return jsonify({"error": "Unauthorized"}), 403
     return jsonify({
         "session": session.to_dict(),
@@ -2433,10 +2478,8 @@ def manager_tickets():
 
     query = Ticket.query
 
-    # Managers see only tickets escalated to them.
+    # Managers see all open/active tickets (not just ones assigned to them).
     # CTO and Admin retain a full view of all tickets.
-    if user.role == "manager":
-        query = query.filter_by(assigned_to=user_id)
 
     if status:
         query = query.filter_by(status=status)
@@ -2874,49 +2917,68 @@ def _require_cto_user():
 
 
 def _latest_site_values_for_kpi(kpi_name):
-    rows = KpiData.query.filter_by(data_level="site", kpi_name=kpi_name).order_by(KpiData.site_id, KpiData.date.desc()).all()
-    latest = {}
-    for row in rows:
-        if row.site_id not in latest and row.value is not None:
-            latest[row.site_id] = {"date": row.date, "value": float(row.value)}
-    return latest
+    from sqlalchemy import func as sa_func
+    # Subquery: max date per site
+    sub = db.session.query(
+        KpiData.site_id,
+        sa_func.max(KpiData.date).label("max_date"),
+    ).filter(
+        KpiData.data_level == "site",
+        KpiData.kpi_name == kpi_name,
+        KpiData.value.isnot(None),
+    ).group_by(KpiData.site_id).subquery()
+
+    rows = db.session.query(
+        KpiData.site_id, KpiData.date, KpiData.value,
+    ).join(sub, db.and_(
+        KpiData.site_id == sub.c.site_id,
+        KpiData.date == sub.c.max_date,
+    )).filter(
+        KpiData.data_level == "site",
+        KpiData.kpi_name == kpi_name,
+    ).all()
+
+    return {r.site_id: {"date": r.date, "value": float(r.value)} for r in rows if r.value is not None}
 
 
 def _site_values_near_date(kpi_name, target_date):
     """Return {site_id: value} for the closest date <= target_date per site."""
-    rows = KpiData.query.filter(
+    from sqlalchemy import func as sa_func
+    sub = db.session.query(
+        KpiData.site_id,
+        sa_func.max(KpiData.date).label("max_date"),
+    ).filter(
         KpiData.data_level == "site",
         KpiData.kpi_name == kpi_name,
+        KpiData.value.isnot(None),
         KpiData.date <= target_date,
-    ).order_by(KpiData.site_id, KpiData.date.desc()).all()
-    result = {}
-    for row in rows:
-        if row.site_id not in result and row.value is not None:
-            result[row.site_id] = float(row.value)
-    return result
+    ).group_by(KpiData.site_id).subquery()
+
+    rows = db.session.query(
+        KpiData.site_id, KpiData.value,
+    ).join(sub, db.and_(
+        KpiData.site_id == sub.c.site_id,
+        KpiData.date == sub.c.max_date,
+    )).filter(
+        KpiData.data_level == "site",
+        KpiData.kpi_name == kpi_name,
+    ).all()
+
+    return {r.site_id: float(r.value) for r in rows if r.value is not None}
 
 
 def _series_for_kpi_patterns(patterns):
-    rows = KpiData.query.filter(
+    from sqlalchemy import func as sa_func
+    rows = db.session.query(
+        KpiData.date,
+        sa_func.avg(KpiData.value).label("avg_val"),
+    ).filter(
         KpiData.data_level == "site",
-        db.or_(*[KpiData.kpi_name.ilike(pattern) for pattern in patterns])
-    ).all()
+        KpiData.value.isnot(None),
+        db.or_(*[KpiData.kpi_name.ilike(pattern) for pattern in patterns]),
+    ).group_by(KpiData.date).order_by(KpiData.date).all()
 
-    grouped = {}
-    for row in rows:
-        if row.value is None:
-            continue
-        key = row.date.isoformat()
-        bucket = grouped.setdefault(key, {"date": key, "total": 0.0, "count": 0})
-        bucket["total"] += float(row.value)
-        bucket["count"] += 1
-
-    series = []
-    for day in sorted(grouped.keys()):
-        bucket = grouped[day]
-        avg = bucket["total"] / bucket["count"] if bucket["count"] else 0
-        series.append({"date": day, "value": round(avg, 2)})
-    return series
+    return [{"date": r.date.isoformat(), "value": round(float(r.avg_val), 2)} for r in rows]
 
 
 def _latest_average_for_patterns(patterns):
@@ -2974,71 +3036,103 @@ def cto_technical_kpi():
         {
             "key": "accessibility",
             "label": "Accessibility",
-            "patterns": [
-                "%availability%",
-                "%rrc setup success rate%",
-                "%call setup success rate%",
-                "%e-rab setup success rate%",
-                "%access success rate%",
+            "names": [
+                "Availability",
+                "LTE RRC Setup Success Rate",
+                "LTE Call Setup Success Rate",
+                "LTE E-RAB Setup Success Rate",
+                "CSFB Access Success Rate",
             ],
         },
         {
             "key": "retainability",
             "label": "Retainability",
-            "patterns": [
-                "%call drop rate%",
-                "%ho success rate%",
-                "%handover success rate%",
+            "names": [
+                "E-RAB Call Drop Rate_1",
+                "Inter-eNBS1HO Success Rate",
+                "Inter-eNBX2HO Success Rate",
+                "Intra-eNB HO Success Rate",
+                "LTE Intra-Freq HO Success Rate",
             ],
         },
         {
             "key": "downlink_throughput",
             "label": "Downlink Throughput",
-            "patterns": [
-                "%dl - cell ave throughput%",
-                "%dl - usr ave throughput%",
-                "%downlink throughput%",
-                "%dl throughput%",
+            "names": [
+                "LTE DL - Cell Ave Throughput",
+                "LTE DL - Usr Ave Throughput",
             ],
         },
         {
             "key": "prb_utilization",
             "label": "PRB Utilization",
-            "patterns": [
-                "%prb utilization%",
-                "%prb util%",
+            "names": [
+                "DL PRB Utilization (1BH)",
+                "UL PRB Utilization (1BH",
             ],
         },
         {
             "key": "downlink_volume",
             "label": "Downlink Volume",
-            "patterns": [
-                "%dl data total volume%",
-                "%downlink volume%",
-                "%dl volume%",
+            "names": [
+                "DL Data Total Volume",
             ],
         },
         {
             "key": "uplink_volume",
             "label": "Uplink Volume",
-            "patterns": [
-                "%ul data total volume%",
-                "%uplink volume%",
-                "%ul volume%",
+            "names": [
+                "UL Data Total Volume",
             ],
         },
     ]
 
+    # Bulk query: all KPI names in one shot, grouped by kpi_name + date
+    from sqlalchemy import func as sa_func
+    all_names = []
+    for item in kpi_defs:
+        all_names.extend(item["names"])
+
+    bulk = db.session.query(
+        KpiData.kpi_name,
+        KpiData.date,
+        sa_func.avg(KpiData.value).label("avg_val"),
+    ).filter(
+        KpiData.data_level == "site",
+        KpiData.value.isnot(None),
+        KpiData.kpi_name.in_(all_names),
+    ).group_by(KpiData.kpi_name, KpiData.date).order_by(KpiData.date).all()
+
+    # Map kpi_name → key
+    name_to_key = {}
+    for item in kpi_defs:
+        for n in item["names"]:
+            name_to_key[n] = item["key"]
+
+    # Aggregate per key per date
+    key_date = {}  # key → {date_str: [values]}
+    for kpi_name, date, avg_val in bulk:
+        k = name_to_key.get(kpi_name)
+        if not k:
+            continue
+        d_str = date.isoformat()
+        key_date.setdefault(k, {}).setdefault(d_str, []).append(float(avg_val))
+
     cards = []
     chart_series = {}
     for item in kpi_defs:
-        series = _series_for_kpi_patterns(item["patterns"])
+        k = item["key"]
+        date_vals = key_date.get(k, {})
+        series = []
+        for day in sorted(date_vals.keys()):
+            vals = date_vals[day]
+            series.append({"date": day, "value": round(sum(vals) / len(vals), 2)})
         cards.append({
-            "key": item["key"],
+            "key": k,
             "label": item["label"],
             "value": round(series[-1]["value"], 2) if series else 0,
         })
-        chart_series[item["key"]] = series[-30:]
+        chart_series[k] = series[-30:]
 
     return jsonify({
         "cards": cards,
@@ -3049,120 +3143,150 @@ def cto_technical_kpi():
 @app.route("/api/cto/core-kpi", methods=["GET"])
 @jwt_required()
 def cto_core_kpi():
-    """Return Core Network KPI data from the flexible upload table."""
+    """Return Core Network KPI data from the flexible upload table.
+    Optimised: uses bulk queries instead of per-KPI loops.
+    """
+    import datetime as _dt
     from sqlalchemy import func as sa_func
 
     user = User.query.get(int(get_jwt_identity()))
     if not user or user.role not in ("cto", "admin"):
         return jsonify({"error": "Unauthorized"}), 403
 
-    # Check if any core data exists
-    total = FlexibleKpiUpload.query.filter_by(kpi_type="core").count()
-    if total == 0:
-        return jsonify({"available": False, "message": "No Core KPI data uploaded yet."})
+    has_kpi_name = db.session.query(FlexibleKpiUpload.id).filter(
+        FlexibleKpiUpload.kpi_type == "core",
+        FlexibleKpiUpload.kpi_name.isnot(None),
+    ).limit(1).scalar() is not None
 
-    # Get all distinct numeric KPI columns (with display labels)
-    col_rows = db.session.query(
-        FlexibleKpiUpload.column_name,
-        FlexibleKpiUpload.str_value,
-    ).filter_by(kpi_type="core", column_type="numeric").distinct(
-        FlexibleKpiUpload.column_name
-    ).order_by(FlexibleKpiUpload.column_name, FlexibleKpiUpload.id.desc()).all()
-
-    # Build column metadata
-    cols_meta = {}
-    for col_name, str_val in col_rows:
-        label = str_val if (str_val and str_val != col_name) else col_name
-        cols_meta[col_name] = label
-
-    # Date range
-    latest_date = db.session.query(
-        sa_func.max(FlexibleKpiUpload.row_date)
-    ).filter_by(kpi_type="core").scalar()
-    min_date = db.session.query(
-        sa_func.min(FlexibleKpiUpload.row_date)
-    ).filter_by(kpi_type="core").scalar()
+    if not has_kpi_name:
+        # Check if any core data exists at all
+        total = FlexibleKpiUpload.query.filter_by(kpi_type="core").count()
+        if total == 0:
+            return jsonify({"available": False, "message": "No Core KPI data uploaded yet."})
+        return jsonify({"available": False, "message": "Core data missing KPI names."})
 
     def _iso(d):
         return d.isoformat() if d and hasattr(d, 'isoformat') else (str(d) if d else None)
 
-    # Summary: avg over all time + avg for latest date
+    def _parse_col_date(col_name):
+        s = col_name.replace("_", "-")[:10]
+        try:
+            return _dt.datetime.strptime(s, "%Y-%m-%d").date()
+        except ValueError:
+            return None
+
+    # ── KPI metadata ─────────────────────────────────────────────
+    LABEL_MAP = {
+        "CPU Utilization": "CPU Usage",
+        "Authentication Success Rate": "Auth Success Rate",
+        "Attach Success Rate": "4G Attach Success",
+        "PDP Bearer Setup Success Rate": "4G Bearer Success",
+    }
+    kpi_names = [r[0] for r in db.session.query(
+        FlexibleKpiUpload.kpi_name
+    ).filter(
+        FlexibleKpiUpload.kpi_type == "core",
+        FlexibleKpiUpload.kpi_name.isnot(None),
+    ).distinct().all()]
+
+    db_to_key = {}   # "CPU Utilization" → "cpu_utilization"
+    cols_meta = {}   # "cpu_utilization" → {"db_name": ..., "label": ...}
+    for kn in kpi_names:
+        key = kn.lower().replace(" ", "_")
+        db_to_key[kn] = key
+        cols_meta[key] = {"db_name": kn, "label": LABEL_MAP.get(kn, kn)}
+
+    # ── Date columns ─────────────────────────────────────────────
+    date_cols = [r[0] for r in db.session.query(
+        FlexibleKpiUpload.column_name
+    ).filter_by(kpi_type="core").distinct().all()]
+    date_cols_parsed = {dc: _parse_col_date(dc) for dc in date_cols}
+    date_cols_parsed = {k: v for k, v in date_cols_parsed.items() if v}
+    sorted_date_cols = sorted(date_cols_parsed.items(), key=lambda x: x[1])
+
+    if not sorted_date_cols:
+        return jsonify({"available": False, "message": "No valid date columns found."})
+
+    min_date = sorted_date_cols[0][1]
+    latest_date = sorted_date_cols[-1][1]
+    latest_col = sorted_date_cols[-1][0]
+
+    # ── SINGLE bulk query: kpi_name + column_name → avg ──────────
+    # This replaces ~8 separate queries with 1
+    bulk_rows = db.session.query(
+        FlexibleKpiUpload.kpi_name,
+        FlexibleKpiUpload.column_name,
+        sa_func.avg(FlexibleKpiUpload.num_value).label("avg_val"),
+    ).filter(
+        FlexibleKpiUpload.kpi_type == "core",
+        FlexibleKpiUpload.kpi_name.isnot(None),
+    ).group_by(
+        FlexibleKpiUpload.kpi_name,
+        FlexibleKpiUpload.column_name,
+    ).all()
+
+    # Build trend + summary from bulk results
+    # per_kpi_all[key] = list of values (for overall avg)
+    # per_kpi_latest[key] = avg for latest column
+    per_kpi_all = {k: [] for k in cols_meta}
+    per_kpi_latest = {k: None for k in cols_meta}
+    trend_pivot = {_iso(d): {"date": _iso(d)} for _, d in sorted_date_cols}
+
+    for kpi_db_name, col_name, avg_val in bulk_rows:
+        key = db_to_key.get(kpi_db_name)
+        if not key or avg_val is None:
+            continue
+        val = round(float(avg_val), 2)
+        per_kpi_all[key].append(val)
+        if col_name == latest_col:
+            per_kpi_latest[key] = val
+        d = date_cols_parsed.get(col_name)
+        if d:
+            d_str = _iso(d)
+            if d_str in trend_pivot:
+                trend_pivot[d_str][key] = val
+
     summary = {}
-    for col_name, label in cols_meta.items():
-        avg_all = db.session.query(
-            sa_func.avg(FlexibleKpiUpload.num_value)
-        ).filter_by(kpi_type="core", column_name=col_name).scalar()
-        avg_latest = None
-        if latest_date is not None:
-            avg_latest = db.session.query(
-                sa_func.avg(FlexibleKpiUpload.num_value)
-            ).filter(
-                FlexibleKpiUpload.kpi_type == "core",
-                FlexibleKpiUpload.column_name == col_name,
-                FlexibleKpiUpload.row_date == latest_date,
-            ).scalar()
-        summary[col_name] = {
-            "label": label,
-            "avg": round(float(avg_all), 2) if avg_all is not None else None,
-            "latest_avg": round(float(avg_latest), 2) if avg_latest is not None else None,
+    for key, meta in cols_meta.items():
+        vals = per_kpi_all[key]
+        avg_all = round(sum(vals) / len(vals), 2) if vals else None
+        summary[key] = {
+            "label": meta["label"],
+            "avg": avg_all,
+            "latest_avg": per_kpi_latest[key],
         }
 
-    # Trend: per-date averages across all sites for each KPI
-    trend_rows = db.session.query(
-        FlexibleKpiUpload.column_name,
-        FlexibleKpiUpload.row_date,
-        sa_func.avg(FlexibleKpiUpload.num_value).label("avg_val"),
-    ).filter_by(kpi_type="core", column_type="numeric").filter(
-        FlexibleKpiUpload.row_date.isnot(None)
-    ).group_by(
-        FlexibleKpiUpload.column_name,
-        FlexibleKpiUpload.row_date,
-    ).order_by(FlexibleKpiUpload.row_date).all()
-
-    trend_pivot = {}
-    for col_name, row_date, avg_val in trend_rows:
-        if col_name not in cols_meta:
-            continue
-        d_str = _iso(row_date)
-        if d_str not in trend_pivot:
-            trend_pivot[d_str] = {"date": d_str}
-        trend_pivot[d_str][col_name] = round(float(avg_val), 2) if avg_val is not None else None
     trend = sorted(trend_pivot.values(), key=lambda x: x["date"])
 
-    # Per-site table: latest date only
-    site_rows_q = db.session.query(
+    # ── Per-site table: latest date only (single query) ──────────
+    site_rows = db.session.query(
         FlexibleKpiUpload.site_id,
-        FlexibleKpiUpload.column_name,
+        FlexibleKpiUpload.kpi_name,
         FlexibleKpiUpload.num_value,
     ).filter(
         FlexibleKpiUpload.kpi_type == "core",
-        FlexibleKpiUpload.column_type == "numeric",
-        FlexibleKpiUpload.row_date == latest_date,
-    ).order_by(FlexibleKpiUpload.site_id).all()
+        FlexibleKpiUpload.column_name == latest_col,
+    ).all()
 
     pivot = {}
-    for site_id, col_name, num_value in site_rows_q:
-        if col_name not in cols_meta:
-            continue
-        if site_id not in pivot:
-            pivot[site_id] = {}
-        if col_name not in pivot[site_id]:
-            pivot[site_id][col_name] = num_value
+    for site_id, kpi_name, num_value in site_rows:
+        key = db_to_key.get(kpi_name)
+        if key:
+            pivot.setdefault(site_id, {})[key] = num_value
 
-    site_ids = sorted(pivot.keys())
     site_table = []
-    for site_id in site_ids:
+    for site_id in sorted(pivot.keys()):
         row = {"site_id": site_id}
-        for col_name in cols_meta:
-            val = pivot[site_id].get(col_name)
-            row[col_name] = round(float(val), 2) if val is not None else None
+        for key in cols_meta:
+            val = pivot[site_id].get(key)
+            row[key] = round(float(val), 2) if val is not None else None
         site_table.append(row)
 
     return jsonify({
         "available": True,
-        "total_sites": len(site_ids),
+        "total_sites": len(site_table),
         "date_range": {"from": _iso(min_date), "to": _iso(latest_date)},
-        "columns": [{"key": k, "label": v} for k, v in cols_meta.items()],
+        "columns": [{"key": k, "label": m["label"]} for k, m in cols_meta.items()],
         "summary": summary,
         "trend": trend,
         "sites": site_table,
@@ -3172,15 +3296,201 @@ def cto_core_kpi():
 @app.route("/api/cto/business-kpi", methods=["GET"])
 @jwt_required()
 def cto_business_kpi():
+    """Business KPI dashboard.
+    Pulls revenue/subscriber data from FlexibleKpiUpload (kpi_type='revenue')
+    and falls back to KpiData if no revenue upload exists.
+    """
     user = _require_cto_user()
     if not user:
         return jsonify({"error": "Unauthorized"}), 403
 
+    # ── Try FlexibleKpiUpload revenue data first ─────────────────────────────
+    rev_count = FlexibleKpiUpload.query.filter_by(kpi_type="revenue").count()
+    use_flexible = rev_count > 0
+
+    if use_flexible:
+        return _business_kpi_from_flexible()
+    else:
+        return _business_kpi_from_kpidata()
+
+
+def _business_kpi_from_flexible():
+    """Build business KPI response from FlexibleKpiUpload revenue data.
+    Columns: subscribers, revenue_jan_l/feb_l/mar_l, opex_jan_l/feb_l/mar_l,
+             zone, technology, site_category
+    """
+    from sqlalchemy import func as sa_func
+
+    # ── Load all revenue rows into per-site dicts ────────────────────────────
+    rows = FlexibleKpiUpload.query.filter_by(kpi_type="revenue").all()
+    sites = {}  # site_id → {col_name: value}
+    for r in rows:
+        site = sites.setdefault(r.site_id, {})
+        if r.column_type == "numeric" and r.num_value is not None:
+            site[r.column_name] = float(r.num_value)
+        elif r.column_type == "text" and r.str_value is not None:
+            site[r.column_name] = r.str_value
+
+    if not sites:
+        return jsonify({"summary": {}, "top_sites": [], "declining_sites": [],
+                        "overloaded_sites": [], "trend": [], "arpu_trend": [],
+                        "site_health": []})
+
+    # ── Detect revenue/opex month columns ────────────────────────────────────
+    MONTH_ORDER = ["jan", "feb", "mar", "apr", "may", "jun",
+                   "jul", "aug", "sep", "oct", "nov", "dec"]
+    sample = next(iter(sites.values()))
+    rev_cols = sorted(
+        [k for k in sample if k.startswith("revenue_") and isinstance(sample.get(k), (int, float))],
+        key=lambda c: next((i for i, m in enumerate(MONTH_ORDER) if m in c), 99)
+    )
+    opex_cols = sorted(
+        [k for k in sample if k.startswith("opex_") and isinstance(sample.get(k), (int, float))],
+        key=lambda c: next((i for i, m in enumerate(MONTH_ORDER) if m in c), 99)
+    )
+
+    latest_rev_col = rev_cols[-1] if rev_cols else None
+    prev_rev_col   = rev_cols[-2] if len(rev_cols) >= 2 else None
+    latest_opex_col = opex_cols[-1] if opex_cols else None
+
+    # ── Pull PRB utilization from KpiData (latest value per site) ────────────
+    prb_latest = _latest_site_values_for_kpi("DL PRB Utilization (1BH)")
+    # fallback: try pattern match if exact name not found
+    if not prb_latest:
+        prb_rows = KpiData.query.filter(
+            KpiData.data_level == "site",
+            KpiData.kpi_name.ilike("%prb%util%"),
+        ).order_by(KpiData.site_id, KpiData.date.desc()).all()
+        for row in prb_rows:
+            if row.site_id not in prb_latest and row.value is not None:
+                prb_latest[row.site_id] = {"date": row.date, "value": float(row.value)}
+
+    # ── Build per-site rows ──────────────────────────────────────────────────
+    site_rows = []
+    for site_id, data in sites.items():
+        subs    = data.get("subscribers", 0)
+        rev_now = data.get(latest_rev_col, 0) if latest_rev_col else 0
+        rev_prev = data.get(prev_rev_col, 0) if prev_rev_col else 0
+        opex    = data.get(latest_opex_col, 0) if latest_opex_col else 0
+        arpu    = round(rev_now / subs, 4) if subs else 0
+        growth  = round(((rev_now - rev_prev) / rev_prev) * 100, 2) if rev_prev and rev_prev != 0 else 0
+        util_val = prb_latest.get(site_id, {}).get("value", 0) if isinstance(prb_latest.get(site_id), dict) else 0
+        site_rows.append({
+            "site_id": site_id,
+            "users": round(subs, 2),
+            "revenue": round(rev_now, 2),
+            "opex": round(opex, 2),
+            "arpu": round(arpu, 4),
+            "growth": growth,
+            "utilization": round(util_val, 2),
+            "zone": data.get("zone", ""),
+            "technology": data.get("technology", ""),
+            "category": data.get("site_category", ""),
+        })
+
+    num_sites     = len(site_rows) or 1
+    total_users   = int(sum(r["users"] for r in site_rows))
+    avg_users     = int(round(total_users / num_sites))
+    total_revenue = round(sum(r["revenue"] for r in site_rows), 2)
+    total_opex    = round(sum(r["opex"] for r in site_rows), 2)
+
+    # ARPU (total)
+    arpu = round(total_revenue / total_users, 4) if total_users else 0
+
+    # Growth: avg revenue change across sites
+    growths = [r["growth"] for r in site_rows if r["growth"] != 0]
+    avg_growth = round(sum(growths) / len(growths), 2) if growths else 0
+
+    # Declining sites: revenue dropped MoM
+    declining_sites = sorted(
+        [r for r in site_rows if r["growth"] < 0],
+        key=lambda r: r["growth"]
+    )[:10]
+
+    # Revenue at risk = total revenue of declining sites
+    revenue_at_risk = round(sum(r["revenue"] for r in site_rows if r["growth"] < 0), 2)
+
+    # Churn proxy: count of sites with revenue decline > 10%
+    heavy_decline = [r for r in site_rows if r["growth"] < -10]
+    churn_rate = round(len(heavy_decline) / num_sites * 100, 2)
+
+    # Network ROI
+    network_roi = round(((total_revenue - total_opex) / total_opex) * 100, 2) if total_opex else 0
+
+    # Top sites by revenue
+    top_sites = sorted(site_rows, key=lambda r: r["revenue"], reverse=True)[:10]
+
+    # Overloaded: utilization > 80% OR category contains "High Util"
+    overloaded_sites = sorted(
+        [r for r in site_rows if r["utilization"] > 80 or "High Util" in (r.get("category") or "")],
+        key=lambda r: r["utilization"], reverse=True
+    )[:10]
+
+    # ── Monthly trend ────────────────────────────────────────────────────────
+    trend = []
+    for col in rev_cols:
+        # Extract month label from column name like 'revenue_jan_l'
+        parts = col.replace("revenue_", "").split("_")
+        month_label = parts[0].capitalize() if parts else col
+        month_rev   = sum(sites[s].get(col, 0) for s in sites)
+        month_users = total_users  # subscribers is a snapshot, same across months
+        trend.append({
+            "date": month_label,
+            "users": month_users,
+            "revenue": round(month_rev, 2),
+        })
+
+    # ARPU trend
+    arpu_trend = []
+    for item in trend:
+        arpu_trend.append({
+            "date": item["date"],
+            "arpu": round(item["revenue"] / item["users"], 4) if item["users"] else 0,
+        })
+
+    # ── Site Health Score ────────────────────────────────────────────────────
+    max_users_v   = max((r["users"]   for r in site_rows), default=1) or 1
+    max_revenue_v = max((r["revenue"] for r in site_rows), default=1) or 1
+
+    site_health = []
+    for row in site_rows:
+        user_score = row["users"]   / max_users_v
+        rev_score  = row["revenue"] / max_revenue_v
+        growth_score = min(1.0, max(0.0, (row["growth"] + 20) / 40))  # -20% → 0, +20% → 1
+        health = round((user_score * 0.3 + rev_score * 0.4 + growth_score * 0.3) * 100, 2)
+        site_health.append({**row, "health_score": health})
+
+    avg_health_score = round(
+        sum(s["health_score"] for s in site_health) / len(site_health), 2
+    ) if site_health else 0
+    worst_sites = sorted(site_health, key=lambda r: r["health_score"])[:10]
+
+    return jsonify({
+        "summary": {
+            "total_users":      total_users,
+            "avg_users":        avg_users,
+            "growth":           avg_growth,
+            "arpu":             arpu,
+            "revenue_at_risk":  revenue_at_risk,
+            "churn_rate":       churn_rate,
+            "network_roi":      network_roi,
+            "avg_health_score": avg_health_score,
+        },
+        "top_sites":        top_sites,
+        "declining_sites":  declining_sites,
+        "overloaded_sites": overloaded_sites,
+        "trend":            trend,
+        "arpu_trend":       arpu_trend,
+        "site_health":      worst_sites,
+    })
+
+
+def _business_kpi_from_kpidata():
+    """Legacy fallback: build business KPI from KpiData table."""
     users_latest = _latest_site_values_for_kpi("Site Users")
     revenue_latest = _latest_site_values_for_kpi("Site Revenue")
     prb_latest = _latest_site_values_for_kpi("DL PRB Utilization (1BH)")
 
-    # Per-site users 7 days before the latest date → for WoW decline detection
     if users_latest:
         _latest_date_val = max(v["date"] for v in users_latest.values())
         _date_7d_ago = _latest_date_val - timedelta(days=7)
@@ -3206,7 +3516,6 @@ def cto_business_kpi():
             "arpu": round(arpu, 2),
         })
 
-    # ── Weekly helpers ────────────────────────────────────────────────────────
     revenue_by_day = {row["date"]: row["value"] for row in revenue_series}
 
     def _week_avg(series, offset=0):
@@ -3218,27 +3527,20 @@ def cto_business_kpi():
             window = series[start:end]
         return sum(p["value"] for p in window) / len(window) if window else None
 
-    # Total Users → weekly avg of daily totals (per-site avg × site count), integer
     num_sites = len(site_rows) or 1
     this_week_users_vals = [p["value"] * num_sites for p in users_series[-7:]]
     total_users = int(round(sum(this_week_users_vals) / len(this_week_users_vals), 0)) if this_week_users_vals else 0
-
-    # Avg Users per Site → weekly avg (integer)
     avg_users = int(round(total_users / num_sites, 0)) if num_sites else 0
-
     total_revenue = round(sum(row["revenue"] for row in site_rows), 2)
 
-    # ARPU → weekly avg revenue (total) / weekly avg users (total)
     this_week_rev_vals = [revenue_by_day.get(p["date"], 0) * num_sites for p in users_series[-7:]]
     avg_weekly_revenue = sum(this_week_rev_vals) / len(this_week_rev_vals) if this_week_rev_vals else 0
     arpu = round(avg_weekly_revenue / total_users, 4) if total_users else 0
 
-    # Growth → week-over-week
     this_w = _week_avg(users_series, 0)
     last_w = _week_avg(users_series, 1)
     growth = round(((this_w - last_w) / last_w) * 100, 2) if this_w and last_w else 0
 
-    
     declining_sites = []
     overloaded_sites = []
     revenue_at_risk = 0.0
@@ -3264,19 +3566,14 @@ def cto_business_kpi():
             revenue_at_risk += row["users"] * arpu
 
     total_sites = max(len(site_rows), 1)
-
     top_sites        = sorted(site_rows,       key=lambda row: (row["revenue"], row["users"]), reverse=True)[:10]
     declining_sites  = sorted(declining_sites,  key=lambda row: row["growth"])[:10]
     overloaded_sites = sorted(overloaded_sites, key=lambda row: row["utilization"], reverse=True)[:10]
 
-    # ── KPI 1: Churn Rate — Users Lost / Total Users at Start × 100 ───────────
     churn_rate = round((users_lost / users_at_start) * 100, 2) if users_at_start else 0.0
-
-    # ── KPI 2: Network ROI ────────────────────────────────────────────────────
     baseline_cost = total_sites * 5000.0
     network_roi   = round(((total_revenue - baseline_cost) / baseline_cost) * 100, 2) if baseline_cost else 0.0
 
-    # ── Trend + ARPU Trend (30 days) ──────────────────────────────────────────
     trend = []
     for row in users_series[-30:]:
         trend.append({
@@ -3285,7 +3582,6 @@ def cto_business_kpi():
             "revenue": revenue_by_day.get(row["date"], 0),
         })
 
-    # ── KPI 3: ARPU Trend ────────────────────────────────────────────────────
     arpu_trend = []
     for row in users_series[-30:]:
         d_users = row["value"]
@@ -3295,7 +3591,6 @@ def cto_business_kpi():
             "arpu": round(d_rev / d_users, 4) if d_users else 0,
         })
 
-    # ── KPI 4: Site Health Score ──────────────────────────────────────────────
     max_users_v   = max((r["users"]   for r in site_rows), default=1) or 1
     max_revenue_v = max((r["revenue"] for r in site_rows), default=1) or 1
 
@@ -4703,9 +4998,12 @@ def admin_upload_flexible_kpi():
     """Flexible KPI upload for Core or Revenue data.
     ?type=core | revenue
     Only Site_ID is mandatory; all other columns are auto-detected.
-    Each upload replaces previous data for the same kpi_type.
+    Uploads APPEND to existing data (use Delete All to clear first).
+    Uses chunked inserts for large files.
     """
     import uuid, io, datetime as _dt
+
+    CHUNK_SIZE = 10_000  # flush every N records
 
     user = User.query.get(int(get_jwt_identity()))
     if not user or user.role != "admin":
@@ -4720,6 +5018,7 @@ def admin_upload_flexible_kpi():
 
     file = request.files["file"]
     fname = file.filename.lower()
+    print(f"[FLEX UPLOAD] type={kpi_type}, file={fname}")
 
     def to_float(v):
         if v is None or v == "":
@@ -4744,6 +5043,13 @@ def admin_upload_flexible_kpi():
                 continue
         return None
 
+    def _flush_chunk(records):
+        """Flush a chunk of records to DB."""
+        if records:
+            db.session.bulk_save_objects(records)
+            db.session.flush()
+        return []
+
     try:
         raw_bytes = file.read()
 
@@ -4761,10 +5067,9 @@ def admin_upload_flexible_kpi():
 
             if kpi_type == "core" and len(sheet_names) > 1:
                 # Multi-sheet format: sheet name = KPI metric, col 0 = Site_ID, col 1+ = dates
-                deleted = FlexibleKpiUpload.query.filter_by(kpi_type=kpi_type).delete()
-                db.session.flush()
                 batch_id = str(uuid.uuid4())
                 records = []
+                total_inserted = 0
                 skipped = 0
                 unique_sites = set()
                 all_kpi_cols = []
@@ -4806,64 +5111,84 @@ def admin_upload_flexible_kpi():
                                 num_value=num,
                                 str_value=display_label,
                                 row_date=date_val,
+                                kpi_name=kpi_col_name,
                             ))
+                            if len(records) >= CHUNK_SIZE:
+                                total_inserted += len(records)
+                                records = _flush_chunk(records)
 
                 wb.close()
-                db.session.bulk_save_objects(records)
+                total_inserted += len(records)
+                _flush_chunk(records)
                 db.session.commit()
                 return jsonify({
-                    "rows_in_file": len(records),
-                    "records_inserted": len(records),
+                    "rows_in_file": total_inserted,
+                    "records_inserted": total_inserted,
                     "unique_sites": len(unique_sites),
                     "columns_detected": all_kpi_cols,
-                    "deleted_previous": deleted,
                     "skipped_rows": skipped,
                 })
 
             else:
-                # Single-sheet fallback
+                # Single-sheet fallback — auto-detect header row
                 ws = wb.active
                 all_rows = list(ws.iter_rows(values_only=True))
                 wb.close()
                 if not all_rows:
                     return jsonify({"error": "Empty file"}), 400
-                raw_headers = all_rows[0]
+
+                # Find the header row: first row containing "site_id" (case-insensitive)
+                SITE_ID_VARIANTS = {"site_id", "site id", "siteid", "site name", "sitename", "site"}
+                header_idx = 0
+                for idx, row in enumerate(all_rows[:10]):  # scan first 10 rows
+                    if row is None:
+                        continue
+                    for cell in row:
+                        if cell is not None and str(cell).strip().lower().replace("_", " ").replace("-", " ") in SITE_ID_VARIANTS:
+                            header_idx = idx
+                            break
+                    else:
+                        continue
+                    break
+
+                raw_headers = all_rows[header_idx]
                 headers = [str(h).strip() if h is not None else "" for h in raw_headers]
+                print(f"[FLEX UPLOAD] Detected header row at index {header_idx}: {headers[:10]}")
                 rows = []
-                for r in all_rows[1:]:
+                for r in all_rows[header_idx + 1:]:
                     rows.append({headers[i]: (r[i] if i < len(r) else None) for i in range(len(headers))})
         else:
             return jsonify({"error": "Unsupported file format. Use .xlsx, .xls or .csv"}), 400
 
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return jsonify({"error": f"Failed to read file: {e}"}), 400
 
     # --- single-sheet path ---
-    # Find Site_ID column (case-insensitive)
     site_col = next(
-        (h for h in headers if h.strip().lower() in ("site_id", "site id", "siteid")),
+        (h for h in headers if h.strip().lower().replace("_", " ").replace("-", " ") in (
+            "site id", "siteid", "site name", "sitename", "site"
+        )),
         None
     )
     if not site_col:
-        return jsonify({"error": "Missing required column: Site_ID"}), 400
+        print(f"[FLEX UPLOAD] Missing Site_ID. Headers found: {headers[:15]}")
+        return jsonify({"error": f"Missing required column: Site_ID. Found columns: {headers[:10]}"}), 400
 
-    # KPI columns = everything except the site id column
     kpi_cols = [h for h in headers if h and h != site_col]
     if not kpi_cols:
         return jsonify({"error": "No KPI columns found besides Site_ID"}), 400
 
-    # Detect column types from sample values
     col_type_map = {}
     for col in kpi_cols:
         sample = [r.get(col) for r in rows[:50]]
         col_type_map[col] = _detect_col_type(sample)
 
-    # Delete all previous records for this kpi_type
-    deleted = FlexibleKpiUpload.query.filter_by(kpi_type=kpi_type).delete()
-    db.session.flush()
-
+    # Append mode — no deletion of previous data
     batch_id = str(uuid.uuid4())
     records = []
+    total_inserted = 0
     skipped = 0
 
     for row in rows:
@@ -4885,7 +5210,7 @@ def admin_upload_flexible_kpi():
                     column_name=col_norm,
                     column_type="numeric",
                     num_value=num,
-                    str_value=label,   # reuse str_value to store display label
+                    str_value=label,
                 ))
             else:
                 records.append(FlexibleKpiUpload(
@@ -4897,16 +5222,19 @@ def admin_upload_flexible_kpi():
                     num_value=None,
                     str_value=str(raw_val) if raw_val is not None else None,
                 ))
+            if len(records) >= CHUNK_SIZE:
+                total_inserted += len(records)
+                records = _flush_chunk(records)
 
-    db.session.bulk_save_objects(records)
+    total_inserted += len(records)
+    _flush_chunk(records)
     db.session.commit()
 
     return jsonify({
         "rows_in_file": len(rows),
-        "records_inserted": len(records),
+        "records_inserted": total_inserted,
         "unique_sites": len({r.get(site_col, "") for r in rows if r.get(site_col)}),
         "columns_detected": kpi_cols,
-        "deleted_previous": deleted,
         "skipped_rows": skipped,
     })
 
@@ -5554,6 +5882,23 @@ def agent_toggle_status():
     user_id = int(get_jwt_identity())
     user = User.query.get(user_id)
     if not user or user.role != "human_agent":
+        return jsonify({"error": "Unauthorized"}), 403
+    data = request.json or {}
+    if "is_online" in data:
+        user.is_online = bool(data["is_online"])
+    else:
+        user.is_online = not user.is_online
+    db.session.commit()
+    return jsonify({"is_online": user.is_online, "message": f"Status set to {'online' if user.is_online else 'offline'}"})
+
+
+@app.route("/api/manager/status", methods=["PUT"])
+@jwt_required()
+def manager_toggle_status():
+    """Toggle manager online/offline status."""
+    user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
+    if not user or user.role != "manager":
         return jsonify({"error": "Unauthorized"}), 403
     data = request.json or {}
     if "is_online" in data:
