@@ -89,8 +89,8 @@ export default function CTODutyRoster() {
       } else {
         setRosterData(resp);
       }
-    } catch {
-      setRosterError('Failed to load duty roster');
+    } catch (err) {
+      setRosterError(err.message || 'Failed to load duty roster');
       setRosterData(null);
     } finally {
       setRosterLoading(false);

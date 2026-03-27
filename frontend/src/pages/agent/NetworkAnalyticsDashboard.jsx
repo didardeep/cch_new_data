@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
+import { useNavigate } from 'react-router-dom';
 import {
   LineChart, Line, BarChart, Bar, AreaChart, Area,
   XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
@@ -316,90 +317,7 @@ function SiteSearch({T,layer,onSelect,placeholder='Search site ID…',filters:se
   );
 }
 
-// ── AI Chat panel ─────────────────────────────────────────────────────────────
-function AIChat({T,open,onClose,summary,filters,onResult}) {
-  const [msgs,setMsgs]=useState([]);
-  const [input,setInput]=useState('');
-  const [loading,setLoading]=useState(false);
-  const endRef=useRef(null);
-
-  useEffect(()=>endRef.current?.scrollIntoView({behavior:'smooth'}),[msgs]);
-
-  const send=async(text)=>{
-    if(!text?.trim())return;
-    setMsgs(p=>[...p,{role:'user',text}]);
-    setInput('');
-    setLoading(true);
-    try{
-      const base=window.location.origin;
-      const resp=await fetch(`${base}/api/network/ai-query`,{
-        method:'POST',
-        headers:{'Content-Type':'application/json','Authorization':`Bearer ${localStorage.getItem('token')}`},
-        body:JSON.stringify({prompt:text,context:{summary,filters}}),
-      });
-      const result=await resp.json();
-      if(result.error){
-        setMsgs(p=>[...p,{role:'ai',text:` ${result.error}. Try: "Show worst sites by PRB" or "Compare zones"`}]);
-      } else {
-        onResult(result);
-        const rows=result.row_count||0;
-        setMsgs(p=>[...p,{role:'ai',text:` ${result.response||'Here are the results.'}`,rows}]);
-      }
-    }catch(e){
-      setMsgs(p=>[...p,{role:'ai',text:' Could not reach the server. Check your connection and try again.'}]);
-    }finally{setLoading(false);}
-  };
-
-  if(!open)return null;
-  return (
-    <div style={{position:'fixed',bottom:24,right:24,width:350,maxHeight:500,background:T.surface,border:`1px solid ${T.border}`,borderRadius:16,boxShadow:'0 20px 60px rgba(0,0,0,.25)',display:'flex',flexDirection:'column',zIndex:1000,animation:'fadeIn .25s ease'}}>
-      <div style={{padding:'12px 14px',borderBottom:`1px solid ${T.border}`,background:T.kpmgBlue,borderRadius:'16px 16px 0 0',display:'flex',alignItems:'center',justifyContent:'space-between'}}>
-        <div style={{display:'flex',alignItems:'center',gap:8}}>
-          <div style={{width:26,height:26,borderRadius:'50%',background:'rgba(255,255,255,.2)',display:'flex',alignItems:'center',justifyContent:'center',fontSize:13}}></div>
-          <div>
-            <div style={{fontWeight:700,color:'#fff',fontSize:11.5}}>Network AI Assistant</div>
-            <div style={{fontSize:9,color:'rgba(255,255,255,.6)'}}>Ask anything about your network</div>
-          </div>
-        </div>
-        <button onClick={onClose} style={{background:'none',border:'none',color:'rgba(255,255,255,.7)',cursor:'pointer',fontSize:15}}></button>
-      </div>
-      <div style={{flex:1,overflowY:'auto',padding:'10px 12px',display:'flex',flexDirection:'column',gap:8}}>
-        {msgs.length===0&&(
-          <div style={{textAlign:'center',padding:'18px 0',color:T.muted,fontSize:11}}>
-            <div style={{fontSize:28,marginBottom:8}}></div>
-            Try: "Show worst 5 cells by PRB" · "Compare zones" · "High latency sites"
-          </div>
-        )}
-        {msgs.map((m,i)=>(
-          <div key={i} style={{display:'flex',flexDirection:m.role==='user'?'row-reverse':'row',gap:6}}>
-            <div style={{width:24,height:24,borderRadius:'50%',background:m.role==='user'?T.blue3:T.kpmgBlue,display:'flex',alignItems:'center',justifyContent:'center',fontSize:10,color:'#fff',flexShrink:0}}>{m.role==='user'?'U':''}</div>
-            <div style={{maxWidth:'80%',padding:'7px 10px',borderRadius:m.role==='user'?'12px 12px 4px 12px':'12px 12px 12px 4px',background:m.role==='user'?T.blue3:T.surface2,color:m.role==='user'?'#fff':T.text,fontSize:11.5,lineHeight:1.5}}>
-              {m.text}
-              {m.rows!=null&&<div style={{fontSize:9.5,opacity:.7,marginTop:3}}>{m.rows} records found</div>}
-            </div>
-          </div>
-        ))}
-        {loading&&<div style={{display:'flex',gap:6,alignItems:'center'}}>
-          <div style={{width:24,height:24,borderRadius:'50%',background:T.kpmgBlue,display:'flex',alignItems:'center',justifyContent:'center',fontSize:10,color:'#fff'}}></div>
-          <div style={{padding:'7px 10px',borderRadius:'12px 12px 12px 4px',background:T.surface2}}>
-            {[0,1,2].map(i=><span key={i} style={{display:'inline-block',width:5,height:5,borderRadius:'50%',background:T.kpmgBlue,margin:'0 2px',animation:`bounce 1s ${i*.15}s infinite`}}/>)}
-          </div>
-        </div>}
-        <div ref={endRef}/>
-      </div>
-      <div style={{padding:'8px 10px',borderTop:`1px solid ${T.border}`,display:'flex',gap:6}}>
-        <input value={input} onChange={e=>setInput(e.target.value)} onKeyDown={e=>e.key==='Enter'&&input.trim()&&send(input)}
-          placeholder="Ask about the network…"
-          style={{flex:1,padding:'7px 10px',borderRadius:18,border:`1px solid ${T.border}`,background:T.surface2,color:T.text,fontSize:11.5,fontFamily:'inherit',outline:'none'}}/>
-        <button onClick={()=>input.trim()&&send(input)} disabled={loading}
-          style={{width:32,height:32,borderRadius:'50%',border:'none',background:T.kpmgBlue,color:'#fff',cursor:'pointer',fontSize:13,display:'flex',alignItems:'center',justifyContent:'center'}}>→</button>
-      </div>
-    </div>
-  );
-}
-
-// ── AI Query Result view ─────────────────────────────────────────────────────
-// ── AI View — Power BI style smart chart renderer ─────────────────────────────
+// ── AI View (kept for reference — charts now rendered in NetworkAiChat page) ─
 function AIView({result,T,onClose}) {
   const [showTable,setShowTable]=useState(false);
   if(!result)return null;
@@ -1897,13 +1815,9 @@ export default function NetworkAnalyticsDashboard() {
 
   // Filters — applied globally to all pages
   // Filters — cluster/city support comma-separated multi-select (e.g. "CBD,Edge")
-  const [filters,    setFilters]    = useState({time_range:'24h',cluster:'',technology:'',region:'',country:'',state:'',city:''});
+  const [filters,    setFilters]    = useState({time_range:'7d',cluster:'',technology:'',region:'',country:'',state:'',city:''});
 
-  // AI
-  const [aiView,     setAiView]     = useState(null);
-  const [chatOpen,   setChatOpen]   = useState(false);
-  const [searchIn,   setSearchIn]   = useState('');
-  const [aiLoading,  setAiLoading]  = useState(false);
+  const navigate = useNavigate();
 
   const qs=useCallback(()=>
     Object.entries(filters).filter(([,v])=>v).map(([k,v])=>`${k}=${encodeURIComponent(v)}`).join('&'),
@@ -1920,15 +1834,16 @@ export default function NetworkAnalyticsDashboard() {
       .catch(e=>{clearTimeout(tid);console.warn('fetch failed',url,e);return null;});
   },[]);
 
-  const fetchAll=useCallback(async(silent=false)=>{
+  const fetchAll=useCallback(async(silent=false,fresh=false)=>{
     if(!silent)setRefreshing(true);
     const q=qs();
     const base=process.env.REACT_APP_API_URL||'';
+    const fr=fresh?'&fresh=1':'';
 
     // ── Phase 1: overview + filters — fast, dismisses spinner ────────────────
     try{
       const [ov,fo]=await Promise.all([
-        fetchWithTimeout(`${base}/api/network/overview-stats?${q}`,12000),
+        fetchWithTimeout(`${base}/api/network/overview-stats?${q}${fr}`,12000),
         fetchWithTimeout(`${base}/api/network/filters`,8000),
       ]);
       if(ov)  setOverview(ov);
@@ -1940,10 +1855,10 @@ export default function NetworkAnalyticsDashboard() {
 
     // ── Phase 2: map + layer data — background, non-blocking ─────────────────
     Promise.allSettled([
-      fetchWithTimeout(`${base}/api/network/map?${q}`,20000),
-      fetchWithTimeout(`${base}/api/network/ran-analytics?${q}`,20000),
-      fetchWithTimeout(`${base}/api/network/core-analytics?${q}`,20000),
-      fetchWithTimeout(`${base}/api/network/transport-analytics?${q}`,20000),
+      fetchWithTimeout(`${base}/api/network/map?${q}${fr}`,20000),
+      fetchWithTimeout(`${base}/api/network/ran-analytics?${q}${fr}`,20000),
+      fetchWithTimeout(`${base}/api/network/core-analytics?${q}${fr}`,20000),
+      fetchWithTimeout(`${base}/api/network/transport-analytics?${q}${fr}`,20000),
     ]).then(([mp,rn,co,tr])=>{
       if(mp.status==='fulfilled'&&mp.value) setMapData(mp.value);
       if(rn.status==='fulfilled'&&rn.value) setRan(rn.value);
@@ -1953,7 +1868,7 @@ export default function NetworkAnalyticsDashboard() {
     }).catch(()=>{});
   },[qs,fetchWithTimeout]);
 
-  useEffect(()=>{fetchAll();},[]);// eslint-disable-line
+  useEffect(()=>{fetchAll(false,true);},[]);// eslint-disable-line 
   const mounted=useRef(false);
   // Keep refs so filter-change effect can see current page/selKpi without stale closure
   const pageRef=useRef('overview');
@@ -1979,35 +1894,8 @@ export default function NetworkAnalyticsDashboard() {
     }catch(_){}
   },[qs]);
 
-  const goKpi=(kf)=>{setSelKpi(kf);setPage('kpi');setAiView(null);setKpiDrop(false);fetchKpiFilter(kf);};
-  const goLayer=(l)=>{setPage(l);setAiView(null);setLayerDrop(false);};
-
-  const runAI=useCallback(async(text)=>{
-    if(!text?.trim())return;
-    setAiLoading(true);setSearchIn('');
-    try{
-      const base=process.env.REACT_APP_API_URL||'';
-      const controller=new AbortController();
-      const timeout=setTimeout(()=>controller.abort(),30000); // 30s timeout
-      const r=await fetch(`${base}/api/network/ai-query`,{
-        method:'POST',
-        headers:{'Content-Type':'application/json','Authorization':`Bearer ${localStorage.getItem('token')}`},
-        body:JSON.stringify({prompt:text,context:{summary:overview,filters}}),
-        signal:controller.signal,
-      });
-      clearTimeout(timeout);
-      const result=await r.json();
-      if(result.error){
-        console.warn('AI query error:',result.error);
-        if(!result.data){setAiLoading(false);return;}
-      }
-      setAiView(result);setPage('ai');
-    }catch(e){
-      if(e.name==='AbortError') console.warn('AI query timed out after 30s');
-      else console.warn('runAI failed',e);
-    }
-    setAiLoading(false);
-  },[overview,filters]);
+  const goKpi=(kf)=>{setSelKpi(kf);setPage('kpi');setKpiDrop(false);fetchKpiFilter(kf);};
+  const goLayer=(l)=>{setPage(l);setLayerDrop(false);};
 
   // Close dropdowns on outside click
   useEffect(()=>{
@@ -2064,8 +1952,7 @@ export default function NetworkAnalyticsDashboard() {
               {dark?(<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>):(<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>)}
               {dark?'Light':'Dark'}
             </button>
-            <button onClick={()=>setChatOpen(o=>!o)} style={{padding:'5px 11px',borderRadius:18,fontSize:11,fontWeight:700,background:`linear-gradient(135deg,${T.kpmgBlue},${T.blue3})`,border:'none',color:'#fff',cursor:'pointer'}}> AI</button>
-            {aiView&&<button onClick={()=>{setAiView(null);setPage('overview');}} style={{padding:'5px 10px',borderRadius:18,fontSize:10.5,fontWeight:700,background:'transparent',border:`1px solid ${T.red}`,color:T.red,cursor:'pointer'}}> AI</button>}
+            <button onClick={()=>navigate('/agent/network-ai')} style={{padding:'5px 11px',borderRadius:18,fontSize:11,fontWeight:700,background:`linear-gradient(135deg,${T.kpmgBlue},${T.blue3})`,border:'none',color:'#fff',cursor:'pointer'}}>AI Chat</button>
             <button onClick={()=>fetchAll()} style={{padding:'5px 9px',borderRadius:6,fontSize:10.5,fontWeight:600,background:T.kpmgBlue,color:'#fff',border:'none',cursor:'pointer'}}>{refreshing?'':'↻'}</button>
           </div>
         </div>
@@ -2101,8 +1988,8 @@ export default function NetworkAnalyticsDashboard() {
 
         {/* Nav bar */}
         <div style={{display:'flex',alignItems:'center',gap:4,padding:'0 20px 7px',flexWrap:'wrap'}}>
-          <button className="nav-btn" onClick={()=>{setPage('overview');setAiView(null);}}
-            style={{padding:'4px 12px',borderRadius:16,fontSize:10.5,fontWeight:700,background:page==='overview'&&!aiView?T.kpmgBlue:'transparent',color:page==='overview'&&!aiView?'#fff':T.textSub,border:`1.5px solid ${page==='overview'&&!aiView?T.kpmgBlue:T.border}`,cursor:'pointer',transition:'all .2s'}}>
+          <button className="nav-btn" onClick={()=>setPage('overview')}
+            style={{padding:'4px 12px',borderRadius:16,fontSize:10.5,fontWeight:700,background:page==='overview'?T.kpmgBlue:'transparent',color:page==='overview'?'#fff':T.textSub,border:`1.5px solid ${page==='overview'?T.kpmgBlue:T.border}`,cursor:'pointer',transition:'all .2s'}}>
              Overview
           </button>
 
@@ -2149,7 +2036,7 @@ export default function NetworkAnalyticsDashboard() {
           </div>
 
           {/* Breadcrumb */}
-          {(page!=='overview'&&!aiView)&&(
+          {page!=='overview'&&(
             <div style={{marginLeft:'auto',display:'flex',alignItems:'center',gap:5,padding:'3px 9px',borderRadius:8,background:`${T.kpmgBlue}10`,border:`1px solid ${T.kpmgBlue}28`}}>
               <button onClick={()=>setPage('overview')} style={{fontSize:9,color:T.muted,background:'none',border:'none',cursor:'pointer'}}>Overview</button>
               <span style={{fontSize:9,color:T.muted}}>›</span>
@@ -2159,46 +2046,10 @@ export default function NetworkAnalyticsDashboard() {
         </div>
       </div>
 
-      {/* ── AI SEARCH BAR ── */}
-      <div style={{background:dark?'linear-gradient(135deg,#0A1628,#0F2040)':'linear-gradient(135deg,#00338D,#005EB8,#0091DA)',padding:'14px 24px 16px',borderBottom:`1px solid ${T.border}`}}>
-        <div style={{maxWidth:800,margin:'0 auto'}}>
-          <div style={{display:'flex',alignItems:'center',gap:10,marginBottom:10}}>
-            <div style={{width:30,height:30,borderRadius:'50%',background:'rgba(255,255,255,.15)',display:'flex',alignItems:'center',justifyContent:'center'}}><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg></div>
-            <div>
-              <div style={{fontSize:13,fontWeight:800,color:'#fff'}}>Network AI — Ask in any language</div>
-              <div style={{fontSize:10,color:'rgba(255,255,255,.6)'}}>English · हिंदी · Complex queries · Filters active: {Object.entries(filters).filter(([k,v])=>v&&k!=='time_range').map(([k,v])=>v).join(', ')||'None'}</div>
-            </div>
-          </div>
-          <div style={{position:'relative'}}>
-            <span style={{position:'absolute',left:14,top:'50%',transform:'translateY(-50%)',color:'rgba(255,255,255,.5)',pointerEvents:'none'}}></span>
-            <input value={searchIn} onChange={e=>setSearchIn(e.target.value)}
-              onKeyDown={e=>e.key==='Enter'&&searchIn.trim()&&runAI(searchIn)}
-              placeholder="Ask anything… 'sabse kharab 5 cell dikhao' · 'Show congestion hotspots' · 'Compare zones'"
-              style={{width:'100%',padding:'11px 48px 11px 40px',borderRadius:28,border:'2px solid rgba(255,255,255,.25)',background:'rgba(255,255,255,.12)',backdropFilter:'blur(12px)',color:'#fff',fontSize:12.5,fontFamily:'inherit',outline:'none'}}/>
-            <button onClick={()=>searchIn.trim()&&runAI(searchIn)} disabled={aiLoading}
-              style={{position:'absolute',right:7,top:'50%',transform:'translateY(-50%)',width:36,height:36,borderRadius:'50%',border:'none',background:'rgba(255,255,255,.25)',color:'#fff',cursor:'pointer',fontSize:16,display:'flex',alignItems:'center',justifyContent:'center'}}>
-              {aiLoading?<span style={{animation:'spin .7s linear infinite',display:'inline-block'}}></span>:'→'}
-            </button>
-          </div>
-          <div style={{display:'flex',gap:6,marginTop:8,flexWrap:'wrap'}}>
-            {[
-              [' Worst 5 cells','Show 5 worst sites where E-RAB Call Drop Rate_1 is greater than 1.5% or LTE Call Setup Success Rate is less than 98.5% or LTE DL - Usr Ave Throughput is less than 8 Mbps. Show all three KPIs for each site.'],
-              [' Call drops','Show top 10 sites with highest E-RAB Call Drop Rate_1 along with their LTE Call Setup Success Rate and DL PRB Utilization'],
-              [' Throughput','Show bottom 10 sites by LTE DL - Usr Ave Throughput along with their DL PRB Utilization and E-RAB Call Drop Rate_1'],
-              [' Congestion','Show top 10 sites where DL PRB Utilization (1BH) is highest along with their LTE DL - Usr Ave Throughput and Ave RRC Connected Ue'],
-              [' Availability','Show sites with lowest Availability along with their E-RAB Call Drop Rate_1 and LTE Call Setup Success Rate'],
-              [' Compare zones','Compare all zones by average E-RAB Call Drop Rate_1, LTE DL - Usr Ave Throughput, DL PRB Utilization (1BH), and LTE Call Setup Success Rate'],
-            ].map(([l,q])=>(
-              <button key={q} onClick={()=>runAI(q)} style={{padding:'3px 10px',borderRadius:14,fontSize:10,fontWeight:600,background:'rgba(255,255,255,.12)',border:'1px solid rgba(255,255,255,.2)',color:'rgba(255,255,255,.9)',cursor:'pointer',whiteSpace:'nowrap'}}>{l}</button>
-            ))}
-          </div>
-        </div>
-      </div>
-
       {/* ── MAIN CONTENT ── */}
       <div style={{padding:'13px 18px 32px',position:'relative'}}>
         {/* Filter context banner — shown whenever non-default filters are active */}
-        {(filters.cluster||filters.technology||filters.region||filters.country||filters.state||filters.city||filters.time_range!=='24h')&&page!=='ai'&&(
+        {(filters.cluster||filters.technology||filters.region||filters.country||filters.state||filters.city||filters.time_range!=='24h')&&(
           <div style={{display:'flex',alignItems:'center',gap:8,padding:'6px 12px',marginBottom:12,borderRadius:9,background:`${T.kpmgBlue}0c`,border:`1px solid ${T.kpmgBlue}22`,flexWrap:'wrap'}}>
             <span style={{fontSize:9.5,fontWeight:700,color:T.kpmgBlue,textTransform:'uppercase',letterSpacing:'0.05em'}}> Filtered View</span>
             {filters.time_range!=='24h'&&<Bdg color={T.kpmgBlue}> {filters.time_range.toUpperCase()}</Bdg>}
@@ -2219,9 +2070,7 @@ export default function NetworkAnalyticsDashboard() {
             Updating…
           </div>
         )}
-        {page==='ai'&&aiView ? (
-          <AIView result={aiView} T={T} onClose={()=>{setAiView(null);setPage('overview');}}/>
-        ) : page==='ran' ? (
+        {page==='ran' ? (
           <RANPage T={T} data={ran} mapSites={mapData?.sites||[]} filters={filters} opts={opts}/>
         ) : page==='core' ? (
           <CorePage T={T} data={core} filters={filters}/>
@@ -2246,9 +2095,6 @@ export default function NetworkAnalyticsDashboard() {
         </div>
       )}
 
-      {/* AI Chat */}
-      <AIChat T={T} open={chatOpen} onClose={()=>setChatOpen(false)} summary={overview} filters={filters}
-        onResult={r=>{setAiView(r);setPage('ai');setChatOpen(false);}}/>
     </div>
   );
 }

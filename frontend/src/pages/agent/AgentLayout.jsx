@@ -142,7 +142,7 @@ export default function AgentLayout() {
           {navLinks.map(link => (
             <button
               key={link.path}
-              className={`sidebar-link${location.pathname.startsWith(link.path) ? ' active' : ''}`}
+              className={`sidebar-link${location.pathname===link.path||location.pathname.startsWith(link.path+'/') ? ' active' : ''}`}
               onClick={() => navigate(link.path)}
             >
               {link.icon}
