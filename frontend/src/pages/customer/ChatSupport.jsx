@@ -1103,7 +1103,9 @@ export default function ChatSupport() {
     st.attempt += 1;
     if (!sessionIdRef.current) await ensureSession({ step: 'query' });
     if (st.attempt === 1) st.queryText = userQuery;
-    saveMessage('user', userQuery, { query_text: userQuery, sector_name: st.sectorName, subprocess_name: st.subprocessName });
+    const msgMeta = { sector_name: st.sectorName, subprocess_name: st.subprocessName };
+    if (st.attempt === 1) msgMeta.query_text = userQuery;   // only first query becomes the session issue
+    saveMessage('user', userQuery, msgMeta);
     const effectiveQuery = st.subprocessSubType ? `${userQuery}\n\nIssue type: ${st.subprocessSubType}` : userQuery;
     setIsTyping(true);
     const resolveData = await chatApiCall('/api/resolve-step', {
@@ -1118,14 +1120,15 @@ export default function ChatSupport() {
     });
     setIsTyping(false);
     if (resolveData.is_telecom === false) {
-      addMessage({ type: 'non-telecom-warning', html: formatResolution(resolveData.resolution) });
-      saveMessage('bot', resolveData.resolution);
+      saveMessage('bot', resolveData.resolution, { type: 'non-telecom-warning', html: formatResolution(resolveData.resolution) });
+      addMessage({ type: 'non-telecom-warning', html: formatResolution(resolveData.resolution), skipPersist: true });
       addMessage({ type: 'bot', html: `Please describe a telecom-related issue so I can help you.` });
       showInput('Describe your telecom issue...'); st.attempt -= 1; return;
     }
     st.resolution = resolveData.resolution; st.previousSolutions.push(resolveData.resolution);
-    saveMessage('bot', resolveData.resolution, { resolution: resolveData.resolution, language: st.language });
-    addMessage({ type: 'resolution', html: formatResolution(resolveData.resolution) });
+    const resHtml = formatResolution(resolveData.resolution);
+    saveMessage('bot', resolveData.resolution, { resolution: resolveData.resolution, language: st.language, type: 'resolution', html: resHtml });
+    addMessage({ type: 'resolution', html: resHtml, skipPersist: true });
     if (st.attempt >= 6) { setTimeout(() => autoRaiseTicket(), 800); return; }
     setTimeout(() => { addMessage({ type: 'bot', html: `Did this help? If not, please describe what's still not working.` }); showInput('Type your response...'); }, 800);
     st.step = 'conversation';
@@ -1438,17 +1441,16 @@ export default function ChatSupport() {
     stateRef.current.previousSolutions = botResolutions; stateRef.current.attempt = botResolutions.length;
     setMessages(prev => [...prev, ...newMsgs]); scrollToBottom();
     if (!msgs.length && session.status === 'active') { addMessage({ type: 'bot', html: `<strong>Welcome to TeleBot Support!</strong><br>Say hello to get started!` }); showInput('Type your greeting here...'); stateRef.current.step = 'greeting'; return; }
-    setTimeout(async () => {
-      if (session.status === 'resolved') { addMessage({ type: 'bot', html: `This chat session is <strong>resolved</strong>. Start a new chat if you need more help.` }); hideInput(); stateRef.current.step = 'view-only'; return; }
-      if (session.status === 'escalated') { addMessage({ type: 'bot', html: `Please wait — we are connecting you to a human agent.` }); agentResolvedShownRef.current = false; agentJoinedRef.current = false; setHandoffActive(true); hideInput(); stateRef.current.step = 'live-agent'; return; }
-      if (!session.sector_name) { addMessage({ type: 'bot', html: 'Please select your <strong>telecom service category</strong>:' }); loadSectorMenu(); }
-      else if (!session.subprocess_name) {
-        addMessage({ type: 'bot', html: `Please select the <strong>type of issue</strong> with <strong>${session.sector_name}</strong>:` });
-        let data = await chatApiCall('/api/subprocesses', { sector_key: stateRef.current.sectorKey, language: stateRef.current.language });
-        data = { ...data, subprocesses: reduceBroadbandSubprocesses(data.subprocesses, stateRef.current.sectorKey) };
-        addMessage({ type: 'subprocess-grid', subprocesses: limitSubprocesses(data.subprocesses), groupId: nextId() }); stateRef.current.step = 'subprocess';
-      } else if (session.resolution) { addMessage({ type: 'bot', html: `Did this help? If not, please describe what's still not working.` }); showInput('Type your response...'); stateRef.current.step = 'conversation'; }
-      else { addMessage({ type: 'bot', html: 'Please <strong>describe your specific issue</strong> so I can provide the best resolution.' }); showInput('Describe your issue in any language...'); stateRef.current.step = 'query'; }
+    // Restore step + input state without adding duplicate bot messages
+    setTimeout(() => {
+      const step = session.current_step || 'greeting';
+      stateRef.current.step = step;
+      if (session.status === 'resolved') { hideInput(); stateRef.current.step = 'view-only'; return; }
+      if (session.status === 'escalated') { agentResolvedShownRef.current = false; agentJoinedRef.current = false; setHandoffActive(true); hideInput(); stateRef.current.step = 'live-agent'; return; }
+      if (step === 'conversation' || step === 'query') { showInput('Type your response...'); }
+      else if (step === 'greeting') { showInput('Type your greeting here...'); }
+      else if (step === 'live-agent') { hideInput(); setHandoffActive(true); }
+      else { showInput('Type your response...'); }
     }, 400);
   }, [addMessage, hideInput, loadSectorMenu, scrollToBottom, showInput]);
 
