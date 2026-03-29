@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { motion } from 'framer-motion';
 import {
-  Activity, AlertTriangle, IndianRupee, Download,
+  Activity, AlertTriangle, IndianRupee,
   MapPin, RefreshCw, TrendingDown, TrendingUp,
   UserMinus, Users, Zap,
 } from 'lucide-react';
@@ -289,18 +289,6 @@ export default function BusinessKPI() {
           }}>
             <RefreshCw size={14} style={{ animation: refreshing ? 'spin 1s linear infinite' : 'none' }} />
             Refresh
-          </button>
-          <button style={{
-            display: 'flex', alignItems: 'center', gap: 6,
-            padding: '8px 16px',
-            background: linear(G.indigo),
-            border: 'none', borderRadius: 10,
-            cursor: 'pointer', fontSize: 13, fontWeight: 700,
-            color: '#fff',
-            boxShadow: `0 4px 14px ${G.indigo[0]}40`,
-          }}>
-            <Download size={14} />
-            Export
           </button>
         </div>
       </motion.div>

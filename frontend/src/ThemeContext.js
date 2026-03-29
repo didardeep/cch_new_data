@@ -9,7 +9,9 @@ export function ThemeProvider({ children }) {
   });
 
   useEffect(() => {
-    localStorage.setItem('theme', isDark ? 'dark' : 'light');
+    const value = isDark ? 'dark' : 'light';
+    localStorage.setItem('theme', value);
+    document.documentElement.setAttribute('data-theme', value);
   }, [isDark]);
 
   const toggleTheme = () => setIsDark(prev => !prev);

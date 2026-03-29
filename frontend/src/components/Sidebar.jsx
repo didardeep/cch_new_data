@@ -122,6 +122,15 @@ export default function Sidebar({ links, statusToggle }) {
           >
             {link.icon}
             {link.label}
+            {link.badge > 0 && (
+              <span style={{
+                marginLeft: 'auto', background: '#dc2626', color: '#fff',
+                fontSize: 10, fontWeight: 700, padding: '1px 7px',
+                borderRadius: 10, minWidth: 18, textAlign: 'center',
+              }}>
+                {link.badge}
+              </span>
+            )}
           </button>
         ))}
 
