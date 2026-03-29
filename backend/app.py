@@ -11,7 +11,7 @@ import time
 import math
 import random
 import string
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, timezone, timedelta
 
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
@@ -2916,9 +2916,25 @@ def _require_cto_user():
     return user
 
 
+# ── CTO KPI Cache (avoids re-querying 25M rows on every page load) ─────────
+import time as _time
+_cto_cache = {}   # key → {"data": ..., "ts": epoch}
+_CTO_CACHE_TTL = 300  # 5 minutes
+
+def _cache_get(key):
+    entry = _cto_cache.get(key)
+    if entry and (_time.time() - entry["ts"]) < _CTO_CACHE_TTL:
+        return entry["data"]
+    return None
+
+def _cache_set(key, data):
+    _cto_cache[key] = {"data": data, "ts": _time.time()}
+
+
 def _latest_site_values_for_kpi(kpi_name):
     from sqlalchemy import func as sa_func
-    # Subquery: max date per site
+    # Only look at last 30 days instead of scanning entire table
+    date_floor = date.today() - timedelta(days=30)
     sub = db.session.query(
         KpiData.site_id,
         sa_func.max(KpiData.date).label("max_date"),
@@ -2926,6 +2942,7 @@ def _latest_site_values_for_kpi(kpi_name):
         KpiData.data_level == "site",
         KpiData.kpi_name == kpi_name,
         KpiData.value.isnot(None),
+        KpiData.date >= date_floor,
     ).group_by(KpiData.site_id).subquery()
 
     rows = db.session.query(
@@ -2944,6 +2961,7 @@ def _latest_site_values_for_kpi(kpi_name):
 def _site_values_near_date(kpi_name, target_date):
     """Return {site_id: value} for the closest date <= target_date per site."""
     from sqlalchemy import func as sa_func
+    date_floor = target_date - timedelta(days=14)
     sub = db.session.query(
         KpiData.site_id,
         sa_func.max(KpiData.date).label("max_date"),
@@ -2951,6 +2969,7 @@ def _site_values_near_date(kpi_name, target_date):
         KpiData.data_level == "site",
         KpiData.kpi_name == kpi_name,
         KpiData.value.isnot(None),
+        KpiData.date >= date_floor,
         KpiData.date <= target_date,
     ).group_by(KpiData.site_id).subquery()
 
@@ -2967,15 +2986,17 @@ def _site_values_near_date(kpi_name, target_date):
     return {r.site_id: float(r.value) for r in rows if r.value is not None}
 
 
-def _series_for_kpi_patterns(patterns):
+def _series_for_kpi_patterns(patterns, days=30):
     from sqlalchemy import func as sa_func
+    date_floor = date.today() - timedelta(days=days)
     rows = db.session.query(
         KpiData.date,
         sa_func.avg(KpiData.value).label("avg_val"),
     ).filter(
         KpiData.data_level == "site",
         KpiData.value.isnot(None),
-        db.or_(*[KpiData.kpi_name.ilike(pattern) for pattern in patterns]),
+        KpiData.kpi_name.in_(patterns),
+        KpiData.date >= date_floor,
     ).group_by(KpiData.date).order_by(KpiData.date).all()
 
     return [{"date": r.date.isoformat(), "value": round(float(r.avg_val), 2)} for r in rows]
@@ -3087,12 +3108,19 @@ def cto_technical_kpi():
         },
     ]
 
+    # Check cache first
+    cached = _cache_get("technical_kpi")
+    if cached:
+        return jsonify(cached)
+
     # Bulk query: all KPI names in one shot, grouped by kpi_name + date
+    # Only last 45 days — enough for 30-day trend + buffer
     from sqlalchemy import func as sa_func
     all_names = []
     for item in kpi_defs:
         all_names.extend(item["names"])
 
+    date_floor = date.today() - timedelta(days=45)
     bulk = db.session.query(
         KpiData.kpi_name,
         KpiData.date,
@@ -3101,6 +3129,7 @@ def cto_technical_kpi():
         KpiData.data_level == "site",
         KpiData.value.isnot(None),
         KpiData.kpi_name.in_(all_names),
+        KpiData.date >= date_floor,
     ).group_by(KpiData.kpi_name, KpiData.date).order_by(KpiData.date).all()
 
     # Map kpi_name → key
@@ -3111,11 +3140,11 @@ def cto_technical_kpi():
 
     # Aggregate per key per date
     key_date = {}  # key → {date_str: [values]}
-    for kpi_name, date, avg_val in bulk:
+    for kpi_name, kpi_date, avg_val in bulk:
         k = name_to_key.get(kpi_name)
         if not k:
             continue
-        d_str = date.isoformat()
+        d_str = kpi_date.isoformat()
         key_date.setdefault(k, {}).setdefault(d_str, []).append(float(avg_val))
 
     cards = []
@@ -3134,10 +3163,9 @@ def cto_technical_kpi():
         })
         chart_series[k] = series[-30:]
 
-    return jsonify({
-        "cards": cards,
-        "series": chart_series,
-    })
+    result = {"cards": cards, "series": chart_series}
+    _cache_set("technical_kpi", result)
+    return jsonify(result)
 
 
 @app.route("/api/cto/core-kpi", methods=["GET"])
@@ -3304,6 +3332,11 @@ def cto_business_kpi():
     if not user:
         return jsonify({"error": "Unauthorized"}), 403
 
+    # Check cache first
+    cached = _cache_get("business_kpi")
+    if cached:
+        return jsonify(cached)
+
     # ── Try FlexibleKpiUpload revenue data first ─────────────────────────────
     rev_count = FlexibleKpiUpload.query.filter_by(kpi_type="revenue").count()
     use_flexible = rev_count > 0
@@ -3321,15 +3354,22 @@ def _business_kpi_from_flexible():
     """
     from sqlalchemy import func as sa_func
 
-    # ── Load all revenue rows into per-site dicts ────────────────────────────
-    rows = FlexibleKpiUpload.query.filter_by(kpi_type="revenue").all()
-    sites = {}  # site_id → {col_name: value}
-    for r in rows:
-        site = sites.setdefault(r.site_id, {})
-        if r.column_type == "numeric" and r.num_value is not None:
-            site[r.column_name] = float(r.num_value)
-        elif r.column_type == "text" and r.str_value is not None:
-            site[r.column_name] = r.str_value
+    # ── Load revenue rows using raw SQL for speed (pivots in Python) ──────
+    pivot_sql = db.text("""
+        SELECT site_id, column_name, column_type,
+               num_value, str_value
+        FROM flexible_kpi_uploads
+        WHERE kpi_type = 'revenue'
+        ORDER BY site_id
+    """)
+    raw = db.session.execute(pivot_sql).fetchall()
+    sites = {}
+    for site_id, col_name, col_type, num_val, str_val in raw:
+        site = sites.setdefault(site_id, {})
+        if col_type == "numeric" and num_val is not None:
+            site[col_name] = float(num_val)
+        elif col_type == "text" and str_val is not None:
+            site[col_name] = str_val
 
     if not sites:
         return jsonify({"summary": {}, "top_sites": [], "declining_sites": [],
@@ -3355,11 +3395,13 @@ def _business_kpi_from_flexible():
 
     # ── Pull PRB utilization from KpiData (latest value per site) ────────────
     prb_latest = _latest_site_values_for_kpi("DL PRB Utilization (1BH)")
-    # fallback: try pattern match if exact name not found
+    # fallback: try pattern match if exact name not found (with date range)
     if not prb_latest:
+        date_floor = date.today() - timedelta(days=30)
         prb_rows = KpiData.query.filter(
             KpiData.data_level == "site",
             KpiData.kpi_name.ilike("%prb%util%"),
+            KpiData.date >= date_floor,
         ).order_by(KpiData.site_id, KpiData.date.desc()).all()
         for row in prb_rows:
             if row.site_id not in prb_latest and row.value is not None:
@@ -3465,7 +3507,7 @@ def _business_kpi_from_flexible():
     ) if site_health else 0
     worst_sites = sorted(site_health, key=lambda r: r["health_score"])[:10]
 
-    return jsonify({
+    result = {
         "summary": {
             "total_users":      total_users,
             "avg_users":        avg_users,
@@ -3482,7 +3524,9 @@ def _business_kpi_from_flexible():
         "trend":            trend,
         "arpu_trend":       arpu_trend,
         "site_health":      worst_sites,
-    })
+    }
+    _cache_set("business_kpi", result)
+    return jsonify(result)
 
 
 def _business_kpi_from_kpidata():
@@ -3607,7 +3651,7 @@ def _business_kpi_from_kpidata():
     ) if site_health else 0.0
     worst_sites = sorted(site_health, key=lambda r: r["health_score"])[:10]
 
-    return jsonify({
+    result = {
         "summary": {
             "total_users":      total_users,
             "avg_users":        avg_users,
@@ -3624,7 +3668,9 @@ def _business_kpi_from_kpidata():
         "trend":           trend,
         "arpu_trend":      arpu_trend,
         "site_health":     worst_sites,
-    })
+    }
+    _cache_set("business_kpi", result)
+    return jsonify(result)
 
 
 @app.route("/api/cto/operational-kpi", methods=["GET"])
