@@ -6662,8 +6662,8 @@ def agent_dashboard():
                     "subcategory": t.subcategory or "",
                     "status": t.status,
                     "sla_hours": total_sla,
-                    "sla_deadline": (dl7.isoformat() + "Z") if dl7 else None,
-                    "created_at": (t.created_at.isoformat() + "Z") if t.created_at else None,
+                    "sla_deadline": (dl7.replace(tzinfo=None).isoformat() + "Z") if dl7 and dl7.tzinfo else ((dl7.isoformat() + "Z") if dl7 else None),
+                    "created_at": (t.created_at.replace(tzinfo=None).isoformat() + "Z") if t.created_at and t.created_at.tzinfo else ((t.created_at.isoformat() + "Z") if t.created_at else None),
                 })
     try:
         db.session.commit()

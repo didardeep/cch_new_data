@@ -56,11 +56,11 @@ function SlaTimer({ deadline, slaHours, status, resolvedAt, slaBreached }) {
     if (!deadline) return <span className="badge badge-resolved">Resolved</span>;
     const dl = new Date(deadline).getTime();
     const ra = resolvedAt ? new Date(resolvedAt).getTime() : null;
-    const wasBreach = slaBreached || (ra && ra > dl);
+    const wasBreach = slaBreached || (ra && !isNaN(ra) && !isNaN(dl) && ra > dl);
     if (wasBreach) {
       const overMs = ra ? ra - dl : Date.now() - dl;
-      const overH = Math.floor(Math.abs(overMs) / 3600000);
-      const overM = Math.floor((Math.abs(overMs) % 3600000) / 60000);
+      const overH = isNaN(overMs) ? 0 : Math.floor(Math.abs(overMs) / 3600000);
+      const overM = isNaN(overMs) ? 0 : Math.floor((Math.abs(overMs) % 3600000) / 60000);
       return (
         <div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
@@ -74,8 +74,8 @@ function SlaTimer({ deadline, slaHours, status, resolvedAt, slaBreached }) {
       );
     }
     const spareMs = ra ? dl - ra : 0;
-    const spareH = Math.floor(spareMs / 3600000);
-    const spareM = Math.floor((spareMs % 3600000) / 60000);
+    const spareH = isNaN(spareMs) ? 0 : Math.floor(spareMs / 3600000);
+    const spareM = isNaN(spareMs) ? 0 : Math.floor((spareMs % 3600000) / 60000);
     return (
       <div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
