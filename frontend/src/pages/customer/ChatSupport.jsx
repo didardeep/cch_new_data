@@ -1494,7 +1494,16 @@ export default function ChatSupport() {
         if (restored) return;
         try { const data = await apiGet(`/api/chat/session/${storedId}`); if (data?.session && data.session.status === 'active') { resumeChat(data.session, data.messages || []); return; } } catch {}
       }
-      // No active session — show the start gate.
+      // Check for resolved sessions needing feedback before showing start gate
+      try {
+        const fbData = await apiGet('/api/customer/pending-feedback');
+        if (fbData?.sessions?.length) {
+          setPendingFeedback(fbData.sessions);
+          setCurrentFbIdx(0);
+          setInitPhase('feedback-gate');
+          return;
+        }
+      } catch {}
       setInitPhase('start-gate');
     })();
   }, [searchParams, resumeChat, restoreSession]);
@@ -1813,6 +1822,148 @@ export default function ChatSupport() {
     );
   };
 
+  const renderFeedbackGate = () => {
+    const session = pendingFeedback[currentFbIdx];
+    if (!session) return null;
+    const total = pendingFeedback.length;
+    const current = currentFbIdx + 1;
+
+    // List view: show all pending sessions
+    if (!fbRating && currentFbIdx === 0 && total > 0) {
+      return (
+        <div className="gate-overlay">
+          <div className="gate-card resume-gate" style={{ maxWidth: 520 }}>
+            <div className="gate-icon" style={{ fontSize: 32 }}>&#9733;</div>
+            <h2 className="gate-title">Feedback Required</h2>
+            <p className="gate-subtitle">
+              You have {total} resolved session{total > 1 ? 's' : ''} awaiting feedback. Please rate your experience to continue.
+            </p>
+            <div style={{ maxHeight: 300, overflowY: 'auto', width: '100%', marginBottom: 16 }}>
+              {pendingFeedback.map((s, idx) => (
+                <div key={s.id}
+                  onClick={() => setCurrentFbIdx(idx)}
+                  style={{
+                    display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                    padding: '12px 16px', margin: '6px 0', borderRadius: 10, cursor: 'pointer',
+                    background: idx === currentFbIdx ? '#eff6ff' : '#f8fafc',
+                    border: idx === currentFbIdx ? '2px solid #3b82f6' : '1px solid #e2e8f0',
+                    transition: 'all 0.15s',
+                  }}
+                >
+                  <div>
+                    <div style={{ fontWeight: 600, fontSize: 13, color: '#1e293b' }}>
+                      Ticket #{s.ticket_id} — {s.subprocess_name || s.sector_name || 'Support'}
+                    </div>
+                    <div style={{ fontSize: 11, color: '#64748b', marginTop: 2 }}>
+                      {s.query_text ? (s.query_text.length > 80 ? s.query_text.slice(0, 80) + '...' : s.query_text) : 'No description'}
+                    </div>
+                  </div>
+                  <div style={{ fontSize: 11, color: '#94a3b8', whiteSpace: 'nowrap', marginLeft: 12 }}>
+                    {s.resolved_at ? new Date(s.resolved_at).toLocaleDateString() : ''}
+                  </div>
+                </div>
+              ))}
+            </div>
+            <p style={{ fontSize: 12, color: '#64748b', marginBottom: 8 }}>Click a session above, then rate below</p>
+            {/* Rating form inline */}
+            <div style={{ width: '100%', background: '#f0f4ff', borderRadius: 10, padding: '16px', border: '1px solid #c7d2fe' }}>
+              <div style={{ fontWeight: 600, fontSize: 13, color: '#1e293b', marginBottom: 8 }}>
+                Rate: Ticket #{session.ticket_id} — {session.subprocess_name || session.sector_name || 'Support'}
+              </div>
+              <div style={{ display: 'flex', gap: 6, marginBottom: 10 }}>
+                {[1, 2, 3, 4, 5].map(n => (
+                  <button key={n} type="button" onClick={() => setFbRating(n)}
+                    style={{
+                      fontSize: 26, background: 'none', border: 'none', cursor: 'pointer',
+                      color: n <= fbRating ? '#f59e0b' : '#cbd5e1', transition: 'color 0.15s',
+                    }}
+                  >&#9733;</button>
+                ))}
+                <span style={{ fontSize: 12, color: '#64748b', alignSelf: 'center', marginLeft: 4 }}>
+                  {fbRating > 0 ? `${fbRating}/5` : ''}
+                </span>
+              </div>
+              <textarea
+                placeholder="Optional comment..."
+                value={fbComment}
+                onChange={e => setFbComment(e.target.value)}
+                rows={2}
+                style={{
+                  width: '100%', borderRadius: 8, border: '1px solid #e2e8f0', padding: '8px 12px',
+                  fontSize: 13, resize: 'none', marginBottom: 10, fontFamily: 'inherit',
+                }}
+              />
+              <button
+                onClick={handleFeedbackSubmit}
+                disabled={fbRating === 0 || fbSubmitting}
+                style={{
+                  width: '100%', padding: '10px', borderRadius: 8, fontWeight: 600, fontSize: 13,
+                  background: fbRating > 0 ? '#3b82f6' : '#e2e8f0',
+                  color: fbRating > 0 ? '#fff' : '#94a3b8',
+                  border: 'none', cursor: fbRating > 0 ? 'pointer' : 'not-allowed',
+                }}
+              >
+                {fbSubmitting ? 'Submitting...' : `Submit Feedback (${current}/${total})`}
+              </button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // Single session feedback (when navigating through the list after first submission)
+    return (
+      <div className="gate-overlay">
+        <div className="gate-card resume-gate" style={{ maxWidth: 460 }}>
+          <div className="gate-icon" style={{ fontSize: 32 }}>&#9733;</div>
+          <h2 className="gate-title">Rate Your Experience ({current}/{total})</h2>
+          <div style={{ width: '100%', background: '#f0f4ff', borderRadius: 10, padding: '16px', border: '1px solid #c7d2fe', marginBottom: 16 }}>
+            <div style={{ fontWeight: 600, fontSize: 13, color: '#1e293b' }}>
+              Ticket #{session.ticket_id} — {session.subprocess_name || session.sector_name || 'Support'}
+            </div>
+            {session.query_text && (
+              <div style={{ fontSize: 12, color: '#64748b', marginTop: 4 }}>
+                {session.query_text.length > 100 ? session.query_text.slice(0, 100) + '...' : session.query_text}
+              </div>
+            )}
+          </div>
+          <div style={{ display: 'flex', gap: 6, marginBottom: 12, justifyContent: 'center' }}>
+            {[1, 2, 3, 4, 5].map(n => (
+              <button key={n} type="button" onClick={() => setFbRating(n)}
+                style={{
+                  fontSize: 30, background: 'none', border: 'none', cursor: 'pointer',
+                  color: n <= fbRating ? '#f59e0b' : '#cbd5e1', transition: 'color 0.15s',
+                }}
+              >&#9733;</button>
+            ))}
+          </div>
+          <textarea
+            placeholder="Optional comment..."
+            value={fbComment}
+            onChange={e => setFbComment(e.target.value)}
+            rows={2}
+            style={{
+              width: '100%', borderRadius: 8, border: '1px solid #e2e8f0', padding: '8px 12px',
+              fontSize: 13, resize: 'none', marginBottom: 12, fontFamily: 'inherit',
+            }}
+          />
+          <button
+            onClick={handleFeedbackSubmit}
+            disabled={fbRating === 0 || fbSubmitting}
+            style={{
+              width: '100%', padding: '10px', borderRadius: 8, fontWeight: 600, fontSize: 13,
+              background: fbRating > 0 ? '#3b82f6' : '#e2e8f0',
+              color: fbRating > 0 ? '#fff' : '#94a3b8',
+              border: 'none', cursor: fbRating > 0 ? 'pointer' : 'not-allowed',
+            }}
+          >
+            {fbSubmitting ? 'Submitting...' : `Submit Feedback (${current}/${total})`}
+          </button>
+        </div>
+      </div>
+    );
+  };
+
   const renderStartGate = () => (
     <div className="gate-overlay">
       <div className="gate-card resume-gate">
@@ -1839,6 +1990,7 @@ export default function ChatSupport() {
           </div>
         )}
         {initPhase === 'resume-prompt' && <div className="chat-area">{renderResumePrompt()}</div>}
+        {initPhase === 'feedback-gate' && <div className="chat-area">{renderFeedbackGate()}</div>}
         {initPhase === 'start-gate' && <div className="chat-area">{renderStartGate()}</div>}
 
         {initPhase === 'chat' && (

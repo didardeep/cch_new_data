@@ -2297,24 +2297,33 @@ def customer_active_session():
 @app.route("/api/customer/pending-feedback", methods=["GET"])
 @jwt_required()
 def customer_pending_feedback():
-    """Return resolved sessions that the user hasn't given feedback for."""
+    """Return ALL resolved sessions (with tickets) that the user hasn't given feedback for."""
     user_id = int(get_jwt_identity())
-    cutoff = datetime.now(timezone.utc) - timedelta(days=7)
     # Subquery: session IDs that already have feedback from this user
     feedback_session_ids = db.session.query(Feedback.chat_session_id).filter(
         Feedback.user_id == user_id,
         Feedback.chat_session_id.isnot(None),
     ).subquery()
 
-    sessions = ChatSession.query.filter(
+    # Only sessions that were escalated and resolved (i.e. have a ticket)
+    sessions = db.session.query(ChatSession, Ticket).join(
+        Ticket, Ticket.chat_session_id == ChatSession.id
+    ).filter(
         ChatSession.user_id == user_id,
-        ChatSession.status.in_(["resolved"]),
-        ChatSession.created_at >= cutoff,
+        ChatSession.status == "resolved",
         ~ChatSession.id.in_(feedback_session_ids),
-    ).order_by(ChatSession.created_at.desc()).limit(1).all()
+    ).order_by(ChatSession.resolved_at.desc()).all()
+
+    result = []
+    for s, t in sessions:
+        sd = s.to_dict()
+        sd["ticket_id"] = t.id
+        sd["ticket_priority"] = t.priority
+        sd["assigned_agent"] = t.assignee.name if t.assignee else ""
+        result.append(sd)
 
     return jsonify({
-        "sessions": [s.to_dict() for s in sessions],
+        "sessions": result,
     })
 
 
@@ -6851,6 +6860,17 @@ def agent_dashboard():
         "ai_insights": ai_insights,
         "forecast": forecast,
         "burndown": burndown,
+        "recent_feedbacks": [
+            {
+                "rating": f.rating,
+                "comment": f.comment,
+                "customer": f.user.name if f.user else "",
+                "session_id": f.chat_session_id,
+                "created_at": f.created_at.isoformat() if f.created_at else None,
+                "subprocess": f.chat_session.subprocess_name if f.chat_session else "",
+            }
+            for f in sorted(feedbacks, key=lambda x: x.created_at or datetime.min, reverse=True)[:10]
+        ],
     })
 
 

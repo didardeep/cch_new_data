@@ -34,7 +34,7 @@ const P_CFG = {
 };
 
 /* ── Live SLA Timer ──────────────────────────────────────────────────────────────── */
-function SlaTimer({ deadline, slaHours, status }) {
+function SlaTimer({ deadline, slaHours, status, resolvedAt, slaBreached }) {
   const [remaining, setRemaining] = useState(null);
   const [pct, setPct] = useState(0);
 
@@ -51,7 +51,44 @@ function SlaTimer({ deadline, slaHours, status }) {
     return () => clearInterval(iv);
   }, [deadline, slaHours, status]);
 
-  if (status === 'resolved') return <span className="badge badge-resolved">Resolved</span>;
+  // Resolved tickets: show whether SLA was met or breached
+  if (status === 'resolved') {
+    if (!deadline) return <span className="badge badge-resolved">Resolved</span>;
+    const dl = new Date(deadline).getTime();
+    const ra = resolvedAt ? new Date(resolvedAt).getTime() : null;
+    const wasBreach = slaBreached || (ra && ra > dl);
+    if (wasBreach) {
+      const overMs = ra ? ra - dl : Date.now() - dl;
+      const overH = Math.floor(Math.abs(overMs) / 3600000);
+      const overM = Math.floor((Math.abs(overMs) % 3600000) / 60000);
+      return (
+        <div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+            <span style={{ fontSize: 12, fontWeight: 700, color: 'var(--danger)' }}>SLA Breached</span>
+          </div>
+          <div style={{ fontSize: 11, color: 'var(--danger)', marginTop: 2 }}>
+            Overdue by {overH}h {overM}m
+          </div>
+          <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 1 }}>Target: {slaHours}h</div>
+        </div>
+      );
+    }
+    const spareMs = ra ? dl - ra : 0;
+    const spareH = Math.floor(spareMs / 3600000);
+    const spareM = Math.floor((spareMs % 3600000) / 60000);
+    return (
+      <div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+          <span style={{ fontSize: 12, fontWeight: 700, color: 'var(--success)' }}>SLA Met</span>
+        </div>
+        <div style={{ fontSize: 11, color: 'var(--success)', marginTop: 2 }}>
+          {spareH}h {spareM}m to spare
+        </div>
+        <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 1 }}>Target: {slaHours}h</div>
+      </div>
+    );
+  }
+
   if (remaining === null) return <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>No SLA</span>;
 
   const breached  = remaining <= 0;
@@ -1654,7 +1691,7 @@ export default function AgentTicketBucket() {
                   {/* SLA Timer */}
                   <div>
                     <div style={{ fontSize: 10, fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 4 }}>SLA Timer</div>
-                    <SlaTimer deadline={ticket.sla_deadline} slaHours={ticket.sla_hours} status={ticket.status} />
+                    <SlaTimer deadline={ticket.sla_deadline} slaHours={ticket.sla_hours} status={ticket.status} resolvedAt={ticket.resolved_at} slaBreached={ticket.sla_breached} />
                   </div>
 
                   {/* Customer */}
