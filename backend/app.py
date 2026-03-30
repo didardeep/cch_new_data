@@ -1887,6 +1887,28 @@ def resolve_session(session_id):
     return jsonify({"session": session.to_dict(), "summary": session.summary})
 
 
+@app.route("/api/chat/session/<int:session_id>", methods=["DELETE"])
+@jwt_required()
+def delete_chat_session(session_id):
+    """Delete a chat session and its messages (customer clearing from dashboard)."""
+    user_id = int(get_jwt_identity())
+    session = ChatSession.query.get(session_id)
+    if not session:
+        return jsonify({"error": "Session not found"}), 404
+    if session.user_id != user_id:
+        return jsonify({"error": "Unauthorized"}), 403
+    # Don't allow deleting sessions that have tickets
+    ticket = Ticket.query.filter_by(chat_session_id=session_id).first()
+    if ticket:
+        return jsonify({"error": "Cannot delete session with an active ticket"}), 409
+    # Delete messages first, then session
+    ChatMessage.query.filter_by(session_id=session_id).delete()
+    Feedback.query.filter_by(chat_session_id=session_id).delete()
+    db.session.delete(session)
+    db.session.commit()
+    return jsonify({"ok": True})
+
+
 def send_ticket_assignment_email(agent, ticket, session):
     """Send a styled HTML email to the assigned agent with ticket details."""
     if not agent or not agent.email:
