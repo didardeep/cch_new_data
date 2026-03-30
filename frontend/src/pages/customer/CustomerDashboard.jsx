@@ -105,13 +105,13 @@ export default function CustomerDashboard() {
                 </tr>
               </thead>
               <tbody>
-                {sessions.map(s => (
+                {sessions.map((s, idx) => (
                   <tr key={s.id}
                     style={{ cursor: 'pointer' }}
                     onClick={() => navigate(`/customer/chat?resume=${s.id}`)}
                     title="Click to open this chat"
                   >
-                    <td>#{s.id}</td>
+                    <td>#{sessions.length - idx}</td>
                     <td>{s.sector_name || '—'}</td>
                     <td style={{ maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                       {s.query_text || '—'}
