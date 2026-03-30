@@ -2001,21 +2001,28 @@ def core_analytics():
         _geo_parts.append(f"LOWER(technology) IN ({','.join([chr(39)+v.strip().lower()+chr(39) for v in _te.split(',') if v.strip()])})" if "," in _te else f"LOWER(technology) = '{_te.lower()}'")
     if _geo_parts:
         _c_sub = f"AND LOWER(site_id) IN (SELECT LOWER(site_id) FROM telecom_sites WHERE {' AND '.join(_geo_parts)})"
-    # Time filter for column_name date strings — use max column_name as reference
+    # Time filter — detect format (row_date vs column_name dates)
     _c_time = ""
     _ctr = (filters or {}).get("time_range", "all")
-    if _ctr and _ctr != "all":
-        _cdays = {"1h": 7, "6h": 7, "24h": 7, "7d": 7, "30d": 30}.get(_ctr, 30)
-        try:
-            _max_col = _sql("SELECT MAX(column_name) AS mx FROM flexible_kpi_uploads WHERE kpi_type='core' AND column_type='numeric'")
-            if _max_col and _max_col[0]["mx"]:
-                # Parse date from column_name like "2026_03_11_000000"
-                _mx_str = _max_col[0]["mx"][:10]  # "2026_03_11"
-                _mx_dt = datetime.strptime(_mx_str, "%Y_%m_%d")
-                _c_cutoff = (_mx_dt - timedelta(days=_cdays)).strftime("%Y_%m_%d")
-                _c_time = f"AND column_name >= '{_c_cutoff}'"
-        except Exception:
-            pass
+    _cdays = {"1h": 7, "6h": 7, "24h": 7, "7d": 7, "30d": 30}.get(_ctr, 30) if _ctr and _ctr != "all" else 9999
+    _has_row_date_core = False
+    try:
+        _has_row_date_core = bool(_sql("SELECT 1 FROM flexible_kpi_uploads WHERE kpi_type='core' AND row_date IS NOT NULL LIMIT 1"))
+    except:
+        pass
+    if _cdays < 9999:
+        if _has_row_date_core:
+            _c_time = f"AND row_date >= (SELECT MAX(row_date) FROM flexible_kpi_uploads WHERE kpi_type='core' AND row_date IS NOT NULL) - INTERVAL '{_cdays} days'"
+        else:
+            try:
+                _max_col = _sql("SELECT MAX(column_name) AS mx FROM flexible_kpi_uploads WHERE kpi_type='core' AND column_type='numeric'")
+                if _max_col and _max_col[0]["mx"]:
+                    _mx_str = _max_col[0]["mx"][:10]
+                    _mx_dt = datetime.strptime(_mx_str, "%Y_%m_%d")
+                    _c_cutoff = (_mx_dt - timedelta(days=_cdays)).strftime("%Y_%m_%d")
+                    _c_time = f"AND column_name >= '{_c_cutoff}'"
+            except:
+                pass
 
     # ── 1. flexible_kpi_uploads (type='core') ─────────────────────────────────
     # The core KPI file may be structured two ways:
@@ -2055,20 +2062,31 @@ def core_analytics():
                 avg_auth = avg_cpu = avg_attach = avg_pdp = overall
 
             # Build trend per KPI: daily averages for each kpi_name
+            # Detect if data uses row_date (new format) or column_name dates (old format)
+            _has_row_date = bool(_sql("SELECT 1 FROM flexible_kpi_uploads WHERE kpi_type='core' AND row_date IS NOT NULL LIMIT 1"))
+
             def _core_trend(kn_rows, field_key, out_key):
-                """Trend over column_name (date strings) for a matched kpi_name."""
+                """Trend over dates for a matched kpi_name."""
                 matched_name = next(
                     (r["kpi_name"] for r in kn_rows if field_key in (r.get("kpi_name") or "").lower()),
                     None
                 )
                 if not matched_name:
                     return []
-                rows = _sql(f"""
-                    SELECT column_name AS dt, AVG(num_value) AS val
-                    FROM flexible_kpi_uploads
-                    WHERE kpi_type='core' AND kpi_name=:kn AND column_type='numeric' {_c_sub} {_c_time}
-                    GROUP BY column_name ORDER BY column_name LIMIT 60
-                """, {"kn": matched_name})
+                if _has_row_date_core:
+                    rows = _sql(f"""
+                        SELECT row_date::text AS dt, AVG(num_value) AS val
+                        FROM flexible_kpi_uploads
+                        WHERE kpi_type='core' AND kpi_name=:kn AND column_type='numeric' AND row_date IS NOT NULL {_c_sub} {_c_time}
+                        GROUP BY row_date ORDER BY row_date LIMIT 60
+                    """, {"kn": matched_name})
+                else:
+                    rows = _sql(f"""
+                        SELECT column_name AS dt, AVG(num_value) AS val
+                        FROM flexible_kpi_uploads
+                        WHERE kpi_type='core' AND kpi_name=:kn AND column_type='numeric' {_c_sub} {_c_time}
+                        GROUP BY column_name ORDER BY column_name LIMIT 60
+                    """, {"kn": matched_name})
                 return [{"date": r["dt"][:10].replace("_", "-"), out_key: _f(r["val"], 2)} for r in rows]
 
             auth_trend   = _core_trend(core_kpi_rows, "auth",   "auth_sr")
@@ -4238,10 +4256,11 @@ def site_core_detail():
     if not site_id:
         return jsonify({"error": "site_id required"}), 400
 
-    ck = _cache_key("site_core_v3", {"site_id": site_id, "tr": time_range})
-    cached = _from_cache(ck)
-    if cached:
-        return jsonify(cached)
+    ck = _cache_key("site_core_v4", {"site_id": site_id, "tr": time_range})
+    if request.args.get("fresh") != "1":
+        cached = _from_cache(ck)
+        if cached:
+            return jsonify(cached)
 
     def _kpi_field(name):
         n = (name or "").lower()
@@ -4251,40 +4270,58 @@ def site_core_detail():
         if "pdp" in n or "bearer" in n: return "pdp_sr"
         return None
 
+    _days_map = {"1h": 1, "6h": 1, "24h": 1, "7d": 7, "30d": 30, "all": 9999}
+    _max_days = _days_map.get(time_range, 30)
+
     trend = []
     # ── flexible_kpi_uploads (primary) ────────────────────────────────────────
     try:
-        rows = _sql("""
-            SELECT kpi_name, column_name, AVG(num_value) AS val
-            FROM flexible_kpi_uploads
-            WHERE kpi_type = 'core'
-              AND LOWER(site_id) = LOWER(:sid)
-              AND column_type = 'numeric'
-              AND num_value IS NOT NULL
-            GROUP BY kpi_name, column_name
-            ORDER BY column_name
-        """, {"sid": site_id})
+        # Detect format: row_date (new) or column_name dates (old)
+        _has_rd = bool(_sql("SELECT 1 FROM flexible_kpi_uploads WHERE kpi_type='core' AND row_date IS NOT NULL LIMIT 1"))
+
+        if _has_rd:
+            # NEW FORMAT: kpi_name in column_name, dates in row_date
+            _date_filter = f"AND row_date >= (SELECT MAX(row_date) FROM flexible_kpi_uploads WHERE kpi_type='core' AND row_date IS NOT NULL) - INTERVAL '{_max_days} days'" if _max_days < 9999 else ""
+            rows = _sql(f"""
+                SELECT kpi_name, row_date::text AS dt, AVG(num_value) AS val
+                FROM flexible_kpi_uploads
+                WHERE kpi_type = 'core'
+                  AND LOWER(site_id) = LOWER(:sid)
+                  AND column_type = 'numeric'
+                  AND num_value IS NOT NULL
+                  AND row_date IS NOT NULL {_date_filter}
+                GROUP BY kpi_name, row_date
+                ORDER BY row_date
+            """, {"sid": site_id})
+        else:
+            # OLD FORMAT: dates as column_name
+            rows = _sql("""
+                SELECT kpi_name, column_name AS dt, AVG(num_value) AS val
+                FROM flexible_kpi_uploads
+                WHERE kpi_type = 'core'
+                  AND LOWER(site_id) = LOWER(:sid)
+                  AND column_type = 'numeric'
+                  AND num_value IS NOT NULL
+                GROUP BY kpi_name, column_name
+                ORDER BY column_name
+            """, {"sid": site_id})
 
         # Pivot: {date_str → {field → value}}
         date_map: dict = {}
         for r in rows:
-            col = r["column_name"] or ""
-            # Parse "2026_02_20_000000" → "2026-02-20"
-            date_str = col[:10].replace("_", "-") if len(col) >= 10 else col
+            dt = r["dt"] or ""
+            date_str = dt[:10].replace("_", "-") if len(dt) >= 10 else dt
             field = _kpi_field(r["kpi_name"])
             if not field or not date_str:
                 continue
             date_map.setdefault(date_str, {})[field] = _f(r["val"], 2)
 
-        # Apply time_range filter to trend dates
-        _days_map = {"1h": 1, "6h": 1, "24h": 1, "7d": 7, "30d": 30, "all": 9999}
-        _max_days = _days_map.get(time_range, 30)
-        _cutoff = (datetime.utcnow() - timedelta(days=_max_days)).strftime("%Y-%m-%d") if _max_days < 9999 else "2000-01-01"
-        trend = [
-            {"date": d, **date_map[d]}
-            for d in sorted(date_map)
-            if d >= _cutoff
-        ]
+        # Apply time_range filter (for old format where SQL filter wasn't applied)
+        if not _has_rd:
+            _cutoff = (datetime.utcnow() - timedelta(days=_max_days)).strftime("%Y-%m-%d") if _max_days < 9999 else "2000-01-01"
+            trend = [{"date": d, **date_map[d]} for d in sorted(date_map) if d >= _cutoff]
+        else:
+            trend = [{"date": d, **date_map[d]} for d in sorted(date_map)]
     except Exception as e:
         _LOG.error("site_core_detail flex: %s", e)
 

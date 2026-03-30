@@ -119,8 +119,8 @@ function Speedometer({ score, T }) {
       {/* Grey track only */}
       <path d={arcD(0, 100)} fill="none" stroke={T.progressTrack} strokeWidth={sw} strokeLinecap="round"/>
 
-      {/* Vibrant active arc with shiny filter - 3 color segments */}
-      <g filter="url(#shiny)">
+      {/* Vibrant active arc - 3 color segments */}
+      <g>
         {v > 0 && v <= 40 && <path d={arcD(0, v)} fill="none" stroke="#EF4444" strokeWidth={sw} strokeLinecap="round"
           style={{transition:'all 1.2s cubic-bezier(.4,0,.2,1)'}}/>}
         {v > 40 && <>
