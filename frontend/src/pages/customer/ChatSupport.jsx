@@ -1487,6 +1487,17 @@ export default function ChatSupport() {
         // Fallback: if restoreSession failed (e.g. network error), use resumeChat with DB messages.
         try { const data = await apiGet(`/api/chat/session/${resumeId}`); if (data?.session) { resumeChat(data.session, data.messages || []); return; } } catch {}
       }
+      // Check for resolved sessions needing feedback before anything else
+      try {
+        const fbData = await apiGet('/api/customer/pending-feedback');
+        if (fbData?.sessions?.length) {
+          localStorage.removeItem('chat_session_id');
+          setPendingFeedback(fbData.sessions);
+          setCurrentFbIdx(0);
+          setInitPhase('feedback-gate');
+          return;
+        }
+      } catch {}
       // If there's an active session in localStorage, auto-resume it on refresh.
       const storedId = localStorage.getItem('chat_session_id');
       if (storedId) {
@@ -1494,16 +1505,6 @@ export default function ChatSupport() {
         if (restored) return;
         try { const data = await apiGet(`/api/chat/session/${storedId}`); if (data?.session && data.session.status === 'active') { resumeChat(data.session, data.messages || []); return; } } catch {}
       }
-      // Check for resolved sessions needing feedback before showing start gate
-      try {
-        const fbData = await apiGet('/api/customer/pending-feedback');
-        if (fbData?.sessions?.length) {
-          setPendingFeedback(fbData.sessions);
-          setCurrentFbIdx(0);
-          setInitPhase('feedback-gate');
-          return;
-        }
-      } catch {}
       setInitPhase('start-gate');
     })();
   }, [searchParams, resumeChat, restoreSession]);

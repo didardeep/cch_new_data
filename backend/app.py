@@ -1887,6 +1887,28 @@ def resolve_session(session_id):
     return jsonify({"session": session.to_dict(), "summary": session.summary})
 
 
+@app.route("/api/chat/session/<int:session_id>", methods=["DELETE"])
+@jwt_required()
+def delete_chat_session(session_id):
+    """Delete a chat session and its messages (customer clearing from dashboard)."""
+    user_id = int(get_jwt_identity())
+    session = ChatSession.query.get(session_id)
+    if not session:
+        return jsonify({"error": "Session not found"}), 404
+    if session.user_id != user_id:
+        return jsonify({"error": "Unauthorized"}), 403
+    # Don't allow deleting sessions that have tickets
+    ticket = Ticket.query.filter_by(chat_session_id=session_id).first()
+    if ticket:
+        return jsonify({"error": "Cannot delete session with an active ticket"}), 409
+    # Delete messages first, then session
+    ChatMessage.query.filter_by(session_id=session_id).delete()
+    Feedback.query.filter_by(chat_session_id=session_id).delete()
+    db.session.delete(session)
+    db.session.commit()
+    return jsonify({"ok": True})
+
+
 def send_ticket_assignment_email(agent, ticket, session):
     """Send a styled HTML email to the assigned agent with ticket details."""
     if not agent or not agent.email:
@@ -6681,8 +6703,8 @@ def agent_dashboard():
                     "subcategory": t.subcategory or "",
                     "status": t.status,
                     "sla_hours": total_sla,
-                    "sla_deadline": (dl7.isoformat() + "Z") if dl7 else None,
-                    "created_at": (t.created_at.isoformat() + "Z") if t.created_at else None,
+                    "sla_deadline": (dl7.replace(tzinfo=None).isoformat() + "Z") if dl7 and dl7.tzinfo else ((dl7.isoformat() + "Z") if dl7 else None),
+                    "created_at": (t.created_at.replace(tzinfo=None).isoformat() + "Z") if t.created_at and t.created_at.tzinfo else ((t.created_at.isoformat() + "Z") if t.created_at else None),
                 })
     try:
         db.session.commit()
@@ -6876,7 +6898,7 @@ def agent_resolve_ticket(ticket_id):
     """Mark a ticket as resolved by the agent."""
     user_id = int(get_jwt_identity())
     user = User.query.get(user_id)
-    if not user or user.role != "human_agent":
+    if not user or user.role not in ("human_agent", "manager", "expert"):
         return jsonify({"error": "Unauthorized"}), 403
     ticket = Ticket.query.get(ticket_id)
     if not ticket:
