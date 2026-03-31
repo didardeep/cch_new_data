@@ -2941,58 +2941,30 @@ def _cache_set(key, data):
 
 
 def _latest_site_values_for_kpi(kpi_name):
-    from sqlalchemy import func as sa_func
-    # Only look at last 30 days instead of scanning entire table
+    # Use DISTINCT ON for fast latest-per-site lookup on PostgreSQL
     date_floor = date.today() - timedelta(days=30)
-    sub = db.session.query(
-        KpiData.site_id,
-        sa_func.max(KpiData.date).label("max_date"),
-    ).filter(
-        KpiData.data_level == "site",
-        KpiData.kpi_name == kpi_name,
-        KpiData.value.isnot(None),
-        KpiData.date >= date_floor,
-    ).group_by(KpiData.site_id).subquery()
+    rows = db.session.execute(db.text("""
+        SELECT DISTINCT ON (site_id) site_id, date, value
+        FROM kpi_data
+        WHERE data_level = 'site' AND kpi_name = :kpi AND value IS NOT NULL AND date >= :floor
+        ORDER BY site_id, date DESC
+    """), {"kpi": kpi_name, "floor": date_floor}).fetchall()
 
-    rows = db.session.query(
-        KpiData.site_id, KpiData.date, KpiData.value,
-    ).join(sub, db.and_(
-        KpiData.site_id == sub.c.site_id,
-        KpiData.date == sub.c.max_date,
-    )).filter(
-        KpiData.data_level == "site",
-        KpiData.kpi_name == kpi_name,
-    ).all()
-
-    return {r.site_id: {"date": r.date, "value": float(r.value)} for r in rows if r.value is not None}
+    return {r.site_id: {"date": r.date, "value": float(r.value)} for r in rows}
 
 
 def _site_values_near_date(kpi_name, target_date):
     """Return {site_id: value} for the closest date <= target_date per site."""
-    from sqlalchemy import func as sa_func
     date_floor = target_date - timedelta(days=14)
-    sub = db.session.query(
-        KpiData.site_id,
-        sa_func.max(KpiData.date).label("max_date"),
-    ).filter(
-        KpiData.data_level == "site",
-        KpiData.kpi_name == kpi_name,
-        KpiData.value.isnot(None),
-        KpiData.date >= date_floor,
-        KpiData.date <= target_date,
-    ).group_by(KpiData.site_id).subquery()
+    rows = db.session.execute(db.text("""
+        SELECT DISTINCT ON (site_id) site_id, value
+        FROM kpi_data
+        WHERE data_level = 'site' AND kpi_name = :kpi AND value IS NOT NULL
+          AND date >= :floor AND date <= :target
+        ORDER BY site_id, date DESC
+    """), {"kpi": kpi_name, "floor": date_floor, "target": target_date}).fetchall()
 
-    rows = db.session.query(
-        KpiData.site_id, KpiData.value,
-    ).join(sub, db.and_(
-        KpiData.site_id == sub.c.site_id,
-        KpiData.date == sub.c.max_date,
-    )).filter(
-        KpiData.data_level == "site",
-        KpiData.kpi_name == kpi_name,
-    ).all()
-
-    return {r.site_id: float(r.value) for r in rows if r.value is not None}
+    return {r.site_id: float(r.value) for r in rows}
 
 
 def _series_for_kpi_patterns(patterns, days=30):
@@ -3406,14 +3378,8 @@ def cto_business_kpi():
     if cached:
         return jsonify(cached)
 
-    # ── Try FlexibleKpiUpload revenue data first ─────────────────────────────
-    rev_count = FlexibleKpiUpload.query.filter_by(kpi_type="revenue").count()
-    use_flexible = rev_count > 0
-
-    if use_flexible:
-        return _business_kpi_from_flexible()
-    else:
-        return _business_kpi_from_kpidata()
+    # ── Always use KpiData (Site Users + Site Revenue) for business KPI ──────
+    return _business_kpi_from_kpidata()
 
 
 def _business_kpi_from_flexible():
@@ -3487,9 +3453,12 @@ def _business_kpi_from_flexible():
         arpu    = round(rev_now / subs, 4) if subs else 0
         growth  = round(((rev_now - rev_prev) / rev_prev) * 100, 2) if rev_prev and rev_prev != 0 else 0
         util_val = prb_latest.get(site_id, {}).get("value", 0) if isinstance(prb_latest.get(site_id), dict) else 0
+        # Estimate previous-period users from revenue ratio for churn calc
+        prev_users = round(subs * (rev_prev / rev_now), 2) if rev_now and rev_prev else subs
         site_rows.append({
             "site_id": site_id,
             "users": round(subs, 2),
+            "prev_users": prev_users,
             "revenue": round(rev_now, 2),
             "opex": round(opex, 2),
             "arpu": round(arpu, 4),
@@ -3513,30 +3482,41 @@ def _business_kpi_from_flexible():
     growths = [r["growth"] for r in site_rows if r["growth"] != 0]
     avg_growth = round(sum(growths) / len(growths), 2) if growths else 0
 
-    # Declining sites: revenue dropped MoM
-    declining_sites = sorted(
-        [r for r in site_rows if r["growth"] < 0],
-        key=lambda r: r["growth"]
-    )[:10]
+    # Declining & overloaded sites, churn, revenue at risk (legacy logic)
+    declining_sites = []
+    overloaded_sites_list = []
+    revenue_at_risk = 0.0
+    users_lost = 0.0
+    users_at_start = 0.0
 
-    # Revenue at risk = total revenue of declining sites
-    revenue_at_risk = round(sum(r["revenue"] for r in site_rows if r["growth"] < 0), 2)
+    for row in site_rows:
+        g = row["growth"]
+        if row.get("prev_users") and row["users"]:
+            users_at_start += row["prev_users"]
+            if g < 0:
+                users_lost += (row["prev_users"] - row["users"])
+        item = row
+        if g < 0:
+            declining_sites.append(item)
+        if row["utilization"] > 80:
+            overloaded_sites_list.append(item)
+        if g < 0 or row["utilization"] > 80:
+            revenue_at_risk += row["users"] * arpu
 
-    # Churn proxy: count of sites with revenue decline > 10%
-    heavy_decline = [r for r in site_rows if r["growth"] < -10]
-    churn_rate = round(len(heavy_decline) / num_sites * 100, 2)
+    revenue_at_risk = round(revenue_at_risk, 2)
 
-    # Network ROI
-    network_roi = round(((total_revenue - total_opex) / total_opex) * 100, 2) if total_opex else 0
+    # Churn rate: users lost / users at start
+    churn_rate = round((users_lost / users_at_start) * 100, 2) if users_at_start else 0.0
+
+    # Network ROI: baseline cost model (legacy)
+    baseline_cost = num_sites * 5000.0
+    network_roi = round(((total_revenue - baseline_cost) / baseline_cost) * 100, 2) if baseline_cost else 0.0
 
     # Top sites by revenue
-    top_sites = sorted(site_rows, key=lambda r: r["revenue"], reverse=True)[:10]
+    top_sites = sorted(site_rows, key=lambda r: (r["revenue"], r["users"]), reverse=True)[:10]
 
-    # Overloaded: utilization > 80% OR category contains "High Util"
-    overloaded_sites = sorted(
-        [r for r in site_rows if r["utilization"] > 80 or "High Util" in (r.get("category") or "")],
-        key=lambda r: r["utilization"], reverse=True
-    )[:10]
+    declining_sites = sorted(declining_sites, key=lambda r: r["growth"])[:10]
+    overloaded_sites = sorted(overloaded_sites_list, key=lambda r: r["utilization"], reverse=True)[:10]
 
     # ── Monthly trend ────────────────────────────────────────────────────────
     trend = []
@@ -3566,10 +3546,10 @@ def _business_kpi_from_flexible():
 
     site_health = []
     for row in site_rows:
+        util_score = max(0.0, 1.0 - row["utilization"] / 100.0)
         user_score = row["users"]   / max_users_v
         rev_score  = row["revenue"] / max_revenue_v
-        growth_score = min(1.0, max(0.0, (row["growth"] + 20) / 40))  # -20% → 0, +20% → 1
-        health = round((user_score * 0.3 + rev_score * 0.4 + growth_score * 0.3) * 100, 2)
+        health     = round((util_score * 0.4 + user_score * 0.3 + rev_score * 0.3) * 100, 2)
         site_health.append({**row, "health_score": health})
 
     avg_health_score = round(
