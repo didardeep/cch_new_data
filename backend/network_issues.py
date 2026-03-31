@@ -441,7 +441,7 @@ def get_worst_cells():
     return jsonify({
         "sites": sites,
         "count": len(sites),
-        "scan_time": datetime.utcnow().isoformat(),
+        "scan_time": (_LATEST_SCAN_TIME or datetime.combine(_date.today(), datetime.min.time()).replace(hour=8)).isoformat(),
     })
 
 

@@ -96,6 +96,14 @@ def register_routes(app):
     import os as _os
     _speedtest_payload = _os.urandom(25 * 1024 * 1024)
 
+    @app.route("/api/speedtest-widget", methods=["GET"])
+    def speedtest_widget():
+        """Serve the self-hosted speed test widget HTML."""
+        import os
+        html_path = os.path.join(os.path.dirname(__file__), "static", "speedtest", "index.html")
+        with open(html_path, "r", encoding="utf-8") as f:
+            return Response(f.read(), mimetype="text/html")
+
     @app.route("/api/broadband/billing-check", methods=["GET"])
     @jwt_required()
     def broadband_billing_check():

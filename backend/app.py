@@ -2963,58 +2963,30 @@ def _cache_set(key, data):
 
 
 def _latest_site_values_for_kpi(kpi_name):
-    from sqlalchemy import func as sa_func
-    # Only look at last 30 days instead of scanning entire table
+    # Use DISTINCT ON for fast latest-per-site lookup on PostgreSQL
     date_floor = date.today() - timedelta(days=30)
-    sub = db.session.query(
-        KpiData.site_id,
-        sa_func.max(KpiData.date).label("max_date"),
-    ).filter(
-        KpiData.data_level == "site",
-        KpiData.kpi_name == kpi_name,
-        KpiData.value.isnot(None),
-        KpiData.date >= date_floor,
-    ).group_by(KpiData.site_id).subquery()
+    rows = db.session.execute(db.text("""
+        SELECT DISTINCT ON (site_id) site_id, date, value
+        FROM kpi_data
+        WHERE data_level = 'site' AND kpi_name = :kpi AND value IS NOT NULL AND date >= :floor
+        ORDER BY site_id, date DESC
+    """), {"kpi": kpi_name, "floor": date_floor}).fetchall()
 
-    rows = db.session.query(
-        KpiData.site_id, KpiData.date, KpiData.value,
-    ).join(sub, db.and_(
-        KpiData.site_id == sub.c.site_id,
-        KpiData.date == sub.c.max_date,
-    )).filter(
-        KpiData.data_level == "site",
-        KpiData.kpi_name == kpi_name,
-    ).all()
-
-    return {r.site_id: {"date": r.date, "value": float(r.value)} for r in rows if r.value is not None}
+    return {r.site_id: {"date": r.date, "value": float(r.value)} for r in rows}
 
 
 def _site_values_near_date(kpi_name, target_date):
     """Return {site_id: value} for the closest date <= target_date per site."""
-    from sqlalchemy import func as sa_func
     date_floor = target_date - timedelta(days=14)
-    sub = db.session.query(
-        KpiData.site_id,
-        sa_func.max(KpiData.date).label("max_date"),
-    ).filter(
-        KpiData.data_level == "site",
-        KpiData.kpi_name == kpi_name,
-        KpiData.value.isnot(None),
-        KpiData.date >= date_floor,
-        KpiData.date <= target_date,
-    ).group_by(KpiData.site_id).subquery()
+    rows = db.session.execute(db.text("""
+        SELECT DISTINCT ON (site_id) site_id, value
+        FROM kpi_data
+        WHERE data_level = 'site' AND kpi_name = :kpi AND value IS NOT NULL
+          AND date >= :floor AND date <= :target
+        ORDER BY site_id, date DESC
+    """), {"kpi": kpi_name, "floor": date_floor, "target": target_date}).fetchall()
 
-    rows = db.session.query(
-        KpiData.site_id, KpiData.value,
-    ).join(sub, db.and_(
-        KpiData.site_id == sub.c.site_id,
-        KpiData.date == sub.c.max_date,
-    )).filter(
-        KpiData.data_level == "site",
-        KpiData.kpi_name == kpi_name,
-    ).all()
-
-    return {r.site_id: float(r.value) for r in rows if r.value is not None}
+    return {r.site_id: float(r.value) for r in rows}
 
 
 def _series_for_kpi_patterns(patterns, days=30):
@@ -3255,56 +3227,126 @@ def cto_core_kpi():
         db_to_key[kn] = key
         cols_meta[key] = {"db_name": kn, "label": LABEL_MAP.get(kn, kn)}
 
-    # ── Date columns ─────────────────────────────────────────────
-    date_cols = [r[0] for r in db.session.query(
-        FlexibleKpiUpload.column_name
-    ).filter_by(kpi_type="core").distinct().all()]
-    date_cols_parsed = {dc: _parse_col_date(dc) for dc in date_cols}
-    date_cols_parsed = {k: v for k, v in date_cols_parsed.items() if v}
-    sorted_date_cols = sorted(date_cols_parsed.items(), key=lambda x: x[1])
-
-    if not sorted_date_cols:
-        return jsonify({"available": False, "message": "No valid date columns found."})
-
-    min_date = sorted_date_cols[0][1]
-    latest_date = sorted_date_cols[-1][1]
-    latest_col = sorted_date_cols[-1][0]
-
-    # ── SINGLE bulk query: kpi_name + column_name → avg ──────────
-    # This replaces ~8 separate queries with 1
-    bulk_rows = db.session.query(
-        FlexibleKpiUpload.kpi_name,
-        FlexibleKpiUpload.column_name,
-        sa_func.avg(FlexibleKpiUpload.num_value).label("avg_val"),
-    ).filter(
+    # ── Detect data format: row_date based (new) or column_name dates (old) ──
+    has_row_date = db.session.query(FlexibleKpiUpload.id).filter(
         FlexibleKpiUpload.kpi_type == "core",
-        FlexibleKpiUpload.kpi_name.isnot(None),
-    ).group_by(
-        FlexibleKpiUpload.kpi_name,
-        FlexibleKpiUpload.column_name,
-    ).all()
+        FlexibleKpiUpload.row_date.isnot(None),
+    ).limit(1).scalar() is not None
 
-    # Build trend + summary from bulk results
-    # per_kpi_all[key] = list of values (for overall avg)
-    # per_kpi_latest[key] = avg for latest column
-    per_kpi_all = {k: [] for k in cols_meta}
-    per_kpi_latest = {k: None for k in cols_meta}
-    trend_pivot = {_iso(d): {"date": _iso(d)} for _, d in sorted_date_cols}
+    if has_row_date:
+        # ── NEW FORMAT: kpi_name in column_name, dates in row_date ──
+        date_range = db.session.query(
+            sa_func.min(FlexibleKpiUpload.row_date),
+            sa_func.max(FlexibleKpiUpload.row_date),
+        ).filter(
+            FlexibleKpiUpload.kpi_type == "core",
+            FlexibleKpiUpload.row_date.isnot(None),
+        ).one()
+        min_date, latest_date = date_range
 
-    for kpi_db_name, col_name, avg_val in bulk_rows:
-        key = db_to_key.get(kpi_db_name)
-        if not key or avg_val is None:
-            continue
-        val = round(float(avg_val), 2)
-        per_kpi_all[key].append(val)
-        if col_name == latest_col:
-            per_kpi_latest[key] = val
-        d = date_cols_parsed.get(col_name)
-        if d:
-            d_str = _iso(d)
+        if not min_date:
+            return jsonify({"available": False, "message": "No valid dates found."})
+
+        # Bulk query: kpi_name + row_date → avg
+        bulk_rows = db.session.query(
+            FlexibleKpiUpload.kpi_name,
+            FlexibleKpiUpload.row_date,
+            sa_func.avg(FlexibleKpiUpload.num_value).label("avg_val"),
+        ).filter(
+            FlexibleKpiUpload.kpi_type == "core",
+            FlexibleKpiUpload.kpi_name.isnot(None),
+            FlexibleKpiUpload.row_date.isnot(None),
+        ).group_by(
+            FlexibleKpiUpload.kpi_name,
+            FlexibleKpiUpload.row_date,
+        ).all()
+
+        # Build unique dates
+        all_dates = sorted(set(r[1] for r in bulk_rows if r[1]))
+
+        per_kpi_all = {k: [] for k in cols_meta}
+        per_kpi_latest = {k: None for k in cols_meta}
+        trend_pivot = {_iso(d): {"date": _iso(d)} for d in all_dates}
+
+        for kpi_db_name, row_date, avg_val in bulk_rows:
+            key = db_to_key.get(kpi_db_name)
+            if not key or avg_val is None:
+                continue
+            val = round(float(avg_val), 2)
+            per_kpi_all[key].append(val)
+            if row_date == latest_date:
+                per_kpi_latest[key] = val
+            d_str = _iso(row_date)
             if d_str in trend_pivot:
                 trend_pivot[d_str][key] = val
 
+        # Per-site table: latest date
+        site_rows = db.session.query(
+            FlexibleKpiUpload.site_id,
+            FlexibleKpiUpload.kpi_name,
+            FlexibleKpiUpload.num_value,
+        ).filter(
+            FlexibleKpiUpload.kpi_type == "core",
+            FlexibleKpiUpload.row_date == latest_date,
+        ).all()
+
+    else:
+        # ── OLD FORMAT: dates as column_name, kpi_name separate ──
+        date_cols = [r[0] for r in db.session.query(
+            FlexibleKpiUpload.column_name
+        ).filter_by(kpi_type="core").distinct().all()]
+        date_cols_parsed = {dc: _parse_col_date(dc) for dc in date_cols}
+        date_cols_parsed = {k: v for k, v in date_cols_parsed.items() if v}
+        sorted_date_cols = sorted(date_cols_parsed.items(), key=lambda x: x[1])
+
+        if not sorted_date_cols:
+            return jsonify({"available": False, "message": "No valid date columns found."})
+
+        min_date = sorted_date_cols[0][1]
+        latest_date = sorted_date_cols[-1][1]
+        latest_col = sorted_date_cols[-1][0]
+
+        bulk_rows = db.session.query(
+            FlexibleKpiUpload.kpi_name,
+            FlexibleKpiUpload.column_name,
+            sa_func.avg(FlexibleKpiUpload.num_value).label("avg_val"),
+        ).filter(
+            FlexibleKpiUpload.kpi_type == "core",
+            FlexibleKpiUpload.kpi_name.isnot(None),
+        ).group_by(
+            FlexibleKpiUpload.kpi_name,
+            FlexibleKpiUpload.column_name,
+        ).all()
+
+        per_kpi_all = {k: [] for k in cols_meta}
+        per_kpi_latest = {k: None for k in cols_meta}
+        trend_pivot = {_iso(d): {"date": _iso(d)} for _, d in sorted_date_cols}
+
+        for kpi_db_name, col_name, avg_val in bulk_rows:
+            key = db_to_key.get(kpi_db_name)
+            if not key or avg_val is None:
+                continue
+            val = round(float(avg_val), 2)
+            per_kpi_all[key].append(val)
+            if col_name == latest_col:
+                per_kpi_latest[key] = val
+            d = date_cols_parsed.get(col_name)
+            if d:
+                d_str = _iso(d)
+                if d_str in trend_pivot:
+                    trend_pivot[d_str][key] = val
+
+        # Per-site table: latest date
+        site_rows = db.session.query(
+            FlexibleKpiUpload.site_id,
+            FlexibleKpiUpload.kpi_name,
+            FlexibleKpiUpload.num_value,
+        ).filter(
+            FlexibleKpiUpload.kpi_type == "core",
+            FlexibleKpiUpload.column_name == latest_col,
+        ).all()
+
+    # ── Common: build summary, trend, site_table ──────────────────
     summary = {}
     for key, meta in cols_meta.items():
         vals = per_kpi_all[key]
@@ -3316,16 +3358,6 @@ def cto_core_kpi():
         }
 
     trend = sorted(trend_pivot.values(), key=lambda x: x["date"])
-
-    # ── Per-site table: latest date only (single query) ──────────
-    site_rows = db.session.query(
-        FlexibleKpiUpload.site_id,
-        FlexibleKpiUpload.kpi_name,
-        FlexibleKpiUpload.num_value,
-    ).filter(
-        FlexibleKpiUpload.kpi_type == "core",
-        FlexibleKpiUpload.column_name == latest_col,
-    ).all()
 
     pivot = {}
     for site_id, kpi_name, num_value in site_rows:
@@ -3368,14 +3400,8 @@ def cto_business_kpi():
     if cached:
         return jsonify(cached)
 
-    # ── Try FlexibleKpiUpload revenue data first ─────────────────────────────
-    rev_count = FlexibleKpiUpload.query.filter_by(kpi_type="revenue").count()
-    use_flexible = rev_count > 0
-
-    if use_flexible:
-        return _business_kpi_from_flexible()
-    else:
-        return _business_kpi_from_kpidata()
+    # ── Always use KpiData (Site Users + Site Revenue) for business KPI ──────
+    return _business_kpi_from_kpidata()
 
 
 def _business_kpi_from_flexible():
@@ -3411,13 +3437,14 @@ def _business_kpi_from_flexible():
     MONTH_ORDER = ["jan", "feb", "mar", "apr", "may", "jun",
                    "jul", "aug", "sep", "oct", "nov", "dec"]
     sample = next(iter(sites.values()))
+    # Support both old format (revenue_jan_l) and new format (Revenue Jan (₹L))
     rev_cols = sorted(
-        [k for k in sample if k.startswith("revenue_") and isinstance(sample.get(k), (int, float))],
-        key=lambda c: next((i for i, m in enumerate(MONTH_ORDER) if m in c), 99)
+        [k for k in sample if (k.lower().startswith("revenue") and any(m in k.lower() for m in MONTH_ORDER)) and isinstance(sample.get(k), (int, float))],
+        key=lambda c: next((i for i, m in enumerate(MONTH_ORDER) if m in c.lower()), 99)
     )
     opex_cols = sorted(
-        [k for k in sample if k.startswith("opex_") and isinstance(sample.get(k), (int, float))],
-        key=lambda c: next((i for i, m in enumerate(MONTH_ORDER) if m in c), 99)
+        [k for k in sample if (k.lower().startswith("opex") or k.lower().startswith("op")) and any(m in k.lower() for m in MONTH_ORDER) and isinstance(sample.get(k), (int, float))],
+        key=lambda c: next((i for i, m in enumerate(MONTH_ORDER) if m in c.lower()), 99)
     )
 
     latest_rev_col = rev_cols[-1] if rev_cols else None
@@ -3441,24 +3468,27 @@ def _business_kpi_from_flexible():
     # ── Build per-site rows ──────────────────────────────────────────────────
     site_rows = []
     for site_id, data in sites.items():
-        subs    = data.get("subscribers", 0)
+        subs    = data.get("subscribers", data.get("Subscribers", 0))
         rev_now = data.get(latest_rev_col, 0) if latest_rev_col else 0
         rev_prev = data.get(prev_rev_col, 0) if prev_rev_col else 0
         opex    = data.get(latest_opex_col, 0) if latest_opex_col else 0
         arpu    = round(rev_now / subs, 4) if subs else 0
         growth  = round(((rev_now - rev_prev) / rev_prev) * 100, 2) if rev_prev and rev_prev != 0 else 0
         util_val = prb_latest.get(site_id, {}).get("value", 0) if isinstance(prb_latest.get(site_id), dict) else 0
+        # Estimate previous-period users from revenue ratio for churn calc
+        prev_users = round(subs * (rev_prev / rev_now), 2) if rev_now and rev_prev else subs
         site_rows.append({
             "site_id": site_id,
             "users": round(subs, 2),
+            "prev_users": prev_users,
             "revenue": round(rev_now, 2),
             "opex": round(opex, 2),
             "arpu": round(arpu, 4),
             "growth": growth,
             "utilization": round(util_val, 2),
-            "zone": data.get("zone", ""),
-            "technology": data.get("technology", ""),
-            "category": data.get("site_category", ""),
+            "zone": data.get("zone", data.get("Zone", "")),
+            "technology": data.get("technology", data.get("Technology", "")),
+            "category": data.get("site_category", data.get("Site Category", "")),
         })
 
     num_sites     = len(site_rows) or 1
@@ -3474,30 +3504,41 @@ def _business_kpi_from_flexible():
     growths = [r["growth"] for r in site_rows if r["growth"] != 0]
     avg_growth = round(sum(growths) / len(growths), 2) if growths else 0
 
-    # Declining sites: revenue dropped MoM
-    declining_sites = sorted(
-        [r for r in site_rows if r["growth"] < 0],
-        key=lambda r: r["growth"]
-    )[:10]
+    # Declining & overloaded sites, churn, revenue at risk (legacy logic)
+    declining_sites = []
+    overloaded_sites_list = []
+    revenue_at_risk = 0.0
+    users_lost = 0.0
+    users_at_start = 0.0
 
-    # Revenue at risk = total revenue of declining sites
-    revenue_at_risk = round(sum(r["revenue"] for r in site_rows if r["growth"] < 0), 2)
+    for row in site_rows:
+        g = row["growth"]
+        if row.get("prev_users") and row["users"]:
+            users_at_start += row["prev_users"]
+            if g < 0:
+                users_lost += (row["prev_users"] - row["users"])
+        item = row
+        if g < 0:
+            declining_sites.append(item)
+        if row["utilization"] > 80:
+            overloaded_sites_list.append(item)
+        if g < 0 or row["utilization"] > 80:
+            revenue_at_risk += row["users"] * arpu
 
-    # Churn proxy: count of sites with revenue decline > 10%
-    heavy_decline = [r for r in site_rows if r["growth"] < -10]
-    churn_rate = round(len(heavy_decline) / num_sites * 100, 2)
+    revenue_at_risk = round(revenue_at_risk, 2)
 
-    # Network ROI
-    network_roi = round(((total_revenue - total_opex) / total_opex) * 100, 2) if total_opex else 0
+    # Churn rate: users lost / users at start
+    churn_rate = round((users_lost / users_at_start) * 100, 2) if users_at_start else 0.0
+
+    # Network ROI: baseline cost model (legacy)
+    baseline_cost = num_sites * 5000.0
+    network_roi = round(((total_revenue - baseline_cost) / baseline_cost) * 100, 2) if baseline_cost else 0.0
 
     # Top sites by revenue
-    top_sites = sorted(site_rows, key=lambda r: r["revenue"], reverse=True)[:10]
+    top_sites = sorted(site_rows, key=lambda r: (r["revenue"], r["users"]), reverse=True)[:10]
 
-    # Overloaded: utilization > 80% OR category contains "High Util"
-    overloaded_sites = sorted(
-        [r for r in site_rows if r["utilization"] > 80 or "High Util" in (r.get("category") or "")],
-        key=lambda r: r["utilization"], reverse=True
-    )[:10]
+    declining_sites = sorted(declining_sites, key=lambda r: r["growth"])[:10]
+    overloaded_sites = sorted(overloaded_sites_list, key=lambda r: r["utilization"], reverse=True)[:10]
 
     # ── Monthly trend ────────────────────────────────────────────────────────
     trend = []
@@ -3527,10 +3568,10 @@ def _business_kpi_from_flexible():
 
     site_health = []
     for row in site_rows:
+        util_score = max(0.0, 1.0 - row["utilization"] / 100.0)
         user_score = row["users"]   / max_users_v
         rev_score  = row["revenue"] / max_revenue_v
-        growth_score = min(1.0, max(0.0, (row["growth"] + 20) / 40))  # -20% → 0, +20% → 1
-        health = round((user_score * 0.3 + rev_score * 0.4 + growth_score * 0.3) * 100, 2)
+        health     = round((util_score * 0.4 + user_score * 0.3 + rev_score * 0.3) * 100, 2)
         site_health.append({**row, "health_score": health})
 
     avg_health_score = round(

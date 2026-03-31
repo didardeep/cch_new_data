@@ -414,8 +414,9 @@ function ConnectionCheckOffer({ msgId, groupId, disabled, queryText, disableGrou
         <div style={{ marginTop: 8 }}>
           <div style={{ position: 'relative', width: '100%', maxWidth: 720, margin: '0 auto', paddingBottom: '30%', minHeight: 160, borderRadius: 10, overflow: 'hidden', border: '1px solid #1e3a5f' }}>
             <iframe
-              src="//openspeedtest.com/speedtest"
+              src="https://openspeedtest.com/speedtest"
               title="Speed Test"
+              sandbox="allow-scripts allow-same-origin"
               style={{ border: 'none', position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', minHeight: 160, overflow: 'hidden' }}
             />
           </div>
