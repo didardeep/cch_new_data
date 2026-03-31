@@ -158,7 +158,6 @@ def register_routes(app):
         return jsonify(connection_data), 200
 
     @app.route("/api/broadband/speedtest-file", methods=["GET"])
-    @jwt_required()
     def broadband_speedtest_file():
         """
         Serves a 25 MB random payload for browser-side download speed measurement.
@@ -177,14 +176,12 @@ def register_routes(app):
         return resp
 
     @app.route("/api/broadband/ping", methods=["GET"])
-    @jwt_required()
     def broadband_ping():
         """Lightweight latency check endpoint."""
         ts_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
         return jsonify({"ok": True, "timestamp": ts_ms}), 200
 
     @app.route("/api/broadband/speedtest-upload", methods=["POST"])
-    @jwt_required()
     def broadband_speedtest_upload():
         """
         Accepts binary upload for upload speed measurement.
