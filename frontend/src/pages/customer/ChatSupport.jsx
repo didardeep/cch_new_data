@@ -409,6 +409,7 @@ function ConnectionCheckOffer({ msgId, groupId, disabled, queryText, disableGrou
           </div>
         </>
       )}
+      
 
       {showWidget && (
         <div style={{ marginTop: 8 }}>
