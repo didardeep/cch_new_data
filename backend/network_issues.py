@@ -337,10 +337,12 @@ def schedule_daily_job(app):
     _ticket_done_date = None    # date of last 08:00 ticket job
 
     def _tickets_already_processed_today():
-        """Check if daily job already ran today by looking at updated_at = today 08:00."""
-        today_08 = datetime.combine(_date.today(), datetime.min.time()).replace(hour=8)
+        """Check if daily job already ran today by looking at created_at date."""
+        today_start = datetime.combine(_date.today(), datetime.min.time())
+        tomorrow_start = today_start + timedelta(days=1)
         count = NetworkIssueTicket.query.filter(
-            NetworkIssueTicket.updated_at == today_08
+            NetworkIssueTicket.created_at >= today_start,
+            NetworkIssueTicket.created_at < tomorrow_start
         ).count()
         return count > 0
 
@@ -490,16 +492,12 @@ def list_network_issues():
 @network_issues_bp.route("/api/network-issues/todays-routing", methods=["GET"])
 @jwt_required()
 def todays_routing():
-    """Return today's ticket routing: created + updated tickets today."""
+    """Return ticket routing info for all open/in_progress tickets."""
     from datetime import date as _date_cls
     today = _date_cls.today()
-    # Get tickets created OR updated today
     tickets = NetworkIssueTicket.query.filter(
-        db.or_(
-            db.func.date(NetworkIssueTicket.created_at) == today,
-            db.func.date(NetworkIssueTicket.updated_at) == today,
-        )
-    ).order_by(NetworkIssueTicket.id.asc()).all()
+        NetworkIssueTicket.status.in_(["open", "in_progress"])
+    ).order_by(NetworkIssueTicket.created_at.desc()).all()
 
     routing = []
     for t in tickets:
@@ -518,7 +516,7 @@ def todays_routing():
             "date": t.created_at.strftime("%Y-%m-%d") if t.created_at else today.isoformat(),
             "agent_name": agent_name,
             "agent_email": agent_email,
-            "type": "created" if created_today else "updated",
+            "type": "created" if created_today else "existing",
         })
     return jsonify({"routing": routing, "date": today.isoformat()})
 
