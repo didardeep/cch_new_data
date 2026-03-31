@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { apiGet, apiPut } from '../../api';
+import { apiGet, apiPut, apiDelete } from '../../api';
 import { useAuth } from '../../AuthContext';
 import { useTheme } from '../../ThemeContext';
 
@@ -30,9 +30,11 @@ export default function CustomerDashboard() {
       recent_sessions: prev.recent_sessions.filter(s => s.id !== sessionId),
     } : prev);
     try {
-      await apiPut(`/api/chat/session/${sessionId}/resolve`, {});
-    } catch {}
-    // Refresh in background to sync stats counts
+      await apiDelete(`/api/chat/session/${sessionId}`);
+    } catch {
+      // Fallback: just mark resolved if delete fails (e.g. session has a ticket)
+      try { await apiPut(`/api/chat/session/${sessionId}/resolve`, {}); } catch {}
+    }
     refreshDashboard();
   };
 

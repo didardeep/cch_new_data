@@ -1887,6 +1887,28 @@ def resolve_session(session_id):
     return jsonify({"session": session.to_dict(), "summary": session.summary})
 
 
+@app.route("/api/chat/session/<int:session_id>", methods=["DELETE"])
+@jwt_required()
+def delete_chat_session(session_id):
+    """Delete a chat session and its messages (customer clearing from dashboard)."""
+    user_id = int(get_jwt_identity())
+    session = ChatSession.query.get(session_id)
+    if not session:
+        return jsonify({"error": "Session not found"}), 404
+    if session.user_id != user_id:
+        return jsonify({"error": "Unauthorized"}), 403
+    # Don't allow deleting sessions that have tickets
+    ticket = Ticket.query.filter_by(chat_session_id=session_id).first()
+    if ticket:
+        return jsonify({"error": "Cannot delete session with an active ticket"}), 409
+    # Delete messages first, then session
+    ChatMessage.query.filter_by(session_id=session_id).delete()
+    Feedback.query.filter_by(chat_session_id=session_id).delete()
+    db.session.delete(session)
+    db.session.commit()
+    return jsonify({"ok": True})
+
+
 def send_ticket_assignment_email(agent, ticket, session):
     """Send a styled HTML email to the assigned agent with ticket details."""
     if not agent or not agent.email:
@@ -3527,7 +3549,14 @@ def cto_business_kpi():
     if cached:
         return jsonify(cached)
 
-    # ── Always use KpiData (Site Users + Site Revenue) for business KPI ──────
+    # ── Try KpiData (Site Users + Site Revenue) first, fall back to FlexibleKpiUpload ──
+    has_kpi = _latest_site_values_for_kpi("Site Users")
+    if has_kpi:
+        return _business_kpi_from_kpidata()
+    from models import FlexibleKpiUpload
+    has_flex = db.session.query(FlexibleKpiUpload.id).filter_by(kpi_type='revenue').first()
+    if has_flex:
+        return _business_kpi_from_flexible()
     return _business_kpi_from_kpidata()
 
 
@@ -3602,15 +3631,12 @@ def _business_kpi_from_flexible():
         arpu    = round(rev_now / subs, 4) if subs else 0
         growth  = round(((rev_now - rev_prev) / rev_prev) * 100, 2) if rev_prev and rev_prev != 0 else 0
         util_val = prb_latest.get(site_id, {}).get("value", 0) if isinstance(prb_latest.get(site_id), dict) else 0
-        # Estimate previous-period users from revenue ratio for churn calc
-        prev_users = round(subs * (rev_prev / rev_now), 2) if rev_now and rev_prev else subs
         site_rows.append({
             "site_id": site_id,
             "users": round(subs, 2),
-            "prev_users": prev_users,
             "revenue": round(rev_now, 2),
             "opex": round(opex, 2),
-            "arpu": round(arpu, 4),
+            "arpu": round(arpu, 2),
             "growth": growth,
             "utilization": round(util_val, 2),
             "zone": data.get("zone", data.get("Zone", "")),
@@ -3624,42 +3650,37 @@ def _business_kpi_from_flexible():
     total_revenue = round(sum(r["revenue"] for r in site_rows), 2)
     total_opex    = round(sum(r["opex"] for r in site_rows), 2)
 
-    # ARPU (total)
+    # ARPU (total) — revenue / users in same unit as revenue
     arpu = round(total_revenue / total_users, 4) if total_users else 0
 
     # Growth: avg revenue change across sites
     growths = [r["growth"] for r in site_rows if r["growth"] != 0]
     avg_growth = round(sum(growths) / len(growths), 2) if growths else 0
 
-    # Declining & overloaded sites, churn, revenue at risk (legacy logic)
+    # Declining & overloaded sites, churn, revenue at risk
     declining_sites = []
     overloaded_sites_list = []
     revenue_at_risk = 0.0
-    users_lost = 0.0
-    users_at_start = 0.0
+    declining_count = 0
 
     for row in site_rows:
         g = row["growth"]
-        if row.get("prev_users") and row["users"]:
-            users_at_start += row["prev_users"]
-            if g < 0:
-                users_lost += (row["prev_users"] - row["users"])
         item = row
         if g < 0:
             declining_sites.append(item)
+            declining_count += 1
         if row["utilization"] > 80:
             overloaded_sites_list.append(item)
         if g < 0 or row["utilization"] > 80:
-            revenue_at_risk += row["users"] * arpu
+            revenue_at_risk += row["revenue"]
 
     revenue_at_risk = round(revenue_at_risk, 2)
 
-    # Churn rate: users lost / users at start
-    churn_rate = round((users_lost / users_at_start) * 100, 2) if users_at_start else 0.0
+    # Churn rate: percentage of sites with declining revenue (subscriber snapshot is static)
+    churn_rate = round((declining_count / num_sites) * 100, 2) if num_sites else 0.0
 
-    # Network ROI: baseline cost model (legacy)
-    baseline_cost = num_sites * 5000.0
-    network_roi = round(((total_revenue - baseline_cost) / baseline_cost) * 100, 2) if baseline_cost else 0.0
+    # Network ROI: use actual OPEX data
+    network_roi = round(((total_revenue - total_opex) / total_opex) * 100, 2) if total_opex else 0.0
 
     # Top sites by revenue
     top_sites = sorted(site_rows, key=lambda r: (r["revenue"], r["users"]), reverse=True)[:10]
@@ -7061,8 +7082,8 @@ def agent_dashboard():
                     "subcategory": t.subcategory or "",
                     "status": t.status,
                     "sla_hours": total_sla,
-                    "sla_deadline": (dl7.isoformat() + "Z") if dl7 else None,
-                    "created_at": (t.created_at.isoformat() + "Z") if t.created_at else None,
+                    "sla_deadline": (dl7.replace(tzinfo=None).isoformat() + "Z") if dl7 and dl7.tzinfo else ((dl7.isoformat() + "Z") if dl7 else None),
+                    "created_at": (t.created_at.replace(tzinfo=None).isoformat() + "Z") if t.created_at and t.created_at.tzinfo else ((t.created_at.isoformat() + "Z") if t.created_at else None),
                 })
     try:
         db.session.commit()
@@ -7256,7 +7277,7 @@ def agent_resolve_ticket(ticket_id):
     """Mark a ticket as resolved by the agent."""
     user_id = int(get_jwt_identity())
     user = User.query.get(user_id)
-    if not user or user.role != "human_agent":
+    if not user or user.role not in ("human_agent", "manager", "expert"):
         return jsonify({"error": "Unauthorized"}), 403
     ticket = Ticket.query.get(ticket_id)
     if not ticket:
