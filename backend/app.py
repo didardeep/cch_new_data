@@ -6857,7 +6857,7 @@ def agent_resolve_ticket(ticket_id):
     """Mark a ticket as resolved by the agent."""
     user_id = int(get_jwt_identity())
     user = User.query.get(user_id)
-    if not user or user.role != "human_agent":
+    if not user or user.role not in ("human_agent", "manager", "expert"):
         return jsonify({"error": "Unauthorized"}), 403
     ticket = Ticket.query.get(ticket_id)
     if not ticket:
