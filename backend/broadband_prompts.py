@@ -6,7 +6,7 @@ Imported and registered by app.py -- do not run directly.
 """
 
 from datetime import datetime, timezone
-from flask import jsonify, Response
+from flask import jsonify, Response, send_from_directory
 from flask_jwt_extended import jwt_required, get_jwt_identity
 from models import BillingAccount
 
@@ -148,6 +148,13 @@ def register_routes(app):
             "sync_speed_mbps": 97,
         }
         return jsonify(connection_data), 200
+
+    @app.route("/api/speedtest-widget", methods=["GET"])
+    def speedtest_widget():
+        """Serve the self-hosted speed test HTML widget (loaded inside an iframe)."""
+        import os
+        static_dir = os.path.join(os.path.dirname(__file__), "static", "speedtest")
+        return send_from_directory(static_dir, "index.html")
 
     @app.route("/api/broadband/speedtest-file", methods=["GET"])
     @jwt_required()
