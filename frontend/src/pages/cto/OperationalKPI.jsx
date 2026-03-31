@@ -1,7 +1,7 @@
-import { useEffect, useState } from 'react';
-import { Cell, Pie, PieChart, ResponsiveContainer, Tooltip } from 'recharts';
+import React, { useEffect, useState } from 'react';
+import { Cell, Line, LineChart, CartesianGrid, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
 import { useNavigate } from 'react-router-dom';
-import { apiGet } from '../../api';
+import { apiGet, apiPut } from '../../api';
 
 // ── Priority config ───────────────────────────────────────────────────────────
 const PRIORITY = {
@@ -94,36 +94,36 @@ function SlaTimer({ clock, remaining }) {
   );
 }
 
-function Sparkline({ data = [] }) {
-  const max = Math.max(...data, 1);
-  return (
-    <div style={{ display: 'flex', alignItems: 'flex-end', gap: 4, height: 36 }}>
-      {data.map((v, i) => (
-        <div key={i} style={{
-          flex: 1,
-          height: `${Math.max((v / max) * 100, 8)}%`,
-          background: i === data.length - 1 ? 'var(--primary)' : 'var(--border)',
-          borderRadius: '3px 3px 0 0',
-        }} />
-      ))}
-    </div>
-  );
-}
 
 // ── Main component ────────────────────────────────────────────────────────────
 export default function OperationalKPI() {
   const [data, setData] = useState(null);
+  const [reviewTicket, setReviewTicket] = useState(null);
+  const [closing, setClosing] = useState(null);
   const navigate = useNavigate();
 
-  useEffect(() => {
+  const [cdo, setCdo] = useState(null);
+  const reload = () => {
     apiGet('/api/cto/operational-kpi').then(setData);
-  }, []);
+    apiGet('/api/cto/cdo-engagement-kpi').then(setCdo);
+  };
+  useEffect(() => { reload(); }, []);
+
+  const handleResolve = async (inc) => {
+    if (!window.confirm(`Resolve ticket #${inc.id}?`)) return;
+    setClosing(inc.id);
+    try {
+      await apiPut(`/api/manager/tickets/${inc.db_id}`, { status: 'resolved' });
+      reload();
+      setReviewTicket(null);
+    } catch (e) { alert('Failed to resolve: ' + e.message); }
+    setClosing(null);
+  };
 
   if (!data) return <div className="page-loader"><div className="spinner" /></div>;
 
   const s          = data.summary || {};
   const incidents  = data.critical_incidents || [];
-  const escalTrend = data.escalation_trend || [2, 4, 3, 6, 2, 3, 4];
 
   // Donut data
   const statusBreakdown = (data.status_breakdown || []).map((item, i) => ({
@@ -165,7 +165,9 @@ export default function OperationalKPI() {
           <div className="stat-card-value" style={{ color: '#fff', fontSize: 34, marginTop: 8 }}>
             {(s.total_tickets || 0).toLocaleString()}
           </div>
-          <div className="stat-card-sub" style={{ color: '#10b981' }}>↑ +12% from last cycle</div>
+          <div className="stat-card-sub" style={{ color: (s.ticket_growth_pct || 0) >= 0 ? '#ef4444' : '#10b981' }}>
+            {(s.ticket_growth_pct || 0) >= 0 ? '↑' : '↓'} {s.ticket_growth_pct > 0 ? '+' : ''}{s.ticket_growth_pct || 0}% from last week
+          </div>
           <div style={{ position: 'absolute', right: -16, top: -16, width: 80, height: 80, borderRadius: '50%', background: 'rgba(255,255,255,0.06)' }} />
           <div style={{ position: 'absolute', right: 12, bottom: -24, width: 60, height: 60, borderRadius: '50%', background: 'rgba(255,255,255,0.05)' }} />
         </div>
@@ -188,7 +190,7 @@ export default function OperationalKPI() {
             borderRadius: 20, padding: '2px 10px', fontSize: 11, fontWeight: 600,
           }}>
             <span style={{ width: 6, height: 6, borderRadius: '50%', background: '#ef4444' }} />
-            High Risk Sector
+            {s.top_breach_category || 'Breached'}
           </span>
         </div>
 
@@ -199,7 +201,9 @@ export default function OperationalKPI() {
             <span className="stat-card-value" style={{ fontSize: 34 }}>{s.avg_resolution_time || 0}</span>
             <span className="stat-card-sub" style={{ marginLeft: 5 }}>hrs</span>
           </div>
-          <div className="stat-card-sub" style={{ color: '#10b981', marginTop: 4 }}>-0.5h improvement</div>
+          <div className="stat-card-sub" style={{ color: (s.resolution_change || 0) <= 0 ? '#10b981' : '#ef4444', marginTop: 4 }}>
+            {(s.resolution_change || 0) <= 0 ? '' : '+'}{s.resolution_change || 0}h {(s.resolution_change || 0) <= 0 ? 'improvement' : 'slower'}
+          </div>
         </div>
 
         {/* CSAT Score */}
@@ -209,6 +213,254 @@ export default function OperationalKPI() {
           <Stars value={s.csat || 0} />
         </div>
       </div>
+
+      {/* ── CDO Row 1: Workload Forecast + Resolution Funnel ── */}
+      {cdo && (
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20, marginBottom: 24 }}>
+
+          {/* Workload Forecast — Premium */}
+          <div style={{
+            background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 20,
+            boxShadow: '0 8px 32px rgba(0,0,0,0.06), inset 0 1px 0 rgba(255,255,255,0.5)',
+            overflow: 'hidden', transition: 'transform 0.2s, box-shadow 0.2s',
+          }}>
+            <div style={{ height: 3, background: 'linear-gradient(90deg, #4F46E5, #06B6D4)' }} />
+            <div style={{ padding: '22px 26px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 4 }}>
+                <div style={{ width: 32, height: 32, borderRadius: 10, background: 'linear-gradient(135deg, #4F46E5, #06B6D4)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2.5" strokeLinecap="round"><path d="M3 12h4l3 8 4-16 3 8h4" /></svg>
+                </div>
+                <div>
+                  <div style={{ fontSize: 14, fontWeight: 700, color: 'var(--text)' }}>Predictive Workload Forecast</div>
+                  <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>AI-predicted ticket volume for next 7 days</div>
+                </div>
+              </div>
+              <ResponsiveContainer width="100%" height={190}>
+                <LineChart data={cdo.workload.series} margin={{ top: 16, right: 10, left: -10, bottom: 0 }}>
+                  <defs>
+                    <linearGradient id="wlGrad" x1="0" y1="0" x2="1" y2="0"><stop offset="0%" stopColor="#4F46E5" /><stop offset="100%" stopColor="#06B6D4" /></linearGradient>
+                  </defs>
+                  <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" strokeOpacity={0.4} />
+                  <XAxis dataKey="date" tick={{ fontSize: 9, fill: 'var(--text-muted)' }} axisLine={false} tickLine={false}
+                    tickFormatter={d => { const dt = new Date(d); return `${['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][dt.getDay()]} ${String(dt.getDate()).padStart(2,'0')}/${String(dt.getMonth()+1).padStart(2,'0')}`; }} />
+                  <YAxis tick={{ fontSize: 9, fill: 'var(--text-muted)' }} axisLine={false} tickLine={false} allowDecimals={false} />
+                  <Tooltip content={({ active, payload }) => {
+                    if (!active || !payload?.length) return null;
+                    const d = payload[0]?.payload;
+                    return (
+                      <div style={{ background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 12, padding: '10px 14px', fontSize: 11, boxShadow: '0 12px 36px rgba(0,0,0,0.12)' }}>
+                        <div style={{ fontWeight: 700, color: 'var(--text)', marginBottom: 4 }}>{d.date}</div>
+                        <div style={{ color: d.type === 'forecast' ? '#4F46E5' : 'var(--text-muted)', fontWeight: 600 }}>
+                          {d.count} tickets {d.type === 'forecast' ? '(predicted)' : ''}
+                        </div>
+                      </div>
+                    );
+                  }} />
+                  <Line type="monotone" dataKey="count" stroke="#4F46E5" strokeWidth={3}
+                    activeDot={{ r: 6, fill: '#4F46E5', stroke: '#fff', strokeWidth: 2 }}
+                    dot={(props) => {
+                      const { cx, cy, payload } = props;
+                      return (
+                        <circle cx={cx} cy={cy} r={payload.type === 'forecast' ? 5 : 4}
+                          fill={payload.type === 'forecast' ? '#4F46E5' : '#fff'}
+                          stroke="#4F46E5" strokeWidth={2.5} />
+                      );
+                    }} />
+                </LineChart>
+              </ResponsiveContainer>
+              <div style={{ display: 'flex', justifyContent: 'space-around', marginTop: 16, textAlign: 'center' }}>
+                {[
+                  { label: 'Current Rate', value: `${cdo.workload.current_rate}%`, color: cdo.workload.current_rate >= 90 ? '#10B981' : '#F59E0B' },
+                  { label: 'Target', value: `${cdo.workload.target_rate}%`, color: '#4F46E5' },
+                  { label: 'To Target', value: cdo.workload.gap_to_target <= 0 ? 'Achieved' : `+${cdo.workload.gap_to_target}%`, color: cdo.workload.gap_to_target <= 0 ? '#10B981' : '#EF4444' },
+                ].map(item => (
+                  <div key={item.label} style={{ padding: '10px 16px', background: `${item.color}0a`, borderRadius: 12, border: `1px solid ${item.color}20` }}>
+                    <div style={{ fontSize: 9, fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 4 }}>{item.label}</div>
+                    <div style={{ fontSize: 22, fontWeight: 900, color: item.color, lineHeight: 1 }}>{item.value}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          {/* Resolution Funnel — Premium with SVG trapezoid */}
+          <div style={{
+            background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 20,
+            boxShadow: '0 8px 32px rgba(0,0,0,0.06), inset 0 1px 0 rgba(255,255,255,0.5)',
+            overflow: 'hidden',
+          }}>
+            <div style={{ height: 3, background: 'linear-gradient(90deg, #00338D, #8B5CF6)' }} />
+            <div style={{ padding: '22px 26px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 16 }}>
+                <div style={{ width: 32, height: 32, borderRadius: 10, background: 'linear-gradient(135deg, #00338D, #8B5CF6)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2.5" strokeLinecap="round"><path d="M22 2L2 22M22 22V2H2" /></svg>
+                </div>
+                <div>
+                  <div style={{ fontSize: 14, fontWeight: 700, color: 'var(--text)' }}>Resolution Funnel</div>
+                  <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>Conversation to resolution flow</div>
+                </div>
+              </div>
+
+              {/* SVG Funnel */}
+              <svg viewBox="0 0 400 280" style={{ width: '100%', height: 'auto' }}>
+                <defs>
+                  <linearGradient id="fg1" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#00338D" /><stop offset="100%" stopColor="#1e52a0" /></linearGradient>
+                  <linearGradient id="fg2" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#1e52a0" /><stop offset="100%" stopColor="#3b7dd8" /></linearGradient>
+                  <linearGradient id="fg3" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#3b7dd8" /><stop offset="100%" stopColor="#6366f1" /></linearGradient>
+                  <linearGradient id="fg4" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#6366f1" /><stop offset="100%" stopColor="#8B5CF6" /></linearGradient>
+                  <filter id="fShadow"><feDropShadow dx="0" dy="2" stdDeviation="3" floodOpacity="0.15" /></filter>
+                </defs>
+                {[
+                  { y: 0, topW: 380, botW: 310, fill: 'url(#fg1)', label: 'Conversations', value: cdo.funnel.conversations },
+                  { y: 65, topW: 310, botW: 240, fill: 'url(#fg2)', label: 'AI Resolved', value: cdo.funnel.ai_resolved },
+                  { y: 130, topW: 240, botW: 180, fill: 'url(#fg3)', label: 'Escalated', value: cdo.funnel.escalated },
+                  { y: 195, topW: 180, botW: 140, fill: 'url(#fg4)', label: 'Resolved', value: cdo.funnel.human_resolved },
+                ].map((s, i) => {
+                  const cx = 200;
+                  const tl = cx - s.topW / 2, tr = cx + s.topW / 2;
+                  const bl = cx - s.botW / 2, br = cx + s.botW / 2;
+                  const dropoff = i > 0 ? (() => {
+                    const prev = [cdo.funnel.conversations, cdo.funnel.ai_resolved, cdo.funnel.escalated][i - 1];
+                    return prev ? Math.round(((prev - s.value) / prev) * 100) : 0;
+                  })() : null;
+                  return (
+                    <g key={s.label}>
+                      <path d={`M${tl},${s.y} L${tr},${s.y} L${br},${s.y + 58} L${bl},${s.y + 58} Z`}
+                        fill={s.fill} filter="url(#fShadow)" rx="8" />
+                      <text x={cx} y={s.y + 24} textAnchor="middle" fill="#fff" fontSize="12" fontWeight="600">{s.label}</text>
+                      <text x={cx} y={s.y + 46} textAnchor="middle" fill="#fff" fontSize="22" fontWeight="900">{s.value}</text>
+                      {dropoff != null && dropoff > 0 && (
+                        <text x={tr + 8} y={s.y + 10} fill="#94A3B8" fontSize="9" fontWeight="700">-{dropoff}%</text>
+                      )}
+                    </g>
+                  );
+                })}
+              </svg>
+
+              <div style={{ display: 'flex', gap: 14, justifyContent: 'center', marginTop: 10, flexWrap: 'wrap' }}>
+                {[['#00338D','Conversations'],['#1e52a0','AI Resolved'],['#3b7dd8','Escalated'],['#8B5CF6','Resolved']].map(([c, l]) => (
+                  <div key={l} style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 10, color: 'var(--text-muted)' }}>
+                    <div style={{ width: 8, height: 8, borderRadius: 3, background: c }} />{l}
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── CDO Row 2: Activity Heatmap + Sentiment ── */}
+      {cdo && (
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20, marginBottom: 24 }}>
+
+          {/* Activity Heatmap — Premium */}
+          <div style={{
+            background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 20,
+            boxShadow: '0 8px 32px rgba(0,0,0,0.06), inset 0 1px 0 rgba(255,255,255,0.5)',
+            overflow: 'hidden',
+          }}>
+            <div style={{ height: 3, background: 'linear-gradient(90deg, #06B6D4, #4F46E5)' }} />
+            <div style={{ padding: '22px 26px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 16 }}>
+                <div style={{ width: 32, height: 32, borderRadius: 10, background: 'linear-gradient(135deg, #06B6D4, #4F46E5)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2.5" strokeLinecap="round"><rect x="3" y="3" width="7" height="7" rx="1" /><rect x="14" y="3" width="7" height="7" rx="1" /><rect x="3" y="14" width="7" height="7" rx="1" /><rect x="14" y="14" width="7" height="7" rx="1" /></svg>
+                </div>
+                <div>
+                  <div style={{ fontSize: 14, fontWeight: 700, color: 'var(--text)' }}>Weekly Activity Heatmap</div>
+                  <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>Productivity pattern by day and hour</div>
+                </div>
+              </div>
+              {['Sun','Mon','Tue','Wed','Thu','Fri','Sat'].map((day, di) => (
+                <div key={day} style={{ display: 'grid', gridTemplateColumns: '36px repeat(24, 1fr)', gap: 3, marginBottom: 3 }}>
+                  <div style={{ fontSize: 9, fontWeight: 700, color: 'var(--text-muted)', display: 'flex', alignItems: 'center' }}>{day}</div>
+                  {Array.from({ length: 24 }, (_, hr) => {
+                    const cell = (cdo.heatmap.cells || []).find(c => c.day === di && c.hour === hr);
+                    const count = cell?.count || 0;
+                    const intensity = cdo.heatmap.peak_activity ? count / cdo.heatmap.peak_activity : 0;
+                    return (
+                      <div key={hr} title={`${day} ${hr}:00 — ${count} activities`} style={{
+                        height: 16, borderRadius: 4, cursor: 'pointer',
+                        background: count > 0
+                          ? `linear-gradient(135deg, rgba(6,182,212,${0.15 + intensity * 0.85}), rgba(79,70,229,${0.15 + intensity * 0.85}))`
+                          : 'var(--border)',
+                        transition: 'all 0.2s ease',
+                        boxShadow: count > 0 ? `0 2px 8px rgba(79,70,229,${intensity * 0.2})` : 'none',
+                      }} />
+                    );
+                  })}
+                </div>
+              ))}
+              <div style={{ display: 'flex', gap: 5, alignItems: 'center', marginTop: 10, fontSize: 9, color: 'var(--text-muted)' }}>
+                <span>Less</span>
+                {[0.1, 0.3, 0.5, 0.7, 1].map((o, i) => (
+                  <div key={i} style={{ width: 12, height: 12, borderRadius: 4, background: `linear-gradient(135deg, rgba(6,182,212,${o}), rgba(79,70,229,${o}))` }} />
+                ))}
+                <span>More</span>
+              </div>
+            </div>
+          </div>
+
+          {/* Customer Sentiment — Premium */}
+          <div style={{
+            background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 20,
+            boxShadow: '0 8px 32px rgba(0,0,0,0.06), inset 0 1px 0 rgba(255,255,255,0.5)',
+            overflow: 'hidden',
+          }}>
+            <div style={{ height: 3, background: 'linear-gradient(90deg, #4F46E5, #8B5CF6)' }} />
+            <div style={{ padding: '22px 26px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 16 }}>
+                <div style={{ width: 32, height: 32, borderRadius: 10, background: 'linear-gradient(135deg, #4F46E5, #8B5CF6)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2.5" strokeLinecap="round"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z" /></svg>
+                </div>
+                <div>
+                  <div style={{ fontSize: 14, fontWeight: 700, color: 'var(--text)' }}>Customer Sentiment Analysis</div>
+                  <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>Feedback rating distribution</div>
+                </div>
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 24 }}>
+                <div style={{ position: 'relative', width: 150, height: 150, flexShrink: 0 }}>
+                  <ResponsiveContainer width="100%" height="100%">
+                    <PieChart>
+                      <Pie
+                        data={(cdo.sentiment.distribution || []).filter(d => d.count > 0)}
+                        cx="50%" cy="50%"
+                        innerRadius={46} outerRadius={70}
+                        dataKey="count" stroke="none" paddingAngle={3}
+                        animationDuration={1000} animationEasing="ease-in-out"
+                      >
+                        {(cdo.sentiment.distribution || []).filter(d => d.count > 0).map((d, i) => (
+                          <Cell key={i} fill={{'Excellent':'#4F46E5','Good':'#06B6D4','Neutral':'#94A3B8','Poor':'#F59E0B','Bad':'#EF4444'}[d.label]} />
+                        ))}
+                      </Pie>
+                      <Tooltip formatter={(val, name) => [`${val} (${cdo.sentiment.total ? Math.round(val / cdo.sentiment.total * 100) : 0}%)`, name]} />
+                    </PieChart>
+                  </ResponsiveContainer>
+                  <div style={{
+                    position: 'absolute', top: '50%', left: '50%', transform: 'translate(-50%, -50%)',
+                    textAlign: 'center', pointerEvents: 'none',
+                  }}>
+                    <div style={{ fontSize: 24, fontWeight: 900, color: 'var(--text)', lineHeight: 1 }}>{cdo.sentiment.total}</div>
+                    <div style={{ fontSize: 8, color: 'var(--text-muted)', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em' }}>Total</div>
+                  </div>
+                </div>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 8, flex: 1 }}>
+                  {(cdo.sentiment.distribution || []).map(d => {
+                    const clr = {'Excellent':'#4F46E5','Good':'#06B6D4','Neutral':'#94A3B8','Poor':'#F59E0B','Bad':'#EF4444'}[d.label];
+                    return (
+                      <div key={d.label} style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: 12 }}>
+                        <div style={{ width: 10, height: 10, borderRadius: 4, background: clr, flexShrink: 0, boxShadow: `0 0 6px ${clr}40` }} />
+                        <span style={{ color: 'var(--text)', fontWeight: 500, flex: 1 }}>{d.label}</span>
+                        <span style={{ fontWeight: 800, color: clr, minWidth: 22, textAlign: 'right' }}>{d.count}</span>
+                        <span style={{ fontSize: 11, color: 'var(--text-muted)', minWidth: 36, textAlign: 'right', fontWeight: 600 }}>{d.pct}%</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ── Middle Row: Donut + Agent Workload */}
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20, marginBottom: 24 }}>
@@ -354,31 +606,131 @@ export default function OperationalKPI() {
                   </thead>
                   <tbody>
                     {incidents.map(inc => (
-                      <tr key={inc.id} style={{ borderTop: '1px solid var(--border)' }}>
-                        <td style={{ padding: '13px 0', fontWeight: 700, color: 'var(--primary)', fontSize: 12, whiteSpace: 'nowrap' }}>
-                          #{inc.id}
-                        </td>
-                        <td style={{ padding: '13px 8px 13px 0', color: 'var(--text)', fontWeight: 500 }}>
-                          {inc.service}
-                        </td>
-                        <td style={{ padding: '13px 8px 13px 0' }}>
-                          <PriorityBadge priority={inc.priority} />
-                        </td>
-                        <td style={{ padding: '13px 8px 13px 0' }}>
-                          <SlaTimer clock={inc.sla_clock} remaining={inc.sla_remaining} />
-                        </td>
-                        <td style={{ padding: '13px 8px 13px 0', color: 'var(--text-muted)', fontStyle: 'italic', fontSize: 12 }}>
-                          {STATUS_LABEL[inc.status] || inc.status}
-                        </td>
-                        <td style={{ padding: '13px 0', textAlign: 'right' }}>
-                          <button
-                            className="btn btn-outline"
-                            style={{ padding: '4px 14px', fontSize: 11, fontWeight: 700 }}
-                          >
-                            Review
-                          </button>
-                        </td>
-                      </tr>
+                      <React.Fragment key={inc.id}>
+                        <tr style={{ borderTop: '1px solid var(--border)' }}>
+                          <td style={{ padding: '13px 0', fontWeight: 700, color: 'var(--primary)', fontSize: 12, whiteSpace: 'nowrap' }}>
+                            #{inc.id}
+                          </td>
+                          <td style={{ padding: '13px 8px 13px 0', color: 'var(--text)', fontWeight: 500 }}>
+                            {inc.service}
+                          </td>
+                          <td style={{ padding: '13px 8px 13px 0' }}>
+                            <PriorityBadge priority={inc.priority} />
+                          </td>
+                          <td style={{ padding: '13px 8px 13px 0' }}>
+                            <SlaTimer clock={inc.sla_clock} remaining={inc.sla_remaining} />
+                          </td>
+                          <td style={{ padding: '13px 8px 13px 0', color: 'var(--text-muted)', fontStyle: 'italic', fontSize: 12 }}>
+                            {STATUS_LABEL[inc.status] || inc.status}
+                          </td>
+                          <td style={{ padding: '13px 0', textAlign: 'right' }}>
+                            <div style={{ display: 'flex', gap: 6, justifyContent: 'flex-end' }}>
+                              <button
+                                className="btn btn-outline"
+                                style={{ padding: '4px 14px', fontSize: 11, fontWeight: 700 }}
+                                onClick={() => setReviewTicket(reviewTicket?.id === inc.id ? null : inc)}
+                              >
+                                {reviewTicket?.id === inc.id ? 'Hide' : 'Review'}
+                              </button>
+                              <button
+                                className="btn btn-primary"
+                                style={{ padding: '4px 14px', fontSize: 11, fontWeight: 700, background: '#10b981', borderColor: '#10b981' }}
+                                onClick={() => handleResolve(inc)}
+                                disabled={closing === inc.id}
+                              >
+                                {closing === inc.id ? '...' : 'Close'}
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                        {reviewTicket?.id === inc.id && (
+                          <tr>
+                            <td colSpan={6} style={{ padding: '12px 0 16px', background: 'var(--bg)' }}>
+                              <div style={{
+                                background: 'var(--bg-card)', border: '1px solid var(--border)',
+                                borderRadius: 10, padding: '20px 24px',
+                              }}>
+                                {/* Header */}
+                                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+                                  <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                                    <span style={{ fontSize: 15, fontWeight: 800, color: 'var(--primary)' }}>#{inc.id}</span>
+                                    <PriorityBadge priority={inc.priority} />
+                                    {inc.sla_breached && (
+                                      <span style={{ fontSize: 10, fontWeight: 800, padding: '2px 8px', borderRadius: 20, background: 'rgba(239,68,68,0.1)', color: '#ef4444', border: '1px solid rgba(239,68,68,0.25)' }}>
+                                        SLA BREACHED
+                                      </span>
+                                    )}
+                                  </div>
+                                  <SlaTimer clock={inc.sla_clock} remaining={inc.sla_remaining} />
+                                </div>
+
+                                {/* Description */}
+                                <div style={{ background: 'var(--bg)', borderRadius: 8, padding: '12px 16px', marginBottom: 16, border: '1px solid var(--border)' }}>
+                                  <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 6 }}>Description</div>
+                                  <div style={{ fontSize: 13, color: 'var(--text)', lineHeight: 1.6 }}>{inc.description}</div>
+                                </div>
+
+                                {/* Details grid */}
+                                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr 1fr', gap: 14, marginBottom: 16, fontSize: 12 }}>
+                                  <div>
+                                    <div style={{ color: 'var(--text-muted)', fontWeight: 600, marginBottom: 3 }}>Category</div>
+                                    <div style={{ fontWeight: 700, color: 'var(--text)' }}>{inc.service}</div>
+                                  </div>
+                                  <div>
+                                    <div style={{ color: 'var(--text-muted)', fontWeight: 600, marginBottom: 3 }}>Subcategory</div>
+                                    <div style={{ fontWeight: 700, color: 'var(--text)' }}>{inc.subcategory || '—'}</div>
+                                  </div>
+                                  <div>
+                                    <div style={{ color: 'var(--text-muted)', fontWeight: 600, marginBottom: 3 }}>Assigned To</div>
+                                    <div style={{ fontWeight: 700, color: 'var(--text)' }}>{inc.assigned_to}</div>
+                                  </div>
+                                  <div>
+                                    <div style={{ color: 'var(--text-muted)', fontWeight: 600, marginBottom: 3 }}>SLA Window</div>
+                                    <div style={{ fontWeight: 700, color: 'var(--text)' }}>{inc.sla_hours ? `${inc.sla_hours}h` : '—'}</div>
+                                  </div>
+                                  <div>
+                                    <div style={{ color: 'var(--text-muted)', fontWeight: 600, marginBottom: 3 }}>Created</div>
+                                    <div style={{ fontWeight: 700, color: 'var(--text)' }}>{inc.created_at ? new Date(inc.created_at).toLocaleString() : '—'}</div>
+                                  </div>
+                                  <div>
+                                    <div style={{ color: 'var(--text-muted)', fontWeight: 600, marginBottom: 3 }}>Status</div>
+                                    <div style={{ fontWeight: 700 }}>{STATUS_LABEL[inc.status] || inc.status}</div>
+                                  </div>
+                                  <div>
+                                    <div style={{ color: 'var(--text-muted)', fontWeight: 600, marginBottom: 3 }}>Time Overdue</div>
+                                    <div style={{ fontWeight: 700, color: inc.sla_remaining < 0 ? '#ef4444' : '#10b981' }}>
+                                      {inc.sla_remaining < 0 ? inc.sla_clock : 'On time'}
+                                    </div>
+                                  </div>
+                                  <div>
+                                    <div style={{ color: 'var(--text-muted)', fontWeight: 600, marginBottom: 3 }}>Resolution Notes</div>
+                                    <div style={{ fontWeight: 700, color: 'var(--text)' }}>{inc.resolution_notes || '—'}</div>
+                                  </div>
+                                </div>
+
+                                {/* Actions */}
+                                <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', borderTop: '1px solid var(--border)', paddingTop: 14 }}>
+                                  <button
+                                    className="btn btn-primary"
+                                    style={{ padding: '7px 22px', fontSize: 12, fontWeight: 700, background: '#10b981', borderColor: '#10b981' }}
+                                    onClick={() => handleResolve(inc)}
+                                    disabled={closing === inc.id}
+                                  >
+                                    {closing === inc.id ? 'Closing...' : 'Resolve & Close'}
+                                  </button>
+                                  <button
+                                    className="btn btn-outline"
+                                    style={{ padding: '7px 22px', fontSize: 12, fontWeight: 700 }}
+                                    onClick={() => setReviewTicket(null)}
+                                  >
+                                    Dismiss
+                                  </button>
+                                </div>
+                              </div>
+                            </td>
+                          </tr>
+                        )}
+                      </React.Fragment>
                     ))}
                   </tbody>
                 </table>
@@ -390,55 +742,68 @@ export default function OperationalKPI() {
         {/* Right column */}
         <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
 
-          {/* Escalation Velocity */}
+          {/* Ticket Deflection Rate */}
           <div className="section-card" style={{ flex: 1 }}>
             <div className="section-card-header">
-              <h3>Escalation Velocity</h3>
+              <h3>Ticket Deflection Rate</h3>
             </div>
             <div className="section-card-body">
-              <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, marginBottom: 8 }}>
-                <span style={{ fontSize: 36, fontWeight: 800, color: 'var(--text)', lineHeight: 1 }}>
-                  {s.escalation_rate || 0}%
-                </span>
-                <span style={{ fontSize: 12, fontWeight: 700, color: '#10b981' }}>↓ 0.4%</span>
-              </div>
-              <p style={{ fontSize: 12, color: 'var(--text-muted)', margin: '0 0 16px', lineHeight: 1.6 }}>
-                Internal escalations have stabilized following the Tier-1 automation patch.
-              </p>
-              <Sparkline data={escalTrend} />
+              {(() => {
+                const f = cdo?.funnel || {};
+                const total = f.conversations || 0;
+                const aiResolved = f.ai_resolved || 0;
+                const escalated = f.escalated || 0;
+                const deflectionRate = total ? round((aiResolved / total) * 100, 1) : 0;
+                const escalationRate = total ? round((escalated / total) * 100, 1) : 0;
+                const deflectionColor = deflectionRate >= 70 ? '#10b981' : deflectionRate >= 40 ? '#f59e0b' : '#ef4444';
+                function round(v, d) { return Math.round(v * 10 ** d) / 10 ** d; }
+                return (
+                  <>
+                    <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, marginBottom: 12 }}>
+                      <span style={{ fontSize: 36, fontWeight: 800, color: deflectionColor, lineHeight: 1 }}>
+                        {deflectionRate}%
+                      </span>
+                      <span style={{
+                        fontSize: 10, fontWeight: 800, padding: '3px 10px', borderRadius: 20,
+                        background: `${deflectionColor}15`, color: deflectionColor,
+                        border: `1px solid ${deflectionColor}30`,
+                      }}>
+                        {deflectionRate >= 70 ? 'On Target' : deflectionRate >= 40 ? 'Below Target' : 'Critical'}
+                      </span>
+                    </div>
+                    <p style={{ fontSize: 12, color: 'var(--text-muted)', margin: '0 0 14px', lineHeight: 1.6 }}>
+                      {aiResolved} of {total} conversations resolved by AI without human intervention.
+                    </p>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                      {[
+                        { label: 'AI Resolved', value: aiResolved, pct: total ? round((aiResolved / total) * 100, 1) : 0, color: '#10b981' },
+                        { label: 'Escalated to Human', value: escalated, pct: escalationRate, color: '#ef4444' },
+                        { label: 'Still Active', value: total - aiResolved - escalated, pct: total ? round(((total - aiResolved - escalated) / total) * 100, 1) : 0, color: '#f59e0b' },
+                      ].map(item => (
+                        <div key={item.label}>
+                          <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4, fontSize: 12 }}>
+                            <span style={{ color: 'var(--text)', fontWeight: 500 }}>{item.label}</span>
+                            <span style={{ fontWeight: 700, color: item.color }}>{item.value} ({item.pct}%)</span>
+                          </div>
+                          <div style={{ background: 'var(--border)', borderRadius: 4, height: 5, overflow: 'hidden' }}>
+                            <div style={{
+                              width: `${item.pct}%`, height: '100%', borderRadius: 4,
+                              background: item.color, transition: 'width 0.7s ease',
+                            }} />
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </>
+                );
+              })()}
             </div>
           </div>
 
-          {/* Weekly Ops Review */}
-          <div className="section-card">
-            <div className="section-card-body" style={{ textAlign: 'center' }}>
-              <div style={{
-                width: 50, height: 50, borderRadius: '50%',
-                background: 'var(--primary-glow)',
-                margin: '0 auto 14px',
-                display: 'flex', alignItems: 'center', justifyContent: 'center',
-              }}>
-                <svg width="22" height="22" viewBox="0 0 24 24" fill="none"
-                  stroke="var(--primary)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" />
-                  <circle cx="9" cy="7" r="4" />
-                  <path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75" />
-                </svg>
-              </div>
-              <div style={{ fontSize: 14, fontWeight: 700, color: 'var(--text)', marginBottom: 8 }}>
-                Weekly Ops Review
-              </div>
-              <p style={{ fontSize: 12, color: 'var(--text-muted)', margin: '0 0 18px', lineHeight: 1.6 }}>
-                Review system performance and agent capacity for next sprint.
-              </p>
-              <button className="btn btn-primary" style={{ width: '100%' }}>
-                Schedule Sync
-              </button>
-            </div>
-          </div>
 
         </div>
       </div>
+
     </div>
   );
 }

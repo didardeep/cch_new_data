@@ -327,28 +327,44 @@ export default function BusinessKPI() {
           colors={G.health(health)} icon={Activity} delay={0.40} />
       </div>
 
-      {/* ── Users & Revenue Trend ────────────────────────────── */}
-      <Section title="Users & Revenue Trend" delay={0.45} accentColor={G.indigo} style={{ marginBottom: 20 }}>
-        <ResponsiveContainer width="100%" height={280}>
-          <AreaChart data={data.trend || []} margin={{ top: 6, right: 16, left: 0, bottom: 0 }}>
-            <GradientDefs />
-            <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" strokeOpacity={0.6} />
-            <XAxis dataKey="date" tick={{ fontSize: 11, fill: 'var(--text-muted)' }} axisLine={false} tickLine={false} />
-            <YAxis tick={{ fontSize: 11, fill: 'var(--text-muted)' }} axisLine={false} tickLine={false} />
-            <Tooltip content={<ChartTooltip />} />
-            <Area type="monotoneX" dataKey="users"   stroke="#6366f1" strokeWidth={3} fill="url(#usersGrad)"   name="Users"   dot={false} activeDot={{ r: 5, fill: '#6366f1', strokeWidth: 0 }} />
-            <Area type="monotoneX" dataKey="revenue" stroke="#10b981" strokeWidth={3} fill="url(#revenueGrad)" name="Revenue" dot={false} activeDot={{ r: 5, fill: '#10b981', strokeWidth: 0 }} />
-          </AreaChart>
-        </ResponsiveContainer>
-        <div style={{ display: 'flex', gap: 20, marginTop: 12, justifyContent: 'center' }}>
-          {[['#6366f1', '#8b5cf6', 'Users'], ['#10b981', '#06b6d4', 'Revenue']].map(([c1, c2, l]) => (
-            <div key={l} style={{ display: 'flex', alignItems: 'center', gap: 7, fontSize: 12, color: 'var(--text-muted)' }}>
-              <span style={{ width: 20, height: 3, borderRadius: 2, background: `linear-gradient(90deg,${c1},${c2})`, display: 'inline-block' }} />
-              {l}
-            </div>
-          ))}
-        </div>
-      </Section>
+      {/* ── Users & Revenue Trend (side by side) ────────────── */}
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20, marginBottom: 20 }}>
+        <Section title="Users Trend" delay={0.45} accentColor={G.indigo}>
+          <ResponsiveContainer width="100%" height={280}>
+            <AreaChart data={data.trend || []} margin={{ top: 6, right: 16, left: 0, bottom: 0 }}>
+              <GradientDefs />
+              <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" strokeOpacity={0.6} />
+              <XAxis dataKey="date" tick={{ fontSize: 11, fill: 'var(--text-muted)' }} axisLine={false} tickLine={false} />
+              <YAxis tick={{ fontSize: 11, fill: 'var(--text-muted)' }} axisLine={false} tickLine={false}
+                domain={[
+                  (dataMin) => Math.floor(dataMin * 0.98),
+                  (dataMax) => Math.ceil(dataMax * 1.02),
+                ]}
+                allowDecimals={false} />
+              <Tooltip content={<ChartTooltip />} />
+              <Area type="monotoneX" dataKey="users" stroke="#6366f1" strokeWidth={3} fill="url(#usersGrad)" name="Users" dot={false} activeDot={{ r: 5, fill: '#6366f1', strokeWidth: 0 }} />
+            </AreaChart>
+          </ResponsiveContainer>
+        </Section>
+
+        <Section title="Revenue Trend" delay={0.47} accentColor={G.emerald}>
+          <ResponsiveContainer width="100%" height={280}>
+            <AreaChart data={data.trend || []} margin={{ top: 6, right: 16, left: 0, bottom: 0 }}>
+              <GradientDefs />
+              <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" strokeOpacity={0.6} />
+              <XAxis dataKey="date" tick={{ fontSize: 11, fill: 'var(--text-muted)' }} axisLine={false} tickLine={false} />
+              <YAxis tick={{ fontSize: 11, fill: 'var(--text-muted)' }} axisLine={false} tickLine={false}
+                domain={[
+                  (dataMin) => Math.floor(dataMin * 0.98),
+                  (dataMax) => Math.ceil(dataMax * 1.02),
+                ]}
+                allowDecimals={false} />
+              <Tooltip content={<ChartTooltip />} />
+              <Area type="monotoneX" dataKey="revenue" stroke="#10b981" strokeWidth={3} fill="url(#revenueGrad)" name="Revenue" dot={false} activeDot={{ r: 5, fill: '#10b981', strokeWidth: 0 }} />
+            </AreaChart>
+          </ResponsiveContainer>
+        </Section>
+      </div>
 
       {/* ── ARPU Trend + Top 10 Sites ────────────────────────── */}
       <div style={{ display: 'grid', gridTemplateColumns: '1.1fr 1fr', gap: 20, marginBottom: 20 }}>
@@ -358,7 +374,12 @@ export default function BusinessKPI() {
               <GradientDefs />
               <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" strokeOpacity={0.6} />
               <XAxis dataKey="date" tick={{ fontSize: 11, fill: 'var(--text-muted)' }} axisLine={false} tickLine={false} />
-              <YAxis tick={{ fontSize: 11, fill: 'var(--text-muted)' }} axisLine={false} tickLine={false} />
+              <YAxis tick={{ fontSize: 11, fill: 'var(--text-muted)' }} axisLine={false} tickLine={false}
+                domain={[
+                  (dataMin) => Math.floor(dataMin * 0.98),
+                  (dataMax) => Math.ceil(dataMax * 1.02),
+                ]}
+                allowDecimals={false} />
               <Tooltip content={<ChartTooltip />} />
               <Area type="monotoneX" dataKey="arpu" stroke="#f59e0b" strokeWidth={3} fill="url(#arpuGrad)" name="ARPU" dot={false} activeDot={{ r: 5, fill: '#f59e0b', strokeWidth: 0 }} />
             </AreaChart>
