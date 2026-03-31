@@ -157,13 +157,6 @@ def register_routes(app):
         }
         return jsonify(connection_data), 200
 
-    @app.route("/api/speedtest-widget", methods=["GET"])
-    def speedtest_widget():
-        """Serve the self-hosted speed test HTML widget (loaded inside an iframe)."""
-        import os
-        static_dir = os.path.join(os.path.dirname(__file__), "static", "speedtest")
-        return send_from_directory(static_dir, "index.html")
-
     @app.route("/api/broadband/speedtest-file", methods=["GET"])
     @jwt_required()
     def broadband_speedtest_file():
