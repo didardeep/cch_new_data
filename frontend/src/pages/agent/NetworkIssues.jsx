@@ -997,8 +997,8 @@ export default function NetworkIssues() {
           <div onClick={e=>e.stopPropagation()} style={{background:'#fff',borderRadius:12,width:700,maxWidth:'95vw',maxHeight:'80vh',overflowY:'auto',boxShadow:'0 20px 60px rgba(0,0,0,.15)'}}>
             <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',padding:'16px 24px',borderBottom:'1px solid #e2e8f0'}}>
               <div>
-                <h3 style={{margin:0,fontSize:16,fontWeight:700,color:'#0f172a'}}>Today's Ticket Routing</h3>
-                <p style={{margin:'2px 0 0',fontSize:11,color:'#64748b'}}>Created & updated tickets today</p>
+                <h3 style={{margin:0,fontSize:16,fontWeight:700,color:'#0f172a'}}>Ticket Routing</h3>
+                <p style={{margin:'2px 0 0',fontSize:11,color:'#64748b'}}>Active ticket assignments</p>
               </div>
               <button onClick={()=>setShowRouting(false)} style={{border:'none',background:'#f1f5f9',borderRadius:6,width:28,height:28,cursor:'pointer',display:'flex',alignItems:'center',justifyContent:'center'}}>{IC.x}</button>
             </div>
@@ -1006,7 +1006,7 @@ export default function NetworkIssues() {
               {routingLoading ? (
                 <div style={{textAlign:'center',padding:40,color:'#94a3b8'}}>Loading...</div>
               ) : routingData.length === 0 ? (
-                <div style={{textAlign:'center',padding:40,color:'#94a3b8',fontSize:13}}>No tickets routed today.</div>
+                <div style={{textAlign:'center',padding:40,color:'#94a3b8',fontSize:13}}>No active tickets.</div>
               ) : (
                 <table style={{width:'100%',borderCollapse:'collapse',fontSize:12}}>
                   <thead>

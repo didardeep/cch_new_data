@@ -1887,6 +1887,28 @@ def resolve_session(session_id):
     return jsonify({"session": session.to_dict(), "summary": session.summary})
 
 
+@app.route("/api/chat/session/<int:session_id>", methods=["DELETE"])
+@jwt_required()
+def delete_chat_session(session_id):
+    """Delete a chat session and its messages (customer clearing from dashboard)."""
+    user_id = int(get_jwt_identity())
+    session = ChatSession.query.get(session_id)
+    if not session:
+        return jsonify({"error": "Session not found"}), 404
+    if session.user_id != user_id:
+        return jsonify({"error": "Unauthorized"}), 403
+    # Don't allow deleting sessions that have tickets
+    ticket = Ticket.query.filter_by(chat_session_id=session_id).first()
+    if ticket:
+        return jsonify({"error": "Cannot delete session with an active ticket"}), 409
+    # Delete messages first, then session
+    ChatMessage.query.filter_by(session_id=session_id).delete()
+    Feedback.query.filter_by(chat_session_id=session_id).delete()
+    db.session.delete(session)
+    db.session.commit()
+    return jsonify({"ok": True})
+
+
 def send_ticket_assignment_email(agent, ticket, session):
     """Send a styled HTML email to the assigned agent with ticket details."""
     if not agent or not agent.email:
@@ -2941,58 +2963,30 @@ def _cache_set(key, data):
 
 
 def _latest_site_values_for_kpi(kpi_name):
-    from sqlalchemy import func as sa_func
-    # Only look at last 30 days instead of scanning entire table
+    # Use DISTINCT ON for fast latest-per-site lookup on PostgreSQL
     date_floor = date.today() - timedelta(days=30)
-    sub = db.session.query(
-        KpiData.site_id,
-        sa_func.max(KpiData.date).label("max_date"),
-    ).filter(
-        KpiData.data_level == "site",
-        KpiData.kpi_name == kpi_name,
-        KpiData.value.isnot(None),
-        KpiData.date >= date_floor,
-    ).group_by(KpiData.site_id).subquery()
+    rows = db.session.execute(db.text("""
+        SELECT DISTINCT ON (site_id) site_id, date, value
+        FROM kpi_data
+        WHERE data_level = 'site' AND kpi_name = :kpi AND value IS NOT NULL AND date >= :floor
+        ORDER BY site_id, date DESC
+    """), {"kpi": kpi_name, "floor": date_floor}).fetchall()
 
-    rows = db.session.query(
-        KpiData.site_id, KpiData.date, KpiData.value,
-    ).join(sub, db.and_(
-        KpiData.site_id == sub.c.site_id,
-        KpiData.date == sub.c.max_date,
-    )).filter(
-        KpiData.data_level == "site",
-        KpiData.kpi_name == kpi_name,
-    ).all()
-
-    return {r.site_id: {"date": r.date, "value": float(r.value)} for r in rows if r.value is not None}
+    return {r.site_id: {"date": r.date, "value": float(r.value)} for r in rows}
 
 
 def _site_values_near_date(kpi_name, target_date):
     """Return {site_id: value} for the closest date <= target_date per site."""
-    from sqlalchemy import func as sa_func
     date_floor = target_date - timedelta(days=14)
-    sub = db.session.query(
-        KpiData.site_id,
-        sa_func.max(KpiData.date).label("max_date"),
-    ).filter(
-        KpiData.data_level == "site",
-        KpiData.kpi_name == kpi_name,
-        KpiData.value.isnot(None),
-        KpiData.date >= date_floor,
-        KpiData.date <= target_date,
-    ).group_by(KpiData.site_id).subquery()
+    rows = db.session.execute(db.text("""
+        SELECT DISTINCT ON (site_id) site_id, value
+        FROM kpi_data
+        WHERE data_level = 'site' AND kpi_name = :kpi AND value IS NOT NULL
+          AND date >= :floor AND date <= :target
+        ORDER BY site_id, date DESC
+    """), {"kpi": kpi_name, "floor": date_floor, "target": target_date}).fetchall()
 
-    rows = db.session.query(
-        KpiData.site_id, KpiData.value,
-    ).join(sub, db.and_(
-        KpiData.site_id == sub.c.site_id,
-        KpiData.date == sub.c.max_date,
-    )).filter(
-        KpiData.data_level == "site",
-        KpiData.kpi_name == kpi_name,
-    ).all()
-
-    return {r.site_id: float(r.value) for r in rows if r.value is not None}
+    return {r.site_id: float(r.value) for r in rows}
 
 
 def _series_for_kpi_patterns(patterns, days=30):
@@ -3344,14 +3338,15 @@ def cto_business_kpi():
     if cached:
         return jsonify(cached)
 
-    # ── Try FlexibleKpiUpload revenue data first ─────────────────────────────
-    rev_count = FlexibleKpiUpload.query.filter_by(kpi_type="revenue").count()
-    use_flexible = rev_count > 0
-
-    if use_flexible:
-        return _business_kpi_from_flexible()
-    else:
+    # ── Try KpiData (Site Users + Site Revenue) first, fall back to FlexibleKpiUpload ──
+    has_kpi = _latest_site_values_for_kpi("Site Users")
+    if has_kpi:
         return _business_kpi_from_kpidata()
+    from models import FlexibleKpiUpload
+    has_flex = db.session.query(FlexibleKpiUpload.id).filter_by(kpi_type='revenue').first()
+    if has_flex:
+        return _business_kpi_from_flexible()
+    return _business_kpi_from_kpidata()
 
 
 def _business_kpi_from_flexible():
@@ -3429,7 +3424,7 @@ def _business_kpi_from_flexible():
             "users": round(subs, 2),
             "revenue": round(rev_now, 2),
             "opex": round(opex, 2),
-            "arpu": round(arpu, 4),
+            "arpu": round(arpu, 2),
             "growth": growth,
             "utilization": round(util_val, 2),
             "zone": data.get("zone", ""),
@@ -3443,37 +3438,43 @@ def _business_kpi_from_flexible():
     total_revenue = round(sum(r["revenue"] for r in site_rows), 2)
     total_opex    = round(sum(r["opex"] for r in site_rows), 2)
 
-    # ARPU (total)
+    # ARPU (total) — revenue / users in same unit as revenue
     arpu = round(total_revenue / total_users, 4) if total_users else 0
 
     # Growth: avg revenue change across sites
     growths = [r["growth"] for r in site_rows if r["growth"] != 0]
     avg_growth = round(sum(growths) / len(growths), 2) if growths else 0
 
-    # Declining sites: revenue dropped MoM
-    declining_sites = sorted(
-        [r for r in site_rows if r["growth"] < 0],
-        key=lambda r: r["growth"]
-    )[:10]
+    # Declining & overloaded sites, churn, revenue at risk
+    declining_sites = []
+    overloaded_sites_list = []
+    revenue_at_risk = 0.0
+    declining_count = 0
 
-    # Revenue at risk = total revenue of declining sites
-    revenue_at_risk = round(sum(r["revenue"] for r in site_rows if r["growth"] < 0), 2)
+    for row in site_rows:
+        g = row["growth"]
+        item = row
+        if g < 0:
+            declining_sites.append(item)
+            declining_count += 1
+        if row["utilization"] > 80:
+            overloaded_sites_list.append(item)
+        if g < 0 or row["utilization"] > 80:
+            revenue_at_risk += row["revenue"]
 
-    # Churn proxy: count of sites with revenue decline > 10%
-    heavy_decline = [r for r in site_rows if r["growth"] < -10]
-    churn_rate = round(len(heavy_decline) / num_sites * 100, 2)
+    revenue_at_risk = round(revenue_at_risk, 2)
 
-    # Network ROI
-    network_roi = round(((total_revenue - total_opex) / total_opex) * 100, 2) if total_opex else 0
+    # Churn rate: percentage of sites with declining revenue (subscriber snapshot is static)
+    churn_rate = round((declining_count / num_sites) * 100, 2) if num_sites else 0.0
+
+    # Network ROI: use actual OPEX data
+    network_roi = round(((total_revenue - total_opex) / total_opex) * 100, 2) if total_opex else 0.0
 
     # Top sites by revenue
-    top_sites = sorted(site_rows, key=lambda r: r["revenue"], reverse=True)[:10]
+    top_sites = sorted(site_rows, key=lambda r: (r["revenue"], r["users"]), reverse=True)[:10]
 
-    # Overloaded: utilization > 80% OR category contains "High Util"
-    overloaded_sites = sorted(
-        [r for r in site_rows if r["utilization"] > 80 or "High Util" in (r.get("category") or "")],
-        key=lambda r: r["utilization"], reverse=True
-    )[:10]
+    declining_sites = sorted(declining_sites, key=lambda r: r["growth"])[:10]
+    overloaded_sites = sorted(overloaded_sites_list, key=lambda r: r["utilization"], reverse=True)[:10]
 
     # ── Monthly trend ────────────────────────────────────────────────────────
     trend = []
@@ -3503,10 +3504,10 @@ def _business_kpi_from_flexible():
 
     site_health = []
     for row in site_rows:
+        util_score = max(0.0, 1.0 - row["utilization"] / 100.0)
         user_score = row["users"]   / max_users_v
         rev_score  = row["revenue"] / max_revenue_v
-        growth_score = min(1.0, max(0.0, (row["growth"] + 20) / 40))  # -20% → 0, +20% → 1
-        health = round((user_score * 0.3 + rev_score * 0.4 + growth_score * 0.3) * 100, 2)
+        health     = round((util_score * 0.4 + user_score * 0.3 + rev_score * 0.3) * 100, 2)
         site_health.append({**row, "health_score": health})
 
     avg_health_score = round(
@@ -6638,8 +6639,8 @@ def agent_dashboard():
                     "subcategory": t.subcategory or "",
                     "status": t.status,
                     "sla_hours": total_sla,
-                    "sla_deadline": (dl7.isoformat() + "Z") if dl7 else None,
-                    "created_at": (t.created_at.isoformat() + "Z") if t.created_at else None,
+                    "sla_deadline": (dl7.replace(tzinfo=None).isoformat() + "Z") if dl7 and dl7.tzinfo else ((dl7.isoformat() + "Z") if dl7 else None),
+                    "created_at": (t.created_at.replace(tzinfo=None).isoformat() + "Z") if t.created_at and t.created_at.tzinfo else ((t.created_at.isoformat() + "Z") if t.created_at else None),
                 })
     try:
         db.session.commit()
@@ -6833,7 +6834,7 @@ def agent_resolve_ticket(ticket_id):
     """Mark a ticket as resolved by the agent."""
     user_id = int(get_jwt_identity())
     user = User.query.get(user_id)
-    if not user or user.role != "human_agent":
+    if not user or user.role not in ("human_agent", "manager", "expert"):
         return jsonify({"error": "Unauthorized"}), 403
     ticket = Ticket.query.get(ticket_id)
     if not ticket:

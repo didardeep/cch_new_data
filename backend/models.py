@@ -228,7 +228,15 @@ class Ticket(db.Model):
     assignee = db.relationship("User", foreign_keys=[assigned_to], backref="assigned_tickets")
     escalator = db.relationship("User", foreign_keys=[escalated_by], backref="escalated_tickets")
 
+    @staticmethod
+    def _iso_z(dt):
+        if not dt:
+            return None
+        s = dt.replace(tzinfo=None).isoformat() + "Z" if dt.tzinfo else dt.isoformat() + "Z"
+        return s
+
     def to_dict(self):
+        iz = self._iso_z
         return {
             "id": self.id,
             "chat_session_id": self.chat_session_id,
@@ -251,18 +259,18 @@ class Ticket(db.Model):
             "assignee_domain": self.assignee.domain if self.assignee else None,
             "assignee_location": self.assignee.location if self.assignee else None,
             "resolution_notes": self.resolution_notes,
-            "created_at": (self.created_at.isoformat() + "Z") if self.created_at else None,
-            "resolved_at": (self.resolved_at.isoformat() + "Z") if self.resolved_at else None,
+            "created_at": iz(self.created_at),
+            "resolved_at": iz(self.resolved_at),
             "sla_hours": self.sla_hours,
-            "sla_deadline": (self.sla_deadline.isoformat() + "Z") if self.sla_deadline else None,
+            "sla_deadline": iz(self.sla_deadline),
             "sla_breached": self.sla_breached,
             "escalated_by": self.escalated_by,
             "escalated_by_name": self.escalator.name if self.escalator else None,
-            "escalated_at": (self.escalated_at.isoformat() + "Z") if self.escalated_at else None,
+            "escalated_at": iz(self.escalated_at),
             "escalation_note": self.escalation_note or "",
-            "first_response_at": self.first_response_at.isoformat() if self.first_response_at else None,
+            "first_response_at": iz(self.first_response_at),
             "reopened_count": self.reopened_count,
-            "last_reopened_at": self.last_reopened_at.isoformat() if self.last_reopened_at else None,
+            "last_reopened_at": iz(self.last_reopened_at),
         }
 
 
