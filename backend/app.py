@@ -2942,7 +2942,7 @@ def cto_overview():
 
 def _require_cto_user():
     user = User.query.get(int(get_jwt_identity()))
-    if not user or user.role != "cto":
+    if not user or user.role not in ("cto", "admin"):
         return None
     return user
 
@@ -3329,8 +3329,8 @@ def cto_core_kpi():
     import datetime as _dt
     from sqlalchemy import func as sa_func
 
-    user = User.query.get(int(get_jwt_identity()))
-    if not user or user.role not in ("cto", "admin"):
+    user = _require_cto_user()
+    if not user:
         return jsonify({"error": "Unauthorized"}), 403
 
     has_kpi_name = db.session.query(FlexibleKpiUpload.id).filter(
