@@ -5240,8 +5240,40 @@ def _auto_populate_geo():
         ("Assam",           "India", 24.0, 28.0, 89.5, 96.0),
     ]
 
+    # ── Known city → state corrections ──────────────────────────────────────
+    # Nominatim sometimes returns wrong or inconsistent state values.
+    # This map ensures cities are always assigned to the correct state.
+    CITY_STATE_FIX = {
+        "delhi":          "Delhi",
+        "new delhi":      "Delhi",
+        "gurugram":       "Haryana",
+        "gurgaon":        "Haryana",
+        "garhi harsaru":  "Haryana",
+        "faridabad":      "Haryana",
+        "noida":          "Uttar Pradesh",
+        "greater noida":  "Uttar Pradesh",
+        "ghaziabad":      "Uttar Pradesh",
+    }
+
     try:
-        # Get all sites — populate geo for those missing it, and tech for all
+        # Step 1: Fix state for sites with known city names (runs always)
+        fixed = 0
+        sites_with_city = TelecomSite.query.filter(
+            TelecomSite.city.isnot(None),
+            TelecomSite.city != "",
+        ).all()
+        for s in sites_with_city:
+            correct_state = CITY_STATE_FIX.get((s.city or "").strip().lower())
+            if correct_state and (s.state or "").strip().lower() != correct_state.lower():
+                s.state = correct_state
+                if not s.country:
+                    s.country = "India"
+                fixed += 1
+        if fixed:
+            db.session.commit()
+            print(f">>> Fixed state for {fixed} sites using city→state mapping")
+
+        # Step 2: Populate geo for sites missing city/state, and infer technology
         sites = TelecomSite.query.filter(
             TelecomSite.latitude.isnot(None),
             TelecomSite.longitude.isnot(None),
