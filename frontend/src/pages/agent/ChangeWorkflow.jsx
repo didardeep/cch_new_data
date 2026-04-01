@@ -48,14 +48,12 @@ const PIPELINE_URGENT = [
 ];
 
 const TABS = [
-  { key: '', label: 'All' },
-  { key: 'classified', label: 'Classified' },
-  { key: 'validated', label: 'Validated' },
-  { key: 'approved', label: 'Approved' },
-  { key: 'pending_cto', label: 'Pending CTO' },
-  { key: 'implementing', label: 'Implementing' },
+  { key: '',            label: 'All' },
+  { key: 'classified',  label: 'Classified' },
+  { key: 'validated',   label: 'Validated' },
+  { key: 'approved',    label: 'Approved' },
   { key: 'implemented', label: 'Implemented' },
-  { key: 'closed', label: 'Closed' },
+  { key: 'closed',      label: 'Closed' },
 ];
 
 /* ── SLA Timer ─────────────────────────────────────────────────────────────── */
@@ -297,7 +295,11 @@ export default function ChangeWorkflow() {
   const aiCRs = crs.filter(c => c.network_issue_id);
   const activeCRs = section === 'customer' ? customerCRs : aiCRs;
 
-  const filtered = filter ? activeCRs.filter(c => c.status === filter || (filter === 'pending_cto' && c.cto_status === 'pending_cto')) : activeCRs;
+  const filtered = filter ? activeCRs.filter(c => {
+    if (filter === 'approved') return ['approved', 'pending_cto', 'cto_approved'].includes(c.status);
+    if (filter === 'implemented') return ['implementing', 'implemented'].includes(c.status);
+    return c.status === filter;
+  }) : activeCRs;
 
   const getAction = (status) => {
     if (status === 'approved' || status === 'cto_approved') return 'implement';
@@ -342,9 +344,8 @@ export default function ChangeWorkflow() {
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 12, marginBottom: 20 }}>
         {[
           { label: 'Total', count: activeCRs.length, color: sectionColor },
-          { label: 'Pending', count: activeCRs.filter(c => ['classified', 'validated', 'pending_cto'].includes(c.status)).length, color: '#f59e0b' },
-          { label: 'Approved', count: activeCRs.filter(c => ['approved', 'cto_approved'].includes(c.status)).length, color: '#16a34a' },
-          { label: 'Implementing', count: activeCRs.filter(c => c.status === 'implementing' || c.status === 'implemented').length, color: '#7c3aed' },
+          { label: 'Approved', count: activeCRs.filter(c => ['approved', 'pending_cto', 'cto_approved'].includes(c.status)).length, color: '#16a34a' },
+          { label: 'Implemented', count: activeCRs.filter(c => ['implementing', 'implemented'].includes(c.status)).length, color: '#7c3aed' },
           { label: 'Closed', count: activeCRs.filter(c => c.status === 'closed').length, color: '#64748b' },
         ].map(s => (
           <div key={s.label} style={{ background: isDark ? '#1e293b' : '#fff', border: `1px solid ${isDark ? '#334155' : '#e2e8f0'}`, borderRadius: 10, padding: '12px 14px', borderTop: `3px solid ${s.color}` }}>
@@ -356,14 +357,20 @@ export default function ChangeWorkflow() {
 
       {/* Tabs */}
       <div style={{ display: 'flex', gap: 6, marginBottom: 16, flexWrap: 'wrap' }}>
-        {TABS.map(t => (
-          <button key={t.key} onClick={() => setFilter(t.key)} style={{
-            padding: '6px 14px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer',
-            background: filter === t.key ? sectionColor : (isDark ? '#1e293b' : '#f8fafc'),
-            color: filter === t.key ? '#fff' : (isDark ? '#94a3b8' : '#64748b'),
-            border: `1px solid ${filter === t.key ? sectionColor : (isDark ? '#334155' : '#e2e8f0')}`,
-          }}>{t.label}</button>
-        ))}
+        {TABS.map(t => {
+          const cnt = !t.key ? activeCRs.length
+            : t.key === 'approved' ? activeCRs.filter(c => ['approved', 'pending_cto', 'cto_approved'].includes(c.status)).length
+            : t.key === 'implemented' ? activeCRs.filter(c => ['implementing', 'implemented'].includes(c.status)).length
+            : activeCRs.filter(c => c.status === t.key).length;
+          return (
+            <button key={t.key} onClick={() => setFilter(t.key)} style={{
+              padding: '6px 14px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer',
+              background: filter === t.key ? sectionColor : (isDark ? '#1e293b' : '#f8fafc'),
+              color: filter === t.key ? '#fff' : (isDark ? '#94a3b8' : '#64748b'),
+              border: `1px solid ${filter === t.key ? sectionColor : (isDark ? '#334155' : '#e2e8f0')}`,
+            }}>{t.label}{cnt > 0 ? ` (${cnt})` : ''}</button>
+          );
+        })}
       </div>
 
       {/* Section Header */}

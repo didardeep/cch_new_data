@@ -4,24 +4,37 @@ import { useTheme } from '../../ThemeContext';
 
 /* ── Constants ─────────────────────────────────────────────────────────────── */
 const TYPE_STYLE = {
+  standard:  { bg: '#f0fdf4', color: '#16a34a', border: '#bbf7d0', label: 'Standard' },
+  normal:    { bg: '#eff6ff', color: '#2563eb', border: '#bfdbfe', label: 'Normal' },
   urgent:    { bg: '#fff7ed', color: '#ea580c', border: '#fed7aa', label: 'Urgent' },
   emergency: { bg: '#fef2f2', color: '#dc2626', border: '#fecaca', label: 'Emergency' },
 };
 
 const STATUS_META = {
-  pending_cto:   { label: 'Pending Review',  color: '#ea580c' },
-  cto_approved:  { label: 'Approved',        color: '#16a34a' },
-  cto_rejected:  { label: 'Rejected',        color: '#dc2626' },
-  implementing:  { label: 'Implementing',    color: '#d97706' },
-  implemented:   { label: 'Implemented',     color: '#15803d' },
+  created:       { label: 'Created',        color: '#64748b' },
+  classified:    { label: 'Classified',     color: '#2563eb' },
+  invalid:       { label: 'Invalid',        color: '#dc2626' },
+  auto_rejected: { label: 'Auto Rejected',  color: '#991b1b' },
+  validated:     { label: 'Validated',       color: '#7c3aed' },
+  approved:      { label: 'Approved',        color: '#16a34a' },
+  rejected:      { label: 'Rejected',        color: '#dc2626' },
+  pending_cto:   { label: 'Pending CTO',    color: '#ea580c' },
+  cto_approved:  { label: 'CTO Approved',   color: '#16a34a' },
+  cto_rejected:  { label: 'CTO Rejected',   color: '#dc2626' },
+  implementing:  { label: 'Implementing',   color: '#d97706' },
+  implemented:   { label: 'Implemented',    color: '#15803d' },
+  failed:        { label: 'Failed',          color: '#dc2626' },
+  rolled_back:   { label: 'Rolled Back',    color: '#9a3412' },
   closed:        { label: 'Closed',          color: '#475569' },
 };
 
 const TABS = [
-  { key: '', label: 'All' },
-  { key: 'pending_cto', label: 'Pending Approval' },
-  { key: 'cto_approved', label: 'Approved' },
-  { key: 'cto_rejected', label: 'Rejected' },
+  { key: '',              label: 'All' },
+  { key: 'classified',    label: 'Classified' },
+  { key: 'validated',     label: 'Validated' },
+  { key: 'approved',      label: 'Approved' },
+  { key: 'implemented',   label: 'Implemented' },
+  { key: 'closed',        label: 'Closed' },
 ];
 
 /* ── SLA Timer ─────────────────────────────────────────────────────────────── */
@@ -29,9 +42,10 @@ function SLATimer({ deadline, slaHours, status }) {
   const [now, setNow] = useState(Date.now());
   useEffect(() => { const iv = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(iv); }, []);
 
-  if (!deadline || ['closed', 'cto_rejected'].includes(status)) {
-    const terminalLabels = { closed: 'Closed', cto_rejected: 'Rejected' };
-    return <span style={{ fontSize: 11, fontWeight: 600, color: status === 'closed' ? '#16a34a' : '#dc2626' }}>{terminalLabels[status] || ''}</span>;
+  const terminal = ['closed', 'cto_rejected', 'rejected', 'auto_rejected', 'failed'].includes(status);
+  if (!deadline || terminal) {
+    const terminalLabels = { closed: 'Closed', cto_rejected: 'Rejected', rejected: 'Rejected', auto_rejected: 'Auto Rejected', failed: 'Failed' };
+    return terminal ? <span style={{ fontSize: 11, fontWeight: 600, color: status === 'closed' ? '#16a34a' : '#dc2626' }}>{terminalLabels[status] || ''}</span> : null;
   }
   const dl = new Date(deadline).getTime();
   const rem = Math.max(0, dl - now);
@@ -80,7 +94,6 @@ function ReviewModal({ cr, onClose, onDone, isDark }) {
   return (
     <div style={{ position: 'fixed', inset: 0, background: 'rgba(15,23,42,0.55)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000, padding: 16 }} onClick={onClose}>
       <div onClick={e => e.stopPropagation()} style={{ width: '100%', maxWidth: 580, background: isDark ? '#1e293b' : '#fff', borderRadius: 14, boxShadow: '0 24px 48px rgba(0,0,0,0.3)', padding: 28, maxHeight: '90vh', overflowY: 'auto' }}>
-        {/* Header */}
         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 16 }}>
           <div>
             <h3 style={{ margin: 0, fontSize: 16, fontWeight: 700, color: isDark ? '#e2e8f0' : '#0f172a' }}>CTO Review</h3>
@@ -92,7 +105,6 @@ function ReviewModal({ cr, onClose, onDone, isDark }) {
           <button onClick={onClose} style={{ border: 'none', background: isDark ? '#334155' : '#f1f5f9', borderRadius: 6, width: 28, height: 28, cursor: 'pointer', fontSize: 14, color: '#94a3b8' }}>X</button>
         </div>
 
-        {/* CR Details */}
         <div style={{ background: isDark ? '#152238' : '#f8fafc', border: `1px solid ${isDark ? '#334155' : '#e2e8f0'}`, borderRadius: 8, padding: '12px 16px', marginBottom: 16 }}>
           <div style={{ fontSize: 13, fontWeight: 600, color: isDark ? '#e2e8f0' : '#0f172a', marginBottom: 4 }}>{cr.title}</div>
           <div style={{ fontSize: 12, color: isDark ? '#94a3b8' : '#64748b', lineHeight: 1.5, marginBottom: 8 }}>{cr.justification || cr.description}</div>
@@ -100,7 +112,6 @@ function ReviewModal({ cr, onClose, onDone, isDark }) {
           {cr.zone && <div style={{ fontSize: 11, color: isDark ? '#64748b' : '#94a3b8' }}>Zone: {cr.zone} | {cr.location}</div>}
         </div>
 
-        {/* Manager Approval Info */}
         {cr.approved_by_name && (
           <div style={{ background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: 8, padding: '10px 14px', marginBottom: 12, fontSize: 12 }}>
             <div style={{ fontWeight: 700, color: '#16a34a', fontSize: 11, marginBottom: 2 }}>MANAGER APPROVED</div>
@@ -109,7 +120,6 @@ function ReviewModal({ cr, onClose, onDone, isDark }) {
           </div>
         )}
 
-        {/* RF Parameters */}
         {cr.rf_params && Object.values(cr.rf_params).some(v => v.proposed != null) && (
           <div style={{ marginBottom: 14 }}>
             <div style={{ fontSize: 11, fontWeight: 700, color: isDark ? '#94a3b8' : '#64748b', textTransform: 'uppercase', marginBottom: 6 }}>RF Parameters</div>
@@ -124,7 +134,6 @@ function ReviewModal({ cr, onClose, onDone, isDark }) {
           </div>
         )}
 
-        {/* PDF download — authenticated */}
         {cr.pdf_filename && (
           <div style={{ marginBottom: 14 }}>
             <button onClick={async () => {
@@ -147,7 +156,6 @@ function ReviewModal({ cr, onClose, onDone, isDark }) {
           </div>
         )}
 
-        {/* Decision buttons */}
         <div style={{ display: 'flex', gap: 10, marginBottom: 14 }}>
           <button onClick={() => setDecision('approved')} style={{
             flex: 1, padding: '12px', borderRadius: 8, cursor: 'pointer', textAlign: 'center', fontSize: 14, fontWeight: 700,
@@ -185,6 +193,55 @@ function ReviewModal({ cr, onClose, onDone, isDark }) {
   );
 }
 
+/* ── Remarks Modal ────────────────────────────────────────────────────────── */
+function RemarksModal({ cr, onClose, isDark }) {
+  if (!cr) return null;
+  const sections = [
+    { key: 'justification', fallback: 'description', label: 'Agent Justification', name: cr.raised_by_name || 'Agent', color: '#00338D' },
+    { key: 'validation_remark', label: 'Validation', name: cr.validated_by_name || 'Manager', color: '#7c3aed' },
+    { key: 'approval_remark', label: 'Manager Approval', name: cr.approved_by_name || 'Manager', color: '#16a34a', at: cr.approved_at },
+    { key: 'manager_proposed_changes', label: 'Manager Proposed Modifications', color: '#7c3aed' },
+    { key: 'cto_remark', label: 'CTO Decision', name: cr.cto_approved_by_name || 'CTO', color: '#ea580c', at: cr.cto_approved_at },
+    { key: 'implementation_notes', label: 'Implementation', name: cr.implemented_by_name || 'Agent', color: '#00338D' },
+    { key: 'closure_notes', label: 'Closure Notes', color: '#475569' },
+  ];
+
+  return (
+    <div style={{ position: 'fixed', inset: 0, background: 'rgba(15,23,42,0.55)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000, padding: 16 }} onClick={onClose}>
+      <div onClick={e => e.stopPropagation()} style={{ width: '100%', maxWidth: 500, background: isDark ? '#1e293b' : '#fff', borderRadius: 14, boxShadow: '0 24px 48px rgba(0,0,0,0.3)', padding: 24, maxHeight: '80vh', overflowY: 'auto' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+          <div>
+            <h3 style={{ margin: 0, fontSize: 16, fontWeight: 700, color: isDark ? '#e2e8f0' : '#0f172a' }}>Remarks and Notes</h3>
+            <span style={{ fontSize: 12, fontFamily: "'IBM Plex Mono',monospace", color: isDark ? '#4da3ff' : '#00338D', fontWeight: 700 }}>{cr.cr_number}</span>
+          </div>
+          <button onClick={onClose} style={{ border: 'none', background: isDark ? '#334155' : '#f1f5f9', borderRadius: 6, width: 28, height: 28, cursor: 'pointer', fontSize: 14, color: '#94a3b8' }}>X</button>
+        </div>
+        {sections.map(sec => {
+          const text = cr[sec.key] || (sec.fallback ? cr[sec.fallback] : '');
+          if (!text) return null;
+          return (
+            <div key={sec.key} style={{ marginBottom: 14 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+                <div style={{ width: 4, height: 4, borderRadius: '50%', background: sec.color }} />
+                <span style={{ fontSize: 11, fontWeight: 700, color: sec.color, textTransform: 'uppercase' }}>
+                  {sec.label}{sec.name ? ` — ${sec.name}` : ''}
+                </span>
+                {sec.at && <span style={{ fontSize: 10, color: '#94a3b8' }}>{new Date(sec.at).toLocaleString()}</span>}
+              </div>
+              <div style={{ background: isDark ? '#0f172a' : '#f8fafc', border: `1px solid ${isDark ? '#334155' : '#e2e8f0'}`, borderRadius: 8, padding: '10px 14px', fontSize: 13, color: isDark ? '#e2e8f0' : '#0f172a', lineHeight: 1.5 }}>
+                {text}
+              </div>
+            </div>
+          );
+        })}
+        <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 16 }}>
+          <button onClick={onClose} style={{ padding: '8px 20px', borderRadius: 7, fontSize: 13, fontWeight: 600, cursor: 'pointer', background: '#00338D', color: '#fff', border: 'none' }}>Close</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 /* ── Main Component ────────────────────────────────────────────────────────── */
 export default function CTOChangeWorkflow() {
   const { isDark } = useTheme();
@@ -211,12 +268,25 @@ export default function CTOChangeWorkflow() {
   const aiCRs = crs.filter(c => c.network_issue_id);
   const activeCRs = section === 'customer' ? customerCRs : aiCRs;
 
+  // Filter by status tab
   const filtered = filter ? activeCRs.filter(c => {
-    if (filter === 'pending_cto') return c.status === 'pending_cto';
-    if (filter === 'cto_approved') return c.cto_status === 'cto_approved';
-    if (filter === 'cto_rejected') return c.cto_status === 'cto_rejected';
-    return true;
+    if (filter === 'approved') return ['approved', 'pending_cto', 'cto_approved'].includes(c.status);
+    if (filter === 'implemented') return ['implementing', 'implemented'].includes(c.status);
+    return c.status === filter;
   }) : activeCRs;
+
+  // Count for each tab
+  const tabCounts = {};
+  TABS.forEach(t => {
+    if (!t.key) { tabCounts[''] = activeCRs.length; return; }
+    if (t.key === 'approved') {
+      tabCounts[t.key] = activeCRs.filter(c => ['approved', 'pending_cto', 'cto_approved'].includes(c.status)).length;
+    } else if (t.key === 'implemented') {
+      tabCounts[t.key] = activeCRs.filter(c => ['implementing', 'implemented'].includes(c.status)).length;
+    } else {
+      tabCounts[t.key] = activeCRs.filter(c => c.status === t.key).length;
+    }
+  });
 
   const pendingCount = activeCRs.filter(c => c.status === 'pending_cto').length;
   const sectionColor = section === 'customer' ? '#00338D' : '#7c3aed';
@@ -232,7 +302,7 @@ export default function CTOChangeWorkflow() {
             </span>
           )}
         </div>
-        <p>Urgent and Emergency Change Requests requiring CTO approval</p>
+        <p>All Change Requests — full lifecycle oversight</p>
       </div>
 
       {/* Section Toggle */}
@@ -259,22 +329,27 @@ export default function CTOChangeWorkflow() {
       </div>
 
       {/* Section Header */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
         <div style={{ width: 4, height: 16, borderRadius: 2, background: sectionColor }} />
         <span style={{ fontSize: 13, fontWeight: 700, color: isDark ? '#e2e8f0' : '#0f172a', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
           {section === 'customer' ? 'Customer Complaint CRs' : 'AI-Detected Network Issue CRs'}
         </span>
+        <span style={{ fontSize: 11, color: isDark ? '#64748b' : '#94a3b8' }}>
+          {section === 'customer' ? 'Raised from customer tickets (SR)' : 'Raised from AI-detected network issues'}
+        </span>
       </div>
 
       {/* Tabs */}
-      <div style={{ display: 'flex', gap: 6, marginBottom: 16 }}>
+      <div style={{ display: 'flex', gap: 6, marginBottom: 16, marginTop: 12, flexWrap: 'wrap' }}>
         {TABS.map(t => (
           <button key={t.key} onClick={() => setFilter(t.key)} style={{
             padding: '6px 14px', borderRadius: 6, fontSize: 12, fontWeight: 600, cursor: 'pointer',
             background: filter === t.key ? sectionColor : (isDark ? '#1e293b' : '#f8fafc'),
             color: filter === t.key ? '#fff' : (isDark ? '#94a3b8' : '#64748b'),
             border: `1px solid ${filter === t.key ? sectionColor : (isDark ? '#334155' : '#e2e8f0')}`,
-          }}>{t.label} {t.key === 'pending_cto' && pendingCount > 0 ? `(${pendingCount})` : ''}</button>
+          }}>
+            {t.label}{tabCounts[t.key] > 0 ? ` (${tabCounts[t.key]})` : ''}
+          </button>
         ))}
       </div>
 
@@ -283,20 +358,20 @@ export default function CTOChangeWorkflow() {
         <div style={{ textAlign: 'center', padding: 40, color: '#94a3b8' }}>Loading...</div>
       ) : filtered.length === 0 ? (
         <div style={{ textAlign: 'center', padding: 40, color: '#94a3b8' }}>
-          No {section === 'customer' ? 'customer complaint' : 'AI ticket'} change requests found.
+          No {section === 'customer' ? 'customer complaint' : 'AI ticket'} change requests{filter ? ` with status "${filter}"` : ''} found.
         </div>
       ) : (
         filtered.map(cr => {
-          const isClosed = ['closed', 'cto_rejected'].includes(cr.status) || cr.cto_status === 'cto_rejected';
-          const ts = isClosed ? { bg: '#f1f5f9', color: '#94a3b8', border: '#e2e8f0', label: cr.change_type ? cr.change_type.charAt(0).toUpperCase() + cr.change_type.slice(1) : 'Urgent' } : (TYPE_STYLE[cr.change_type] || TYPE_STYLE.urgent);
-          const meta = STATUS_META[cr.status] || STATUS_META[cr.cto_status] || { label: cr.status, color: '#64748b' };
+          const terminal = ['closed', 'cto_rejected', 'rejected', 'auto_rejected', 'failed'].includes(cr.status);
+          const ts = terminal ? { bg: '#f1f5f9', color: '#94a3b8', border: '#e2e8f0', label: cr.change_type ? cr.change_type.charAt(0).toUpperCase() + cr.change_type.slice(1) : 'Standard' } : (TYPE_STYLE[cr.change_type] || TYPE_STYLE.standard);
+          const meta = STATUS_META[cr.status] || { label: cr.status, color: '#64748b' };
           const isPending = cr.status === 'pending_cto';
 
           return (
             <div key={cr.id} style={{
               background: isDark ? '#1e293b' : '#fff', borderRadius: 12,
               border: `1px solid ${isDark ? '#334155' : '#e2e8f0'}`,
-              borderLeft: `4px solid ${ts.color}`,
+              borderLeft: `4px solid ${meta.color}`,
               marginBottom: 12, padding: '16px 20px',
               boxShadow: isPending ? (isDark ? '0 2px 8px rgba(0,0,0,0.2)' : '0 2px 8px rgba(234,88,12,0.1)') : 'none',
             }}>
@@ -304,8 +379,9 @@ export default function CTOChangeWorkflow() {
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 8 }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
                   <span style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: 14, fontWeight: 800, color: isDark ? '#4da3ff' : '#00338D' }}>{cr.cr_number}</span>
-                  <span style={{ fontSize: 10, fontWeight: 700, padding: '2px 7px', borderRadius: 4, background: ts.bg, color: ts.color, border: `1px solid ${ts.border}` }}>{ts.label}</span>
+                  {cr.change_type && <span style={{ fontSize: 10, fontWeight: 700, padding: '2px 7px', borderRadius: 4, background: ts.bg, color: ts.color, border: `1px solid ${ts.border}` }}>{ts.label}</span>}
                   <span style={{ fontSize: 10, fontWeight: 700, padding: '2px 7px', borderRadius: 4, background: `${meta.color}15`, color: meta.color, border: `1px solid ${meta.color}30` }}>{meta.label}</span>
+                  {cr.ticket_ref && <span style={{ fontSize: 10, color: isDark ? '#64748b' : '#94a3b8' }}>Ticket: {cr.ticket_ref}</span>}
                 </div>
                 <SLATimer deadline={cr.cr_sla_deadline} slaHours={cr.cr_sla_hours} status={cr.status} />
               </div>
@@ -316,6 +392,7 @@ export default function CTOChangeWorkflow() {
                 {cr.category && <span>{cr.category}{cr.subcategory ? ` > ${cr.subcategory}` : ''}</span>}
                 {cr.zone && <span> | Zone: {cr.zone}</span>}
                 {cr.raised_by_name && <span> | Agent: <strong>{cr.raised_by_name}</strong></span>}
+                {cr.assigned_manager_name && <span> | Manager: <strong>{cr.assigned_manager_name}</strong></span>}
               </div>
 
               {/* RF Params */}
@@ -331,142 +408,52 @@ export default function CTOChangeWorkflow() {
 
               {/* Actions */}
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 8 }}>
-                {(cr.description || cr.justification || cr.approval_remark || cr.cto_remark || cr.implementation_notes || cr.closure_notes || cr.manager_proposed_changes) && (
-                  <button onClick={() => setRemarksCR(cr)} style={{
-                    background: 'none', border: `1px solid ${isDark ? '#334155' : '#e2e8f0'}`, borderRadius: 6,
-                    padding: '4px 12px', fontSize: 11, fontWeight: 600, cursor: 'pointer',
-                    color: isDark ? '#94a3b8' : '#64748b',
-                  }}>
-                    View Remarks
-                  </button>
-                )}
-              </div>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 4 }}>
-                <span style={{ fontSize: 10, color: '#94a3b8' }}>{cr.created_at ? new Date(cr.created_at).toLocaleString() : ''}</span>
-                {isPending && (
-                  <button onClick={() => setReviewCR(cr)} style={{
-                    padding: '8px 20px', borderRadius: 7, fontSize: 13, fontWeight: 700, cursor: 'pointer',
-                    background: 'linear-gradient(135deg, #00338D, #0047c9)', color: '#fff', border: 'none',
-                  }}>
-                    Review and Decide
-                  </button>
-                )}
-                {cr.pdf_filename && !isPending && (
-                  <button onClick={async () => {
-                    try {
-                      const token = localStorage.getItem('token');
-                      const resp = await fetch(`/api/cr/${cr.id}/pdf`, { headers: { 'Authorization': `Bearer ${token}` } });
-                      if (!resp.ok) throw new Error('Failed');
-                      const blob = await resp.blob();
-                      const url = URL.createObjectURL(blob);
-                      const a = document.createElement('a'); a.href = url; a.download = cr.pdf_filename; a.click();
-                      URL.revokeObjectURL(url);
-                    } catch (_) { alert('Download failed'); }
-                  }} style={{ fontSize: 12, color: isDark ? '#4da3ff' : '#00338D', fontWeight: 600, background: 'none', border: `1px solid ${isDark ? '#334155' : '#bfdbfe'}`, borderRadius: 6, padding: '6px 12px', cursor: 'pointer' }}>
-                    Download Report
-                  </button>
-                )}
+                <div style={{ display: 'flex', gap: 8 }}>
+                  {(cr.description || cr.justification || cr.approval_remark || cr.cto_remark || cr.implementation_notes || cr.closure_notes || cr.manager_proposed_changes) && (
+                    <button onClick={() => setRemarksCR(cr)} style={{
+                      background: 'none', border: `1px solid ${isDark ? '#334155' : '#e2e8f0'}`, borderRadius: 6,
+                      padding: '4px 12px', fontSize: 11, fontWeight: 600, cursor: 'pointer',
+                      color: isDark ? '#94a3b8' : '#64748b',
+                    }}>
+                      View Remarks
+                    </button>
+                  )}
+                  {cr.pdf_filename && (
+                    <button onClick={async () => {
+                      try {
+                        const token = localStorage.getItem('token');
+                        const resp = await fetch(`/api/cr/${cr.id}/pdf`, { headers: { 'Authorization': `Bearer ${token}` } });
+                        if (!resp.ok) throw new Error('Failed');
+                        const blob = await resp.blob();
+                        const url = URL.createObjectURL(blob);
+                        const a = document.createElement('a'); a.href = url; a.download = cr.pdf_filename; a.click();
+                        URL.revokeObjectURL(url);
+                      } catch (_) { alert('Download failed'); }
+                    }} style={{ fontSize: 11, color: isDark ? '#4da3ff' : '#00338D', fontWeight: 600, background: 'none', border: `1px solid ${isDark ? '#334155' : '#bfdbfe'}`, borderRadius: 6, padding: '4px 12px', cursor: 'pointer' }}>
+                      Download PDF
+                    </button>
+                  )}
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <span style={{ fontSize: 10, color: '#94a3b8' }}>{cr.created_at ? new Date(cr.created_at).toLocaleString() : ''}</span>
+                  {isPending && (
+                    <button onClick={() => setReviewCR(cr)} style={{
+                      padding: '8px 20px', borderRadius: 7, fontSize: 13, fontWeight: 700, cursor: 'pointer',
+                      background: 'linear-gradient(135deg, #00338D, #0047c9)', color: '#fff', border: 'none',
+                    }}>
+                      Review and Decide
+                    </button>
+                  )}
+                </div>
               </div>
             </div>
           );
         })
       )}
 
-      {/* Review Modal */}
+      {/* Modals */}
       {reviewCR && <ReviewModal cr={reviewCR} onClose={() => setReviewCR(null)} onDone={fetchCRs} isDark={isDark} />}
-
-      {/* Remarks Modal */}
-      {remarksCR && (
-        <div style={{ position: 'fixed', inset: 0, background: 'rgba(15,23,42,0.55)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000, padding: 16 }} onClick={() => setRemarksCR(null)}>
-          <div onClick={e => e.stopPropagation()} style={{ width: '100%', maxWidth: 500, background: isDark ? '#1e293b' : '#fff', borderRadius: 14, boxShadow: '0 24px 48px rgba(0,0,0,0.3)', padding: 24, maxHeight: '80vh', overflowY: 'auto' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
-              <div>
-                <h3 style={{ margin: 0, fontSize: 16, fontWeight: 700, color: isDark ? '#e2e8f0' : '#0f172a' }}>Remarks and Notes</h3>
-                <span style={{ fontSize: 12, fontFamily: "'IBM Plex Mono',monospace", color: isDark ? '#4da3ff' : '#00338D', fontWeight: 700 }}>{remarksCR.cr_number}</span>
-              </div>
-              <button onClick={() => setRemarksCR(null)} style={{ border: 'none', background: isDark ? '#334155' : '#f1f5f9', borderRadius: 6, width: 28, height: 28, cursor: 'pointer', fontSize: 14, color: '#94a3b8' }}>X</button>
-            </div>
-
-            {(remarksCR.justification || remarksCR.description) && (
-              <div style={{ marginBottom: 14 }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
-                  <div style={{ width: 4, height: 4, borderRadius: '50%', background: '#00338D' }} />
-                  <span style={{ fontSize: 11, fontWeight: 700, color: '#00338D', textTransform: 'uppercase' }}>Agent Justification — {remarksCR.raised_by_name || 'Agent'}</span>
-                </div>
-                <div style={{ background: isDark ? '#0f172a' : '#f8fafc', border: `1px solid ${isDark ? '#334155' : '#e2e8f0'}`, borderRadius: 8, padding: '10px 14px', fontSize: 13, color: isDark ? '#e2e8f0' : '#0f172a', lineHeight: 1.5 }}>
-                  {remarksCR.justification || remarksCR.description}
-                </div>
-              </div>
-            )}
-
-            {remarksCR.approval_remark && (
-              <div style={{ marginBottom: 14 }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
-                  <div style={{ width: 4, height: 4, borderRadius: '50%', background: '#16a34a' }} />
-                  <span style={{ fontSize: 11, fontWeight: 700, color: '#16a34a', textTransform: 'uppercase' }}>Manager Approval — {remarksCR.approved_by_name || 'Manager'}</span>
-                  {remarksCR.approved_at && <span style={{ fontSize: 10, color: '#94a3b8' }}>{new Date(remarksCR.approved_at).toLocaleString()}</span>}
-                </div>
-                <div style={{ background: isDark ? '#0f172a' : '#f0fdf4', border: `1px solid ${isDark ? '#334155' : '#bbf7d0'}`, borderRadius: 8, padding: '10px 14px', fontSize: 13, color: isDark ? '#e2e8f0' : '#0f172a', lineHeight: 1.5 }}>
-                  {remarksCR.approval_remark}
-                </div>
-              </div>
-            )}
-
-            {remarksCR.manager_proposed_changes && (
-              <div style={{ marginBottom: 14 }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
-                  <div style={{ width: 4, height: 4, borderRadius: '50%', background: '#7c3aed' }} />
-                  <span style={{ fontSize: 11, fontWeight: 700, color: '#7c3aed', textTransform: 'uppercase' }}>Manager Proposed Modifications</span>
-                </div>
-                <div style={{ background: isDark ? '#0f172a' : '#f5f3ff', border: `1px solid ${isDark ? '#334155' : '#c4b5fd'}`, borderRadius: 8, padding: '10px 14px', fontSize: 13, color: isDark ? '#e2e8f0' : '#0f172a', lineHeight: 1.5 }}>
-                  {remarksCR.manager_proposed_changes}
-                </div>
-              </div>
-            )}
-
-            {remarksCR.cto_remark && (
-              <div style={{ marginBottom: 14 }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
-                  <div style={{ width: 4, height: 4, borderRadius: '50%', background: '#ea580c' }} />
-                  <span style={{ fontSize: 11, fontWeight: 700, color: '#ea580c', textTransform: 'uppercase' }}>CTO Decision — {remarksCR.cto_approved_by_name || 'CTO'}</span>
-                  {remarksCR.cto_approved_at && <span style={{ fontSize: 10, color: '#94a3b8' }}>{new Date(remarksCR.cto_approved_at).toLocaleString()}</span>}
-                </div>
-                <div style={{ background: isDark ? '#0f172a' : '#fff7ed', border: `1px solid ${isDark ? '#334155' : '#fed7aa'}`, borderRadius: 8, padding: '10px 14px', fontSize: 13, color: isDark ? '#e2e8f0' : '#0f172a', lineHeight: 1.5 }}>
-                  {remarksCR.cto_remark}
-                </div>
-              </div>
-            )}
-
-            {remarksCR.implementation_notes && (
-              <div style={{ marginBottom: 14 }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
-                  <div style={{ width: 4, height: 4, borderRadius: '50%', background: '#00338D' }} />
-                  <span style={{ fontSize: 11, fontWeight: 700, color: '#00338D', textTransform: 'uppercase' }}>Implementation — {remarksCR.implemented_by_name || 'Agent'}</span>
-                </div>
-                <div style={{ background: isDark ? '#0f172a' : '#eff6ff', border: `1px solid ${isDark ? '#334155' : '#bfdbfe'}`, borderRadius: 8, padding: '10px 14px', fontSize: 13, color: isDark ? '#e2e8f0' : '#0f172a', lineHeight: 1.5 }}>
-                  {remarksCR.implementation_notes}
-                </div>
-              </div>
-            )}
-
-            {remarksCR.closure_notes && (
-              <div style={{ marginBottom: 14 }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
-                  <div style={{ width: 4, height: 4, borderRadius: '50%', background: '#475569' }} />
-                  <span style={{ fontSize: 11, fontWeight: 700, color: '#475569', textTransform: 'uppercase' }}>Closure Notes</span>
-                </div>
-                <div style={{ background: isDark ? '#0f172a' : '#f8fafc', border: `1px solid ${isDark ? '#334155' : '#e2e8f0'}`, borderRadius: 8, padding: '10px 14px', fontSize: 13, color: isDark ? '#e2e8f0' : '#0f172a', lineHeight: 1.5 }}>
-                  {remarksCR.closure_notes}
-                </div>
-              </div>
-            )}
-
-            <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 16 }}>
-              <button onClick={() => setRemarksCR(null)} style={{ padding: '8px 20px', borderRadius: 7, fontSize: 13, fontWeight: 600, cursor: 'pointer', background: '#00338D', color: '#fff', border: 'none' }}>Close</button>
-            </div>
-          </div>
-        </div>
-      )}
+      {remarksCR && <RemarksModal cr={remarksCR} onClose={() => setRemarksCR(null)} isDark={isDark} />}
     </div>
   );
 }

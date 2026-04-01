@@ -108,9 +108,9 @@ _TPUT_KPI = "LTE DL - Usr Ave Throughput"
 
 def _get_worst_cells_by_site():
     """Find worst cells: every cell_site_id where ALL 3 KPI thresholds fail
-    on last 7 days average from CURRENT DATE. Groups results by site_id."""
+    on last 7 days average from latest available data date. Groups results by site_id."""
 
-    # Last 7 days counted from today (CURRENT_DATE)
+    # Last 7 days from current date
     today = _date.today()
     start_date = today - timedelta(days=7)
     print(f"[WORST CELLS] Scanning cells from {start_date} to {today} (last 7 days from today)")
@@ -337,12 +337,14 @@ def schedule_daily_job(app):
     _ticket_done_date = None    # date of last 08:00 ticket job
 
     def _tickets_already_processed_today():
-        """Check if daily job already ran today by looking at created_at date."""
+        """Check if daily job already ran today by looking at created_at OR updated_at date."""
         today_start = datetime.combine(_date.today(), datetime.min.time())
         tomorrow_start = today_start + timedelta(days=1)
         count = NetworkIssueTicket.query.filter(
-            NetworkIssueTicket.created_at >= today_start,
-            NetworkIssueTicket.created_at < tomorrow_start
+            db.or_(
+                db.and_(NetworkIssueTicket.created_at >= today_start, NetworkIssueTicket.created_at < tomorrow_start),
+                db.and_(NetworkIssueTicket.updated_at >= today_start, NetworkIssueTicket.updated_at < tomorrow_start),
+            )
         ).count()
         return count > 0
 
@@ -492,12 +494,18 @@ def list_network_issues():
 @network_issues_bp.route("/api/network-issues/todays-routing", methods=["GET"])
 @jwt_required()
 def todays_routing():
-    """Return ticket routing info for all open/in_progress tickets."""
-    from datetime import date as _date_cls
-    today = _date_cls.today()
+    """Return tickets created or updated TODAY with site, cells, and agent info."""
+    today = _date.today()
+    today_start = datetime.combine(today, datetime.min.time())
+    tomorrow_start = today_start + timedelta(days=1)
+
+    # Only tickets created or updated today
     tickets = NetworkIssueTicket.query.filter(
-        NetworkIssueTicket.status.in_(["open", "in_progress"])
-    ).order_by(NetworkIssueTicket.created_at.desc()).all()
+        db.or_(
+            db.and_(NetworkIssueTicket.created_at >= today_start, NetworkIssueTicket.created_at < tomorrow_start),
+            db.and_(NetworkIssueTicket.updated_at >= today_start, NetworkIssueTicket.updated_at < tomorrow_start),
+        )
+    ).order_by(NetworkIssueTicket.updated_at.desc()).all()
 
     routing = []
     for t in tickets:
@@ -508,17 +516,28 @@ def todays_routing():
                 agent_name = ag.name or ""
                 agent_email = ag.email or ""
         created_today = t.created_at and t.created_at.date() == today
+        updated_today = t.updated_at and t.updated_at.date() == today
         routing.append({
             "ticket_id": t.id,
             "site_id": t.site_id,
+            "cells_affected": t.cells_affected or "",
+            "cell_site_ids": t.cell_site_ids or "",
+            "cell_count": len(t.cells_affected.split(",")) if t.cells_affected else 0,
+            "category": t.category,
             "priority": t.priority,
             "status": t.status or "open",
-            "date": t.created_at.strftime("%Y-%m-%d") if t.created_at else today.isoformat(),
+            "avg_drop_rate": t.avg_drop_rate,
+            "avg_cssr": t.avg_cssr,
+            "avg_tput": t.avg_tput,
+            "zone": t.zone,
+            "location": t.location,
+            "date": t.updated_at.strftime("%Y-%m-%d") if t.updated_at else today.isoformat(),
+            "timestamp": t.updated_at.isoformat() if t.updated_at else None,
             "agent_name": agent_name,
             "agent_email": agent_email,
-            "type": "created" if created_today else "existing",
+            "type": "created" if created_today else ("updated" if updated_today else "existing"),
         })
-    return jsonify({"routing": routing, "date": today.isoformat()})
+    return jsonify({"routing": routing, "total": len(routing), "date": today.isoformat()})
 
 
 @network_issues_bp.route("/api/network-issues/<int:ticket_id>", methods=["GET"])

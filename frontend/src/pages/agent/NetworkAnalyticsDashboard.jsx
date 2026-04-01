@@ -583,12 +583,12 @@ function AIView({result,T,onClose}) {
 }
 
 // ── Overview Page ─────────────────────────────────────────────────────────────
-function OverviewPage({T,data,mapSites}) {
+function OverviewPage({T,data,mapSites,filters}) {
   const d=data||{};
   const TipC=(p)=><Tip T={T} {...p}/>;
   const hs=Math.round(d.network_health_score||0);
 
-  // Pre-scan worst cells (updated every 30 min by backend)
+  // Pre-scan worst cells (updated every 30 min by backend) — unfiltered, always shows all
   const [preScanCells,setPreScanCells]=useState([]);
   const [preScanTime,setPreScanTime]=useState(null);
   useEffect(()=>{
@@ -740,14 +740,12 @@ function OverviewPage({T,data,mapSites}) {
           preScanTime&&<span style={{fontSize:9,color:T.muted}}>Updated: {new Date(preScanTime).toLocaleString()}</span>
         }>
           {(()=>{
-            // Flatten pre-scan site data into cell-level rows; fallback to summary worst_cells
-            const rows = preScanCells.length > 0
-              ? preScanCells.flatMap(s => (s.cells||[]).map(c => ({
+            // Flatten pre-scan site data into cell-level rows (current date scan only)
+            const rows = preScanCells.flatMap(s => (s.cells||[]).map(c => ({
                   cell_id: c, site_id: s.site_id, zone: s.zone || '—',
                   call_drop_rate: f(s.avg_drop,2), lte_cssr: f(s.avg_cssr,2),
                   dl_usr_tput: f(s.avg_tput,2), violations: 3,
-                })))
-              : worstCells;
+                })));
             return rows.length>0?(
               <div style={{maxHeight:220,overflowY:'auto'}}>
                 <table style={{width:'100%',borderCollapse:'collapse',fontSize:10.5}}>
@@ -1501,7 +1499,7 @@ function TransportPage({T,data,filters}) {
 }
 
 // ── KPI Filter Page ───────────────────────────────────────────────────────────
-function KPIFilterPage({T,kpiFilter,data,mapSites:_mapSites}) {
+function KPIFilterPage({T,kpiFilter,data,mapSites:_mapSites,filters}) {
   const TipC=(p)=><Tip T={T} {...p}/>;
   const kd=data||{};
   const sites=kd.sites||[];
@@ -1842,7 +1840,7 @@ export default function NetworkAnalyticsDashboard() {
     try{
       const [ov,fo]=await Promise.all([
         fetchWithTimeout(`${base}/api/network/overview-stats?${q}${fr}`,12000),
-        fetchWithTimeout(`${base}/api/network/filters`,8000),
+        fetchWithTimeout(`${base}/api/network/filters?${['country','state'].filter(k=>filters[k]).map(k=>`${k}=${encodeURIComponent(filters[k])}`).join('&')}`,8000),
       ]);
       if(ov)  setOverview(ov);
       if(fo)  setOpts(fo);
@@ -1977,7 +1975,25 @@ export default function NetworkAnalyticsDashboard() {
                 <button onClick={()=>setFilters(p=>({...p,region:''}))} style={{background:'none',border:'none',color:T.purple,cursor:'pointer',padding:0,fontSize:10,lineHeight:1}}>×</button>
               </span>
             )}
-            <button onClick={()=>setFilters({time_range:filters.time_range,cluster:'',technology:'',region:''})}
+            {filters.country&&(
+              <span style={{display:'inline-flex',alignItems:'center',gap:4,padding:'2px 8px',borderRadius:12,fontSize:9.5,fontWeight:700,background:'#0E793418',color:'#0E7934',border:'1px solid #0E793433'}}>
+                🌍 {filters.country}
+                <button onClick={()=>setFilters(p=>({...p,country:'',state:'',city:''}))} style={{background:'none',border:'none',color:'#0E7934',cursor:'pointer',padding:0,fontSize:10,lineHeight:1}}>×</button>
+              </span>
+            )}
+            {filters.state&&(
+              <span style={{display:'inline-flex',alignItems:'center',gap:4,padding:'2px 8px',borderRadius:12,fontSize:9.5,fontWeight:700,background:'#B4540018',color:'#B45400',border:'1px solid #B4540033'}}>
+                📍 {filters.state}
+                <button onClick={()=>setFilters(p=>({...p,state:'',city:''}))} style={{background:'none',border:'none',color:'#B45400',cursor:'pointer',padding:0,fontSize:10,lineHeight:1}}>×</button>
+              </span>
+            )}
+            {filters.city&&(
+              <span style={{display:'inline-flex',alignItems:'center',gap:4,padding:'2px 8px',borderRadius:12,fontSize:9.5,fontWeight:700,background:'#6B21A818',color:'#6B21A8',border:'1px solid #6B21A833'}}>
+                🏙 {filters.city}
+                <button onClick={()=>setFilters(p=>({...p,city:''}))} style={{background:'none',border:'none',color:'#6B21A8',cursor:'pointer',padding:0,fontSize:10,lineHeight:1}}>×</button>
+              </span>
+            )}
+            <button onClick={()=>setFilters({time_range:filters.time_range,cluster:'',technology:'',region:'',country:'',state:'',city:''})}
               style={{fontSize:9,color:T.red,background:'none',border:`1px solid ${T.red}44`,borderRadius:10,cursor:'pointer',padding:'1px 7px',fontWeight:600}}>
               Clear all
             </button>
@@ -2076,13 +2092,13 @@ export default function NetworkAnalyticsDashboard() {
           <TransportPage T={T} data={transport} filters={filters}/>
         ) : page==='kpi' ? (
           kpiFilterData
-            ? <KPIFilterPage T={T} kpiFilter={selKpi} data={kpiFilterData} mapSites={mapData?.sites||[]}/>
+            ? <KPIFilterPage T={T} kpiFilter={selKpi} data={kpiFilterData} mapSites={mapData?.sites||[]} filters={filters}/>
             : <div style={{display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',height:300,gap:12}}>
                 <div style={{width:28,height:28,border:`3px solid ${T.border}`,borderTopColor:T.kpmgBlue,borderRadius:'50%',animation:'spin .7s linear infinite'}}/>
                 <div style={{fontSize:12,color:T.muted}}>Loading filter data…</div>
               </div>
         ) : (
-          <OverviewPage T={T} data={overview} mapSites={mapData?.sites||[]}/>
+          <OverviewPage T={T} data={overview} mapSites={mapData?.sites||[]} filters={filters}/>
         )}
       </div>
 

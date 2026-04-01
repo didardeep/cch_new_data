@@ -274,11 +274,11 @@ function ActionModal({ cr, onClose, onDone, isDark }) {
             />
             {errMsg && <p style={{ margin: '6px 0 0', fontSize: 12, color: '#dc2626' }}>{errMsg}</p>}
             <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 16 }}>
-              <button onClick={onClose} disabled={loading} style={btnStyle('ghost')}>Cancel</button>
-              <button onClick={() => submit('invalid')} disabled={loading} style={btnStyle('danger')}>
+              <button onClick={onClose} disabled={loading} style={btnStyle('ghost', isDark)}>Cancel</button>
+              <button onClick={() => submit('invalid')} disabled={loading} style={btnStyle('danger', isDark)}>
                 {loading ? '…' : `Reject (${cr.rejection_count + 1}/2)`}
               </button>
-              <button onClick={() => submit('valid')} disabled={loading} style={btnStyle('success')}>
+              <button onClick={() => submit('valid')} disabled={loading} style={btnStyle('success', isDark)}>
                 {loading ? '…' : 'Mark Valid ✓'}
               </button>
             </div>
@@ -440,8 +440,8 @@ function ActionModal({ cr, onClose, onDone, isDark }) {
             />
             {errMsg && <p style={{ margin: '6px 0 0', fontSize: 12, color: '#dc2626' }}>{errMsg}</p>}
             <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 16 }}>
-              <button onClick={onClose} disabled={loading} style={btnStyle('ghost')}>Cancel</button>
-              <button onClick={() => submit()} disabled={loading} style={btnStyle('primary')}>
+              <button onClick={onClose} disabled={loading} style={btnStyle('ghost', isDark)}>Cancel</button>
+              <button onClick={() => submit()} disabled={loading} style={btnStyle('primary', isDark)}>
                 {loading ? '…' : 'Close Change Request'}
               </button>
             </div>
@@ -692,7 +692,7 @@ function DetailDrawer({ cr, onClose }) {
 }
 
 /* ── Helpers ────────────────────────────────────────────────────────────────── */
-function btnStyle(type) {
+function btnStyle(type, isDark) {
   const base = { padding: '8px 18px', borderRadius: 7, fontSize: 13, fontWeight: 600, cursor: 'pointer', border: '1px solid' };
   if (type === 'primary') return { ...base, background: '#00338D', color: '#fff', borderColor: '#00338D' };
   if (type === 'success') return { ...base, background: '#16a34a', color: '#fff', borderColor: '#16a34a' };
@@ -824,7 +824,7 @@ function CRCard({ cr, onAction, onDetail, onRemarks, isDark }) {
           </button>
           {needsAction && (
             <button onClick={() => onAction(cr)} style={{
-              ...btnStyle('primary'),
+              ...btnStyle('primary', isDark),
               background: 'linear-gradient(135deg, #00338D, #0047c9)',
             }}>
               {cr.status === 'created' || cr.status === 'classified' || cr.status === 'invalid' ? 'Validate →'
@@ -841,12 +841,12 @@ function CRCard({ cr, onAction, onDetail, onRemarks, isDark }) {
 
 /* ── Main Component ─────────────────────────────────────────────────────────── */
 const FILTER_TABS = [
-  { key: '',             label: 'All' },
-  { key: 'needs_action', label: 'Needs Action' },
-  { key: 'approved',     label: 'Approved' },
-  { key: 'implementing', label: 'Implementing' },
-  { key: 'closed',       label: 'Closed' },
-  { key: 'rejected',     label: 'Rejected' },
+  { key: '',              label: 'All' },
+  { key: 'classified',    label: 'Classified' },
+  { key: 'validated',     label: 'Validated' },
+  { key: 'approved',      label: 'Approved' },
+  { key: 'implemented',   label: 'Implemented' },
+  { key: 'closed',        label: 'Closed' },
 ];
 
 export default function ManagerChangeWorkflow() {
@@ -862,17 +862,14 @@ export default function ManagerChangeWorkflow() {
 
   const fetchCRs = useCallback(async () => {
     try {
-      const d = await apiGet(`/api/cr/manager-list${filter ? `?status=${filter}` : ''}`);
+      const d = await apiGet('/api/cr/manager-list');
       setCrs(d?.change_requests || d?.crs || []);
       if (d?.stats) setStats(d.stats);
     } catch { /* ignore */ }
     setLoading(false);
-  }, [filter]);
+  }, []);
 
-  useEffect(() => {
-    setLoading(true);
-    fetchCRs();
-  }, [filter, fetchCRs]);
+  useEffect(() => { fetchCRs(); }, [fetchCRs]);
 
   useEffect(() => {
     const iv = setInterval(fetchCRs, 30000);
@@ -884,13 +881,20 @@ export default function ManagerChangeWorkflow() {
   const aiCRs = crs.filter(c => c.network_issue_id);
   const activeCRs = section === 'customer' ? customerCRs : aiCRs;
 
+  // Client-side filtering by tab
+  const filteredCRs = filter ? activeCRs.filter(c => {
+    if (filter === 'approved') return ['approved', 'pending_cto', 'cto_approved'].includes(c.status);
+    if (filter === 'implemented') return ['implementing', 'implemented'].includes(c.status);
+    return c.status === filter;
+  }) : activeCRs;
+
   const sectionColor = section === 'customer' ? '#00338D' : '#7c3aed';
 
   // Compute stats for active section
   const activeStats = {
     total: activeCRs.length,
     needs_action: activeCRs.filter(c => ['created','classified','invalid','validated','implemented','rolled_back'].includes(c.status)).length,
-    approved: activeCRs.filter(c => ['approved', 'cto_approved'].includes(c.status)).length,
+    approved: activeCRs.filter(c => ['approved', 'pending_cto', 'cto_approved'].includes(c.status)).length,
     closed: activeCRs.filter(c => c.status === 'closed').length,
   };
 
@@ -1000,31 +1004,29 @@ export default function ManagerChangeWorkflow() {
 
       {/* Filter tabs */}
       <div style={{ display: 'flex', gap: 4, marginBottom: 20, flexWrap: 'wrap' }}>
-        {FILTER_TABS.map(t => (
-          <button key={t.key} onClick={() => setFilter(t.key)} style={{
-            padding: '7px 16px', borderRadius: 7, fontSize: 13, fontWeight: 600,
-            border: '1px solid', cursor: 'pointer',
-            background: filter === t.key ? (isDark ? '#4da3ff' : sectionColor) : (isDark ? '#1e293b' : '#fff'),
-            color: filter === t.key ? '#fff' : (isDark ? '#94a3b8' : '#475569'),
-            borderColor: filter === t.key ? (isDark ? '#4da3ff' : sectionColor) : (isDark ? '#334155' : '#e2e8f0'),
-          }}>
-            {t.label}
-            {t.key === 'needs_action' && activeStats.needs_action > 0 && (
-              <span style={{
-                marginLeft: 6, background: filter === t.key ? 'rgba(255,255,255,0.3)' : '#dc2626',
-                color: '#fff', fontSize: 10, fontWeight: 700, padding: '1px 6px', borderRadius: 10,
-              }}>
-                {activeStats.needs_action}
-              </span>
-            )}
-          </button>
-        ))}
+        {FILTER_TABS.map(t => {
+          const cnt = !t.key ? activeCRs.length
+            : t.key === 'approved' ? activeCRs.filter(c => ['approved', 'pending_cto', 'cto_approved'].includes(c.status)).length
+            : t.key === 'implemented' ? activeCRs.filter(c => ['implementing', 'implemented'].includes(c.status)).length
+            : activeCRs.filter(c => c.status === t.key).length;
+          return (
+            <button key={t.key} onClick={() => setFilter(t.key)} style={{
+              padding: '7px 16px', borderRadius: 7, fontSize: 13, fontWeight: 600,
+              border: '1px solid', cursor: 'pointer',
+              background: filter === t.key ? (isDark ? '#4da3ff' : sectionColor) : (isDark ? '#1e293b' : '#fff'),
+              color: filter === t.key ? '#fff' : (isDark ? '#94a3b8' : '#475569'),
+              borderColor: filter === t.key ? (isDark ? '#4da3ff' : sectionColor) : (isDark ? '#334155' : '#e2e8f0'),
+            }}>
+              {t.label}{cnt > 0 ? ` (${cnt})` : ''}
+            </button>
+          );
+        })}
       </div>
 
       {/* CR list */}
       {loading ? (
         <div className="page-loader" style={{ minHeight: 200 }}><div className="spinner" /></div>
-      ) : activeCRs.length === 0 ? (
+      ) : filteredCRs.length === 0 ? (
         <div style={{
           background: '#fff', borderRadius: 12, border: '1px solid #e2e8f0',
           padding: '60px 20px', textAlign: 'center',
@@ -1037,7 +1039,7 @@ export default function ManagerChangeWorkflow() {
         </div>
       ) : (
         <div>
-          {activeCRs.map(cr => (
+          {filteredCRs.map(cr => (
             <CRCard
               key={cr.id}
               cr={cr}

@@ -994,11 +994,11 @@ export default function NetworkIssues() {
       {/* Today's Routing Modal */}
       {showRouting && (
         <div style={{position:'fixed',inset:0,background:'rgba(15,23,42,0.45)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:1000}} onClick={()=>setShowRouting(false)}>
-          <div onClick={e=>e.stopPropagation()} style={{background:'#fff',borderRadius:12,width:700,maxWidth:'95vw',maxHeight:'80vh',overflowY:'auto',boxShadow:'0 20px 60px rgba(0,0,0,.15)'}}>
+          <div onClick={e=>e.stopPropagation()} style={{background:'#fff',borderRadius:12,width:880,maxWidth:'95vw',maxHeight:'85vh',overflowY:'auto',boxShadow:'0 20px 60px rgba(0,0,0,.15)'}}>
             <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',padding:'16px 24px',borderBottom:'1px solid #e2e8f0'}}>
               <div>
-                <h3 style={{margin:0,fontSize:16,fontWeight:700,color:'#0f172a'}}>Ticket Routing</h3>
-                <p style={{margin:'2px 0 0',fontSize:11,color:'#64748b'}}>Active ticket assignments</p>
+                <h3 style={{margin:0,fontSize:16,fontWeight:700,color:'#0f172a'}}>Today's Routing</h3>
+                <p style={{margin:'2px 0 0',fontSize:11,color:'#64748b'}}>Tickets created or updated today — {routingData.length} ticket{routingData.length!==1?'s':''}</p>
               </div>
               <button onClick={()=>setShowRouting(false)} style={{border:'none',background:'#f1f5f9',borderRadius:6,width:28,height:28,cursor:'pointer',display:'flex',alignItems:'center',justifyContent:'center'}}>{IC.x}</button>
             </div>
@@ -1006,14 +1006,15 @@ export default function NetworkIssues() {
               {routingLoading ? (
                 <div style={{textAlign:'center',padding:40,color:'#94a3b8'}}>Loading...</div>
               ) : routingData.length === 0 ? (
-                <div style={{textAlign:'center',padding:40,color:'#94a3b8',fontSize:13}}>No active tickets.</div>
+                <div style={{textAlign:'center',padding:40,color:'#94a3b8',fontSize:13}}>No tickets created or updated today.</div>
               ) : (
                 <table style={{width:'100%',borderCollapse:'collapse',fontSize:12}}>
                   <thead>
                     <tr style={{borderBottom:'2px solid #e2e8f0'}}>
-                      <th style={{textAlign:'left',padding:'8px 10px',fontWeight:700,color:'#475569',fontSize:11,textTransform:'uppercase'}}>Ticket ID</th>
+                      <th style={{textAlign:'left',padding:'8px 10px',fontWeight:700,color:'#475569',fontSize:11,textTransform:'uppercase'}}>Ticket</th>
                       <th style={{textAlign:'left',padding:'8px 10px',fontWeight:700,color:'#475569',fontSize:11,textTransform:'uppercase'}}>Type</th>
                       <th style={{textAlign:'left',padding:'8px 10px',fontWeight:700,color:'#475569',fontSize:11,textTransform:'uppercase'}}>Site</th>
+                      <th style={{textAlign:'left',padding:'8px 10px',fontWeight:700,color:'#475569',fontSize:11,textTransform:'uppercase'}}>Cells</th>
                       <th style={{textAlign:'left',padding:'8px 10px',fontWeight:700,color:'#475569',fontSize:11,textTransform:'uppercase'}}>Priority</th>
                       <th style={{textAlign:'left',padding:'8px 10px',fontWeight:700,color:'#475569',fontSize:11,textTransform:'uppercase'}}>Status</th>
                       <th style={{textAlign:'left',padding:'8px 10px',fontWeight:700,color:'#475569',fontSize:11,textTransform:'uppercase'}}>Assigned Agent</th>
@@ -1026,15 +1027,17 @@ export default function NetworkIssues() {
                         <tr key={r.ticket_id||i} style={{borderBottom:'1px solid #f1f5f9',background:i%2===0?'#fff':'#f8fafc'}}>
                           <td style={{padding:'8px 10px',fontWeight:700,color:'#00338D',fontFamily:'monospace'}}>#{r.ticket_id}</td>
                           <td style={{padding:'8px 10px'}}><span style={{padding:'2px 8px',borderRadius:10,fontSize:10,fontWeight:700,
-                            background:r.type==='created'?'#16A34A18':'#0091DA18',color:r.type==='created'?'#16A34A':'#0091DA'}}>
-                            {r.type==='created'?'New':'Updated'}</span></td>
-                          <td style={{padding:'8px 10px',fontWeight:600,color:'#0f172a'}}>{r.site_id}</td>
+                            background:r.type==='created'?'#16A34A18':r.type==='updated'?'#0091DA18':'#94a3b818',
+                            color:r.type==='created'?'#16A34A':r.type==='updated'?'#0091DA':'#94a3b8'}}>
+                            {r.type==='created'?'New':r.type==='updated'?'Updated':'Existing'}</span></td>
+                          <td style={{padding:'8px 10px',fontWeight:600,color:'#0f172a'}}>{r.site_id}<br/><span style={{fontSize:10,color:'#64748b'}}>{r.zone}{r.location?' · '+r.location:''}</span></td>
+                          <td style={{padding:'8px 10px',color:'#475569'}}>{r.cell_count} cell{r.cell_count!==1?'s':''}</td>
                           <td style={{padding:'8px 10px'}}><span style={{padding:'2px 8px',borderRadius:10,fontSize:10,fontWeight:700,background:prc.bar+'18',color:prc.bar}}>{r.priority}</span></td>
                           <td style={{padding:'8px 10px'}}><span style={{padding:'2px 8px',borderRadius:10,fontSize:10,fontWeight:700,
                             background:r.status==='resolved'?'#16A34A18':r.status==='in_progress'?'#F59E0B18':'#00338D18',
                             color:r.status==='resolved'?'#16A34A':r.status==='in_progress'?'#F59E0B':'#00338D'}}>
                             {(r.status||'open').replace('_',' ')}</span></td>
-                          <td style={{padding:'8px 10px',fontWeight:600,color:'#0f172a'}}>{r.agent_name || 'Unassigned'}</td>
+                          <td style={{padding:'8px 10px'}}><span style={{fontWeight:600,color:'#0f172a'}}>{r.agent_name || 'Unassigned'}</span>{r.agent_email?<><br/><span style={{fontSize:10,color:'#64748b'}}>{r.agent_email}</span></>:null}</td>
                         </tr>
                       );
                     })}
