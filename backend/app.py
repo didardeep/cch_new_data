@@ -8211,6 +8211,34 @@ with app.app_context():
                     _conn.rollback()
 
 
+def _warm_cto_cache():
+    """Pre-warm Technical & Business KPI caches in background so first page load is instant."""
+    import threading
+    def _warm():
+        import time as _t
+        _t.sleep(8)  # wait for server to be ready
+        try:
+            import requests as _req
+            with app.app_context():
+                cto_user = User.query.filter_by(role="cto").first()
+                if not cto_user:
+                    print("[CACHE WARM] No CTO user, skipping"); return
+                token = create_access_token(identity=str(cto_user.id))
+            headers = {"Authorization": f"Bearer {token}"}
+            for ep in ["/api/cto/technical-kpi", "/api/cto/business-kpi"]:
+                try:
+                    t0 = _t.time()
+                    r = _req.get(f"http://127.0.0.1:5500{ep}", headers=headers, timeout=30)
+                    ms = (_t.time() - t0) * 1000
+                    print(f"[CACHE WARM] {ep} -> {r.status_code} ({ms:.0f}ms)")
+                except Exception as e:
+                    print(f"[CACHE WARM] {ep} failed: {e}")
+        except Exception as e:
+            print(f"[CACHE WARM] error: {e}")
+    threading.Thread(target=_warm, daemon=True).start()
+
+
 if __name__ == "__main__":
     run_sla_checks()
+    _warm_cto_cache()
     socketio.run(app, debug=True, host="0.0.0.0", port=5500, use_reloader=False)
