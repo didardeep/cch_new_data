@@ -15,15 +15,15 @@ import { apiGet } from '../../api';
    DESIGN TOKENS — Premium gradient palette
    ═══════════════════════════════════════════════════════════ */
 const G = {
-  indigo:   ['#6366f1', '#8b5cf6'],   // users
-  violet:   ['#7c3aed', '#9333ea'],   // avg users
-  emerald:  ['#10b981', '#06b6d4'],   // growth+ / roi
-  amber:    ['#f59e0b', '#f97316'],   // arpu / revenue at risk
-  rose:     ['#ef4444', '#ec4899'],   // churn critical / growth-
-  teal:     ['#0d9488', '#06b6d4'],   // info
+  indigo:   ['#00338D', '#4F46E5'],   // users
+  violet:   ['#4F46E5', '#8B5CF6'],   // avg users
+  emerald:  ['#0d9488', '#06B6D4'],   // growth+ / roi
+  amber:    ['#00338D', '#06B6D4'],   // arpu / revenue at risk
+  rose:     ['#ef4444', '#f97316'],   // churn critical / growth-
+  teal:     ['#06B6D4', '#4F46E5'],   // info
   health: (v) => v < 40
-    ? ['#ef4444', '#ec4899']
-    : v < 70 ? ['#f59e0b', '#f97316'] : ['#10b981', '#06b6d4'],
+    ? ['#ef4444', '#f97316']
+    : v < 70 ? ['#f59e0b', '#f97316'] : ['#0d9488', '#06B6D4'],
   glow: (from, opacity = 0.22) =>
     `0 8px 32px ${from}${Math.round(opacity * 255).toString(16).padStart(2, '0')}`,
 };
@@ -74,9 +74,9 @@ function ChartTooltip({ active, payload, label }) {
 /* ─── Gradient Pill Badge ─────────────────────────────────── */
 function Pill({ value, suffix = '', positive, negative, neutral }) {
   let bg, color;
-  if (positive) { bg = 'rgba(16,185,129,0.13)'; color = '#10b981'; }
+  if (positive) { bg = 'rgba(0,51,141,0.1)'; color = '#00338D'; }
   else if (negative) { bg = 'rgba(239,68,68,0.13)'; color = '#ef4444'; }
-  else if (neutral) { bg = 'rgba(245,158,11,0.13)'; color = '#f59e0b'; }
+  else if (neutral) { bg = 'rgba(13,148,136,0.13)'; color = '#0d9488'; }
   else { bg = 'rgba(148,163,184,0.12)'; color = 'var(--text-muted)'; }
   return (
     <span style={{
@@ -202,7 +202,7 @@ function PremiumTable({ cols, rows, emptyText = 'No data' }) {
           <tr
             key={i}
             style={{ borderTop: '1px solid var(--border)', transition: 'background 0.15s' }}
-            onMouseEnter={e => { e.currentTarget.style.background = 'rgba(99,102,241,0.05)'; }}
+            onMouseEnter={e => { e.currentTarget.style.background = 'rgba(0,51,141,0.05)'; }}
             onMouseLeave={e => { e.currentTarget.style.background = 'transparent'; }}
           >
             {cols.map((c) => (
@@ -243,20 +243,20 @@ export default function BusinessKPI() {
   const GradientDefs = () => (
     <defs>
       <linearGradient id="usersGrad"   x1="0" y1="0" x2="0" y2="1">
-        <stop offset="0%"  stopColor="#6366f1" stopOpacity={0.35} />
-        <stop offset="100%" stopColor="#6366f1" stopOpacity={0.02} />
+        <stop offset="0%"  stopColor="#00338D" stopOpacity={0.35} />
+        <stop offset="100%" stopColor="#00338D" stopOpacity={0.02} />
       </linearGradient>
       <linearGradient id="revenueGrad" x1="0" y1="0" x2="0" y2="1">
-        <stop offset="0%"  stopColor="#10b981" stopOpacity={0.35} />
-        <stop offset="100%" stopColor="#10b981" stopOpacity={0.02} />
+        <stop offset="0%"  stopColor="#0d9488" stopOpacity={0.35} />
+        <stop offset="100%" stopColor="#0d9488" stopOpacity={0.02} />
       </linearGradient>
       <linearGradient id="arpuGrad"    x1="0" y1="0" x2="0" y2="1">
-        <stop offset="0%"  stopColor="#f59e0b" stopOpacity={0.35} />
-        <stop offset="100%" stopColor="#f59e0b" stopOpacity={0.02} />
+        <stop offset="0%"  stopColor="#00338D" stopOpacity={0.35} />
+        <stop offset="100%" stopColor="#00338D" stopOpacity={0.02} />
       </linearGradient>
       <linearGradient id="barGrad"     x1="0" y1="0" x2="1" y2="0">
-        <stop offset="0%"  stopColor="#6366f1" />
-        <stop offset="100%" stopColor="#8b5cf6" />
+        <stop offset="0%"  stopColor="#00338D" />
+        <stop offset="100%" stopColor="#4F46E5" />
       </linearGradient>
     </defs>
   );
@@ -342,7 +342,7 @@ export default function BusinessKPI() {
                 ]}
                 allowDecimals={false} />
               <Tooltip content={<ChartTooltip />} />
-              <Area type="monotoneX" dataKey="users" stroke="#6366f1" strokeWidth={3} fill="url(#usersGrad)" name="Users" dot={false} activeDot={{ r: 5, fill: '#6366f1', strokeWidth: 0 }} />
+              <Area type="monotoneX" dataKey="users" stroke="#00338D" strokeWidth={3} fill="url(#usersGrad)" name="Users" dot={false} activeDot={{ r: 5, fill: '#00338D', strokeWidth: 0 }} />
             </AreaChart>
           </ResponsiveContainer>
         </Section>
@@ -360,7 +360,7 @@ export default function BusinessKPI() {
                 ]}
                 allowDecimals={false} />
               <Tooltip content={<ChartTooltip />} />
-              <Area type="monotoneX" dataKey="revenue" stroke="#10b981" strokeWidth={3} fill="url(#revenueGrad)" name="Revenue" dot={false} activeDot={{ r: 5, fill: '#10b981', strokeWidth: 0 }} />
+              <Area type="monotoneX" dataKey="revenue" stroke="#0d9488" strokeWidth={3} fill="url(#revenueGrad)" name="Revenue" dot={false} activeDot={{ r: 5, fill: '#0d9488', strokeWidth: 0 }} />
             </AreaChart>
           </ResponsiveContainer>
         </Section>
@@ -381,7 +381,7 @@ export default function BusinessKPI() {
                 ]}
                 allowDecimals={false} />
               <Tooltip content={<ChartTooltip />} />
-              <Area type="monotoneX" dataKey="arpu" stroke="#f59e0b" strokeWidth={3} fill="url(#arpuGrad)" name="ARPU" dot={false} activeDot={{ r: 5, fill: '#f59e0b', strokeWidth: 0 }} />
+              <Area type="monotoneX" dataKey="arpu" stroke="#00338D" strokeWidth={3} fill="url(#arpuGrad)" name="ARPU" dot={false} activeDot={{ r: 5, fill: '#00338D', strokeWidth: 0 }} />
             </AreaChart>
           </ResponsiveContainer>
         </Section>
