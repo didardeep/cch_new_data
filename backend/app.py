@@ -3166,7 +3166,156 @@ def cto_technical_kpi():
         })
         chart_series[k] = series[-30:]
 
-    result = {"cards": cards, "series": chart_series}
+    # ── KPI Forecast (simple linear regression) ──────────────────────
+    def _linear_forecast(series, forecast_days=7):
+        vals = [p["value"] for p in series]
+        n = len(vals)
+        if n < 2:
+            return None
+        x_mean = (n - 1) / 2.0
+        y_mean = sum(vals) / n
+        num = sum((i - x_mean) * (v - y_mean) for i, v in enumerate(vals))
+        den = sum((i - x_mean) ** 2 for i in range(n))
+        slope = num / den if den else 0
+        intercept = y_mean - slope * x_mean
+        predictions = [round(max(0, slope * (n + i) + intercept), 2) for i in range(forecast_days)]
+        return slope, predictions
+
+    forecast = {}
+    forecast_keys = ["accessibility", "retainability", "downlink_throughput", "prb_utilization"]
+    for k in forecast_keys:
+        s = chart_series.get(k, [])
+        if len(s) < 2:
+            continue
+        result_fc = _linear_forecast(s)
+        if not result_fc:
+            continue
+        slope, preds = result_fc
+        current = s[-1]["value"]
+        predicted_7d = preds[-1] if preds else current
+        # Determine direction: for PRB, up is bad; for others, down is bad
+        if k == "prb_utilization":
+            direction = "up" if slope > 0.01 else ("down" if slope < -0.01 else "stable")
+        else:
+            direction = "up" if slope > 0.01 else ("down" if slope < -0.01 else "stable")
+        forecast[k] = {
+            "current": current,
+            "predicted_7d": predicted_7d,
+            "direction": direction,
+            "daily_change": round(slope, 3),
+        }
+
+    # ── Per-site latest values for the site breakdown table ──────────
+    date_floor_site = date.today() - timedelta(days=7)
+    site_sub = db.session.query(
+        KpiData.site_id,
+        KpiData.kpi_name,
+        sa_func.max(KpiData.date).label("max_date"),
+    ).filter(
+        KpiData.data_level == "site",
+        KpiData.kpi_name.in_(all_names),
+        KpiData.value.isnot(None),
+        KpiData.date >= date_floor_site,
+    ).group_by(KpiData.site_id, KpiData.kpi_name).subquery()
+
+    site_bulk = db.session.query(
+        KpiData.site_id, KpiData.kpi_name, KpiData.value,
+    ).join(site_sub, db.and_(
+        KpiData.site_id == site_sub.c.site_id,
+        KpiData.kpi_name == site_sub.c.kpi_name,
+        KpiData.date == site_sub.c.max_date,
+    )).filter(
+        KpiData.data_level == "site",
+        KpiData.kpi_name.in_(all_names),
+    ).all()
+
+    site_pivot = {}
+    for site_id, kpi_name, value in site_bulk:
+        k = name_to_key.get(kpi_name)
+        if k:
+            site_pivot.setdefault(site_id, {})[k] = round(float(value), 2)
+
+    site_list = []
+    for sid in sorted(site_pivot.keys()):
+        row = {"site_id": sid}
+        row.update(site_pivot[sid])
+        site_list.append(row)
+
+    # Sort by worst accessibility, limit to 50
+    site_list.sort(key=lambda r: r.get("accessibility", 100))
+    site_list = site_list[:50]
+
+    # ── Packet Loss ──────────────────────────────────────────────────
+    # Primary: use network_kpi_timeseries.packet_loss (agent upload)
+    # Fallback: derive from E-RAB Call Drop Rate_1 in kpi_data
+    pl_floor = date.today() - timedelta(days=14)
+    pl_series = []
+    pl_worst = []
+
+    from sqlalchemy import inspect as sa_inspect
+    has_nkt = sa_inspect(db.engine).has_table("network_kpi_timeseries")
+    if has_nkt:
+        # Check if packet_loss data exists
+        nkt_count = db.session.execute(db.text(
+            "SELECT count(*) FROM network_kpi_timeseries WHERE packet_loss IS NOT NULL AND timestamp::date >= :floor"
+        ), {"floor": pl_floor}).scalar()
+    else:
+        nkt_count = 0
+
+    if nkt_count > 0:
+        # ── Primary: real packet_loss from network_kpi_timeseries ──
+        pl_series_rows = db.session.execute(db.text("""
+            SELECT timestamp::date AS d, AVG(packet_loss) AS avg_val
+            FROM network_kpi_timeseries
+            WHERE packet_loss IS NOT NULL AND timestamp::date >= :floor
+            GROUP BY d ORDER BY d
+        """), {"floor": pl_floor}).fetchall()
+        pl_series = [{"date": r.d.isoformat(), "value": round(float(r.avg_val), 2)} for r in pl_series_rows]
+
+        pl_site_rows = db.session.execute(db.text("""
+            SELECT DISTINCT ON (site_id) site_id, packet_loss
+            FROM network_kpi_timeseries
+            WHERE packet_loss IS NOT NULL AND timestamp::date >= :floor
+            ORDER BY site_id, timestamp DESC
+        """), {"floor": pl_floor}).fetchall()
+        pl_worst = sorted(
+            [{"site_id": r.site_id, "value": round(float(r.packet_loss), 2)} for r in pl_site_rows],
+            key=lambda r: r["value"], reverse=True
+        )
+    else:
+        # ── Fallback: derive from E-RAB Call Drop Rate_1 ──
+        pl_name = "E-RAB Call Drop Rate_1"
+        pl_series_rows = db.session.query(
+            KpiData.date,
+            sa_func.avg(KpiData.value).label("avg_val"),
+        ).filter(
+            KpiData.data_level == "site",
+            KpiData.kpi_name == pl_name,
+            KpiData.value.isnot(None),
+            KpiData.date >= pl_floor,
+        ).group_by(KpiData.date).order_by(KpiData.date).all()
+        pl_series = [{"date": r.date.isoformat(), "value": round(float(r.avg_val), 2)} for r in pl_series_rows]
+
+        pl_site_rows = db.session.execute(db.text("""
+            SELECT DISTINCT ON (site_id) site_id, value
+            FROM kpi_data
+            WHERE data_level = 'site' AND kpi_name = :kpi AND value IS NOT NULL AND date >= :floor
+            ORDER BY site_id, date DESC
+        """), {"kpi": pl_name, "floor": pl_floor}).fetchall()
+        pl_worst = sorted(
+            [{"site_id": r.site_id, "value": round(float(r.value), 2)} for r in pl_site_rows],
+            key=lambda r: r["value"], reverse=True
+        )
+
+    pl_avg = round(pl_series[-1]["value"], 2) if pl_series else 0
+    packet_loss = {
+        "avg": pl_avg,
+        "series": pl_series,
+        "worst_sites": pl_worst,
+        "source": "network_kpi_timeseries" if nkt_count > 0 else "kpi_data (E-RAB Call Drop Rate)",
+    }
+
+    result = {"cards": cards, "series": chart_series, "sites": site_list, "packet_loss": packet_loss, "forecast": forecast}
     _cache_set("technical_kpi", result)
     return jsonify(result)
 
@@ -3691,7 +3840,7 @@ def cto_operational_kpi():
     tickets = Ticket.query.all()
     total_tickets = len(tickets)
     resolved_tickets = [t for t in tickets if t.status == "resolved"]
-    sla_breaches = len([t for t in tickets if t.sla_breached])
+    sla_breaches = len([t for t in tickets if t.sla_breached and t.status != "resolved"])
     sla_compliance = round(((total_tickets - sla_breaches) / total_tickets) * 100, 1) if total_tickets else 0
 
     resolution_hours = []
@@ -3739,11 +3888,19 @@ def cto_operational_kpi():
         sign = "-" if rem < 0 else ""
         critical_incidents.append({
             "id": t.reference_number,
+            "db_id": t.id,
             "service": t.category or "General",
+            "subcategory": t.subcategory or "",
             "priority": t.priority or "low",
             "sla_clock": f"{sign}{h:02d}:{m:02d}:{s_val:02d}",
             "sla_remaining": round(rem),
             "status": t.status or "pending",
+            "description": (t.description[:200] if t.description else "No description"),
+            "created_at": t.created_at.isoformat() if t.created_at else None,
+            "sla_hours": t.sla_hours,
+            "assigned_to": t.assignee.name if t.assignee else "Unassigned",
+            "sla_breached": bool(t.sla_breached),
+            "resolution_notes": t.resolution_notes or "",
         })
 
     # ── Escalation trend: last 7 days daily escalated-ticket counts ─────────
@@ -3758,6 +3915,52 @@ def cto_operational_kpi():
         )
         escalation_trend.append(count)
 
+    # ── Ticket growth % vs previous period ────────────────────────────────
+    period_days = 7
+    period_start = now_utc - timedelta(days=period_days)
+    prev_period_start = period_start - timedelta(days=period_days)
+
+    def _in_range(t, start, end):
+        if not t.created_at:
+            return False
+        ca = t.created_at.replace(tzinfo=timezone.utc) if t.created_at.tzinfo is None else t.created_at
+        return start <= ca < end
+
+    current_period_count = sum(1 for t in tickets if _in_range(t, period_start, now_utc))
+    prev_period_count = sum(1 for t in tickets if _in_range(t, prev_period_start, period_start))
+    ticket_growth_pct = round(((current_period_count - prev_period_count) / prev_period_count) * 100, 1) if prev_period_count else 0.0
+
+    # ── Resolution time change vs previous period ─────────────────────────
+    prev_resolved = [t for t in tickets if t.status == "resolved" and t.created_at and t.resolved_at and _in_range(t, prev_period_start, period_start)]
+    prev_res_hours = [(t.resolved_at - t.created_at).total_seconds() / 3600 for t in prev_resolved if t.resolved_at and t.created_at]
+    prev_avg_res = round(sum(prev_res_hours) / len(prev_res_hours), 2) if prev_res_hours else 0
+    resolution_change = round(avg_resolution_time - prev_avg_res, 2)
+
+    # ── Escalation rate change vs previous period ─────────────────────────
+    prev_escalated = sum(1 for t in tickets if t.status in ("escalated", "manager_escalated") and _in_range(t, prev_period_start, period_start))
+    prev_esc_rate = round((prev_escalated / prev_period_count) * 100, 1) if prev_period_count else 0.0
+    escalation_rate_change = round(escalation_rate - prev_esc_rate, 1)
+
+    # ── Highest breach category ───────────────────────────────────────────
+    breach_by_category = {}
+    for t in tickets:
+        if t.sla_breached:
+            cat = t.category or "General"
+            breach_by_category[cat] = breach_by_category.get(cat, 0) + 1
+    top_breach_category = max(breach_by_category, key=breach_by_category.get) if breach_by_category else ""
+
+    # ── Escalation commentary (dynamic) ───────────────────────────────────
+    esc_this_week = sum(escalation_trend[-7:])
+    esc_prev_week = sum(escalation_trend[:7]) if len(escalation_trend) >= 14 else 0
+    if escalation_rate == 0:
+        esc_comment = "No escalations recorded in the current period."
+    elif escalation_rate_change < -1:
+        esc_comment = f"Escalation rate decreased by {abs(escalation_rate_change)}% compared to last period."
+    elif escalation_rate_change > 1:
+        esc_comment = f"Escalation rate increased by {escalation_rate_change}% — review agent capacity and routing rules."
+    else:
+        esc_comment = "Escalation rate is stable compared to last period."
+
     return jsonify({
         "summary": {
             "total_tickets": total_tickets,
@@ -3767,11 +3970,188 @@ def cto_operational_kpi():
             "csat": csat,
             "escalation_rate": escalation_rate,
             "breach_alerts": breach_alerts,
+            "ticket_growth_pct": ticket_growth_pct,
+            "resolution_change": resolution_change,
+            "escalation_rate_change": escalation_rate_change,
+            "top_breach_category": top_breach_category,
+            "escalation_comment": esc_comment,
         },
         "status_breakdown": status_data,
         "agent_workload": workload_data,
         "critical_incidents": critical_incidents,
         "escalation_trend": escalation_trend,
+    })
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CDO ENGAGEMENT KPI ENDPOINT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.route("/api/cto/cdo-engagement-kpi", methods=["GET"])
+@jwt_required()
+def cto_cdo_engagement_kpi():
+    user = _require_cto_user()
+    if not user:
+        return jsonify({"error": "Unauthorized"}), 403
+
+    from sqlalchemy import func as sa_func, extract
+    now_utc = datetime.now(timezone.utc)
+
+    # ── 1. Resolution Funnel ─────────────────────────────────────────────────
+    total_conversations = ChatSession.query.count()
+    escalated_session_ids = set(
+        r[0] for r in db.session.query(Ticket.chat_session_id).filter(
+            Ticket.chat_session_id.isnot(None)
+        ).all()
+    )
+    escalated_count = len(escalated_session_ids)
+    ai_resolved = ChatSession.query.filter(
+        ChatSession.status == "resolved",
+        ~ChatSession.id.in_(escalated_session_ids) if escalated_session_ids else ChatSession.id.isnot(None),
+    ).count()
+    human_resolved = Ticket.query.filter_by(status="resolved").count()
+
+    ai_resolution_rate = round((ai_resolved / total_conversations) * 100, 1) if total_conversations else 0
+    escalation_rate_funnel = round((escalated_count / total_conversations) * 100, 1) if total_conversations else 0
+
+    funnel = {
+        "conversations": total_conversations,
+        "ai_resolved": ai_resolved,
+        "escalated": escalated_count,
+        "human_resolved": human_resolved,
+        "ai_resolution_rate": ai_resolution_rate,
+        "escalation_rate": escalation_rate_funnel,
+    }
+
+    # ── 2. Customer Sentiment Analysis ────────────────────────────────────────
+    ratings = db.session.query(Feedback.rating, sa_func.count(Feedback.id)).filter(
+        Feedback.rating > 0
+    ).group_by(Feedback.rating).all()
+    rating_map = {int(r): c for r, c in ratings}
+    total_feedback = sum(rating_map.values())
+
+    sentiment_labels = {5: "Excellent", 4: "Good", 3: "Neutral", 2: "Poor", 1: "Bad"}
+    sentiment = []
+    for score in [5, 4, 3, 2, 1]:
+        count = rating_map.get(score, 0)
+        sentiment.append({
+            "label": sentiment_labels[score],
+            "count": count,
+            "pct": round((count / total_feedback) * 100, 1) if total_feedback else 0,
+        })
+
+    positive_score = round(((rating_map.get(5, 0) + rating_map.get(4, 0)) / total_feedback) * 100, 1) if total_feedback else 0
+    csat_index = round(sum(r * c for r, c in rating_map.items()) / total_feedback, 2) if total_feedback else 0
+
+    sentiment_data = {
+        "total": total_feedback,
+        "distribution": sentiment,
+        "positive_score": positive_score,
+        "csat_index": csat_index,
+    }
+
+    # ── 3. Weekly Activity Heatmap ────────────────────────────────────────────
+    from models import ChatMessage
+    activity_rows = db.session.query(
+        extract("dow", ChatMessage.created_at).label("dow"),
+        extract("hour", ChatMessage.created_at).label("hr"),
+        sa_func.count(ChatMessage.id),
+    ).filter(
+        ChatMessage.created_at.isnot(None),
+    ).group_by("dow", "hr").all()
+
+    # Build heatmap: {day: {hour: count}}
+    heatmap = []
+    total_activity = sum(r[2] for r in activity_rows)
+    max_activity = max((r[2] for r in activity_rows), default=1)
+    for dow, hr, cnt in activity_rows:
+        heatmap.append({"day": int(dow), "hour": int(hr), "count": cnt})
+
+    # Peak slots and idle calculation
+    total_slots = 7 * 24
+    active_slots = len(activity_rows)
+    idle_pct = round(((total_slots - active_slots) / total_slots) * 100, 1)
+    workforce_util = round((active_slots / total_slots) * 100, 1)
+
+    heatmap_data = {
+        "cells": heatmap,
+        "peak_activity": max_activity,
+        "idle_pct": idle_pct,
+        "workforce_util": workforce_util,
+    }
+
+    # ── 4. Predictive Workload Forecast ───────────────────────────────────────
+    # Daily ticket counts for last 14 days + predict next 7
+    daily_counts = db.session.query(
+        sa_func.date_trunc("day", Ticket.created_at).label("day"),
+        sa_func.count(Ticket.id),
+    ).filter(
+        Ticket.created_at.isnot(None),
+        Ticket.created_at >= now_utc - timedelta(days=14),
+    ).group_by("day").order_by("day").all()
+
+    # Fill in missing days
+    workload_series = []
+    for i in range(14):
+        d = (now_utc - timedelta(days=13 - i)).date()
+        count = next((c for day, c in daily_counts if day.date() == d), 0)
+        workload_series.append({"date": d.isoformat(), "count": count})
+
+    # Simple linear forecast for next 7 days
+    vals = [p["count"] for p in workload_series]
+    n = len(vals)
+    if n >= 2:
+        x_mean = (n - 1) / 2.0
+        y_mean = sum(vals) / n
+        num = sum((i - x_mean) * (v - y_mean) for i, v in enumerate(vals))
+        den = sum((i - x_mean) ** 2 for i in range(n))
+        slope = num / den if den else 0
+        intercept = y_mean - slope * x_mean
+        forecast_vals = [max(0, round(slope * (n + i) + intercept)) for i in range(7)]
+    else:
+        forecast_vals = [0] * 7
+
+    forecast_series = []
+    for i, v in enumerate(forecast_vals):
+        d = (now_utc + timedelta(days=i + 1)).date()
+        forecast_series.append({"date": d.isoformat(), "count": v, "type": "forecast"})
+
+    # Combine last 7 actual + 7 forecast
+    combined_workload = [
+        {**p, "type": "actual"} for p in workload_series[-7:]
+    ] + forecast_series
+
+    total_assigned = Ticket.query.count()
+    total_completed = Ticket.query.filter_by(status="resolved").count()
+    current_rate = round((total_completed / total_assigned) * 100) if total_assigned else 0
+    target_rate = 90
+    gap_to_target = target_rate - current_rate
+
+    workload_data = {
+        "series": combined_workload,
+        "current_rate": current_rate,
+        "target_rate": target_rate,
+        "gap_to_target": gap_to_target,
+        "peak_day": max(combined_workload, key=lambda x: x["count"])["date"] if combined_workload else None,
+    }
+
+    # ── 5. Alerts ─────────────────────────────────────────────────────────────
+    alerts = []
+    if escalation_rate_funnel > 30:
+        alerts.append({"type": "alert", "message": f"Escalation Rate {escalation_rate_funnel}% exceeds 30% threshold"})
+    if ai_resolution_rate < 70:
+        alerts.append({"type": "warning", "message": f"AI Resolution Rate {ai_resolution_rate}% below 70% target"})
+    if positive_score < 85:
+        alerts.append({"type": "critical", "message": f"Sentiment Score {positive_score}% below 85% threshold"})
+    if idle_pct > 40:
+        alerts.append({"type": "info", "message": f"Idle Time {idle_pct}% — optimization needed"})
+
+    return jsonify({
+        "funnel": funnel,
+        "sentiment": sentiment_data,
+        "heatmap": heatmap_data,
+        "workload": workload_data,
+        "alerts": alerts,
     })
 
 

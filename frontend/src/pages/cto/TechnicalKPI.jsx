@@ -62,19 +62,23 @@ function CircleGauge({ value, max = 100, color, size = 60 }) {
 
 /* ─── Mini sparkline bars ─────────────────────────────────── */
 function Sparkline({ series = [], color }) {
-  const vals = series.slice(-8).map(d => d.value || 0);
-  const mx   = Math.max(...vals, 1);
+  const items = series.slice(-8);
+  const mx = Math.max(...items.map(d => d.value || 0), 1);
   return (
     <div style={{ display: 'flex', alignItems: 'flex-end', gap: 3, height: 36, flex: 1 }}>
-      {vals.map((v, i) => (
-        <div key={i} style={{
-          flex: 1, borderRadius: '3px 3px 0 0',
-          background: color,
-          opacity: 0.3 + (v / mx) * 0.55,
-          height: `${Math.max(15, (v / mx) * 100)}%`,
-          transition: 'height 0.5s ease',
-        }} />
-      ))}
+      {items.map((d, i) => {
+        const v = d.value || 0;
+        return (
+          <div key={i} title={`${d.date || ''}: ${v}`} style={{
+            flex: 1, borderRadius: '3px 3px 0 0',
+            background: color,
+            opacity: 0.3 + (v / mx) * 0.55,
+            height: `${Math.max(15, (v / mx) * 100)}%`,
+            transition: 'height 0.5s ease',
+            cursor: 'pointer',
+          }} />
+        );
+      })}
     </div>
   );
 }
@@ -100,7 +104,7 @@ function ChartTooltip({ active, payload, label }) {
 function GradBar({ value, max = 100, colors }) {
   const pct = Math.min(100, Math.max(0, (value / max) * 100));
   return (
-    <div style={{ background: 'var(--border)', borderRadius: 6, height: 5, width: '100%', overflow: 'hidden', marginTop: 8 }}>
+    <div title={`${value} / ${max}`} style={{ background: 'var(--border)', borderRadius: 6, height: 5, width: '100%', overflow: 'hidden', marginTop: 8, cursor: 'pointer' }}>
       <div style={{
         width: `${pct}%`, height: '100%',
         background: lin(colors, 90),
@@ -114,20 +118,32 @@ function GradBar({ value, max = 100, colors }) {
 /* ─── Heatmap grid (for DL/UL volume visual) ──────────────── */
 function HeatGrid({ series = [], color }) {
   const cells = series.slice(-16);
-  const mx = Math.max(...cells.map(d => d.value || 0), 1);
+  const vals = cells.map(d => d?.value || 0);
+  const mn = Math.min(...vals);
+  const mx = Math.max(...vals);
+  const range = mx - mn || 1;
   return (
-    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(8, 1fr)', gap: 3, height: 60 }}>
-      {Array.from({ length: 16 }).map((_, i) => {
-        const v = cells[i]?.value || 0;
-        return (
-          <div key={i} style={{
-            borderRadius: 3,
-            background: color,
-            opacity: 0.12 + (v / mx) * 0.75,
-            transition: 'opacity 0.4s',
-          }} />
-        );
-      })}
+    <div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 8, color: 'var(--text-muted)', marginBottom: 3 }}>
+        <span>Min: <b style={{ color }}>{mn.toFixed(2)}</b></span>
+        <span>Max: <b style={{ color }}>{mx.toFixed(2)}</b></span>
+      </div>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(8, 1fr)', gap: 3, height: 60 }}>
+        {Array.from({ length: 16 }).map((_, i) => {
+          const v = cells[i]?.value || 0;
+          const d = cells[i]?.date || '';
+          const norm = (v - mn) / range;
+          return (
+            <div key={i} title={`${d}: ${v.toLocaleString()}`} style={{
+              borderRadius: 3,
+              background: color,
+              opacity: 0.15 + norm * 0.85,
+              transition: 'opacity 0.4s',
+              cursor: 'pointer',
+            }} />
+          );
+        })}
+      </div>
     </div>
   );
 }
@@ -174,6 +190,7 @@ export default function TechnicalKPI() {
   const [coreData, setCoreData] = useState(null);
   const [coreLoading, setCoreLoading] = useState(false);
   const [coreFetched, setCoreFetched] = useState(false);
+  const [siteSearch, setSiteSearch] = useState('');
 
   useEffect(() => {
     apiGet('/api/cto/technical-kpi').then(setData);
@@ -323,8 +340,8 @@ export default function TechnicalKPI() {
                 {ret.value}{retCfg.unit}
               </div>
               <div style={{ marginTop: 6, display: 'flex', alignItems: 'center', gap: 5, fontSize: 11 }}>
-                <span style={{ width: 7, height: 7, borderRadius: '50%', background: retCfg.colors[0], boxShadow: `0 0 5px ${retCfg.colors[0]}` }} />
-                <span style={{ color: retCfg.colors[0], fontWeight: 600 }}>Stable</span>
+                <span style={{ width: 7, height: 7, borderRadius: '50%', background: ret.value >= 90 ? '#10b981' : ret.value >= 60 ? '#f59e0b' : '#ef4444', boxShadow: `0 0 5px ${ret.value >= 90 ? '#10b981' : ret.value >= 60 ? '#f59e0b' : '#ef4444'}` }} />
+                <span style={{ color: ret.value >= 90 ? '#10b981' : ret.value >= 60 ? '#f59e0b' : '#ef4444', fontWeight: 600 }}>{ret.value >= 90 ? 'Stable' : ret.value >= 60 ? '⚠ Warning' : '⚠ Critical'}</span>
               </div>
             </div>
             <CircleGauge value={ret.value} max={100} color={retCfg.colors[0]} />
@@ -345,8 +362,8 @@ export default function TechnicalKPI() {
               <div style={{ fontSize: 30, fontWeight: 900, background: lin(prbCfg.colors), WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent', backgroundClip: 'text', lineHeight: 1 }}>
                 {prb.value}{prbCfg.unit}
               </div>
-              <div style={{ marginTop: 6, fontSize: 11, color: prbCfg.colors[0], fontWeight: 600, display: 'flex', alignItems: 'center', gap: 4 }}>
-                ⚠ High Load
+              <div style={{ marginTop: 6, fontSize: 11, color: prb.value > 70 ? '#ef4444' : prb.value > 50 ? '#f59e0b' : '#10b981', fontWeight: 600, display: 'flex', alignItems: 'center', gap: 4 }}>
+                {prb.value > 70 ? '⚠ High Load' : prb.value > 50 ? '⚠ Moderate' : '● Normal'}
               </div>
             </div>
             <CircleGauge value={prb.value} max={100} color={prbCfg.colors[0]} />
@@ -427,7 +444,9 @@ export default function TechnicalKPI() {
                 <GradDefs />
                 <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" strokeOpacity={0.6} />
                 <XAxis dataKey="date" tick={{ fontSize: 10, fill: 'var(--text-muted)' }} axisLine={false} tickLine={false} />
-                <YAxis tick={{ fontSize: 10, fill: 'var(--text-muted)' }} axisLine={false} tickLine={false} />
+                <YAxis tick={{ fontSize: 10, fill: 'var(--text-muted)' }} axisLine={false} tickLine={false}
+                  domain={[(dataMin) => Math.floor(dataMin), (dataMax) => Math.ceil(dataMax)]}
+                  allowDecimals={false} />
                 <Tooltip content={<ChartTooltip />} />
                 <Area type="monotoneX" dataKey="value" stroke="#10b981" strokeWidth={3}
                   fill="url(#trendGrad)" name={acc.label} dot={false}
@@ -437,38 +456,56 @@ export default function TechnicalKPI() {
           </div>
         </motion.div>
 
-        {/* ── KPI Status Panel ──────────────────────────────── */}
+        {/* ── KPI Forecast Panel ─────────────────────────────── */}
         <motion.div {...FADE(0.40)} style={{ ...glass, overflow: 'hidden' }}>
-          <div style={{ height: 3, background: lin(retCfg.colors, 90) }} />
+          <div style={{ height: 3, background: 'linear-gradient(90deg, #6366f1, #10b981)' }} />
           <div style={{ padding: '18px 20px 14px', borderBottom: '1px solid var(--border)' }}>
-            <h3 style={{ margin: 0, fontSize: 14, fontWeight: 700, color: 'var(--text)' }}>KPI Performance</h3>
+            <h3 style={{ margin: 0, fontSize: 14, fontWeight: 700, color: 'var(--text)' }}>KPI Forecast <span style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-muted)' }}>(7 Days)</span></h3>
           </div>
-          <div style={{ padding: '12px 20px', display: 'flex', flexDirection: 'column', gap: 14 }}>
-            {[acc, ret, thr, prb, dlv, ulv].map((card) => {
-              const cfg = CFG[card.key] || FALLBACK;
-              const pct = cfg.max ? Math.min(100, (card.value / cfg.max) * 100) : 60;
-              const statusColor = card.key === 'prb_utilization' && card.value > 70
-                ? cfg.colors[0]
-                : card.key === 'accessibility' || card.key === 'retainability'
-                  ? (card.value > 90 ? '#10b981' : card.value > 70 ? '#f59e0b' : '#ef4444')
-                  : cfg.colors[0];
+          <div style={{ padding: '12px 20px', display: 'flex', flexDirection: 'column', gap: 16 }}>
+            {[
+              { key: 'accessibility', label: 'Accessibility', unit: '%', goodUp: true },
+              { key: 'retainability', label: 'Retainability', unit: '%', goodUp: true },
+              { key: 'downlink_throughput', label: 'DL Throughput', unit: '', goodUp: true },
+              { key: 'prb_utilization', label: 'PRB Utilization', unit: '%', goodUp: false },
+            ].map(({ key, label, unit, goodUp }) => {
+              const fc = (data.forecast || {})[key];
+              if (!fc) return null;
+              const diff = fc.predicted_7d - fc.current;
+              const isUp = diff > 0;
+              const isGood = goodUp ? isUp : !isUp;
+              const isNeutral = Math.abs(diff) < 0.05;
+              const color = isNeutral ? 'var(--text-muted)' : isGood ? '#10b981' : '#ef4444';
+              const arrow = isNeutral ? '→' : isUp ? '▲' : '▼';
               return (
-                <div key={card.key}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4, alignItems: 'center' }}>
-                    <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--text)' }}>{card.label}</span>
-                    <span style={{ fontSize: 12, fontWeight: 800, color: statusColor }}>{card.value}{cfg.unit}</span>
+                <div key={key}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+                    <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--text)' }}>{label}</span>
+                    <span style={{ fontSize: 11, fontWeight: 800, color }}>
+                      {arrow} {Math.abs(diff).toFixed(2)}{unit}
+                    </span>
                   </div>
-                  <div style={{ background: 'var(--border)', borderRadius: 4, height: 4, overflow: 'hidden' }}>
-                    <div style={{
-                      width: `${pct}%`, height: '100%',
-                      background: lin(cfg.colors, 90), borderRadius: 4,
-                      transition: 'width 0.9s ease',
-                      boxShadow: `0 0 5px ${cfg.colors[0]}50`,
-                    }} />
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, color: 'var(--text-muted)', marginBottom: 3 }}>
+                        <span>Now: <b style={{ color: 'var(--text)' }}>{fc.current}{unit}</b></span>
+                        <span>7d: <b style={{ color }}>{fc.predicted_7d}{unit}</b></span>
+                      </div>
+                      <div style={{ background: 'var(--border)', borderRadius: 4, height: 4, overflow: 'hidden', position: 'relative' }}>
+                        <div style={{
+                          width: '100%', height: '100%',
+                          background: `linear-gradient(90deg, var(--text-muted) 70%, ${color} 100%)`,
+                          borderRadius: 4, opacity: 0.4,
+                        }} />
+                      </div>
+                    </div>
                   </div>
                 </div>
               );
             })}
+            <div style={{ fontSize: 9, color: 'var(--text-muted)', fontStyle: 'italic', textAlign: 'center', marginTop: 2 }}>
+              Based on linear trend analysis of last 30 days
+            </div>
           </div>
         </motion.div>
       </div>
@@ -478,25 +515,57 @@ export default function TechnicalKPI() {
           ══════════════════════════════════════════════════════ */}
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 16 }}>
 
-        {/* ── PRB Donut ─────────────────────────────────────── */}
+        {/* ── Packet Loss Panel ─────────────────────────────── */}
         <motion.div {...FADE(0.45)} style={{ ...glass, overflow: 'hidden' }}>
-          <div style={{ height: 3, background: lin(prbCfg.colors, 90) }} />
-          <div style={{ padding: '16px 20px' }}>
-            <h4 style={{ margin: '0 0 16px', fontSize: 11, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--text-muted)' }}>
-              PRB Resource Load
-            </h4>
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 24 }}>
-              <Donut value={prb.value} max={100} colors={prbCfg.colors} label="Total Load" />
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-                {[['#f59e0b', 'Used'], ['#6366f1', 'Control'], ['var(--border)', 'Free']].map(([c, l]) => (
-                  <div key={l} style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: 'var(--text-muted)', fontWeight: 600 }}>
-                    <span style={{ width: 8, height: 8, borderRadius: '50%', background: c, flexShrink: 0 }} />
-                    {l}
+          {(() => {
+            const pl = data.packet_loss || {};
+            const avg = pl.avg ?? 0;
+            const plColor = avg < 1 ? '#10b981' : avg < 3 ? '#f59e0b' : '#ef4444';
+            const plLabel = avg < 1 ? 'Normal' : avg < 3 ? 'Warning' : 'Critical';
+            return (
+              <>
+                <div style={{ height: 3, background: `linear-gradient(90deg, ${plColor}, ${plColor}88)` }} />
+                <div style={{ padding: '16px 20px' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+                    <h4 style={{ margin: 0, fontSize: 11, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--text-muted)' }}>
+                      Packet Loss
+                    </h4>
+                    <span style={{
+                      fontSize: 9, fontWeight: 800, padding: '2px 8px', borderRadius: 999,
+                      background: `${plColor}18`, color: plColor, border: `1px solid ${plColor}30`,
+                    }}>{plLabel}</span>
                   </div>
-                ))}
-              </div>
-            </div>
-          </div>
+                  <div style={{ display: 'flex', alignItems: 'flex-end', gap: 16, marginBottom: 12 }}>
+                    <div style={{ fontSize: 36, fontWeight: 900, lineHeight: 1, color: plColor }}>
+                      {avg}<span style={{ fontSize: 16, fontWeight: 600, opacity: 0.6 }}>%</span>
+                    </div>
+                    <Sparkline series={pl.series || []} color={plColor} />
+                  </div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+                    <span style={{ fontSize: 10, fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>
+                      All Sites ({(pl.worst_sites || []).length})
+                    </span>
+                  </div>
+                  <div style={{ maxHeight: 120, overflowY: 'auto' }}>
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                      {(pl.worst_sites || []).map(s => {
+                        const c = s.value < 1 ? '#10b981' : s.value < 3 ? '#f59e0b' : '#ef4444';
+                        return (
+                          <div key={s.site_id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 11, padding: '2px 0', borderBottom: '1px solid var(--border)' }}>
+                            <span style={{ fontWeight: 600, color: 'var(--text)' }}>{s.site_id.replace('GUR_LTE_', '')}</span>
+                            <span style={{ fontWeight: 800, color: c }}>{s.value}%</span>
+                          </div>
+                        );
+                      })}
+                      {(pl.worst_sites || []).length === 0 && (
+                        <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>No data</span>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              </>
+            );
+          })()}
         </motion.div>
 
         {/* ── Throughput mini bars ──────────────────────────── */}
@@ -513,22 +582,36 @@ export default function TechnicalKPI() {
                 </span>
               )}
             </div>
-            <div style={{ display: 'flex', alignItems: 'flex-end', gap: 4, height: 80 }}>
-              {(ser.downlink_throughput || []).slice(-14).map((d, i) => {
-                const mx = Math.max(...(ser.downlink_throughput || []).slice(-14).map(x => x.value), 1);
-                const h  = Math.max(10, (d.value / mx) * 100);
-                return (
-                  <div key={i} style={{
-                    flex: 1, borderRadius: '3px 3px 0 0',
-                    background: lin(thrCfg.colors, 180),
-                    opacity: 0.4 + (d.value / mx) * 0.55,
-                    height: `${h}%`,
-                    transition: 'all 0.3s',
-                    boxShadow: i === 13 ? `0 0 8px ${thrCfg.colors[0]}60` : 'none',
-                  }} />
-                );
-              })}
-            </div>
+            {(() => {
+              const items = (ser.downlink_throughput || []).slice(-14);
+              const vals = items.map(x => x.value);
+              const mn = Math.min(...vals);
+              const mx = Math.max(...vals);
+              const range = mx - mn || 1;
+              return (
+                <>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 9, color: 'var(--text-muted)', marginBottom: 4 }}>
+                    <span>Min: <b style={{ color: thrCfg.colors[0] }}>{mn.toFixed(2)}</b></span>
+                    <span>Max: <b style={{ color: thrCfg.colors[0] }}>{mx.toFixed(2)}</b></span>
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'flex-end', gap: 4, height: 80 }}>
+                    {items.map((d, i) => {
+                      const h = 20 + ((d.value - mn) / range) * 80;
+                      return (
+                        <div key={i} title={`${d.date || ''}: ${d.value} Mbps`} style={{
+                          flex: 1, borderRadius: '3px 3px 0 0',
+                          background: lin(thrCfg.colors, 180),
+                          height: `${h}%`,
+                          transition: 'all 0.3s',
+                          cursor: 'pointer',
+                          boxShadow: i === items.length - 1 ? `0 0 8px ${thrCfg.colors[0]}60` : 'none',
+                        }} />
+                      );
+                    })}
+                  </div>
+                </>
+              );
+            })()}
           </div>
         </motion.div>
 
@@ -820,7 +903,7 @@ function CoreTab({ data, loading, onRetry }) {
               </div>
               <div style={{ height: 48, display: 'flex', alignItems: 'flex-end', gap: 3, opacity: 0.5 }}>
                 {authSparkline.map((v, i) => (
-                  <div key={i} style={{ flex: 1, background: '#fff', borderRadius: '2px 2px 0 0', height: `${Math.max(15, (v / maxAuthSpark) * 100)}%` }} />
+                  <div key={i} title={`${trend.slice(-8)[i]?.date || ''}: ${v}`} style={{ flex: 1, background: '#fff', borderRadius: '2px 2px 0 0', height: `${Math.max(15, (v / maxAuthSpark) * 100)}%`, cursor: 'pointer' }} />
                 ))}
               </div>
             </div>
