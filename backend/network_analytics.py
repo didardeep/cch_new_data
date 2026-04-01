@@ -194,24 +194,38 @@ def _kpi_filter_clause(filters: dict, k_alias: str = "k", ts_alias: str = "ts"):
     if zone:
         parts.append(_multi(f"{ts_alias}.zone", zone, "_fz"))
         needs_ts = True
-    if tech:
-        parts.append(_multi(f"{ts_alias}.technology", tech, "_ft"))
-        needs_ts = True
-    if country:
-        parts.append(f"LOWER({ts_alias}.country) = LOWER(:_fcountry)")
-        params["_fcountry"] = country
-        needs_ts = True
-    if state:
-        parts.append(f"LOWER({ts_alias}.state) = LOWER(:_fstate)")
-        params["_fstate"] = state
-        needs_ts = True
-    if city:
-        parts.append(_multi(f"{ts_alias}.city", city, "_fcity"))
-        needs_ts = True
     if region:
-        parts.append(f"(LOWER({ts_alias}.zone) = LOWER(:_fr) OR LOWER({ts_alias}.city) = LOWER(:_fr) OR LOWER({ts_alias}.state) = LOWER(:_fr))")
+        parts.append(f"(LOWER({ts_alias}.zone) = LOWER(:_fr) OR {k_alias}.site_id IN (SELECT site_id FROM telecom_sites WHERE LOWER(city) = LOWER(:_fr2) OR LOWER(state) = LOWER(:_fr3)))")
         params["_fr"] = region
-        needs_ts = True
+        params["_fr2"] = region
+        params["_fr3"] = region
+        needs_ts = True  # still need ts for zone
+
+    # Geo + tech filters: use subquery to avoid missing-column errors on older DBs
+    _geo = []
+    if tech:
+        _geo.append(_multi("technology", tech, "_ft"))
+    if country:
+        _geo.append(f"LOWER(country) = LOWER(:_fcountry)")
+        params["_fcountry"] = country
+    if state:
+        _geo.append(f"LOWER(state) = LOWER(:_fstate)")
+        params["_fstate"] = state
+    if city:
+        items_c = [v.strip() for v in city.split(",") if v.strip()]
+        if len(items_c) == 1:
+            _geo.append(f"LOWER(city) = LOWER(:_fcity)")
+            params["_fcity"] = items_c[0]
+        else:
+            phs_c = []
+            for i, v in enumerate(items_c):
+                ck = f"_fcity_{i}"
+                params[ck] = v
+                phs_c.append(f"LOWER(:{ck})")
+            _geo.append(f"LOWER(city) IN ({','.join(phs_c)})")
+    if _geo:
+        parts.append(f"{k_alias}.site_id IN (SELECT site_id FROM telecom_sites WHERE {' AND '.join(_geo)})")
+        # no needs_ts — using subquery instead of ts join
     if site:
         parts.append(f"LOWER({k_alias}.site_id) = LOWER(:_fs)")
         params["_fs"] = site
@@ -301,7 +315,9 @@ def _dynamic_time_filter(time_range: str = "24h") -> str:
 
 def _build_where(filters: dict, table_prefix: str = "") -> tuple[str, dict]:
     """WHERE clause for network_kpi_timeseries (timestamp-based). Only adds
-    timestamp filter when that table actually has data."""
+    timestamp filter when that table actually has data.
+    Supports multi-select (comma-separated) for cluster and technology.
+    Supports country/state/city via subquery to telecom_sites."""
     col = lambda c: f"{table_prefix}.{c}" if table_prefix else c
     parts, params = ["1=1"], {}
     _, latest = _get_data_window()
@@ -312,16 +328,55 @@ def _build_where(filters: dict, table_prefix: str = "") -> tuple[str, dict]:
     if filters.get("region"):
         parts.append(f"LOWER({col('region')}) = LOWER(:region)")
         params["region"] = filters["region"]
+
+    # Multi-select helper for _build_where
+    def _bw_multi(column, val, prefix):
+        items = [v.strip() for v in val.split(",") if v.strip()]
+        if len(items) == 1:
+            params[prefix] = items[0]
+            return f"LOWER({column}) = LOWER(:{prefix})"
+        phs = []
+        for i, v in enumerate(items):
+            key = f"{prefix}_{i}"
+            params[key] = v
+            phs.append(f"LOWER(:{key})")
+        return f"LOWER({column}) IN ({','.join(phs)})"
+
     if filters.get("cluster") or filters.get("zone"):
         v = filters.get("cluster") or filters.get("zone")
-        parts.append(f"LOWER({col('cluster')}) = LOWER(:cluster)")
-        params["cluster"] = v
+        parts.append(_bw_multi(col('cluster'), v, 'cluster'))
     if filters.get("site"):
         parts.append(f"LOWER({col('site_id')}) = LOWER(:site)")
         params["site"] = filters["site"]
     if filters.get("technology"):
-        parts.append(f"LOWER({col('technology')}) = LOWER(:technology)")
-        params["technology"] = filters["technology"]
+        parts.append(_bw_multi(col('technology'), filters["technology"], 'technology'))
+
+    # Country / State / City — filter via telecom_sites subquery on site_id
+    geo_parts = []
+    geo_params = {}
+    if filters.get("country"):
+        geo_parts.append("LOWER(country) = LOWER(:_bw_country)")
+        geo_params["_bw_country"] = filters["country"]
+    if filters.get("state"):
+        geo_parts.append("LOWER(state) = LOWER(:_bw_state)")
+        geo_params["_bw_state"] = filters["state"]
+    if filters.get("city"):
+        items = [v.strip() for v in filters["city"].split(",") if v.strip()]
+        if len(items) == 1:
+            geo_parts.append("LOWER(city) = LOWER(:_bw_city)")
+            geo_params["_bw_city"] = items[0]
+        else:
+            phs_city = []
+            for i, v in enumerate(items):
+                ck = f"_bw_city_{i}"
+                geo_params[ck] = v
+                phs_city.append(f"LOWER(:{ck})")
+            geo_parts.append(f"LOWER(city) IN ({','.join(phs_city)})")
+    if geo_parts:
+        sub = f"{col('site_id')} IN (SELECT DISTINCT site_id FROM telecom_sites WHERE {' AND '.join(geo_parts)})"
+        parts.append(sub)
+        params.update(geo_params)
+
     return " AND ".join(parts), params
 
 
@@ -403,6 +458,7 @@ def _kpi_where(filters: dict):
     """WHERE clause for kpi_data queries. Aliases: k=kpi_data, ts=telecom_sites.
     Always restricts to site-level data (data_level='site') for network-wide
     aggregations — cell-level rows (17M+) are excluded to keep queries fast.
+    Now also applies zone, technology, country, state, city filters via subquery.
     """
     from_date, to_date = _kpi_date_range(filters)
     parts = ["k.value IS NOT NULL", "k.data_level = 'site'"]
@@ -413,27 +469,106 @@ def _kpi_where(filters: dict):
         parts.append("k.date <= :kd_to");   params["kd_to"]   = to_date
     if filters and filters.get("site"):
         parts.append("LOWER(k.site_id) = LOWER(:kd_site)"); params["kd_site"] = filters["site"]
+
+    # Geo + technology filters via telecom_sites subquery
+    def _kw_multi(col, val, prefix):
+        items = [v.strip() for v in val.split(",") if v.strip()]
+        if len(items) == 1:
+            params[f"{prefix}"] = items[0]
+            return f"LOWER({col}) = LOWER(:{prefix})"
+        phs = []
+        for i, v in enumerate(items):
+            key = f"{prefix}_{i}"
+            params[key] = v
+            phs.append(f"LOWER(:{key})")
+        return f"LOWER({col}) IN ({','.join(phs)})"
+
+    geo = []
+    if filters and filters.get("cluster"):
+        geo.append(_kw_multi("zone", filters["cluster"], "_kw_zone"))
+    if filters and filters.get("technology"):
+        geo.append(_kw_multi("technology", filters["technology"], "_kw_tech"))
+    if filters and filters.get("country"):
+        geo.append("LOWER(country) = LOWER(:_kw_country)")
+        params["_kw_country"] = filters["country"]
+    if filters and filters.get("state"):
+        geo.append("LOWER(state) = LOWER(:_kw_state)")
+        params["_kw_state"] = filters["state"]
+    if filters and filters.get("city"):
+        items_c = [v.strip() for v in filters["city"].split(",") if v.strip()]
+        if len(items_c) == 1:
+            geo.append(f"LOWER(city) = LOWER(:_kw_city)")
+            params["_kw_city"] = items_c[0]
+        else:
+            phs_c = []
+            for i, v in enumerate(items_c):
+                ck = f"_kw_city_{i}"
+                params[ck] = v
+                phs_c.append(f"LOWER(:{ck})")
+            geo.append(f"LOWER(city) IN ({','.join(phs_c)})")
+    if geo:
+        parts.append(f"k.site_id IN (SELECT site_id FROM telecom_sites WHERE {' AND '.join(geo)})")
+
     return " AND ".join(parts), params
 
 
 def _zone_join(filters: dict):
-    """LEFT JOIN telecom_sites; add zone WHERE only when filter set."""
+    """LEFT JOIN telecom_sites; add zone/geo WHERE clauses."""
     zone = (filters or {}).get("cluster") or (filters or {}).get("zone") or ""
     join = "LEFT JOIN telecom_sites ts ON LOWER(k.site_id) = LOWER(ts.site_id)"
+    parts = []
+    params = {}
+
+    def _zj_multi(col, val, prefix):
+        items = [v.strip() for v in val.split(",") if v.strip()]
+        if len(items) == 1:
+            params[prefix] = items[0]
+            return f"LOWER({col}) = LOWER(:{prefix})"
+        phs = []
+        for i, v in enumerate(items):
+            key = f"{prefix}_{i}"
+            params[key] = v
+            phs.append(f"LOWER(:{key})")
+        return f"LOWER({col}) IN ({','.join(phs)})"
+
     if zone:
-        return join, "AND LOWER(ts.zone) = LOWER(:zone_val)", {"zone_val": zone}
-    return join, "", {}
+        parts.append(_zj_multi("ts.zone", zone, "zone_val"))
+    if (filters or {}).get("technology"):
+        parts.append(_zj_multi("ts.technology", filters["technology"], "_zj_tech"))
+    if (filters or {}).get("country"):
+        parts.append("LOWER(ts.country) = LOWER(:_zj_country)")
+        params["_zj_country"] = filters["country"]
+    if (filters or {}).get("state"):
+        parts.append("(LOWER(ts.state) = LOWER(:_zj_state) OR LOWER(ts.city) = LOWER(:_zj_state2))")
+        params["_zj_state"] = filters["state"]
+        params["_zj_state2"] = filters["state"]
+    if (filters or {}).get("city"):
+        items_c = [v.strip() for v in filters["city"].split(",") if v.strip()]
+        if len(items_c) == 1:
+            parts.append(f"(LOWER(ts.city) = LOWER(:_zj_city) OR LOWER(ts.state) = LOWER(:_zj_city2))")
+            params["_zj_city"] = items_c[0]
+            params["_zj_city2"] = items_c[0]
+        else:
+            phs_c, phs_s = [], []
+            for i, v in enumerate(items_c):
+                ck = f"_zj_city_{i}"
+                sk = f"_zj_cityst_{i}"
+                params[ck] = v
+                params[sk] = v
+                phs_c.append(f"LOWER(:{ck})")
+                phs_s.append(f"LOWER(:{sk})")
+            parts.append(f"(LOWER(ts.city) IN ({','.join(phs_c)}) OR LOWER(ts.state) IN ({','.join(phs_s)}))")
+
+    extra_where = ("AND " + " AND ".join(parts)) if parts else ""
+    return join, extra_where, params
 
 
 def _kpi_network_agg(filters: dict) -> dict:
     """Network-wide KPI averages from kpi_data — ALL rows (site + cell level)."""
     where_sql, where_params = _kpi_where(filters)
-    zone = (filters or {}).get("cluster") or (filters or {}).get("zone") or ""
-    zone_join = "LEFT JOIN telecom_sites ts ON LOWER(k.site_id) = LOWER(ts.site_id)"
-    zone_where = "AND LOWER(ts.zone) = LOWER(:zone_val)" if zone else ""
-    params = {**where_params}
-    if zone:
-        params["zone_val"] = zone
+    join_sql, extra_where, extra_params = _zone_join(filters)
+    needs_join = bool(extra_where)
+    params = {**where_params, **extra_params}
     internal: dict = {}
     max_sites = 0
     try:
@@ -441,8 +576,8 @@ def _kpi_network_agg(filters: dict) -> dict:
             SELECT k.kpi_name,
                    AVG(k.value)              AS avg_val,
                    COUNT(DISTINCT k.site_id) AS n_sites
-            FROM kpi_data k {zone_join if zone else ""}
-            WHERE {where_sql} {zone_where}
+            FROM kpi_data k {join_sql if needs_join else ""}
+            WHERE {where_sql} {extra_where}
             GROUP BY k.kpi_name
         """, params)
         for r in rows:
@@ -454,9 +589,12 @@ def _kpi_network_agg(filters: dict) -> dict:
                 max_sites = n
     except Exception as e:
         _LOG.error("_kpi_network_agg: %s", e, exc_info=True)
-    # Authoritative site count directly from kpi_data
+    # Authoritative site count — respect filters
     try:
-        cnt = _sql("SELECT COUNT(DISTINCT site_id) AS n FROM kpi_data")
+        if needs_join:
+            cnt = _sql(f"SELECT COUNT(DISTINCT k.site_id) AS n FROM kpi_data k {join_sql} WHERE {where_sql} {extra_where}", params)
+        else:
+            cnt = _sql(f"SELECT COUNT(DISTINCT site_id) AS n FROM kpi_data WHERE {where_sql}", where_params)
         direct = int((cnt[0].get("n") or 0) if cnt else 0)
         if direct > max_sites:
             max_sites = direct
@@ -468,12 +606,8 @@ def _kpi_network_agg(filters: dict) -> dict:
 def _kpi_site_list(filters: dict) -> list[dict]:
     """Per-site KPI pivot from kpi_data joined with telecom_sites for geo/zone."""
     where_sql, where_params = _kpi_where(filters)
-    zone = (filters or {}).get("cluster") or (filters or {}).get("zone") or ""
-    zone_join = "LEFT JOIN telecom_sites ts ON LOWER(k.site_id) = LOWER(ts.site_id)"
-    zone_where = "AND LOWER(ts.zone) = LOWER(:zone_val)" if zone else ""
-    params = {**where_params}
-    if zone:
-        params["zone_val"] = zone
+    join_sql, extra_where, extra_params = _zone_join(filters)
+    params = {**where_params, **extra_params}
     try:
         rows = _sql(f"""
             SELECT k.site_id,
@@ -482,9 +616,8 @@ def _kpi_site_list(filters: dict) -> list[dict]:
                    MAX(ts.zone)      AS zone,
                    AVG(ts.latitude)  AS lat,
                    AVG(ts.longitude) AS lng
-            FROM kpi_data k LEFT JOIN telecom_sites ts
-                 ON LOWER(k.site_id) = LOWER(ts.site_id)
-            WHERE {where_sql} {zone_where}
+            FROM kpi_data k {join_sql}
+            WHERE {where_sql} {extra_where}
             GROUP BY k.site_id, k.kpi_name
             LIMIT 60000
         """, params)
@@ -1487,13 +1620,16 @@ def network_summary():
         except Exception:
             pass
 
-    try:
-        ts_cnt = _sql("SELECT COUNT(DISTINCT site_id) AS s, COUNT(*) AS c FROM telecom_sites")
-        n_sites = int(ts_cnt[0].get("s") or 0) if ts_cnt else 0
-        n_cells = int(ts_cnt[0].get("c") or 0) if ts_cnt else n_sites
-    except Exception:
-        n_sites = int(agg.get("total_sites") or 0)
-        n_cells = n_sites
+    # Use filtered site count from _kpi_network_agg; fall back to telecom_sites
+    n_sites = int(agg.get("total_sites") or 0)
+    n_cells = n_sites
+    if not n_sites:
+        try:
+            ts_cnt = _sql("SELECT COUNT(DISTINCT site_id) AS s, COUNT(*) AS c FROM telecom_sites")
+            n_sites = int(ts_cnt[0].get("s") or 0) if ts_cnt else 0
+            n_cells = int(ts_cnt[0].get("c") or 0) if ts_cnt else n_sites
+        except Exception:
+            pass
 
     r: dict = {}
     if n_sites > 0:
@@ -1994,8 +2130,10 @@ def core_analytics():
     if _z:
         _geo_parts.append(f"LOWER(zone) IN ({','.join([chr(39)+v.strip().lower()+chr(39) for v in _z.split(',') if v.strip()])})" if "," in _z else f"LOWER(zone) = '{_z.lower()}'")
     if _ci:
-        _geo_parts.append(f"LOWER(city) IN ({','.join([chr(39)+v.strip().lower()+chr(39) for v in _ci.split(',') if v.strip()])})" if "," in _ci else f"LOWER(city) = '{_ci.lower()}'")
-    if _st: _geo_parts.append(f"LOWER(state) = '{_st.lower()}'")
+        _ci_vals = ','.join([chr(39)+v.strip().lower()+chr(39) for v in _ci.split(',') if v.strip()])
+        _geo_parts.append(f"LOWER(city) IN ({_ci_vals})" if "," in _ci else f"LOWER(city) = '{_ci.lower()}'")
+    if _st:
+        _geo_parts.append(f"LOWER(state) = '{_st.lower()}'")
     if _co: _geo_parts.append(f"LOWER(country) = '{_co.lower()}'")
     if _te:
         _geo_parts.append(f"LOWER(technology) IN ({','.join([chr(39)+v.strip().lower()+chr(39) for v in _te.split(',') if v.strip()])})" if "," in _te else f"LOWER(technology) = '{_te.lower()}'")
@@ -2209,8 +2347,10 @@ def transport_analytics():
     if _tz:
         _tg.append(f"LOWER(zone) IN ({','.join([chr(39)+v.strip().lower()+chr(39) for v in _tz.split(',') if v.strip()])})" if "," in _tz else f"LOWER(zone) = '{_tz.lower()}'")
     if _tci:
-        _tg.append(f"LOWER(city) IN ({','.join([chr(39)+v.strip().lower()+chr(39) for v in _tci.split(',') if v.strip()])})" if "," in _tci else f"LOWER(city) = '{_tci.lower()}'")
-    if _tst: _tg.append(f"LOWER(state) = '{_tst.lower()}'")
+        _tci_vals = ','.join([chr(39)+v.strip().lower()+chr(39) for v in _tci.split(',') if v.strip()])
+        _tg.append(f"LOWER(city) IN ({_tci_vals})" if "," in _tci else f"LOWER(city) = '{_tci.lower()}'")
+    if _tst:
+        _tg.append(f"LOWER(state) = '{_tst.lower()}'")
     if _tco: _tg.append(f"LOWER(country) = '{_tco.lower()}'")
     if _tte:
         _tg.append(f"LOWER(technology) IN ({','.join([chr(39)+v.strip().lower()+chr(39) for v in _tte.split(',') if v.strip()])})" if "," in _tte else f"LOWER(technology) = '{_tte.lower()}'")
@@ -2878,8 +3018,12 @@ def network_kpi_filter():
 @network_bp.route("/api/network/filters", methods=["GET"])
 @jwt_required()
 def network_filters():
-    """Filter options for dropdowns — unions from all tables."""
-    ck = "filters_v5"
+    """Filter options for dropdowns — unions from all tables.
+    Accepts ?country=X&state=Y to cascade state/city options."""
+    sel_country = request.args.get("country", "").strip() or None
+    sel_state   = request.args.get("state",   "").strip() or None
+
+    ck = f"filters_v6_{sel_country or ''}_{sel_state or ''}"
     cached = _from_cache(ck)
     if cached:
         return jsonify(cached)
@@ -2915,18 +3059,42 @@ def network_filters():
     except Exception:
         pass
 
+    # Also pull technology from telecom_sites
+    try:
+        for r in _sql("SELECT DISTINCT technology FROM telecom_sites WHERE technology IS NOT NULL AND technology != '' ORDER BY technology"):
+            techs_set.add(r["technology"])
+    except Exception:
+        pass
+
     zones = sorted(zones_set)
 
-    # ── Country / State / City from telecom_sites (real geo data) ─────────
+    # ── Country / State / City from telecom_sites — cascaded by selection ─────
     countries_set = set()
     states_set = set()
     cities_set = set()
     try:
         for r in _sql("SELECT DISTINCT country FROM telecom_sites WHERE country IS NOT NULL AND country != '' ORDER BY country"):
             countries_set.add(r["country"])
-        for r in _sql("SELECT DISTINCT state FROM telecom_sites WHERE state IS NOT NULL AND state != '' ORDER BY state"):
-            states_set.add(r["state"])
-        for r in _sql("SELECT DISTINCT city FROM telecom_sites WHERE city IS NOT NULL AND city != '' ORDER BY city"):
+
+        # States: filtered by country if selected
+        if sel_country:
+            for r in _sql("SELECT DISTINCT state FROM telecom_sites WHERE state IS NOT NULL AND state != '' AND LOWER(country) = LOWER(:c) ORDER BY state",
+                          {"c": sel_country}):
+                states_set.add(r["state"])
+        else:
+            for r in _sql("SELECT DISTINCT state FROM telecom_sites WHERE state IS NOT NULL AND state != '' ORDER BY state"):
+                states_set.add(r["state"])
+
+        # Cities: filtered by state (and country) if selected
+        city_where = "city IS NOT NULL AND city != ''"
+        city_params = {}
+        if sel_country:
+            city_where += " AND LOWER(country) = LOWER(:c)"
+            city_params["c"] = sel_country
+        if sel_state:
+            city_where += " AND LOWER(state) = LOWER(:s)"
+            city_params["s"] = sel_state
+        for r in _sql(f"SELECT DISTINCT city FROM telecom_sites WHERE {city_where} ORDER BY city", city_params):
             cities_set.add(r["city"])
     except Exception:
         pass
@@ -2938,8 +3106,8 @@ def network_filters():
         "technologies": sorted(techs_set),
         "sites":        sorted(sites_set)[:1000],
         "countries":    sorted(countries_set) or ["India"],
-        "states":       sorted(states_set) or ["Haryana"],
-        "cities":       sorted(cities_set) or ["Gurgaon"],
+        "states":       sorted(states_set),
+        "cities":       sorted(cities_set),
     }
     _to_cache(ck, result)
     return jsonify(result)
@@ -4507,8 +4675,16 @@ def overview_stats():
                     phs.append(f"LOWER(:_tz{i})")
                 _ts_parts.append(f"LOWER(zone) IN ({','.join(phs)})")
         if _city_f:
-            _ts_parts.append("LOWER(city) = LOWER(:_tc)")
-            _ts_params["_tc"] = _city_f
+            city_items = [v.strip() for v in _city_f.split(",") if v.strip()]
+            if len(city_items) == 1:
+                _ts_parts.append("LOWER(city) = LOWER(:_tc)")
+                _ts_params["_tc"] = city_items[0]
+            else:
+                city_phs = []
+                for i, v in enumerate(city_items):
+                    _ts_params[f"_tc{i}"] = v
+                    city_phs.append(f"LOWER(:_tc{i})")
+                _ts_parts.append(f"LOWER(city) IN ({','.join(city_phs)})")
         if _state_f:
             _ts_parts.append("LOWER(state) = LOWER(:_tst)")
             _ts_params["_tst"] = _state_f

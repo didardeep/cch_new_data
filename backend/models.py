@@ -408,6 +408,8 @@ class TelecomSite(db.Model):
     zone = db.Column(db.String(100), default="")
     city = db.Column(db.String(100), nullable=True)
     state = db.Column(db.String(100), nullable=True)
+    country = db.Column(db.String(100), default="India")
+    technology = db.Column(db.String(50), nullable=True)
     site_status = db.Column(db.String(20), default="on_air")   # 'on_air' or 'off_air'
     alarms = db.Column(db.Text, default="")
     solution = db.Column(db.Text, default="")
@@ -434,6 +436,8 @@ class TelecomSite(db.Model):
             "zone": self.zone,
             "city": self.city,
             "state": self.state,
+            "country": self.country or "India",
+            "technology": self.technology or "",
             "site_status": self.site_status or "on_air",
             "alarms": self.alarms or "",
             "solution": self.solution or "",
@@ -546,6 +550,10 @@ class ChangeRequest(db.Model):
     # ── CR SLA ──────────────────────────────────────────────────────────────
     cr_sla_hours       = db.Column(db.Float, nullable=True)
     cr_sla_deadline    = db.Column(db.DateTime, nullable=True)
+    cr_sla_breached    = db.Column(db.Boolean, default=False)
+    cr_breach_alert_sent = db.Column(db.Boolean, default=False)
+    cr_alert_75_sent   = db.Column(db.Boolean, default=False)
+    cr_alert_90_sent   = db.Column(db.Boolean, default=False)
 
     # ── Manager assignment ──────────────────────────────────────────────────
     assigned_manager_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=True)
@@ -644,6 +652,7 @@ class ChangeRequest(db.Model):
             "change_type":          self.change_type,
             "cr_sla_hours":         self.cr_sla_hours,
             "cr_sla_deadline":      self.cr_sla_deadline.isoformat() if self.cr_sla_deadline else None,
+            "cr_sla_breached":      self.cr_sla_breached or False,
             "assigned_manager_id":  self.assigned_manager_id,
             "assigned_manager_name": self.assigned_manager.name if self.assigned_manager else "",
             "assigned_manager_email": self.assigned_manager.email if self.assigned_manager else "",
@@ -701,6 +710,46 @@ class CRAuditTrail(db.Model):
             "new_status": self.new_status,
             "notes": self.notes,
             "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class CrSlaAlert(db.Model):
+    """SLA alerts for Change Requests — sent to CTO/manager when CR SLA approaches or breaches."""
+    __tablename__ = "cr_sla_alerts"
+
+    id             = db.Column(db.Integer, primary_key=True)
+    cr_id          = db.Column(db.Integer, db.ForeignKey("change_requests.id"), nullable=False)
+    alert_level    = db.Column(db.String(10), nullable=False)     # '75', '90', 'breach'
+    recipient_role = db.Column(db.String(20), nullable=False)     # 'manager' or 'cto'
+    message        = db.Column(db.String(500), nullable=False)
+    is_read        = db.Column(db.Boolean, default=False)
+    created_at     = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+
+    cr = db.relationship("ChangeRequest", backref="sla_alerts")
+
+    def to_dict(self):
+        c = self.cr
+        return {
+            "id": self.id,
+            "cr_id": self.cr_id,
+            "cr_number": c.cr_number if c else "",
+            "alert_level": self.alert_level,
+            "recipient_role": self.recipient_role,
+            "message": self.message,
+            "is_read": self.is_read,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "change_type": c.change_type if c else "",
+            "status": c.status if c else "",
+            "title": c.title if c else "",
+            "category": c.category if c else "",
+            "subcategory": c.subcategory if c else "",
+            "zone": c.zone if c else "",
+            "cr_sla_hours": c.cr_sla_hours if c else None,
+            "cr_sla_deadline": c.cr_sla_deadline.isoformat() if c and c.cr_sla_deadline else None,
+            "raised_by_name": c.raiser.name if c and c.raiser else "",
+            "assigned_manager_name": c.assigned_manager.name if c and c.assigned_manager else "",
+            "ticket_ref": c.ticket.reference_number if c and c.ticket else "",
+            "source": "customer" if (c and c.ticket_id and not c.network_issue_id) else "ai",
         }
 
 

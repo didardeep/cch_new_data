@@ -425,17 +425,32 @@ def manager_list():
 @change_workflow_bp.route("/api/cr/cto-list", methods=["GET"])
 @jwt_required()
 def cto_list():
-    """List CRs requiring CTO approval (urgent + emergency only)."""
+    """List all CRs for CTO — full lifecycle view.
+    Includes urgent/emergency that need CTO approval AND all other CRs for oversight."""
     user, user_id = _get_user()
     if not user or user.role not in ("cto", "admin"):
         return jsonify({"error": "Unauthorized"}), 403
 
-    crs = ChangeRequest.query.filter(
-        ChangeRequest.change_type.in_(["urgent", "emergency"]),
-        ChangeRequest.cto_approval_required == True,
-    ).order_by(ChangeRequest.created_at.desc()).all()
+    status_filter = request.args.get("status", "").strip() or None
 
-    return jsonify({"crs": [c.to_dict() for c in crs], "total": len(crs)})
+    q = ChangeRequest.query
+
+    if status_filter:
+        q = q.filter(ChangeRequest.status == status_filter)
+
+    crs = q.order_by(ChangeRequest.created_at.desc()).all()
+
+    # Split counts for summary
+    all_crs = crs
+    customer_crs = [c for c in all_crs if c.ticket_id and not c.network_issue_id]
+    ai_crs = [c for c in all_crs if c.network_issue_id]
+
+    return jsonify({
+        "crs": [c.to_dict() for c in crs],
+        "total": len(crs),
+        "customer_count": len(customer_crs),
+        "ai_count": len(ai_crs),
+    })
 
 
 @change_workflow_bp.route("/api/cr/<int:cr_id>", methods=["GET"])

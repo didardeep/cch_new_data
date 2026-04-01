@@ -52,7 +52,7 @@ app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", os.urandom(24).hex())
 app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get(
     "DATABASE_URL",
-    "postgresql://postgres:postgres@localhost:5432/telecom_complaints"
+    "postgresql://postgres:ROOT@localhost:5432/telecom_cch"
 )
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 app.config["JWT_SECRET_KEY"] = os.environ.get("JWT_SECRET", "super-secret-jwt-key-change-in-prod")
@@ -3593,14 +3593,13 @@ def _business_kpi_from_flexible():
     MONTH_ORDER = ["jan", "feb", "mar", "apr", "may", "jun",
                    "jul", "aug", "sep", "oct", "nov", "dec"]
     sample = next(iter(sites.values()))
-    # Support both old format (revenue_jan_l) and new format (Revenue Jan (₹L))
     rev_cols = sorted(
-        [k for k in sample if (k.lower().startswith("revenue") and any(m in k.lower() for m in MONTH_ORDER)) and isinstance(sample.get(k), (int, float))],
-        key=lambda c: next((i for i, m in enumerate(MONTH_ORDER) if m in c.lower()), 99)
+        [k for k in sample if k.startswith("revenue_") and isinstance(sample.get(k), (int, float))],
+        key=lambda c: next((i for i, m in enumerate(MONTH_ORDER) if m in c), 99)
     )
     opex_cols = sorted(
-        [k for k in sample if (k.lower().startswith("opex") or k.lower().startswith("op")) and any(m in k.lower() for m in MONTH_ORDER) and isinstance(sample.get(k), (int, float))],
-        key=lambda c: next((i for i, m in enumerate(MONTH_ORDER) if m in c.lower()), 99)
+        [k for k in sample if k.startswith("opex_") and isinstance(sample.get(k), (int, float))],
+        key=lambda c: next((i for i, m in enumerate(MONTH_ORDER) if m in c), 99)
     )
 
     latest_rev_col = rev_cols[-1] if rev_cols else None
@@ -3624,7 +3623,7 @@ def _business_kpi_from_flexible():
     # ── Build per-site rows ──────────────────────────────────────────────────
     site_rows = []
     for site_id, data in sites.items():
-        subs    = data.get("subscribers", data.get("Subscribers", 0))
+        subs    = data.get("subscribers", 0)
         rev_now = data.get(latest_rev_col, 0) if latest_rev_col else 0
         rev_prev = data.get(prev_rev_col, 0) if prev_rev_col else 0
         opex    = data.get(latest_opex_col, 0) if latest_opex_col else 0
@@ -3639,9 +3638,9 @@ def _business_kpi_from_flexible():
             "arpu": round(arpu, 2),
             "growth": growth,
             "utilization": round(util_val, 2),
-            "zone": data.get("zone", data.get("Zone", "")),
-            "technology": data.get("technology", data.get("Technology", "")),
-            "category": data.get("site_category", data.get("Site Category", "")),
+            "zone": data.get("zone", ""),
+            "technology": data.get("technology", ""),
+            "category": data.get("site_category", ""),
         })
 
     num_sites     = len(site_rows) or 1
@@ -4296,6 +4295,96 @@ def cto_mark_all_alerts_read():
     if user.role != "cto":
         return jsonify({"error": "Unauthorized"}), 403
     SlaAlert.query.filter_by(recipient_role="cto", is_read=False).update({"is_read": True})
+    db.session.commit()
+    return jsonify({"success": True})
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CR SLA ALERTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.route("/api/cto/cr-alerts", methods=["GET"])
+@jwt_required()
+def cto_cr_alerts():
+    """CR SLA alerts for CTO — breach + 90% warnings."""
+    from models import CrSlaAlert
+    user = User.query.get(int(get_jwt_identity()))
+    if user.role != "cto":
+        return jsonify({"error": "Unauthorized"}), 403
+    unread_only = request.args.get("unread_only", "false").lower() == "true"
+    q = CrSlaAlert.query.filter(CrSlaAlert.recipient_role == "cto")
+    if unread_only:
+        q = q.filter_by(is_read=False)
+    alerts = q.order_by(CrSlaAlert.created_at.desc()).limit(100).all()
+    return jsonify({"alerts": [a.to_dict() for a in alerts]})
+
+
+@app.route("/api/manager/cr-alerts", methods=["GET"])
+@jwt_required()
+def manager_cr_alerts():
+    """CR SLA alerts for Manager — 75% warnings + breaches."""
+    from models import CrSlaAlert
+    user = User.query.get(int(get_jwt_identity()))
+    if user.role not in ("manager", "admin"):
+        return jsonify({"error": "Unauthorized"}), 403
+    unread_only = request.args.get("unread_only", "false").lower() == "true"
+    q = CrSlaAlert.query.filter(CrSlaAlert.recipient_role == "manager")
+    if unread_only:
+        q = q.filter_by(is_read=False)
+    alerts = q.order_by(CrSlaAlert.created_at.desc()).limit(100).all()
+    return jsonify({"alerts": [a.to_dict() for a in alerts]})
+
+
+@app.route("/api/cto/cr-alerts/<int:alert_id>/read", methods=["PUT"])
+@jwt_required()
+def cto_mark_cr_alert_read(alert_id):
+    from models import CrSlaAlert
+    user = User.query.get(int(get_jwt_identity()))
+    if user.role != "cto":
+        return jsonify({"error": "Unauthorized"}), 403
+    alert = CrSlaAlert.query.get(alert_id)
+    if not alert:
+        return jsonify({"error": "Alert not found"}), 404
+    alert.is_read = True
+    db.session.commit()
+    return jsonify({"success": True})
+
+
+@app.route("/api/manager/cr-alerts/<int:alert_id>/read", methods=["PUT"])
+@jwt_required()
+def manager_mark_cr_alert_read(alert_id):
+    from models import CrSlaAlert
+    user = User.query.get(int(get_jwt_identity()))
+    if user.role not in ("manager", "admin"):
+        return jsonify({"error": "Unauthorized"}), 403
+    alert = CrSlaAlert.query.get(alert_id)
+    if not alert:
+        return jsonify({"error": "Alert not found"}), 404
+    alert.is_read = True
+    db.session.commit()
+    return jsonify({"success": True})
+
+
+@app.route("/api/cto/cr-alerts/read-all", methods=["PUT"])
+@jwt_required()
+def cto_mark_all_cr_alerts_read():
+    from models import CrSlaAlert
+    user = User.query.get(int(get_jwt_identity()))
+    if user.role != "cto":
+        return jsonify({"error": "Unauthorized"}), 403
+    CrSlaAlert.query.filter_by(recipient_role="cto", is_read=False).update({"is_read": True})
+    db.session.commit()
+    return jsonify({"success": True})
+
+
+@app.route("/api/manager/cr-alerts/read-all", methods=["PUT"])
+@jwt_required()
+def manager_mark_all_cr_alerts_read():
+    from models import CrSlaAlert
+    user = User.query.get(int(get_jwt_identity()))
+    if user.role not in ("manager", "admin"):
+        return jsonify({"error": "Unauthorized"}), 403
+    CrSlaAlert.query.filter_by(recipient_role="manager", is_read=False).update({"is_read": True})
     db.session.commit()
     return jsonify({"success": True})
 
@@ -4991,6 +5080,10 @@ def admin_upload_sites():
             col_map["e_tilt_degree"] = i
         elif "crs" in h or h == "crs_gain":
             col_map["crs_gain"] = i
+        elif h in ("country",):
+            col_map["country"] = i
+        elif h in ("technology", "tech", "tech_type", "technology_type"):
+            col_map["technology"] = i
 
     required = ["site_id", "latitude", "longitude"]
     missing = [k for k in required if k not in col_map]
@@ -5046,6 +5139,8 @@ def admin_upload_sites():
             zone=_str_cell(row, "zone"),
             city=_str_cell(row, "city") or None,
             state=_str_cell(row, "state") or None,
+            country=_str_cell(row, "country") or "India",
+            technology=_str_cell(row, "technology") or None,
             site_status=site_status,
             alarms=_str_cell(row, "alarms"),
             solution=_str_cell(row, "solution"),
@@ -5059,8 +5154,167 @@ def admin_upload_sites():
         created += 1
 
     db.session.commit()
+
+    # Auto-populate city/state/country from lat/lng for sites missing geo data
+    _auto_populate_geo()
+
     clear_analytics_cache()
     return jsonify({"created": created, "skipped": skipped, "total": created})
+
+
+def _auto_populate_geo():
+    """Populate city, state, country for telecom_sites using lat/lng coordinate mapping.
+    Uses a built-in mapping of Indian city bounding boxes — no external API needed."""
+    import math
+
+    # Indian city coordinate regions: (name, state, lat_min, lat_max, lng_min, lng_max)
+    CITY_REGIONS = [
+        # NCR / Haryana
+        ("Gurgaon",     "Haryana",        "India", 28.38, 28.55, 76.90, 77.12),
+        ("Faridabad",   "Haryana",        "India", 28.30, 28.45, 77.25, 77.40),
+        ("Noida",       "Uttar Pradesh",  "India", 28.50, 28.65, 77.30, 77.45),
+        ("Greater Noida","Uttar Pradesh", "India", 28.40, 28.52, 77.45, 77.60),
+        ("Ghaziabad",   "Uttar Pradesh",  "India", 28.60, 28.72, 77.38, 77.50),
+        ("New Delhi",   "Delhi",          "India", 28.50, 28.80, 77.10, 77.35),
+        ("Delhi",       "Delhi",          "India", 28.40, 28.90, 76.85, 77.35),
+        # Rajasthan
+        ("Jaipur",      "Rajasthan",      "India", 26.78, 27.05, 75.65, 75.92),
+        ("Jodhpur",     "Rajasthan",      "India", 26.22, 26.40, 72.93, 73.10),
+        ("Udaipur",     "Rajasthan",      "India", 24.50, 24.65, 73.60, 73.80),
+        # Maharashtra
+        ("Mumbai",      "Maharashtra",    "India", 18.87, 19.30, 72.77, 73.00),
+        ("Navi Mumbai", "Maharashtra",    "India", 19.00, 19.15, 73.00, 73.15),
+        ("Thane",       "Maharashtra",    "India", 19.15, 19.30, 72.95, 73.10),
+        ("Pune",        "Maharashtra",    "India", 18.45, 18.65, 73.75, 73.95),
+        ("Nagpur",      "Maharashtra",    "India", 21.05, 21.22, 79.00, 79.15),
+        # Karnataka
+        ("Bangalore",   "Karnataka",      "India", 12.85, 13.10, 77.45, 77.75),
+        ("Mysore",      "Karnataka",      "India", 12.25, 12.40, 76.55, 76.72),
+        # Tamil Nadu
+        ("Chennai",     "Tamil Nadu",     "India", 12.90, 13.20, 80.15, 80.30),
+        ("Coimbatore",  "Tamil Nadu",     "India", 10.95, 11.10, 76.90, 77.05),
+        # Telangana
+        ("Hyderabad",   "Telangana",      "India", 17.30, 17.55, 78.35, 78.60),
+        # West Bengal
+        ("Kolkata",     "West Bengal",    "India", 22.45, 22.70, 88.25, 88.45),
+        # Gujarat
+        ("Ahmedabad",   "Gujarat",        "India", 22.95, 23.15, 72.50, 72.70),
+        ("Surat",       "Gujarat",        "India", 21.10, 21.25, 72.75, 72.90),
+        # Madhya Pradesh
+        ("Indore",      "Madhya Pradesh", "India", 22.65, 22.80, 75.80, 75.95),
+        ("Bhopal",      "Madhya Pradesh", "India", 23.20, 23.35, 77.35, 77.50),
+        # Punjab
+        ("Chandigarh",  "Chandigarh",     "India", 30.68, 30.78, 76.72, 76.82),
+        ("Ludhiana",    "Punjab",         "India", 30.85, 30.98, 75.82, 75.95),
+        ("Amritsar",    "Punjab",         "India", 31.58, 31.70, 74.82, 74.92),
+        # Kerala
+        ("Kochi",       "Kerala",         "India", 9.90, 10.05, 76.22, 76.38),
+        ("Thiruvananthapuram","Kerala",   "India", 8.45, 8.58, 76.90, 77.02),
+        # Bihar
+        ("Patna",       "Bihar",          "India", 25.55, 25.68, 85.08, 85.22),
+        # Uttar Pradesh
+        ("Lucknow",     "Uttar Pradesh",  "India", 26.78, 26.95, 80.88, 81.05),
+        ("Kanpur",      "Uttar Pradesh",  "India", 26.40, 26.55, 80.28, 80.42),
+        ("Varanasi",    "Uttar Pradesh",  "India", 25.28, 25.40, 82.95, 83.08),
+        # Assam
+        ("Guwahati",    "Assam",          "India", 26.12, 26.22, 91.68, 91.82),
+    ]
+
+    # Broader state-level fallback from lat/lng ranges
+    STATE_REGIONS = [
+        ("Haryana",         "India", 27.5, 31.0, 74.5, 77.5),
+        ("Delhi",           "India", 28.4, 28.9, 76.8, 77.4),
+        ("Uttar Pradesh",   "India", 23.5, 30.5, 77.0, 84.5),
+        ("Rajasthan",       "India", 23.0, 30.0, 69.5, 78.0),
+        ("Maharashtra",     "India", 15.5, 22.0, 72.5, 80.5),
+        ("Karnataka",       "India", 11.5, 18.5, 74.0, 78.5),
+        ("Tamil Nadu",      "India", 8.0, 13.5, 76.0, 80.5),
+        ("Telangana",       "India", 15.8, 19.9, 77.2, 81.3),
+        ("West Bengal",     "India", 21.5, 27.2, 85.8, 89.9),
+        ("Gujarat",         "India", 20.0, 24.5, 68.2, 74.5),
+        ("Madhya Pradesh",  "India", 21.0, 26.9, 74.0, 82.8),
+        ("Punjab",          "India", 29.5, 32.5, 73.8, 76.9),
+        ("Chandigarh",      "India", 30.6, 30.8, 76.7, 76.9),
+        ("Kerala",          "India", 8.2, 12.8, 74.8, 77.4),
+        ("Bihar",           "India", 24.3, 27.5, 83.3, 88.2),
+        ("Assam",           "India", 24.0, 28.0, 89.5, 96.0),
+    ]
+
+    try:
+        # Get all sites — populate geo for those missing it, and tech for all
+        sites = TelecomSite.query.filter(
+            TelecomSite.latitude.isnot(None),
+            TelecomSite.longitude.isnot(None),
+        ).all()
+
+        updated = 0
+        for s in sites:
+            changed = False
+            lat, lng = float(s.latitude), float(s.longitude)
+
+            # Infer technology from site_id (e.g. "GUR_LTE_001" → "LTE")
+            if not s.technology and s.site_id:
+                sid_upper = s.site_id.upper()
+                for tech_name in ("5G", "NR", "LTE", "4G", "3G", "UMTS", "2G", "GSM"):
+                    if tech_name in sid_upper:
+                        s.technology = "5G" if tech_name == "NR" else "4G" if tech_name == "LTE" else tech_name
+                        changed = True
+                        break
+
+            # Skip geo if already populated
+            if s.city and s.state:
+                if changed:
+                    updated += 1
+                continue
+
+            city_found = ""
+            state_found = ""
+            country_found = "India"
+
+            # Try city-level match first
+            for cname, sname, cntry, lat_min, lat_max, lng_min, lng_max in CITY_REGIONS:
+                if lat_min <= lat <= lat_max and lng_min <= lng <= lng_max:
+                    city_found = cname
+                    state_found = sname
+                    country_found = cntry
+                    break
+
+            # Fallback to state-level if no city match
+            if not state_found:
+                for sname, cntry, lat_min, lat_max, lng_min, lng_max in STATE_REGIONS:
+                    if lat_min <= lat <= lat_max and lng_min <= lng <= lng_max:
+                        state_found = sname
+                        country_found = cntry
+                        break
+
+            if city_found or state_found:
+                if city_found:
+                    s.city = city_found
+                if state_found:
+                    s.state = state_found
+                s.country = country_found
+                updated += 1
+
+        if updated:
+            db.session.commit()
+            print(f">>> Auto-populated geo data for {updated} sites")
+    except Exception as e:
+        print(f">>> Geo population error: {e}")
+        db.session.rollback()
+
+
+@app.route("/api/admin/populate-geo", methods=["POST"])
+@jwt_required()
+def admin_populate_geo():
+    """Manually trigger geo-population for all sites missing city/state/country."""
+    user = User.query.get(int(get_jwt_identity()))
+    if not user or user.role != "admin":
+        return jsonify({"error": "Unauthorized"}), 403
+    _auto_populate_geo()
+    clear_analytics_cache()
+    count = TelecomSite.query.filter(TelecomSite.city.isnot(None), TelecomSite.city != '').count()
+    total = TelecomSite.query.count()
+    return jsonify({"message": f"Geo populated: {count}/{total} sites have city data"})
 
 
 @app.route("/api/admin/upload-kpi-site-level", methods=["POST"])
@@ -7839,7 +8093,7 @@ def send_sla_alert_email(recipients, subject, ticket, alert_type, time_left_hour
 
 
 def run_sla_checks():
-    """Background function: check open tickets and send escalating SLA alerts."""
+    """Background function: check open tickets AND change requests, send escalating SLA alerts."""
     import threading
     def _check():
         while True:
@@ -7943,6 +8197,77 @@ def run_sla_checks():
 
                         if changed:
                             db.session.commit()
+
+                    # ── CR SLA Checks — escalating alerts for Change Requests ─────
+                    from models import CrSlaAlert
+                    TERMINAL_CR = {"closed", "cto_rejected", "rejected", "auto_rejected", "failed"}
+                    open_crs = ChangeRequest.query.filter(
+                        ChangeRequest.cr_sla_deadline.isnot(None),
+                        ~ChangeRequest.status.in_(TERMINAL_CR),
+                    ).all()
+
+                    for cr in open_crs:
+                        dl = cr.cr_sla_deadline
+                        if dl.tzinfo is None:
+                            dl = dl.replace(tzinfo=timezone.utc)
+                        cr_created = cr.created_at
+                        if cr_created and cr_created.tzinfo is None:
+                            cr_created = cr_created.replace(tzinfo=timezone.utc)
+                        if not cr_created:
+                            continue
+
+                        total_sla = (dl - cr_created).total_seconds()
+                        if total_sla <= 0:
+                            continue
+                        elapsed = (now - cr_created).total_seconds()
+                        time_left_hours = (dl - now).total_seconds() / 3600
+                        fraction_elapsed = elapsed / max(total_sla, 1)
+
+                        if time_left_hours >= 1:
+                            tl_display = f"{round(time_left_hours, 1)}h"
+                        elif time_left_hours > 0:
+                            tl_display = f"{int(time_left_hours * 60)}m"
+                        else:
+                            tl_display = "0"
+
+                        cr_changed = False
+                        type_label = (cr.change_type or "standard").upper()
+                        src = "Customer CR" if (cr.ticket_id and not cr.network_issue_id) else "AI CR"
+
+                        # 75% elapsed — alert to manager
+                        if fraction_elapsed >= 0.75 and not cr.cr_alert_75_sent:
+                            msg = f"{tl_display} remaining — {src} {cr.cr_number} [{type_label}] approaching SLA deadline"
+                            db.session.add(CrSlaAlert(
+                                cr_id=cr.id, alert_level="75",
+                                recipient_role="manager", message=msg,
+                            ))
+                            cr.cr_alert_75_sent = True
+                            cr_changed = True
+
+                        # 90% elapsed — alert to CTO
+                        if fraction_elapsed >= 0.90 and not cr.cr_alert_90_sent:
+                            msg = f"{tl_display} remaining — {src} {cr.cr_number} [{type_label}] critical SLA warning"
+                            db.session.add(CrSlaAlert(
+                                cr_id=cr.id, alert_level="90",
+                                recipient_role="cto", message=msg,
+                            ))
+                            cr.cr_alert_90_sent = True
+                            cr_changed = True
+
+                        # SLA Breach — alert to CTO
+                        if now > dl and not cr.cr_breach_alert_sent:
+                            cr.cr_sla_breached = True
+                            msg = f"CR SLA BREACHED — {src} {cr.cr_number} [{type_label}] — {cr.title[:80]}"
+                            db.session.add(CrSlaAlert(
+                                cr_id=cr.id, alert_level="breach",
+                                recipient_role="cto", message=msg,
+                            ))
+                            cr.cr_breach_alert_sent = True
+                            cr_changed = True
+
+                        if cr_changed:
+                            db.session.commit()
+
             except Exception as e:
                 print(f"⚠️ SLA check error: {e}")
             time.sleep(300)  # Check every 5 minutes
@@ -8000,6 +8325,20 @@ with app.app_context():
                 conn.execute(sa_text("ALTER TABLE telecom_sites ADD COLUMN state VARCHAR(100)"))
                 conn.commit()
                 print(">>> Added state column to telecom_sites")
+            if "country" not in existing_cols:
+                conn.execute(sa_text("ALTER TABLE telecom_sites ADD COLUMN country VARCHAR(100) DEFAULT 'India'"))
+                conn.commit()
+                print(">>> Added country column to telecom_sites")
+            if "technology" not in existing_cols:
+                conn.execute(sa_text("ALTER TABLE telecom_sites ADD COLUMN technology VARCHAR(50)"))
+                conn.commit()
+                print(">>> Added technology column to telecom_sites")
+
+    # Auto-populate geo data for sites missing city/state/country
+    try:
+        _auto_populate_geo()
+    except Exception as e:
+        print(f">>> Startup geo population skipped: {e}")
 
     # Migrate: add new columns to users if they don't exist
     if insp.has_table("users"):
@@ -8172,6 +8511,8 @@ except ImportError:
 with app.app_context():
     from models import CRAuditTrail
     CRAuditTrail.__table__.create(db.engine, checkfirst=True)
+    from models import CrSlaAlert
+    CrSlaAlert.__table__.create(db.engine, checkfirst=True)
     # Add new columns to change_requests if they don't exist
     _engine = db.engine
     _insp = db.inspect(_engine)
@@ -8195,6 +8536,10 @@ with app.app_context():
         'rf_crs_gain_current': 'FLOAT', 'rf_crs_gain_proposed': 'FLOAT',
         'pdf_filename': 'VARCHAR(300)', 'pdf_path': 'VARCHAR(500)',
         'cr_sla_hours': 'FLOAT', 'cr_sla_deadline': 'TIMESTAMP',
+        'cr_sla_breached': 'BOOLEAN DEFAULT FALSE',
+        'cr_breach_alert_sent': 'BOOLEAN DEFAULT FALSE',
+        'cr_alert_75_sent': 'BOOLEAN DEFAULT FALSE',
+        'cr_alert_90_sent': 'BOOLEAN DEFAULT FALSE',
         'assigned_manager_id': 'INTEGER',
         'cto_approval_required': 'BOOLEAN DEFAULT FALSE',
         'cto_approved_by': 'INTEGER', 'cto_approved_at': 'TIMESTAMP',
