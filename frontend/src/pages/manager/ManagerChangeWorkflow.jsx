@@ -203,13 +203,13 @@ function ActionModal({ cr, onClose, onDone, isDark }) {
       zIndex: 1000, padding: 16,
     }} onClick={onClose}>
       <div onClick={e => e.stopPropagation()} style={{
-        width: '100%', maxWidth: 540, background: '#fff', borderRadius: 14,
+        width: '100%', maxWidth: 540, background: isDark ? '#1e293b' : '#fff', borderRadius: 14,
         boxShadow: '0 24px 48px rgba(15,23,42,0.2)', padding: 28,
       }}>
         {/* Header */}
         <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 18 }}>
           <div>
-            <h3 style={{ margin: '0 0 4px', fontSize: 16, fontWeight: 700, color: '#0f172a' }}>
+            <h3 style={{ margin: '0 0 4px', fontSize: 16, fontWeight: 700, color: isDark ? '#e2e8f0' : '#0f172a' }}>
               {STEP_TITLES[step]}
             </h3>
             <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
@@ -246,11 +246,11 @@ function ActionModal({ cr, onClose, onDone, isDark }) {
         {!successMsg && <>
         {/* CR summary box */}
         <div style={{
-          background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 8,
+          background: isDark ? '#0f172a' : '#f8fafc', border: `1px solid ${isDark ? '#334155' : '#e2e8f0'}`, borderRadius: 8,
           padding: '10px 14px', marginBottom: 18,
         }}>
-          <div style={{ fontSize: 13, fontWeight: 600, color: '#0f172a', marginBottom: 4 }}>{cr.title}</div>
-          <div style={{ fontSize: 12, color: '#64748b', lineHeight: 1.5 }}>{cr.description}</div>
+          <div style={{ fontSize: 13, fontWeight: 600, color: isDark ? '#e2e8f0' : '#0f172a', marginBottom: 4 }}>{cr.title}</div>
+          <div style={{ fontSize: 12, color: isDark ? '#94a3b8' : '#64748b', lineHeight: 1.5 }}>{cr.description}</div>
           {cr.rejection_count > 0 && (
             <div style={{
               marginTop: 8, fontSize: 11, fontWeight: 700, color: '#dc2626',
@@ -460,7 +460,7 @@ function ActionModal({ cr, onClose, onDone, isDark }) {
 }
 
 /* ── Detail Drawer ──────────────────────────────────────────────────────────── */
-function DetailDrawer({ cr, onClose }) {
+function DetailDrawer({ cr, onClose, isDark }) {
   if (!cr) return null;
   const Row = ({ label, value, mono }) => value ? (
     <div style={{ display: 'grid', gridTemplateColumns: '130px 1fr', gap: 8, padding: '7px 0', borderBottom: '1px solid #f1f5f9' }}>
@@ -927,7 +927,7 @@ export default function ManagerChangeWorkflow() {
 
       {/* Modals */}
       {actionCR && (
-        <ActionModal cr={actionCR} onClose={() => setActionCR(null)} onDone={fetchCRs} />
+        <ActionModal cr={actionCR} onClose={() => setActionCR(null)} onDone={fetchCRs} isDark={isDark} />
       )}
       {detailCR && (
         <DetailDrawer cr={detailCR} onClose={() => setDetailCR(null)} isDark={isDark} />

@@ -682,6 +682,267 @@ def _filter_rca_lines(lines):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# TICKET ROOT CAUSE ANALYSIS & FINAL RECOMMENDATIONS
+# ─────────────────────────────────────────────────────────────────────────────
+# Full workflow (called from agent ticket detail page):
+#   1. Agent clicks "Root Cause Analysis" → POST /api/agent/tickets/:id/root-cause
+#   2. Agent clicks "Recommendation"      → POST /api/agent/tickets/:id/recommendation
+# Both routes are registered via network_diagnosis.register_routes(app).
+# The functions below provide the core logic used by those routes.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def generate_root_cause_analysis(ticket, session, client, deployment):
+    """
+    Generate AI-powered root cause analysis for a ticket.
+
+    Flow:
+      1. Find nearest tower site to customer's location
+      2. Fetch site-level and cell-level KPI trend data for that site
+      3. Filter KPIs relevant to the problem type (Internet Speed / Call Drop / Call Failure)
+      4. Build prompt with site status, alarms, RF parameters, and KPI trends
+      5. Call AI model for analysis (4-5 numbered points)
+      6. Fallback to _kpi_degradation_points() if AI fails
+
+    Args:
+        ticket:     Ticket object with category, subcategory, description, priority
+        session:    ChatSession object with customer latitude/longitude
+        client:     OpenAI/Azure client for AI completions
+        deployment: Model deployment name
+
+    Returns:
+        dict with keys: analysis, analysis_pdf, site_id, site_zone, site_status,
+                        distance_km, problem_type, selected_kpis
+    """
+    if not session or not session.latitude or not session.longitude:
+        return {"error": "Customer location not available"}
+
+    nearest_list = find_nearest_sites(session.latitude, session.longitude, n=1)
+    if not nearest_list:
+        return {"error": "No site data available for nearest-site lookup."}
+
+    nearest = nearest_list[0]
+    nearest_site_id = nearest["site_id"]
+    nearest_zone = nearest.get("zone")
+    dist_km = nearest["distance_km"]
+    site_status = (nearest.get("site_status") or "on_air").lower()
+    alarms_text = nearest.get("alarms") or "None"
+    solution_text = nearest.get("solution") or "No action required"
+    std_solution_text = nearest.get("standard_solution_step") or ""
+    site_params_text = "\n".join([
+        f"- Bandwidth (MHz): {nearest.get('bandwidth_mhz')}",
+        f"- Antenna Gain (dBi): {nearest.get('antenna_gain_dbi')}",
+        f"- RF Power (EIRP) [dBm]: {nearest.get('rf_power_eirp_dbm')}",
+        f"- Antenna height (AGL) (M): {nearest.get('antenna_height_agl_m')}",
+        f"- E-tilt (Degree): {nearest.get('e_tilt_degree')}",
+        f"- CRS Gain: {nearest.get('crs_gain')}",
+    ])
+
+    problem_type = _detect_network_problem_type(ticket)
+    problem_type_label = _problem_type_label(problem_type)
+
+    # Fetch KPI data for nearest site
+    site_rows = KpiData.query.filter_by(site_id=nearest_site_id, data_level="site").all()
+    cell_rows = KpiData.query.filter_by(site_id=nearest_site_id, data_level="cell").all()
+    all_kpis = {r.kpi_name for r in site_rows + cell_rows}
+    selected_kpis = _filter_kpi_names_for_problem(all_kpis, problem_type)
+    site_kpi_text = _build_kpi_summary_text(site_rows, selected_kpis, "site-level")
+    cell_kpi_text = _build_kpi_summary_text(cell_rows, selected_kpis, "cell-level")
+    kpis_str = ", ".join(selected_kpis) if selected_kpis else "none matched"
+
+    # Build prompt based on site status
+    if site_status == "off_air":
+        prompt = f"""You are a senior telecom network engineer performing root cause analysis.
+
+TICKET: {ticket.reference_number} — {ticket.category} / {ticket.subcategory}
+CUSTOMER REPORTED ISSUE: {ticket.description}
+PROBLEM TYPE: {problem_type_label}
+NEAREST SITE: {nearest_site_id} (Zone: {nearest_zone}, Distance: {dist_km} km from customer)
+
+=== SITE STATUS: OFF AIR ===
+ACTIVE ALARMS:\n{alarms_text}
+KNOWN SOLUTION:\n{solution_text}
+STANDARD SOLUTION STEP:\n{std_solution_text if std_solution_text else 'N/A'}
+SITE RF PARAMETERS:\n{site_params_text}
+SITE-LEVEL KPI TREND DATA (KPIs: {kpis_str}):\n{site_kpi_text}
+CELL-LEVEL KPI TREND DATA:\n{cell_kpi_text}
+
+INSTRUCTIONS:
+- Write exactly 4–5 numbered points. Format: **Concise Title**: 1-2 sentences with specific technical evidence.
+- Point 1: Primary root cause linking alarm to {problem_type_label} degradation with a specific KPI value.
+- Point 2: What KPI trend shows before/during the outage and magnitude of drop.
+- Point 3: RF/parameter context using actual values and how they contribute.
+- Point 4: Link alarm's standard solution step to expected KPI recovery.
+- Point 5: Secondary impact on adjacent cells visible in cell-level KPI trends.
+- Use actual numbers. Do not add headings or extra sections."""
+    else:
+        prompt = f"""You are a senior telecom network engineer performing root cause analysis.
+
+TICKET: {ticket.reference_number} — {ticket.category} / {ticket.subcategory}
+CUSTOMER REPORTED ISSUE: {ticket.description}
+PROBLEM TYPE: {problem_type_label}
+NEAREST SITE: {nearest_site_id} (Zone: {nearest_zone}, Distance: {dist_km} km from customer)
+
+=== SITE STATUS: ON AIR ===
+SITE RF PARAMETERS:\n{site_params_text}
+SITE-LEVEL KPI TREND DATA (KPIs: {kpis_str}):\n{site_kpi_text}
+CELL-LEVEL KPI TREND DATA:\n{cell_kpi_text}
+
+INSTRUCTIONS:
+- Write exactly 4–5 numbered points. Format: **Concise Title**: 1-2 sentences with specific technical evidence.
+- Point 1: PRIMARY degraded KPI — state recent value vs baseline (actual numbers) and what it reflects.
+- Point 2: SECONDARY degraded KPI — state values and chain of impact to customer's {problem_type_label}.
+- Point 3: RF parameter context (bandwidth, E-tilt, EIRP, height, CRS gain) and how values amplify degradation.
+- Point 4: Temporal pattern — when degradation started, continuous or intermittent, peak vs off-peak.
+- Point 5: Cell-level vs site-level discrepancy narrowing fault to specific cell/sector.
+- Be precise: use actual KPI values. Do not add headings or extra sections."""
+
+    try:
+        response = client.chat.completions.create(
+            model=deployment,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            max_tokens=1500,
+        )
+        analysis_raw = response.choices[0].message.content.strip()
+        cleaned_lines = _filter_rca_lines(_normalize_ai_lines(analysis_raw))
+        fallback_rca = []
+        if site_status == "off_air":
+            fallback_rca.append(f"**Site Outage**: Nearest site {nearest_site_id} is OFF AIR; alarms indicate outage as primary cause.")
+        fallback_rca += _kpi_degradation_points(site_rows + cell_rows, selected_kpis, max_points=3)
+        if len(fallback_rca) < 4:
+            fallback_rca += [
+                f"**KPI Evidence**: Trend shifts across {problem_type_label}-related KPIs indicate measurable degradation.",
+                "**Correlation**: Site-level and cell-level KPI movement aligns with the customer's symptom timeline.",
+                "**Impact Scope**: Degradation appears localized to the nearest site/cells based on trend evidence.",
+                "**Next Check**: Validate alarms and RF parameters for contributing factors.",
+            ]
+            fallback_rca = fallback_rca[:4]
+        analysis = _force_numbered_points(
+            "\n".join(cleaned_lines) if cleaned_lines else "",
+            min_points=4, max_points=5, fallback_points=fallback_rca,
+        )
+    except Exception as e:
+        fallback_rca = _kpi_degradation_points(site_rows + cell_rows, selected_kpis, max_points=4)
+        if not fallback_rca:
+            fallback_rca = [
+                f"**Model Error**: RCA could not be generated: {str(e)}.",
+                f"**KPI Evidence**: Review KPI shifts for {problem_type_label} and isolate the largest deviations.",
+                "**Correlation**: Correlate degraded cell indicators with site KPIs to confirm fault domain.",
+                "**Next Check**: Validate alarms and site status if KPI evidence is weak.",
+            ]
+        analysis = _force_numbered_points(
+            "\n".join(fallback_rca), min_points=4, max_points=5, fallback_points=fallback_rca,
+        )
+
+    return {
+        "analysis": analysis,
+        "analysis_pdf": _format_points_for_pdf(analysis),
+        "site_id": nearest_site_id,
+        "site_zone": nearest_zone,
+        "site_status": site_status,
+        "distance_km": dist_km,
+        "problem_type": problem_type_label,
+        "selected_kpis": selected_kpis,
+    }
+
+
+def generate_final_recommendations(ticket, session, root_cause, trend_summary, client, deployment):
+    """
+    Generate AI-powered final recommendations based on root cause analysis.
+
+    Flow:
+      1. Find nearest tower site to customer's location
+      2. Build site context with RF parameters (bandwidth, tilt, EIRP, gain, height, CRS)
+      3. Call AI model with root cause + trend evidence for 4-5 actionable recommendations
+      4. Each recommendation proposes concrete parameter changes with expected KPI improvement
+      5. Fallback to _build_parameter_recommendations() if AI fails
+
+    Args:
+        ticket:        Ticket object
+        session:       ChatSession object with customer lat/lng
+        root_cause:    Text output from generate_root_cause_analysis()
+        trend_summary: Text summary of KPI trend analysis
+        client:        OpenAI/Azure client
+        deployment:    Model deployment name
+
+    Returns:
+        dict with keys: recommendation, recommendation_pdf
+    """
+    nearest = None
+    if session and session.latitude and session.longitude:
+        nearest_list = find_nearest_sites(session.latitude, session.longitude, n=1)
+        if nearest_list:
+            nearest = nearest_list[0]
+
+    problem_type = _problem_type_label(_detect_network_problem_type(ticket))
+
+    site_context = "Nearest site data not available."
+    if nearest:
+        site_context = "\n".join([
+            f"NEAREST SITE: {nearest.get('site_id')} (Zone: {nearest.get('zone')}, Distance: {nearest.get('distance_km')} km)",
+            f"SITE STATUS: {nearest.get('site_status') or 'on_air'}",
+            "SITE PARAMETERS:",
+            f"- Bandwidth (MHz): {nearest.get('bandwidth_mhz')}",
+            f"- Antenna Gain (dBi): {nearest.get('antenna_gain_dbi')}",
+            f"- RF Power (EIRP) [dBm]: {nearest.get('rf_power_eirp_dbm')}",
+            f"- Antenna height (AGL) (M): {nearest.get('antenna_height_agl_m')}",
+            f"- E-tilt (Degree): {nearest.get('e_tilt_degree')}",
+            f"- CRS Gain: {nearest.get('crs_gain')}",
+        ])
+
+    prompt = f"""You are a senior telecom network optimization engineer providing precise, actionable field recommendations.
+
+TICKET: {ticket.reference_number} — {ticket.category} / {ticket.subcategory}
+CUSTOMER REPORTED ISSUE: {ticket.description}
+PRIORITY: {ticket.priority.upper()}
+PROBLEM TYPE: {problem_type}
+
+{site_context}
+
+=== TREND ANALYSIS EVIDENCE ===
+{trend_summary if trend_summary else 'No trend analysis summary available.'}
+
+=== ROOT CAUSE ANALYSIS FINDINGS ===
+{root_cause if root_cause else 'No root cause analysis available.'}
+
+=== INSTRUCTIONS ===
+Generate exactly 4–5 numbered recommendations. Format: **Action Title**: 2–3 sentences.
+Rules:
+1. Each recommendation must directly address a specific finding from the Root Cause Analysis.
+2. At least 3 recommendations MUST use exact current site parameter values and propose a CONCRETE target value.
+3. One recommendation may use broader telecom best-practices (neighbor cell optimization, scheduler tuning, load balancing).
+4. State the EXPECTED OUTCOME for each (which KPI will improve, by how much approximately).
+5. Prioritize by impact — most impactful first.
+6. Be precise: say "adjust X from Y to Z to achieve W", not "consider adjusting".
+7. Do not repeat the root cause. Focus only on the fix and expected outcome.
+8. Do not add headings, summaries, or extra sections."""
+
+    try:
+        response = client.chat.completions.create(
+            model=deployment,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            max_tokens=1500,
+        )
+        recommendation_raw = response.choices[0].message.content.strip()
+        fallback_points = _build_parameter_recommendations(problem_type, root_cause, trend_summary, nearest or {})
+        if recommendation_raw and len(recommendation_raw) > 80:
+            recommendation = _force_numbered_points(recommendation_raw, min_points=4, max_points=5, fallback_points=fallback_points)
+        else:
+            recommendation = _force_numbered_points("\n".join(fallback_points), min_points=4, max_points=5, fallback_points=fallback_points)
+    except Exception as e:
+        fallback_points = _build_parameter_recommendations(problem_type, root_cause, trend_summary, nearest or {})
+        fallback_points.insert(0, f"**Model Error**: Recommendation generation failed: {str(e)}.")
+        recommendation = _force_numbered_points("\n".join(fallback_points), min_points=4, max_points=5, fallback_points=fallback_points)
+
+    return {
+        "recommendation": recommendation,
+        "recommendation_pdf": _format_points_for_pdf(recommendation),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def find_nearest_sites(lat, lon, n=3):

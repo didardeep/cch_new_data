@@ -219,7 +219,7 @@ function SpeedTestCard({ msgId, groupId, disabled, disableGroup, addMessage, fet
         <div style={{ borderRadius: 10, overflow: 'hidden', border: '1px solid #1e3a5f', marginBottom: 8, height: 220 }}>
           <iframe
             ref={iframeRef}
-            src={`${API_BASE}/api/speedtest-widget?Run`}
+            src={`${SOCKET_URL}/api/speedtest-widget?Run`}
             title="Speed Test"
             onLoad={handleIframeLoad}
             style={{ width: '100%', height: '100%', border: 'none', display: 'block' }}
@@ -328,7 +328,7 @@ function LiveConnectionCard({ groupId, disabled, autoStart, saveMessage, stateRe
       <div style={{ borderRadius: 10, overflow: 'hidden', border: '1px solid #1e3a5f', marginBottom: 8, height: 220 }}>
         <iframe
           ref={iframeRef}
-          src={`${API_BASE}/api/speedtest-widget?Run`}
+          src={`${SOCKET_URL}/api/speedtest-widget?Run`}
           title="Connection Check"
           onLoad={handleIframeLoad}
           style={{ width: '100%', height: '100%', border: 'none', display: 'block' }}
