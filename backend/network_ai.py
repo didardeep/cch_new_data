@@ -195,30 +195,51 @@ Tables:
    'DL PRB Utilization (1BH)'           -- DL PRB utilization %, congestion
    'UL PRB Utilization (1BH)'           -- UL PRB utilization %
 
-2. telecom_sites(site_id, cell_id, latitude, longitude, zone)
-   - JOIN: kpi_data k JOIN telecom_sites ts ON k.site_id = ts.site_id
-   - zone column has values like zone names / cluster names
+2. telecom_sites(site_id, cell_id, latitude, longitude, zone, city, state, technology, site_status)
+   - JOIN with kpi_data: kpi_data k JOIN telecom_sites ts ON k.site_id = ts.site_id
 
-3. flexible_kpi_uploads(site_id, kpi_name, kpi_type, column_name, num_value, str_value)
-   - kpi_type = 'core' for core KPIs: Authentication Success Rate, CPU Utilization, Attach Success Rate, PDP Bearer Setup Success Rate
-   - kpi_type = 'revenue' for revenue data
+3. revenue_data — Revenue per site (flat table, one row per site)
+   Columns: site_id, zone, technology, subscribers, rev_jan, rev_feb, rev_mar, opex_jan, opex_feb, opex_mar, site_category
+   NOTE: revenue is MONTHLY data, NOT daily. There is no date column.
+   Example: SELECT r.site_id, r.subscribers, r.rev_jan, r.rev_feb, r.rev_mar FROM revenue_data r ORDER BY r.subscribers DESC
+
+4. flexible_kpi_uploads — EAV table for Core and Revenue data
+   Columns: kpi_type, site_id, column_name, column_type, num_value, str_value
+   - kpi_type='revenue': column_name in ('subscribers','revenue_jan_l','revenue_feb_l','opex_jan_l', etc.)
+   - kpi_type='core': column_name in ('auth_success_rate','cpu_utilization','attach_success_rate','pdp_bearer_setup_success_rate')
+
+5. core_kpi_data — Core network KPIs with dates
+   Columns: site_id, date, auth_sr, cpu_util, attach_sr, pdp_sr
+
+6. transport_kpi_data — Transport/backhaul KPIs
+   Columns: site_id, zone, backhaul_type, link_capacity, avg_util, peak_util, packet_loss, avg_latency, jitter, availability
+
+7. network_issue_tickets — Auto-generated worst-cell tickets
+   Columns: site_id, priority, avg_drop_rate, avg_cssr, avg_tput, violations, status, zone, created_at
+
+=== TABLE SELECTION RULE ===
+- RAN KPIs (drop rate, throughput, PRB, latency) → kpi_data
+- Revenue, OPEX, subscribers, ARPU → revenue_data (or flexible_kpi_uploads fallback)
+- Core KPIs (auth, CPU, attach, PDP) → core_kpi_data (or flexible_kpi_uploads fallback)
+- Transport/backhaul → transport_kpi_data
+- Network issues/worst cells → network_issue_tickets
+NEVER query kpi_data for revenue — it does not exist there.
 
 === Natural Language → KPI Mapping Guide ===
-User says "call drop" / "drop rate" / "CDR" / "call failure" → 'E-RAB Call Drop Rate_1'
-User says "throughput" / "speed" / "download speed" → 'LTE DL - Usr Ave Throughput' (user) or 'LTE DL - Cell Ave Throughput' (cell)
-User says "PRB" / "congestion" / "load" / "utilization" → 'DL PRB Utilization (1BH)'
-User says "availability" / "uptime" / "downtime" → 'Availability'
-User says "connected users" / "RRC users" / "active users" → 'Ave RRC Connected Ue'
-User says "handover" / "HO" → 'LTE Intra-Freq HO Success Rate'
-User says "VoLTE" / "voice" → 'VoLTE Traffic Erlang'
-User says "latency" / "delay" / "ping" → 'Average Latency Downlink'
-User says "data volume" / "traffic volume" → 'DL Data Total Volume'
-User says "call setup" / "CSSR" → 'LTE Call Setup Success Rate'
-User says "RRC" / "accessibility" / "access" → 'LTE RRC Setup Success Rate'
-User says "noise" / "interference" → 'Average NI of Carrier-'
+User says "call drop" / "drop rate" / "CDR" → 'E-RAB Call Drop Rate_1' (kpi_data)
+User says "throughput" / "speed" → 'LTE DL - Cell Ave Throughput' (kpi_data)
+User says "PRB" / "congestion" → 'DL PRB Utilization (1BH)' (kpi_data)
+User says "availability" / "uptime" → 'Availability' (kpi_data)
+User says "connected users" / "RRC users" → 'Ave RRC Connected Ue' (kpi_data)
+User says "revenue" / "income" → revenue_data table
+User says "OPEX" / "expenditure" → revenue_data table
+User says "subscribers" → revenue_data table
+User says "ARPU" → compute from revenue_data
+User says "transport" / "backhaul" / "jitter" → transport_kpi_data table
+User says "core KPI" / "authentication" / "CPU" → core_kpi_data table
+User says "network issue" / "worst cell" / "AI ticket" → network_issue_tickets table
 User says "last 7 days" → AND k.date >= CURRENT_DATE - INTERVAL '7 days' AND k.date <= CURRENT_DATE
-User says "last month" → AND k.date >= CURRENT_DATE - INTERVAL '1 month' AND k.date <= CURRENT_DATE
-ALWAYS add AND k.date <= CURRENT_DATE when any date range is used, to exclude future data.
+ALWAYS add AND k.date <= CURRENT_DATE when any date range is used.
 """
 
     # ── CHANGE: read session_context for dynamic prompt injection ──
@@ -592,6 +613,19 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
             ai_result = _rule_based_query(prompt, time_filter, prev_context=None)
             provider  = {"provider": "rule-based-multisite"}
             _LOG.info("Multi-site trend intercepted before LLM: %s", _prompt_sites)
+
+    # 3. Revenue / Core / Transport / Ticket queries — route to rule-based
+    #    These tables are not in kpi_data, so LLMs often generate wrong SQL.
+    if not ai_result:
+        _is_rev_pre   = any(w in _p_lower for w in ('revenue', 'opex', 'subscriber', 'arpu', 'income'))
+        _is_core_pre  = any(w in _p_lower for w in ('core kpi', 'core network', 'auth sr', 'attach sr', 'pdp sr', 'cpu util'))
+        _is_trans_pre = any(w in _p_lower for w in ('transport', 'backhaul', 'packet loss', 'jitter'))
+        _is_tick_pre  = any(w in _p_lower for w in ('network ticket', 'network issue', 'fault', 'worst cell', 'ai ticket'))
+        if _is_rev_pre or _is_core_pre or _is_trans_pre or _is_tick_pre:
+            ai_result = _rule_based_query(prompt, time_filter, prev_context=None)
+            provider  = {"provider": "rule-based-multitable"}
+            _LOG.info("Non-kpi_data query intercepted before LLM: rev=%s core=%s trans=%s ticket=%s",
+                       _is_rev_pre, _is_core_pre, _is_trans_pre, _is_tick_pre)
 
     for _prov in _providers:
         if ai_result:
@@ -1482,6 +1516,165 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
                      'history' in p or 'daily' in p or 'last' in p or
                      'week' in p or 'month' in p or 'year' in p)
 
+    # ── Revenue / Core / Transport / Ticket handlers ──────────────────────────
+    # Route queries about non-kpi_data tables BEFORE kpi_data catch-all handlers.
+    _is_revenue_q  = any(w in p for w in ('revenue', 'opex', 'subscriber', 'arpu', 'income'))
+    _is_core_q     = any(w in p for w in ('core kpi', 'core network', 'auth sr', 'attach sr', 'pdp sr', 'cpu util'))
+    _is_transport_q = any(w in p for w in ('transport', 'backhaul', 'packet loss', 'jitter'))
+    _is_ticket_q   = any(w in p for w in ('network ticket', 'network issue', 'fault', 'worst cell', 'ai ticket'))
+
+    if _is_revenue_q:
+        _n = 10
+        _nums_r = re.findall(r'(?:top|bottom|worst|best)\s+(\d+)', p)
+        if _nums_r:
+            _n = min(int(_nums_r[0]), 100)
+        if site_ids and is_trend:
+            site_filter = " OR ".join(f"r.site_id = '{s}'" for s in site_ids[:5])
+            sql = f"""SELECT r.site_id, t.month_name, t.revenue, t.opex
+                FROM revenue_data r
+                CROSS JOIN LATERAL (VALUES
+                    ('Jan', 1, r.rev_jan, r.opex_jan),
+                    ('Feb', 2, r.rev_feb, r.opex_feb),
+                    ('Mar', 3, r.rev_mar, r.opex_mar)
+                ) AS t(month_name, month_ord, revenue, opex)
+                WHERE ({site_filter})
+                ORDER BY r.site_id, t.month_ord"""
+            return {
+                "sql": sql, "query_type": "composed", "chart_type": "composed",
+                "title": f"Revenue Trend — {', '.join(site_ids[:3])}",
+                "x_axis": "month_name", "y_axes": ["revenue", "opex"],
+                "response": f"Monthly revenue & OPEX for {', '.join(site_ids[:3])}. Revenue data is monthly (Jan–Mar).",
+            }
+        elif site_ids:
+            site_filter = " OR ".join(f"site_id = '{s}'" for s in site_ids[:5])
+            sql = f"""SELECT site_id, zone, technology, subscribers, site_category,
+                       rev_jan, rev_feb, rev_mar, opex_jan, opex_feb, opex_mar,
+                       (COALESCE(rev_jan,0)+COALESCE(rev_feb,0)+COALESCE(rev_mar,0)) AS total_rev
+                FROM revenue_data WHERE ({site_filter})"""
+            return {
+                "sql": sql, "query_type": "bar", "chart_type": "bar",
+                "title": f"Revenue — {', '.join(site_ids[:3])}",
+                "x_axis": "site_id", "y_axes": ["rev_jan", "rev_feb", "rev_mar"],
+                "response": f"Revenue data for {', '.join(site_ids[:3])}. Data is monthly (Jan–Mar).",
+            }
+        else:
+            order = "ASC" if any(w in p for w in ('worst', 'low', 'bottom', 'least')) else "DESC"
+            sql = f"""SELECT site_id, zone, technology, subscribers,
+                       rev_jan, rev_feb, rev_mar,
+                       (COALESCE(rev_jan,0)+COALESCE(rev_feb,0)+COALESCE(rev_mar,0)) AS total_rev
+                FROM revenue_data
+                ORDER BY total_rev {order} NULLS LAST LIMIT {_n}"""
+            return {
+                "sql": sql, "query_type": "bar", "chart_type": "bar",
+                "title": f"{'Bottom' if order=='ASC' else 'Top'} {_n} Sites by Revenue",
+                "x_axis": "site_id", "y_axes": ["rev_jan", "rev_feb", "rev_mar"],
+                "response": f"{'Lowest' if order=='ASC' else 'Highest'} {_n} sites by total revenue (monthly: Jan–Mar).",
+            }
+
+    if _is_core_q:
+        _n = 10
+        date_clause = (
+            f"AND date >= CURRENT_DATE - INTERVAL '{days} days' AND date <= CURRENT_DATE"
+            if days else "AND date <= CURRENT_DATE"
+        )
+        if site_ids and is_trend:
+            site_clause = "AND site_id IN (" + ",".join(f"'{s}'" for s in site_ids[:5]) + ")"
+            sql = f"""SELECT date::text AS date, site_id,
+                       AVG(auth_sr) AS auth_sr, AVG(cpu_util) AS cpu_util,
+                       AVG(attach_sr) AS attach_sr, AVG(pdp_sr) AS pdp_sr
+                FROM core_kpi_data
+                WHERE 1=1 {site_clause} {date_clause}
+                GROUP BY date, site_id ORDER BY date"""
+            return {
+                "sql": sql, "query_type": "composed", "chart_type": "composed",
+                "title": f"Core KPIs — {', '.join(site_ids[:3])}",
+                "x_axis": "date", "y_axes": ["auth_sr", "cpu_util", "attach_sr", "pdp_sr"],
+                "response": f"Core network KPI trends for {', '.join(site_ids[:3])}.",
+            }
+        elif site_ids:
+            site_clause = "AND site_id IN (" + ",".join(f"'{s}'" for s in site_ids[:5]) + ")"
+            sql = f"""SELECT site_id,
+                       AVG(auth_sr) AS auth_sr, AVG(cpu_util) AS cpu_util,
+                       AVG(attach_sr) AS attach_sr, AVG(pdp_sr) AS pdp_sr
+                FROM core_kpi_data WHERE 1=1 {site_clause}
+                GROUP BY site_id"""
+            return {
+                "sql": sql, "query_type": "bar", "chart_type": "bar",
+                "title": f"Core KPIs — {', '.join(site_ids[:3])}",
+                "x_axis": "site_id", "y_axes": ["auth_sr", "cpu_util", "attach_sr", "pdp_sr"],
+                "response": f"Core network KPIs for {', '.join(site_ids[:3])}.",
+            }
+        else:
+            sql = f"""SELECT site_id,
+                       AVG(auth_sr) AS auth_sr, AVG(cpu_util) AS cpu_util,
+                       AVG(attach_sr) AS attach_sr, AVG(pdp_sr) AS pdp_sr
+                FROM core_kpi_data WHERE 1=1 {date_clause}
+                GROUP BY site_id ORDER BY auth_sr ASC NULLS LAST LIMIT {_n}"""
+            return {
+                "sql": sql, "query_type": "bar", "chart_type": "bar",
+                "title": f"Bottom {_n} — Core Network KPIs",
+                "x_axis": "site_id", "y_axes": ["auth_sr", "cpu_util", "attach_sr"],
+                "response": f"Showing {_n} sites with lowest core KPIs.",
+            }
+
+    if _is_transport_q:
+        _n = 10
+        _nums_t = re.findall(r'(?:top|bottom|worst|best)\s+(\d+)', p)
+        if _nums_t:
+            _n = min(int(_nums_t[0]), 100)
+        if site_ids:
+            site_clause = "site_id IN (" + ",".join(f"'{s}'" for s in site_ids[:5]) + ")"
+            sql = f"""SELECT site_id, zone, backhaul_type, link_capacity,
+                       avg_util, peak_util, packet_loss, avg_latency, jitter, availability
+                FROM transport_kpi_data WHERE {site_clause}
+                ORDER BY site_id"""
+            return {
+                "sql": sql, "query_type": "bar", "chart_type": "bar",
+                "title": f"Transport KPIs — {', '.join(site_ids[:3])}",
+                "x_axis": "site_id", "y_axes": ["avg_util", "peak_util", "packet_loss", "avg_latency"],
+                "response": f"Transport/backhaul KPIs for {', '.join(site_ids[:3])}.",
+            }
+        else:
+            sql = f"""SELECT site_id, zone, backhaul_type,
+                       avg_util, peak_util, packet_loss, avg_latency, jitter
+                FROM transport_kpi_data
+                ORDER BY packet_loss DESC NULLS LAST LIMIT {_n}"""
+            return {
+                "sql": sql, "query_type": "bar", "chart_type": "bar",
+                "title": f"Top {_n} — Transport Issues",
+                "x_axis": "site_id", "y_axes": ["packet_loss", "avg_latency", "jitter"],
+                "response": f"Top {_n} sites with worst transport KPIs (by packet loss).",
+            }
+
+    if _is_ticket_q:
+        _n = 10
+        _nums_k = re.findall(r'(?:top|bottom|worst|best)\s+(\d+)', p)
+        if _nums_k:
+            _n = min(int(_nums_k[0]), 100)
+        if site_ids:
+            site_clause = "site_id IN (" + ",".join(f"'{s}'" for s in site_ids[:5]) + ")"
+            sql = f"""SELECT site_id, priority, avg_drop_rate, avg_cssr, avg_tput,
+                       violations, status, zone, created_at::text AS created_at
+                FROM network_issue_tickets WHERE {site_clause}
+                ORDER BY created_at DESC"""
+            return {
+                "sql": sql, "query_type": "bar", "chart_type": "bar",
+                "title": f"Network Tickets — {', '.join(site_ids[:3])}",
+                "x_axis": "site_id", "y_axes": ["avg_drop_rate", "violations"],
+                "response": f"Network issue tickets for {', '.join(site_ids[:3])}.",
+            }
+        else:
+            sql = f"""SELECT site_id, priority, avg_drop_rate, avg_cssr, avg_tput,
+                       violations, status, zone, created_at::text AS created_at
+                FROM network_issue_tickets
+                ORDER BY created_at DESC NULLS LAST LIMIT {_n}"""
+            return {
+                "sql": sql, "query_type": "bar", "chart_type": "bar",
+                "title": f"Latest {_n} Network Issue Tickets",
+                "x_axis": "site_id", "y_axes": ["avg_drop_rate", "violations"],
+                "response": f"Showing {_n} most recent network issue tickets.",
+            }
+
     # ── FIX: Multiple sites + trend → multi_chart (one chart per site, each with ALL KPIs) ──
     # Previously this incorrectly paired kpi[i] with site[i].
     if len(site_ids) >= 2 and is_trend:
@@ -1709,7 +1902,7 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
         sql = _kd_site_query([("DL Data Total Volume","dl_volume"),("UL Data Total Volume","ul_volume"),("DL PRB Utilization (1BH)","dl_prb_util")],"dl_volume","DESC")
         return {"sql":sql,"query_type":"bar","title":f"Top {N} by Data Volume","x_axis":"site_id","y_axes":["dl_volume","ul_volume"],"response":f"Showing {N} sites with highest data volume."}
 
-    if 'user' in p or 'ue' in p or 'connected' in p:
+    if 'connected' in p or re.search(r'\busers?\b', p) or re.search(r'\bue\b', p):
         sql = _kd_site_query([("Ave RRC Connected Ue","avg_rrc_ue"),("Max RRC Connected Ue","max_rrc_ue"),("DL PRB Utilization (1BH)","dl_prb_util")],"avg_rrc_ue","DESC")
         return {"sql":sql,"query_type":"bar","title":f"Top {N} by Connected Users","x_axis":"site_id","y_axes":["avg_rrc_ue","max_rrc_ue"],"response":f"Showing {N} sites with most users."}
 
