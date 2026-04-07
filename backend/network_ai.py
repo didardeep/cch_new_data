@@ -98,11 +98,11 @@ def ai_query():
         _ensure_ai_session_tables()
         ai_session = db.session.get(NetworkAiSession, int(session_id))
         if ai_session and ai_session.user_id == int(uid):
-            # ── CHANGE: load last 6 messages (not 20) + prepend summary ──
+            # ── CHANGE: load last 10 messages (5 turns) + prepend summary ──
             recent_msgs = (NetworkAiMessage.query
                           .filter_by(session_id=session_id)
                           .order_by(NetworkAiMessage.created_at.desc())
-                          .limit(6)
+                          .limit(10)
                           .all())
             recent_msgs.reverse()
             # Prepend rolling summary so LLM retains full history context
@@ -338,8 +338,11 @@ STRICTNESS RULES — FOLLOW THESE EXACTLY:
 4. EXTRACT THE EXACT NUMBER OF DAYS mentioned. "last 18 days" = 18, NOT 7 or 30.
 5. KPI names are CASE-SENSITIVE — copy EXACTLY from the list above.
 6. Site IDs are EXACT — copy every character. NEVER truncate in SQL (only title has 60-char limit).
-7. ALWAYS: WHERE k.data_level='site' AND k.value IS NOT NULL
+7. ALWAYS: WHERE k.data_level='site' AND k.value IS NOT NULL. NEVER use data_level='cell'.
 8. JOIN telecom_sites only when you need zone/geo data.
+9. In UNION ALL queries, NEVER put ORDER BY or LIMIT inside individual SELECT branches. Put ONE ORDER BY at the very end AFTER the last UNION ALL branch.
+10. "a week" / "1 week" = INTERVAL '7 days'. "a month" = INTERVAL '30 days'. Always convert to days.
+11. When user says "for both" or "for site A and site B", you MUST include ALL mentioned sites — never drop any.
 
 ═══════════════════════════════════════════════════════════
 CHART TYPE — MUST MATCH THE DATA SHAPE:
@@ -421,7 +424,7 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
                 parsed["response"] = parsed.get("title", "Results")
             for chart in parsed["charts"]:
                 if chart.get("sql"):
-                    chart["sql"] = _fix_site_ids_in_sql(chart["sql"])
+                    chart["sql"] = _sanitize_llm_sql(chart["sql"])
             return parsed
         ct = parsed.get("chart_type") or parsed.get("chart") or parsed.get("query_type") or "bar"
         parsed["chart_type"] = ct
@@ -437,14 +440,18 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
         if "chart_config" not in parsed:
             parsed["chart_config"] = {}
         if parsed.get("sql"):
-            parsed["sql"] = _fix_site_ids_in_sql(parsed["sql"])
+            parsed["sql"] = _sanitize_llm_sql(parsed["sql"])
         return parsed
 
-    def _fix_site_ids_in_sql(sql: str) -> str:
+    # ── CHANGE: comprehensive SQL sanitizer for all known LLM mistakes ──
+    def _sanitize_llm_sql(sql: str) -> str:
+        """Fix common LLM-generated SQL mistakes before execution."""
         import re
-        prompt_site_ids = re.findall(r'[A-Za-z]{2,}[_\-][A-Za-z]{2,}[_\-]\d{3,}', prompt)
-        if not prompt_site_ids:
+        if not sql or not sql.strip():
             return sql
+
+        # 1. Fix truncated site IDs (LLM cuts off last chars)
+        prompt_site_ids = re.findall(r'[A-Za-z]{2,}[_\-][A-Za-z]{2,}[_\-]\d{3,}', prompt)
         for correct_id in prompt_site_ids:
             for trim in range(1, 4):
                 truncated = correct_id[:-trim]
@@ -454,8 +461,58 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
                 replacement = r"\g<1>" + correct_id + r"\g<3>"
                 fixed = re.sub(pattern, replacement, sql, flags=re.IGNORECASE)
                 if fixed != sql:
-                    _LOG.info("Fixed truncated site ID in SQL: '%s' → '%s'", truncated, correct_id)
+                    _LOG.info("[SQL-fix] truncated site ID: '%s' → '%s'", truncated, correct_id)
                     sql = fixed
+
+        # 2. Fix ORDER BY inside UNION ALL branches (PostgreSQL syntax error)
+        if re.search(r'\bUNION\s+ALL\b', sql, re.IGNORECASE):
+            parts = re.split(r'\bUNION\s+ALL\b', sql, flags=re.IGNORECASE)
+            if len(parts) > 1:
+                cleaned = []
+                for part in parts:
+                    part = re.sub(r'\s+ORDER\s+BY\s+[\w\s,.]+$', '', part.strip(), flags=re.IGNORECASE)
+                    cleaned.append(part)
+                sql = '\nUNION ALL\n'.join(cleaned) + '\nORDER BY date'
+                _LOG.info("[SQL-fix] moved ORDER BY to end of UNION ALL")
+
+        # 3. Fix data_level='cell' → 'site' (prompt rule #7 says ALWAYS 'site')
+        if re.search(r"data_level\s*=\s*'cell'", sql, re.IGNORECASE):
+            sql = re.sub(r"data_level\s*=\s*'cell'", "data_level = 'site'", sql, flags=re.IGNORECASE)
+            _LOG.info("[SQL-fix] changed data_level='cell' → 'site'")
+
+        # 4. Ensure k.date <= CURRENT_DATE cap exists when date range is used
+        if re.search(r"CURRENT_DATE\s*-\s*INTERVAL", sql, re.IGNORECASE):
+            if not re.search(r"date\s*<=\s*CURRENT_DATE", sql, re.IGNORECASE):
+                sql = re.sub(
+                    r"(CURRENT_DATE\s*-\s*INTERVAL\s*'[^']+'\s*)",
+                    r"\1AND k.date <= CURRENT_DATE ",
+                    sql, count=1, flags=re.IGNORECASE,
+                )
+                _LOG.info("[SQL-fix] added missing k.date <= CURRENT_DATE cap")
+
+        # 5. Ensure k.value IS NOT NULL exists
+        if 'kpi_data' in sql.lower() and 'is not null' not in sql.lower():
+            sql = re.sub(
+                r"(data_level\s*=\s*'site')",
+                r"\1 AND k.value IS NOT NULL",
+                sql, count=1, flags=re.IGNORECASE,
+            )
+            _LOG.info("[SQL-fix] added missing k.value IS NOT NULL")
+
+        # 6. Fix LIMIT inside UNION ALL branches (PostgreSQL syntax error)
+        if re.search(r'\bUNION\s+ALL\b', sql, re.IGNORECASE):
+            parts = re.split(r'\bUNION\s+ALL\b', sql, flags=re.IGNORECASE)
+            if len(parts) > 1:
+                cleaned = []
+                for part in parts:
+                    part = re.sub(r'\s+LIMIT\s+\d+\s*$', '', part.strip(), flags=re.IGNORECASE)
+                    cleaned.append(part)
+                # Preserve the ORDER BY we already placed at end
+                if re.search(r'\bORDER\s+BY\b', cleaned[-1], re.IGNORECASE):
+                    sql = '\nUNION ALL\n'.join(cleaned)
+                else:
+                    sql = '\nUNION ALL\n'.join(cleaned) + '\nORDER BY date'
+
         return sql
 
     user_prompt = f"User query: {prompt}"
@@ -510,7 +567,8 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
 
     _p_lower = prompt.lower().strip()
     _prompt_sites = _re_pre.findall(r'[A-Za-z]{2,}[_\-][A-Za-z]{2,}[_\-]\d{3,}', prompt)
-    _prompt_days  = _re_pre.search(r'last\s+(\d+)\s*days?', _p_lower)
+    # ── CHANGE: use unified time parser instead of just regex for "last N days" ──
+    _prompt_days_int = _parse_time_to_days(_p_lower)
 
     # 1. Follow-up detection — run rule-based BEFORE LLM so context is never lost
     if _is_followup(_p_lower):
@@ -524,10 +582,11 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
 
     # 2. Multi-site trend queries — rule-based reliably generates one chart per site
     #    with ALL requested KPIs, which LLMs often get wrong.
+    # ── CHANGE: detect "a week", "a month" etc. via _parse_time_to_days ──
     if not ai_result and len(_prompt_sites) >= 2:
         _is_trend_pre = (
-            bool(_prompt_days) or
-            any(w in _p_lower for w in ('trend', 'over time', 'history', 'daily', 'last'))
+            bool(_prompt_days_int) or
+            any(w in _p_lower for w in ('trend', 'over time', 'history', 'daily', 'last', 'week', 'month', 'year'))
         )
         if _is_trend_pre:
             ai_result = _rule_based_query(prompt, time_filter, prev_context=None)
@@ -818,12 +877,26 @@ def _extract_session_context(sql_str, chart_type="bar"):
 
 def _update_session_context(ai_session, sql_str, chart_type="bar"):
     """Update ai_session.session_context from the SQL that was just executed.
+    MERGES new sites/KPIs with existing ones so earlier context isn't lost.
     Wrapped in try/except so it never breaks the main response."""
     if not ai_session:
         return
     try:
-        ctx = _extract_session_context(sql_str, chart_type)
-        ai_session.session_context = ctx
+        new_ctx = _extract_session_context(sql_str, chart_type)
+        old_ctx = (getattr(ai_session, 'session_context', None) or {})
+
+        # ── CHANGE: merge instead of replace — keep last 8 sites/KPIs seen ──
+        merged_sites = list(dict.fromkeys(
+            old_ctx.get("active_sites", []) + new_ctx.get("active_sites", [])
+        ))[-8:]  # keep last 8 unique sites
+        merged_kpis = list(dict.fromkeys(
+            old_ctx.get("active_kpis", []) + new_ctx.get("active_kpis", [])
+        ))[-6:]  # keep last 6 unique KPIs
+
+        new_ctx["active_sites"] = merged_sites
+        new_ctx["active_kpis"]  = merged_kpis
+        # Days and chart type always use the latest
+        ai_session.session_context = new_ctx
         db.session.commit()
     except Exception as e:
         _LOG.warning("Failed to update session_context: %s", e)
@@ -834,20 +907,22 @@ def _update_session_context(ai_session, sql_str, chart_type="bar"):
 
 
 def _maybe_summarize_conversation(ai_session):
-    """Every 10 messages, generate a rolling summary via the same LLM provider.
+    """Generate a rolling summary — first at 8 messages, then every 8 after.
+    This ensures the summary exists BEFORE old messages drop out of the history window.
     Wrapped in try/except so it never breaks the main response."""
     if not ai_session:
         return
     try:
         msg_count = NetworkAiMessage.query.filter_by(session_id=ai_session.id).count()
-        if msg_count < 10 or msg_count % 10 != 0:
+        # ── CHANGE: trigger at 8 instead of 10, so summary exists before messages drop ──
+        if msg_count < 8 or msg_count % 8 != 0:
             return
 
-        # Grab last 10 messages for summarization
+        # Grab last 12 messages for summarization (wider window for better summary)
         last_10 = (NetworkAiMessage.query
                    .filter_by(session_id=ai_session.id)
                    .order_by(NetworkAiMessage.created_at.desc())
-                   .limit(10).all())
+                   .limit(12).all())
         last_10.reverse()
         convo_text = "\n".join(
             f"{m.role}: {m.content[:300]}" for m in last_10
@@ -903,6 +978,58 @@ def _maybe_summarize_conversation(ai_session):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Shared time-range parser
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── CHANGE: unified time parser that handles "a week", "1 month", "last 18 days", etc. ──
+def _parse_time_to_days(text: str):
+    """Extract a day count from natural-language time references.
+    Returns int (number of days) or None if no time reference found."""
+    import re
+    t = text.lower().strip()
+
+    # "last 18 days", "past 7 days", "recent 30 days"
+    m = re.search(r'(?:last|past|recent)\s+(\d+)\s*days?', t)
+    if m:
+        return int(m.group(1))
+
+    # "18 days", "7 day" (bare number + days)
+    m = re.search(r'(\d+)\s*days?', t)
+    if m and not re.search(r'(top|bottom|worst|best)\s+' + m.group(1), t):
+        return int(m.group(1))
+
+    # Word-based: "a week", "one week", "1 week", "2 weeks", "a month", etc.
+    _WORD_MAP = {
+        'week': 7, 'weeks': 7,
+        'month': 30, 'months': 30,
+        'year': 365, 'years': 365,
+        'quarter': 90, 'quarters': 90,
+        'fortnight': 14, 'fortnights': 14,
+    }
+    # "last week", "a week", "1 week", "one week", "2 weeks", "last 3 months"
+    m = re.search(
+        r'(?:last|past|a|an|one|1|(\d+))\s+(week|weeks|month|months|year|years|quarter|quarters|fortnight|fortnights)',
+        t
+    )
+    if m:
+        multiplier = int(m.group(1)) if m.group(1) else 1
+        unit = m.group(2)
+        return multiplier * _WORD_MAP.get(unit, 7)
+
+    # "for a week", "for one month"
+    m = re.search(
+        r'for\s+(?:a|an|one|1|(\d+))\s+(week|weeks|month|months|year|years|quarter|quarters)',
+        t
+    )
+    if m:
+        multiplier = int(m.group(1)) if m.group(1) else 1
+        unit = m.group(2)
+        return multiplier * _WORD_MAP.get(unit, 7)
+
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Follow-up / Conversation Context Handling
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -930,11 +1057,8 @@ def _is_followup(prompt_lower: str) -> bool:
 
     has_site     = bool(re.findall(r'[a-z]{2,}[_\-][a-z]{2,}[_\-]\d{3,}', p))
     has_kpi      = any(kw in p for kw in _FU_KPI_WORDS)
-    has_days     = bool(re.search(r'last\s+\d+\s*days?', p))
-    has_time_ref = has_days or bool(re.search(
-        r'last\s+(year|month|week|quarter|6\s*months?|3\s*months?)'
-        r'|\d+\s*(month|year|week)s?|this\s+(year|month|week)', p
-    ))
+    # ── CHANGE: use unified time parser so "a week", "a month" are detected ──
+    has_time_ref = bool(_parse_time_to_days(p))
 
     # 1. Truly self-contained: site + explicit time reference → always fresh
     if has_site and has_time_ref:
@@ -1077,12 +1201,8 @@ def _handle_followup(prompt_orig: str, p: str, prev: dict, time_filter: str) -> 
 
     new_sites  = re.findall(r'[A-Za-z]{2,}[_\-][A-Za-z]{2,}[_\-]\d{3,}', prompt_orig)
     new_kpi    = _detect_kpi(p)
-    new_days_m = re.search(r'(?:last|past|recent)\s+(\d+)\s*days?', p)
-    new_days   = int(new_days_m.group(1)) if new_days_m else None
-    if not new_days:
-        dm = re.search(r'(\d+)\s*days?', p)
-        if dm and not re.search(r'(top|bottom|worst|best)\s+' + dm.group(1), p):
-            new_days = int(dm.group(1))
+    # ── CHANGE: use unified time parser for "a week", "a month", etc. ──
+    new_days   = _parse_time_to_days(p)
 
     # ── FIX: Site switch — new site mentioned, no new KPI → inherit ALL previous KPIs ──
     # This handles: "i want to see for site id GUR_LTE_0001" after a multi-chart response.
@@ -1338,9 +1458,9 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
                 seen.add(KPI_MAP[kw][0])
         return found
 
+    # ── CHANGE: use unified time parser to handle "a week", "a month", etc. ──
     def _extract_days(text):
-        m = re.search(r'last\s+(\d+)\s*days?', text.lower())
-        return int(m.group(1)) if m else None
+        return _parse_time_to_days(text)
 
     # _try_split_compound REMOVED — caused incorrect KPI-site pairing on "and" keyword
 
@@ -1357,8 +1477,10 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
 
     detected_kpis = _detect_kpis(p)
     days          = _extract_days(p)
+    # ── CHANGE: also detect "week", "month", "year" as trend signals ──
     is_trend      = (bool(days) or 'trend' in p or 'over time' in p or
-                     'history' in p or 'daily' in p or 'last' in p)
+                     'history' in p or 'daily' in p or 'last' in p or
+                     'week' in p or 'month' in p or 'year' in p)
 
     # ── FIX: Multiple sites + trend → multi_chart (one chart per site, each with ALL KPIs) ──
     # Previously this incorrectly paired kpi[i] with site[i].
