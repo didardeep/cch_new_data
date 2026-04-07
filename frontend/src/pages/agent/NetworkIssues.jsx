@@ -448,6 +448,9 @@ export default function NetworkIssues() {
   const [showRouting, setShowRouting] = useState(false);
   const [routingData, setRoutingData] = useState([]);
   const [routingLoading, setRoutingLoading] = useState(false);
+  const [showLogs, setShowLogs] = useState(false);
+  const [logsData, setLogsData] = useState([]);
+  const [logsLoading, setLogsLoading] = useState(false);
 
   /* ── PDF Trend Chart Helper ────────────────────────────────────────────────── */
   const drawTrendChart = (doc, { x, y, w, h, title, points, color = [0, 51, 141] }) => {
@@ -846,6 +849,16 @@ export default function NetworkIssues() {
     setShowRouting(true);
   };
 
+  const fetchLogs = async () => {
+    setLogsLoading(true);
+    try {
+      const d = await apiGet('/api/network-issues/logs');
+      setLogsData(d.logs || []);
+    } catch (_) {}
+    setLogsLoading(false);
+    setShowLogs(true);
+  };
+
   if (loading) return <div style={{display:'flex',alignItems:'center',justifyContent:'center',height:400}}><div className="spinner"/></div>;
 
   return (
@@ -860,6 +873,10 @@ export default function NetworkIssues() {
           <p style={{margin:'4px 0 0',fontSize:12,color:'#64748b'}}>{openCount} open · {resolvedCount} resolved · {myTickets.length} total</p>
         </div>
         <div style={{display:'flex',gap:8}}>
+          <button onClick={fetchLogs} style={{display:'flex',alignItems:'center',gap:5,padding:'7px 14px',borderRadius:8,fontSize:12,fontWeight:600,background:'#f8fafc',color:'#475569',border:'1px solid #e2e8f0',cursor:'pointer'}}>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
+            System Logs
+          </button>
           <button onClick={fetchRouting} style={{display:'flex',alignItems:'center',gap:5,padding:'7px 14px',borderRadius:8,fontSize:12,fontWeight:600,background:'#f8fafc',color:'#475569',border:'1px solid #e2e8f0',cursor:'pointer'}}>
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8.5" cy="7" r="4"/><line x1="20" y1="8" x2="20" y2="14"/><line x1="23" y1="11" x2="17" y2="11"/></svg>
             Today's Routing
@@ -1044,6 +1061,48 @@ export default function NetworkIssues() {
                   </tbody>
                 </table>
               )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* System Logs Modal */}
+      {showLogs && (
+        <div style={{position:'fixed',inset:0,background:'rgba(15,23,42,0.45)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:1000}} onClick={()=>setShowLogs(false)}>
+          <div onClick={e=>e.stopPropagation()} style={{background:'#fff',borderRadius:12,width:780,maxWidth:'95vw',maxHeight:'85vh',overflowY:'auto',boxShadow:'0 20px 60px rgba(0,0,0,.15)'}}>
+            <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',padding:'16px 24px',borderBottom:'1px solid #e2e8f0'}}>
+              <div>
+                <h3 style={{margin:0,fontSize:16,fontWeight:700,color:'#0f172a'}}>AI Ticket System Logs</h3>
+                <p style={{margin:'2px 0 0',fontSize:11,color:'#64748b'}}>Data pipeline, scheduler status, and ticket history</p>
+              </div>
+              <button onClick={()=>setShowLogs(false)} style={{border:'none',background:'#f1f5f9',borderRadius:6,width:28,height:28,cursor:'pointer',display:'flex',alignItems:'center',justifyContent:'center'}}>{IC.x}</button>
+            </div>
+            <div style={{padding:'16px 24px',fontFamily:'monospace',fontSize:12,lineHeight:1.8}}>
+              {logsLoading ? (
+                <div style={{textAlign:'center',padding:40,color:'#94a3b8'}}>Loading...</div>
+              ) : logsData.length === 0 ? (
+                <div style={{textAlign:'center',padding:40,color:'#94a3b8',fontSize:13}}>No logs available.</div>
+              ) : logsData.map((log, i) => {
+                if (log.type === 'header') return (
+                  <div key={i} style={{margin:i>0?'16px 0 6px':'0 0 6px',padding:'6px 10px',background:'#00338D',color:'#fff',borderRadius:6,fontSize:11,fontWeight:700,letterSpacing:'0.05em',textTransform:'uppercase'}}>
+                    {log.text}
+                  </div>
+                );
+                const colors = {
+                  info: {bg:'#f0f9ff',color:'#0369a1',icon:'i'},
+                  warn: {bg:'#fffbeb',color:'#b45309',icon:'!'},
+                  error: {bg:'#fef2f2',color:'#dc2626',icon:'x'},
+                  detail: {bg:'#f8fafc',color:'#475569',icon:'>'},
+                  ticket: {bg:'#f0fdf4',color:'#166534',icon:'#'},
+                };
+                const c = colors[log.type] || colors.info;
+                return (
+                  <div key={i} style={{padding:'5px 10px',marginBottom:2,background:c.bg,borderRadius:4,color:c.color,borderLeft:`3px solid ${c.color}`,display:'flex',gap:8,alignItems:'flex-start'}}>
+                    <span style={{opacity:0.6,flexShrink:0,width:14,textAlign:'center',fontWeight:700}}>{c.icon}</span>
+                    <span style={{whiteSpace:'pre-wrap',wordBreak:'break-word'}}>{log.text}</span>
+                  </div>
+                );
+              })}
             </div>
           </div>
         </div>
