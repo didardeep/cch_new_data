@@ -52,6 +52,19 @@ def _ensure_ai_session_tables():
         NetworkAiMessage.__table__.create(db.engine, checkfirst=True)
     except Exception:
         pass
+    # ── CHANGE: migration-safe — add new columns if table already exists ──
+    try:
+        with db.engine.connect() as conn:
+            from sqlalchemy import inspect as sa_inspect
+            cols = {c["name"] for c in sa_inspect(db.engine).get_columns("network_ai_sessions")}
+            if "session_context" not in cols:
+                conn.execute(sa_text("ALTER TABLE network_ai_sessions ADD COLUMN session_context JSON DEFAULT '{}'"))
+                conn.commit()
+            if "conversation_summary" not in cols:
+                conn.execute(sa_text("ALTER TABLE network_ai_sessions ADD COLUMN conversation_summary TEXT"))
+                conn.commit()
+    except Exception:
+        pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -85,12 +98,19 @@ def ai_query():
         _ensure_ai_session_tables()
         ai_session = db.session.get(NetworkAiSession, int(session_id))
         if ai_session and ai_session.user_id == int(uid):
+            # ── CHANGE: load last 6 messages (not 20) + prepend summary ──
             recent_msgs = (NetworkAiMessage.query
                           .filter_by(session_id=session_id)
                           .order_by(NetworkAiMessage.created_at.desc())
-                          .limit(20)
+                          .limit(6)
                           .all())
             recent_msgs.reverse()
+            # Prepend rolling summary so LLM retains full history context
+            if getattr(ai_session, 'conversation_summary', None):
+                conversation_history.append({
+                    "role": "system",
+                    "content": f"Conversation so far: {ai_session.conversation_summary}",
+                })
             for m in recent_msgs:
                 if m.role == "user":
                     conversation_history.append({
@@ -201,6 +221,14 @@ User says "last month" → AND k.date >= CURRENT_DATE - INTERVAL '1 month' AND k
 ALWAYS add AND k.date <= CURRENT_DATE when any date range is used, to exclude future data.
 """
 
+    # ── CHANGE: read session_context for dynamic prompt injection ──
+    _sctx = (getattr(ai_session, 'session_context', None) or {}) if ai_session else {}
+    _active_sites = ", ".join(_sctx.get("active_sites", [])) or "none yet"
+    _active_kpis  = ", ".join(_sctx.get("active_kpis", []))  or "none yet"
+    _active_days  = _sctx.get("active_days")
+    _active_days_str = f"last {_active_days} days" if _active_days else "not set"
+    _last_chart   = _sctx.get("last_chart_type", "bar")
+
     LLM_SYSTEM = f"""You are a telecom network analytics SQL generator. Your ONLY job is to convert the user's natural-language query into an EXACT, STRICT SQL query that fetches PRECISELY what was asked — nothing more, nothing less.
 
 READ THE USER QUERY VERY CAREFULLY. Understand EVERY part of it before generating SQL.
@@ -208,6 +236,18 @@ READ THE USER QUERY VERY CAREFULLY. Understand EVERY part of it before generatin
 The user may write in English, Hindi, Hinglish, or any language. Understand the intent and translate to SQL.
 
 {SCHEMA_HINT}
+
+═══════════════════════════════════════════════════════════
+ACTIVE SESSION STATE (always inherit this for follow-ups):
+═══════════════════════════════════════════════════════════
+- Sites currently in focus: {_active_sites}
+- KPIs currently in focus:  {_active_kpis}
+- Time range in use:        {_active_days_str}
+- Last chart type:          {_last_chart}
+
+If the user's query does not mention a new site, inherit the active_sites above.
+If the user's query does not mention a new KPI, inherit the active_kpis above.
+If the user's query does not mention a new time range, inherit the active_days above.
 
 ═══════════════════════════════════════════════════════════
 CRITICAL RULE #00 — CONVERSATION CONTEXT & FOLLOW-UPS:
@@ -648,6 +688,10 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
                 db.session.commit()
             except Exception as e:
                 _LOG.error("Failed to persist AI message: %s", e)
+            # ── CHANGE: update session context + maybe summarize ──
+            _all_sqls = " ".join(ch.get("sql", "") for ch in charts_out)
+            _update_session_context(ai_session, _all_sqls, "multi_chart")
+            _maybe_summarize_conversation(ai_session)
 
         return jsonify({
             "response":     resp_text,
@@ -723,6 +767,9 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
             db.session.commit()
         except Exception as e:
             _LOG.error("Failed to persist AI message: %s", e)
+        # ── CHANGE: update session context + maybe summarize ──
+        _update_session_context(ai_session, sql, resp_chart)
+        _maybe_summarize_conversation(ai_session)
 
     return jsonify({
         "response":      resp_text,
@@ -742,6 +789,117 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
         "provider":      provider["provider"] if provider else "rule-based",
         "session_id":    ai_session.id if ai_session else None,
     })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CHANGE: Session context tracking + conversation summarization
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _extract_session_context(sql_str, chart_type="bar"):
+    """Parse active sites, KPIs, days, chart type from an executed SQL string.
+    Returns a dict suitable for storing in ai_session.session_context."""
+    import re
+    ctx = {
+        "active_sites": [],
+        "active_kpis": [],
+        "active_days": None,
+        "last_chart_type": chart_type or "bar",
+        "last_sql": (sql_str or "")[:2000],
+    }
+    if not sql_str:
+        return ctx
+    ctx["active_sites"] = list(dict.fromkeys(re.findall(r"site_id\s*=\s*'([^']+)'", sql_str)))
+    ctx["active_kpis"]  = list(dict.fromkeys(re.findall(r"kpi_name\s*=\s*'([^']+)'", sql_str)))
+    days_m = re.search(r"INTERVAL\s+'(\d+)\s+days?'", sql_str)
+    if days_m:
+        ctx["active_days"] = int(days_m.group(1))
+    return ctx
+
+
+def _update_session_context(ai_session, sql_str, chart_type="bar"):
+    """Update ai_session.session_context from the SQL that was just executed.
+    Wrapped in try/except so it never breaks the main response."""
+    if not ai_session:
+        return
+    try:
+        ctx = _extract_session_context(sql_str, chart_type)
+        ai_session.session_context = ctx
+        db.session.commit()
+    except Exception as e:
+        _LOG.warning("Failed to update session_context: %s", e)
+        try:
+            db.session.rollback()
+        except Exception:
+            pass
+
+
+def _maybe_summarize_conversation(ai_session):
+    """Every 10 messages, generate a rolling summary via the same LLM provider.
+    Wrapped in try/except so it never breaks the main response."""
+    if not ai_session:
+        return
+    try:
+        msg_count = NetworkAiMessage.query.filter_by(session_id=ai_session.id).count()
+        if msg_count < 10 or msg_count % 10 != 0:
+            return
+
+        # Grab last 10 messages for summarization
+        last_10 = (NetworkAiMessage.query
+                   .filter_by(session_id=ai_session.id)
+                   .order_by(NetworkAiMessage.created_at.desc())
+                   .limit(10).all())
+        last_10.reverse()
+        convo_text = "\n".join(
+            f"{m.role}: {m.content[:300]}" for m in last_10
+        )
+
+        summary_prompt = (
+            "Summarize this telecom analytics conversation in 3-4 sentences. "
+            "Focus on: which sites were analyzed, which KPIs were discussed, "
+            "what time ranges were used, and what insights were found.\n\n"
+            f"Conversation:\n{convo_text}"
+        )
+        summary_msgs = [
+            {"role": "system", "content": "You are a concise summarizer."},
+            {"role": "user", "content": summary_prompt},
+        ]
+
+        _cfg = lambda k, default="": current_app.config.get(k, "") or os.environ.get(k, "") or default
+        azure_key   = _cfg("AZURE_OPENAI_API_KEY")
+        azure_ep    = _cfg("AZURE_OPENAI_ENDPOINT")
+        azure_dep   = _cfg("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini")
+        azure_ver   = _cfg("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
+        gemini_key  = _cfg("GEMINI_API_KEY")
+        openai_key  = _cfg("OPENAI_API_KEY")
+
+        summary_text = None
+
+        if azure_key and azure_ep:
+            from openai import AzureOpenAI as _AzOAI
+            c = _AzOAI(api_key=azure_key, api_version=azure_ver, azure_endpoint=azure_ep, timeout=15.0)
+            r = c.chat.completions.create(model=azure_dep, messages=summary_msgs, temperature=0.3, max_tokens=300)
+            summary_text = r.choices[0].message.content
+        elif gemini_key:
+            from openai import OpenAI as _OAI
+            c = _OAI(api_key=gemini_key, base_url="https://generativelanguage.googleapis.com/v1beta/openai/", timeout=15.0)
+            r = c.chat.completions.create(model=_cfg("OPENAI_MODEL", "gemini-2.0-flash"), messages=summary_msgs, temperature=0.3, max_tokens=300)
+            summary_text = r.choices[0].message.content
+        elif openai_key:
+            from openai import OpenAI as _OAI2
+            c = _OAI2(api_key=openai_key, timeout=15.0)
+            r = c.chat.completions.create(model="gpt-4o-mini", messages=summary_msgs, temperature=0.3, max_tokens=300)
+            summary_text = r.choices[0].message.content
+
+        if summary_text:
+            ai_session.conversation_summary = summary_text.strip()
+            db.session.commit()
+            _LOG.info("Conversation summary updated for session %d (%d msgs)", ai_session.id, msg_count)
+    except Exception as e:
+        _LOG.warning("Summarization failed (non-fatal): %s", e)
+        try:
+            db.session.rollback()
+        except Exception:
+            pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────

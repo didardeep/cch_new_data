@@ -152,6 +152,10 @@ class NetworkAiSession(db.Model):
     status = db.Column(db.String(20), default="active")
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
     last_message_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+    # ── CHANGE: session_context stores active sites/KPIs/days/chart for follow-ups ──
+    session_context = db.Column(db.JSON, default=dict)
+    # ── CHANGE: conversation_summary stores rolling plain-text summary ──
+    conversation_summary = db.Column(db.Text, nullable=True)
 
     messages = db.relationship("NetworkAiMessage", backref="session", lazy=True,
                                order_by="NetworkAiMessage.created_at")
