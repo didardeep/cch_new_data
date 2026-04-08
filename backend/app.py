@@ -6669,6 +6669,15 @@ def agent_dashboard():
     if not user or user.role != "human_agent":
         return jsonify({"error": "Unauthorized"}), 403
 
+    # ── Mock dashboard for demo user ──
+    from mock_dashboard import MOCK_EMAIL, get_mock_dashboard
+    if user.email == MOCK_EMAIL:
+        return jsonify(get_mock_dashboard(
+            agent_name=user.name or "Agent",
+            agent_location=getattr(user, "location", "Gurgaon"),
+            agent_domain=getattr(user, "domain", "broadband"),
+        ))
+
     now = datetime.now(timezone.utc)
 
     # Helper: make any datetime UTC-aware (DB columns are stored as naive UTC)
