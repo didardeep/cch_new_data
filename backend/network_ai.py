@@ -732,11 +732,9 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
             provider  = {"provider": "rule-based-multisite"}
             _LOG.info("Multi-site trend intercepted before LLM: %s", _prompt_sites)
 
-    # 3. Revenue / Core / Transport / Ticket queries — LLM handles these now.
+    # 3. LLM handles all queries (revenue, core, transport, tickets, KPIs).
     #    Dynamic schema (AVAILABLE TABLES section) tells LLM which tables exist.
     #    Rule-based handlers remain as fallback if LLM SQL fails at execution.
-
-    # ── Use the global LLM client (already initialized at startup) ──
     if not ai_result:
         try:
             _llm_resp = _llm_client.chat.completions.create(
@@ -1525,11 +1523,12 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
         'e rab':           ('E-RAB Call Drop Rate_1', 'drop_rate'),
         'drop rate':       ('E-RAB Call Drop Rate_1', 'drop_rate'),
         'call drop':       ('E-RAB Call Drop Rate_1', 'drop_rate'),
-        'call failure':    ('E-RAB Call Drop Rate_1', 'drop_rate'),
         'cdr':             ('E-RAB Call Drop Rate_1', 'drop_rate'),
+        'call failure':    ('E-RAB Call Drop Rate_1', 'drop_rate'),
         'throughput':      ('LTE DL - Cell Ave Throughput', 'dl_tput'),
         'tput':            ('LTE DL - Cell Ave Throughput', 'dl_tput'),
         'dl throughput':   ('LTE DL - Cell Ave Throughput', 'dl_tput'),
+        'speed':           ('LTE DL - Cell Ave Throughput', 'dl_tput'),
         'download speed':  ('LTE DL - Cell Ave Throughput', 'dl_tput'),
         'mbps':            ('LTE DL - Cell Ave Throughput', 'dl_tput'),
         'prb':             ('DL PRB Utilization (1BH)', 'dl_prb'),
@@ -1541,11 +1540,16 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
         'uptime':          ('Availability', 'availability'),
         'downtime':        ('Availability', 'availability'),
         'latency':         ('Average Latency Downlink', 'latency'),
+        'delay':           ('Average Latency Downlink', 'latency'),
         'ping':            ('Average Latency Downlink', 'latency'),
         'volte':           ('VoLTE Traffic Erlang', 'volte_erl'),
+        'voice traffic':   ('VoLTE Traffic Erlang', 'volte_erl'),
         'handover':        ('LTE Intra-Freq HO Success Rate', 'ho_sr'),
+        'ho success':      ('LTE Intra-Freq HO Success Rate', 'ho_sr'),
         'volume':          ('DL Data Total Volume', 'dl_volume'),
         'data volume':     ('DL Data Total Volume', 'dl_volume'),
+        'traffic volume':  ('DL Data Total Volume', 'dl_volume'),
+        'connected':       ('Ave RRC Connected Ue', 'avg_rrc_ue'),
         'connected users': ('Ave RRC Connected Ue', 'avg_rrc_ue'),
         'active users':    ('Ave RRC Connected Ue', 'avg_rrc_ue'),
         'noise':           ('Average NI of Carrier-', 'noise_interference'),
@@ -1617,7 +1621,7 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
             site_filter_t = f"AND t.site_id IN ({in_clause})"
             site_filter_n = f"AND n.site_id IN ({in_clause})"
 
-        # Check which optional tables actually exist (via information_schema — no transaction errors)
+        # Check which optional tables actually exist
         def _tbl_exists(name):
             try:
                 rows = _sql(
@@ -1644,6 +1648,8 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
             elif _bot_m:
                 _rev_n = min(int(_bot_m.group(1)), 100)
                 _rev_order = "ASC"
+            elif any(w in p for w in ('worst', 'low', 'bottom', 'least')):
+                _rev_order = "ASC"
             _limit = f"LIMIT {_rev_n}"
 
             if not _has_rev_tbl:
@@ -1656,9 +1662,9 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
                               AND f.num_value IS NOT NULL {site_filter_f}
                             ORDER BY f.num_value {_rev_order} {_limit}""",
                         "query_type": "bar", "chart_type": "bar",
-                        "title": "Subscribers per Site",
+                        "title": f"{'Bottom' if _rev_order=='ASC' else 'Top'} {_rev_n} — Subscribers",
                         "x_axis": "site_id", "y_axes": ["subscribers"],
-                        "response": "Showing subscriber count per site (from uploaded data).",
+                        "response": f"{'Lowest' if _rev_order=='ASC' else 'Top'} {_rev_n} sites by subscriber count.",
                     }
                 elif any(w in p for w in ('opex', 'expenditure', 'operating cost')):
                     return {
@@ -1667,11 +1673,11 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
                             WHERE f.kpi_type = 'revenue' AND f.column_name LIKE 'opex\\_%'
                               AND f.column_type = 'numeric' {site_filter_f}
                             GROUP BY f.site_id
-                            ORDER BY total_opex {_rev_order} NULLS LAST {_limit}""",
+                            ORDER BY total_opex {_rev_order} {_limit}""",
                         "query_type": "bar", "chart_type": "bar",
-                        "title": "OPEX by Site",
+                        "title": f"{'Bottom' if _rev_order=='ASC' else 'Top'} {_rev_n} — OPEX",
                         "x_axis": "site_id", "y_axes": ["total_opex"],
-                        "response": "Showing OPEX data per site (from uploaded data).",
+                        "response": f"{'Lowest' if _rev_order=='ASC' else 'Highest'} {_rev_n} sites by total OPEX.",
                     }
                 elif 'arpu' in p:
                     return {
@@ -1692,12 +1698,12 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
                             ) sub ON rev.site_id = sub.site_id
                             ORDER BY arpu {_rev_order} {_limit}""",
                         "query_type": "bar", "chart_type": "bar",
-                        "title": "ARPU per Site",
+                        "title": f"{'Bottom' if _rev_order=='ASC' else 'Top'} {_rev_n} — ARPU",
                         "x_axis": "site_id", "y_axes": ["arpu"],
-                        "response": "Showing Average Revenue Per User (ARPU) per site.",
+                        "response": f"{'Lowest' if _rev_order=='ASC' else 'Top'} {_rev_n} sites by ARPU.",
                     }
                 else:
-                    # Default: aggregate total revenue per site from EAV
+                    # Default: aggregate total revenue per site
                     return {
                         "sql": f"""SELECT f.site_id, SUM(f.num_value) AS total_revenue
                             FROM flexible_kpi_uploads f
@@ -1706,9 +1712,9 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
                             GROUP BY f.site_id
                             ORDER BY total_revenue {_rev_order} NULLS LAST {_limit}""",
                         "query_type": "bar", "chart_type": "bar",
-                        "title": "Revenue per Site",
+                        "title": f"{'Bottom' if _rev_order=='ASC' else 'Top'} {_rev_n} Sites by Revenue",
                         "x_axis": "site_id", "y_axes": ["total_revenue"],
-                        "response": "Showing total revenue per site (from uploaded data).",
+                        "response": f"{'Lowest' if _rev_order=='ASC' else 'Top'} {_rev_n} sites by total revenue.",
                     }
 
             # revenue_data table exists — use flat table queries
@@ -1719,22 +1725,21 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
                         WHERE r.subscribers IS NOT NULL {site_filter_r}
                         ORDER BY r.subscribers {_rev_order} {_limit}""",
                     "query_type": "bar", "chart_type": "bar",
-                    "title": "Subscribers per Site",
+                    "title": f"{'Bottom' if _rev_order=='ASC' else 'Top'} {_rev_n} — Subscribers",
                     "x_axis": "site_id", "y_axes": ["subscribers"],
-                    "response": "Showing subscriber count per site.",
+                    "response": f"{'Lowest' if _rev_order=='ASC' else 'Top'} {_rev_n} sites by subscriber count.",
                 }
             elif any(w in p for w in ('opex', 'expenditure', 'operating cost')):
                 return {
-                    "sql": f"""SELECT r.site_id,
-                               (COALESCE(r.opex_jan,0) + COALESCE(r.opex_feb,0) + COALESCE(r.opex_mar,0)) AS total_opex,
-                               r.opex_jan, r.opex_feb, r.opex_mar
+                    "sql": f"""SELECT r.site_id, r.opex_jan, r.opex_feb, r.opex_mar,
+                               (COALESCE(r.opex_jan,0)+COALESCE(r.opex_feb,0)+COALESCE(r.opex_mar,0)) AS total_opex
                         FROM revenue_data r
                         WHERE r.site_id IS NOT NULL {site_filter_r}
                         ORDER BY total_opex {_rev_order} {_limit}""",
                     "query_type": "bar", "chart_type": "bar",
-                    "title": "OPEX by Site",
-                    "x_axis": "site_id", "y_axes": ["total_opex"],
-                    "response": "Showing monthly OPEX data per site.",
+                    "title": f"{'Bottom' if _rev_order=='ASC' else 'Top'} {_rev_n} — OPEX",
+                    "x_axis": "site_id", "y_axes": ["opex_jan", "opex_feb", "opex_mar"],
+                    "response": f"{'Lowest' if _rev_order=='ASC' else 'Highest'} {_rev_n} sites by total OPEX.",
                 }
             elif 'arpu' in p:
                 return {
@@ -1745,9 +1750,9 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
                         WHERE r.subscribers > 0 {site_filter_r}
                         ORDER BY arpu {_rev_order} {_limit}""",
                     "query_type": "bar", "chart_type": "bar",
-                    "title": "ARPU per Site",
+                    "title": f"{'Bottom' if _rev_order=='ASC' else 'Top'} {_rev_n} — ARPU",
                     "x_axis": "site_id", "y_axes": ["arpu"],
-                    "response": "Showing Average Revenue Per User (ARPU) per site.",
+                    "response": f"{'Lowest' if _rev_order=='ASC' else 'Top'} {_rev_n} sites by ARPU.",
                 }
             elif site_ids and is_trend:
                 # Revenue trend — unpivot monthly columns into time series
@@ -1769,24 +1774,31 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
                 }
             else:
                 return {
-                    "sql": f"""SELECT r.site_id,
+                    "sql": f"""SELECT r.site_id, r.subscribers,
+                               r.rev_jan, r.rev_feb, r.rev_mar,
                                (COALESCE(r.rev_jan,0) + COALESCE(r.rev_feb,0) + COALESCE(r.rev_mar,0)) AS total_revenue,
-                               r.subscribers, r.zone, r.technology
+                               r.zone, r.technology
                         FROM revenue_data r
                         WHERE r.site_id IS NOT NULL {site_filter_r}
-                        ORDER BY total_revenue {_rev_order} {_limit}""",
+                        ORDER BY total_revenue {_rev_order} NULLS LAST {_limit}""",
                     "query_type": "bar", "chart_type": "bar",
-                    "title": "Revenue per Site",
+                    "title": f"{'Bottom' if _rev_order=='ASC' else 'Top'} {_rev_n} Sites by Revenue",
                     "x_axis": "site_id", "y_axes": ["total_revenue"],
-                    "response": "Showing revenue data per site.",
+                    "response": f"{'Lowest' if _rev_order=='ASC' else 'Top'} {_rev_n} sites by total revenue.",
                 }
 
-        # Shared: extract top/bottom N for non-revenue handlers too
+        # ── Shared: extract top/bottom N for non-revenue handlers too ──
         _top_m2 = re.search(r'(?:top|best|highest)\s+(\d+)', p)
         _bot_m2 = re.search(r'(?:bottom|worst|lowest|least)\s+(\d+)', p)
-        _hn = 10; _horder = "DESC"
-        if _top_m2: _hn = min(int(_top_m2.group(1)), 100)
-        elif _bot_m2: _hn = min(int(_bot_m2.group(1)), 100); _horder = "ASC"
+        _hn = 10
+        _horder = "DESC"
+        if _top_m2:
+            _hn = min(int(_top_m2.group(1)), 100)
+        elif _bot_m2:
+            _hn = min(int(_bot_m2.group(1)), 100)
+            _horder = "ASC"
+        elif any(w in p for w in ('worst', 'low', 'bottom', 'least')):
+            _horder = "ASC"
         _hlimit = f"LIMIT {_hn}"
 
         # ── Core KPI queries (core_kpi_data → flexible_kpi_uploads fallback) ──
@@ -1807,51 +1819,62 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
                         "response": f"Showing core network KPIs for {site_ids[0]}.",
                     }
                 else:
+                    _core_sort = "auth_sr ASC" if _horder == "ASC" else "auth_sr DESC"
                     return {
                         "sql": f"""SELECT c.site_id, AVG(c.auth_sr) AS auth_sr, AVG(c.cpu_util) AS cpu_util,
                                    AVG(c.attach_sr) AS attach_sr, AVG(c.pdp_sr) AS pdp_sr
                             FROM core_kpi_data c
                             WHERE c.site_id IS NOT NULL {date_clause}
-                            GROUP BY c.site_id ORDER BY auth_sr {_horder} {_hlimit}""",
+                            GROUP BY c.site_id ORDER BY {_core_sort} NULLS LAST {_hlimit}""",
                         "query_type": "bar", "chart_type": "bar",
-                        "title": "Core KPIs — All Sites",
+                        "title": f"{'Bottom' if _horder=='ASC' else 'Top'} {_hn} — Core KPIs",
                         "x_axis": "site_id", "y_axes": ["auth_sr", "cpu_util", "attach_sr", "pdp_sr"],
-                        "response": "Showing core network KPIs for all sites.",
+                        "response": f"{'Worst' if _horder=='ASC' else 'Top'} {_hn} sites by core KPIs.",
                     }
             else:
                 # Fallback to flexible_kpi_uploads EAV
                 return {
-                    "sql": f"""SELECT f.site_id, f.column_name, AVG(f.num_value) AS avg_value
+                    "sql": f"""SELECT f.site_id, f.column_name, f.num_value
                         FROM flexible_kpi_uploads f
                         WHERE f.kpi_type = 'core' AND f.column_type = 'numeric'
                           {site_filter_f}
-                        GROUP BY f.site_id, f.column_name
-                        ORDER BY f.site_id {_hlimit}""",
+                        ORDER BY f.site_id, f.column_name""",
                     "query_type": "bar", "chart_type": "bar",
                     "title": "Core KPIs" + (f" — {', '.join(site_ids[:2])}" if site_ids else ""),
-                    "x_axis": "site_id", "y_axes": ["avg_value"],
+                    "x_axis": "site_id", "y_axes": ["num_value"],
                     "response": "Showing core network KPIs (from uploaded data).",
                 }
 
         # ── Transport/backhaul queries ──
         if _is_transport:
             if _tbl_exists("transport_kpi_data"):
-                # Pick sort column based on query intent
-                _sort_col = "avg_util"
-                if 'packet loss' in p: _sort_col = "packet_loss"
-                elif 'latency' in p or 'ping' in p: _sort_col = "avg_latency"
-                elif 'jitter' in p: _sort_col = "jitter"
-                return {
-                    "sql": f"""SELECT t.site_id, t.backhaul_type, t.link_capacity, t.avg_util,
-                               t.peak_util, t.packet_loss, t.avg_latency, t.jitter, t.availability
-                        FROM transport_kpi_data t
-                        WHERE t.site_id IS NOT NULL {site_filter_t}
-                        ORDER BY {_sort_col} {_horder} NULLS LAST {_hlimit}""",
-                    "query_type": "bar", "chart_type": "bar",
-                    "title": "Transport KPIs" + (f" — {', '.join(site_ids[:2])}" if site_ids else ""),
-                    "x_axis": "site_id", "y_axes": ["avg_util", "packet_loss", "avg_latency", "jitter"],
-                    "response": "Showing transport/backhaul KPIs.",
-                }
+                _trans_sort = "packet_loss" if any(w in p for w in ('packet loss', 'loss')) else \
+                              "avg_latency" if any(w in p for w in ('latency', 'delay')) else \
+                              "jitter" if 'jitter' in p else "packet_loss"
+                if site_ids:
+                    return {
+                        "sql": f"""SELECT t.site_id, t.backhaul_type, t.link_capacity, t.avg_util,
+                                   t.peak_util, t.packet_loss, t.avg_latency, t.jitter, t.availability
+                            FROM transport_kpi_data t
+                            WHERE t.site_id IS NOT NULL {site_filter_t}
+                            ORDER BY t.site_id""",
+                        "query_type": "bar", "chart_type": "bar",
+                        "title": f"Transport KPIs — {', '.join(site_ids[:2])}",
+                        "x_axis": "site_id", "y_axes": ["avg_util", "packet_loss", "avg_latency", "jitter"],
+                        "response": f"Transport/backhaul KPIs for {', '.join(site_ids[:2])}.",
+                    }
+                else:
+                    return {
+                        "sql": f"""SELECT t.site_id, t.backhaul_type, t.link_capacity, t.avg_util,
+                                   t.peak_util, t.packet_loss, t.avg_latency, t.jitter, t.availability
+                            FROM transport_kpi_data t
+                            WHERE t.site_id IS NOT NULL
+                            ORDER BY {_trans_sort} DESC NULLS LAST {_hlimit}""",
+                        "query_type": "bar", "chart_type": "bar",
+                        "title": f"Top {_hn} — Transport Issues (by {_trans_sort})",
+                        "x_axis": "site_id", "y_axes": ["packet_loss", "avg_latency", "jitter"],
+                        "response": f"Top {_hn} sites with worst transport KPIs (by {_trans_sort}).",
+                    }
             else:
                 return {
                     "sql": "", "query_type": "bar", "chart_type": "bar",
@@ -1862,17 +1885,30 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
         # ── Network issue ticket queries ──
         if _is_ticket:
             if _tbl_exists("network_issue_tickets"):
-                return {
-                    "sql": f"""SELECT n.site_id, n.priority, n.avg_drop_rate, n.avg_cssr, n.avg_tput,
-                               n.violations, n.status, n.zone, n.created_at::text
-                        FROM network_issue_tickets n
-                        WHERE n.status IN ('open','in_progress') {site_filter_n}
-                        ORDER BY n.priority_score {_horder} {_hlimit}""",
-                    "query_type": "bar", "chart_type": "bar",
-                    "title": "Network Issue Tickets",
-                    "x_axis": "site_id", "y_axes": ["avg_drop_rate", "avg_cssr", "avg_tput"],
-                    "response": "Showing open network issue tickets with KPI violations.",
-                }
+                if site_ids:
+                    return {
+                        "sql": f"""SELECT n.site_id, n.priority, n.avg_drop_rate, n.avg_cssr, n.avg_tput,
+                                   n.violations, n.status, n.zone, n.created_at::text
+                            FROM network_issue_tickets n
+                            WHERE n.status IN ('open','in_progress') {site_filter_n}
+                            ORDER BY n.priority_score DESC""",
+                        "query_type": "bar", "chart_type": "bar",
+                        "title": f"Network Tickets — {', '.join(site_ids[:2])}",
+                        "x_axis": "site_id", "y_axes": ["avg_drop_rate", "avg_cssr", "avg_tput"],
+                        "response": f"Network issue tickets for {', '.join(site_ids[:2])}.",
+                    }
+                else:
+                    return {
+                        "sql": f"""SELECT n.site_id, n.priority, n.avg_drop_rate, n.avg_cssr, n.avg_tput,
+                                   n.violations, n.status, n.zone, n.created_at::text
+                            FROM network_issue_tickets n
+                            WHERE n.status IN ('open','in_progress')
+                            ORDER BY n.priority_score DESC {_hlimit}""",
+                        "query_type": "bar", "chart_type": "bar",
+                        "title": f"Top {_hn} Network Issue Tickets",
+                        "x_axis": "site_id", "y_axes": ["avg_drop_rate", "avg_cssr", "avg_tput"],
+                        "response": f"Showing {_hn} highest-priority open tickets.",
+                    }
             else:
                 return {
                     "sql": "", "query_type": "bar", "chart_type": "bar",
@@ -2131,7 +2167,7 @@ def _rule_based_legacy(p: str, time_filter: str) -> dict:
         return {"sql": f"SELECT site_id, cluster, AVG(volte_traffic_erl) as volte_traffic_erl, AVG(latitude) as lat, AVG(longitude) as lng {base} GROUP BY site_id,cluster ORDER BY volte_traffic_erl DESC NULLS LAST LIMIT {N}", "query_type":"bar","title":f"VoLTE — Top {N}","x_axis":"site_id","y_axes":["volte_traffic_erl"],"response":f"Top {N} sites by VoLTE Erlang."}
     if 'drop rate' in p or 'call drop' in p or 'call failure' in p or 'cdr' in p:
         return {"sql": f"SELECT site_id, cluster, AVG(COALESCE(erab_drop_rate,call_drop_rate,0)) as erab_drop_rate, AVG(COALESCE(dl_prb_util,prb_utilization)) as avg_prb, AVG(latitude) as lat, AVG(longitude) as lng {base} GROUP BY site_id,cluster ORDER BY erab_drop_rate DESC NULLS LAST LIMIT {N}", "query_type":"mixed","title":f"Call Drop — Top {N}","x_axis":"site_id","y_axes":["erab_drop_rate","avg_prb"],"response":f"Top {N} call drop sites."}
-    if 'zone' in p or 'compare' in p or 'comparison' in p or 'cluster' in p:
+    if 'zone' in p or 'compar' in p or 'cluster' in p:
         return {"sql": f"SELECT cluster, COUNT(DISTINCT site_id) as sites, AVG(COALESCE(dl_prb_util,prb_utilization)) as avg_prb, AVG(COALESCE(dl_cell_tput,throughput_dl)) as avg_tput {base} GROUP BY cluster ORDER BY avg_prb DESC", "query_type":"bar","title":"Zone Comparison","x_axis":"cluster","y_axes":["avg_prb","avg_tput"],"response":"Zone KPI comparison."}
     return {"sql": f"SELECT site_id, cluster, AVG(COALESCE(dl_prb_util,prb_utilization)) as avg_prb, AVG(COALESCE(dl_cell_tput,throughput_dl)) as avg_tput, AVG(COALESCE(erab_drop_rate,call_drop_rate,0)) as avg_drop, AVG(latitude) as lat, AVG(longitude) as lng {base} GROUP BY site_id,cluster ORDER BY avg_prb DESC NULLS LAST LIMIT {N}", "query_type":"mixed","title":f"Top {N} Sites by PRB","x_axis":"site_id","y_axes":["avg_prb","avg_tput"],"response":f"Top {N} sites by PRB utilization."}
 
