@@ -1657,8 +1657,81 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
             site_filter_t = f"AND t.site_id IN ({in_clause})"
             site_filter_n = f"AND n.site_id IN ({in_clause})"
 
-        # ── Revenue queries ──
+        # Check which optional tables actually exist
+        def _tbl_exists(name):
+            try:
+                _sql(f"SELECT 1 FROM {name} LIMIT 1")
+                return True
+            except Exception:
+                return False
+
+        # ── Revenue queries (revenue_data → flexible_kpi_uploads fallback) ──
         if _is_revenue:
+            _has_rev_tbl = _tbl_exists("revenue_data")
+
+            if not _has_rev_tbl:
+                # Fallback: use flexible_kpi_uploads EAV table
+                if any(w in p for w in ('subscriber', 'subscribers', 'customer count')):
+                    return {
+                        "sql": f"""SELECT f.site_id, f.num_value AS subscribers
+                            FROM flexible_kpi_uploads f
+                            WHERE f.kpi_type = 'revenue' AND f.column_name = 'subscribers'
+                              AND f.num_value IS NOT NULL {site_filter_f}
+                            ORDER BY f.num_value DESC""",
+                        "query_type": "bar", "chart_type": "bar",
+                        "title": "Subscribers per Site",
+                        "x_axis": "site_id", "y_axes": ["subscribers"],
+                        "response": "Showing subscriber count per site (from uploaded data).",
+                    }
+                elif any(w in p for w in ('opex', 'expenditure', 'operating cost')):
+                    return {
+                        "sql": f"""SELECT f.site_id, f.column_name, f.num_value
+                            FROM flexible_kpi_uploads f
+                            WHERE f.kpi_type = 'revenue' AND f.column_name LIKE 'opex\\_%'
+                              AND f.column_type = 'numeric' {site_filter_f}
+                            ORDER BY f.site_id, f.column_name""",
+                        "query_type": "bar", "chart_type": "bar",
+                        "title": "OPEX by Site",
+                        "x_axis": "site_id", "y_axes": ["num_value"],
+                        "response": "Showing OPEX data per site (from uploaded data).",
+                    }
+                elif 'arpu' in p:
+                    return {
+                        "sql": f"""SELECT rev.site_id,
+                                   ROUND(CAST(rev.total_rev AS NUMERIC) / NULLIF(sub.subscribers, 0), 2) AS arpu
+                            FROM (
+                                SELECT f.site_id, SUM(f.num_value) AS total_rev
+                                FROM flexible_kpi_uploads f
+                                WHERE f.kpi_type = 'revenue' AND f.column_name LIKE 'revenue\\_%'
+                                  AND f.column_type = 'numeric' {site_filter_f}
+                                GROUP BY f.site_id
+                            ) rev
+                            JOIN (
+                                SELECT f.site_id, f.num_value AS subscribers
+                                FROM flexible_kpi_uploads f
+                                WHERE f.kpi_type = 'revenue' AND f.column_name = 'subscribers'
+                                  AND f.num_value > 0
+                            ) sub ON rev.site_id = sub.site_id
+                            ORDER BY arpu DESC""",
+                        "query_type": "bar", "chart_type": "bar",
+                        "title": "ARPU per Site",
+                        "x_axis": "site_id", "y_axes": ["arpu"],
+                        "response": "Showing Average Revenue Per User (ARPU) per site.",
+                    }
+                else:
+                    return {
+                        "sql": f"""SELECT f.site_id, f.column_name, f.num_value
+                            FROM flexible_kpi_uploads f
+                            WHERE f.kpi_type = 'revenue' AND f.column_type = 'numeric'
+                              {site_filter_f}
+                            ORDER BY f.site_id, f.column_name""",
+                        "query_type": "bar", "chart_type": "bar",
+                        "title": "Revenue Data per Site",
+                        "x_axis": "site_id", "y_axes": ["num_value"],
+                        "response": "Showing revenue data per site (from uploaded data).",
+                    }
+
+            # revenue_data table exists — use flat table queries
             if any(w in p for w in ('subscriber', 'subscribers', 'customer count')):
                 return {
                     "sql": f"""SELECT r.site_id, r.subscribers
@@ -1727,62 +1800,90 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
                     "response": "Showing revenue data per site.",
                 }
 
-        # ── Core KPI queries ──
+        # ── Core KPI queries (core_kpi_data → flexible_kpi_uploads fallback) ──
         if _is_core:
-            date_clause = ""
-            if days:
-                date_clause = f"AND c.date >= CURRENT_DATE - INTERVAL '{days} days' AND c.date <= CURRENT_DATE"
-            if site_ids:
-                return {
-                    "sql": f"""SELECT c.date::text AS date, c.auth_sr, c.cpu_util, c.attach_sr, c.pdp_sr
-                        FROM core_kpi_data c
-                        WHERE c.site_id = '{site_ids[0]}' {date_clause}
-                        ORDER BY c.date""",
-                    "query_type": "composed", "chart_type": "composed",
-                    "title": f"Core KPIs — {site_ids[0]}",
-                    "x_axis": "date", "y_axes": ["auth_sr", "cpu_util", "attach_sr", "pdp_sr"],
-                    "response": f"Showing core network KPIs for {site_ids[0]}.",
-                }
+            if _tbl_exists("core_kpi_data"):
+                date_clause = ""
+                if days:
+                    date_clause = f"AND c.date >= CURRENT_DATE - INTERVAL '{days} days' AND c.date <= CURRENT_DATE"
+                if site_ids:
+                    return {
+                        "sql": f"""SELECT c.date::text AS date, c.auth_sr, c.cpu_util, c.attach_sr, c.pdp_sr
+                            FROM core_kpi_data c
+                            WHERE c.site_id = '{site_ids[0]}' {date_clause}
+                            ORDER BY c.date""",
+                        "query_type": "composed", "chart_type": "composed",
+                        "title": f"Core KPIs — {site_ids[0]}",
+                        "x_axis": "date", "y_axes": ["auth_sr", "cpu_util", "attach_sr", "pdp_sr"],
+                        "response": f"Showing core network KPIs for {site_ids[0]}.",
+                    }
+                else:
+                    return {
+                        "sql": f"""SELECT c.site_id, AVG(c.auth_sr) AS auth_sr, AVG(c.cpu_util) AS cpu_util,
+                                   AVG(c.attach_sr) AS attach_sr, AVG(c.pdp_sr) AS pdp_sr
+                            FROM core_kpi_data c
+                            WHERE c.site_id IS NOT NULL {date_clause}
+                            GROUP BY c.site_id ORDER BY c.site_id""",
+                        "query_type": "bar", "chart_type": "bar",
+                        "title": "Core KPIs — All Sites",
+                        "x_axis": "site_id", "y_axes": ["auth_sr", "cpu_util", "attach_sr", "pdp_sr"],
+                        "response": "Showing core network KPIs for all sites.",
+                    }
             else:
+                # Fallback to flexible_kpi_uploads EAV
                 return {
-                    "sql": f"""SELECT c.site_id, AVG(c.auth_sr) AS auth_sr, AVG(c.cpu_util) AS cpu_util,
-                               AVG(c.attach_sr) AS attach_sr, AVG(c.pdp_sr) AS pdp_sr
-                        FROM core_kpi_data c
-                        WHERE c.site_id IS NOT NULL {date_clause}
-                        GROUP BY c.site_id ORDER BY c.site_id""",
+                    "sql": f"""SELECT f.site_id, f.column_name, f.num_value
+                        FROM flexible_kpi_uploads f
+                        WHERE f.kpi_type = 'core' AND f.column_type = 'numeric'
+                          {site_filter_f}
+                        ORDER BY f.site_id, f.column_name""",
                     "query_type": "bar", "chart_type": "bar",
-                    "title": "Core KPIs — All Sites",
-                    "x_axis": "site_id", "y_axes": ["auth_sr", "cpu_util", "attach_sr", "pdp_sr"],
-                    "response": "Showing core network KPIs for all sites.",
+                    "title": "Core KPIs" + (f" — {', '.join(site_ids[:2])}" if site_ids else ""),
+                    "x_axis": "site_id", "y_axes": ["num_value"],
+                    "response": "Showing core network KPIs (from uploaded data).",
                 }
 
         # ── Transport/backhaul queries ──
         if _is_transport:
-            return {
-                "sql": f"""SELECT t.site_id, t.backhaul_type, t.link_capacity, t.avg_util,
-                           t.peak_util, t.packet_loss, t.avg_latency, t.jitter, t.availability
-                    FROM transport_kpi_data t
-                    WHERE t.site_id IS NOT NULL {site_filter_t}
-                    ORDER BY t.site_id""",
-                "query_type": "bar", "chart_type": "bar",
-                "title": "Transport KPIs" + (f" — {', '.join(site_ids[:2])}" if site_ids else ""),
-                "x_axis": "site_id", "y_axes": ["avg_util", "packet_loss", "avg_latency", "jitter"],
-                "response": "Showing transport/backhaul KPIs.",
-            }
+            if _tbl_exists("transport_kpi_data"):
+                return {
+                    "sql": f"""SELECT t.site_id, t.backhaul_type, t.link_capacity, t.avg_util,
+                               t.peak_util, t.packet_loss, t.avg_latency, t.jitter, t.availability
+                        FROM transport_kpi_data t
+                        WHERE t.site_id IS NOT NULL {site_filter_t}
+                        ORDER BY t.site_id""",
+                    "query_type": "bar", "chart_type": "bar",
+                    "title": "Transport KPIs" + (f" — {', '.join(site_ids[:2])}" if site_ids else ""),
+                    "x_axis": "site_id", "y_axes": ["avg_util", "packet_loss", "avg_latency", "jitter"],
+                    "response": "Showing transport/backhaul KPIs.",
+                }
+            else:
+                return {
+                    "sql": "", "query_type": "bar", "chart_type": "bar",
+                    "title": "Transport KPIs", "x_axis": "site_id", "y_axes": [],
+                    "response": "No transport data available. Please upload transport KPI data via the admin panel.",
+                }
 
         # ── Network issue ticket queries ──
         if _is_ticket:
-            return {
-                "sql": f"""SELECT n.site_id, n.priority, n.avg_drop_rate, n.avg_cssr, n.avg_tput,
-                           n.violations, n.status, n.zone, n.created_at::text
-                    FROM network_issue_tickets n
-                    WHERE n.status IN ('open','in_progress') {site_filter_n}
-                    ORDER BY n.priority_score DESC""",
-                "query_type": "bar", "chart_type": "bar",
-                "title": "Network Issue Tickets",
-                "x_axis": "site_id", "y_axes": ["avg_drop_rate", "avg_cssr", "avg_tput"],
-                "response": "Showing open network issue tickets with KPI violations.",
-            }
+            if _tbl_exists("network_issue_tickets"):
+                return {
+                    "sql": f"""SELECT n.site_id, n.priority, n.avg_drop_rate, n.avg_cssr, n.avg_tput,
+                               n.violations, n.status, n.zone, n.created_at::text
+                        FROM network_issue_tickets n
+                        WHERE n.status IN ('open','in_progress') {site_filter_n}
+                        ORDER BY n.priority_score DESC""",
+                    "query_type": "bar", "chart_type": "bar",
+                    "title": "Network Issue Tickets",
+                    "x_axis": "site_id", "y_axes": ["avg_drop_rate", "avg_cssr", "avg_tput"],
+                    "response": "Showing open network issue tickets with KPI violations.",
+                }
+            else:
+                return {
+                    "sql": "", "query_type": "bar", "chart_type": "bar",
+                    "title": "Network Tickets", "x_axis": "site_id", "y_axes": [],
+                    "response": "No network issue tickets found. The AI ticket system generates tickets during the daily 08:00 IST scan.",
+                }
 
     # ── FIX: Multiple sites + trend → multi_chart (one chart per site, each with ALL KPIs) ──
     # Previously this incorrectly paired kpi[i] with site[i].
