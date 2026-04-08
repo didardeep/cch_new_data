@@ -334,7 +334,7 @@ function InlineChart({result,T,chartId}) {
     }
 
     // BAR
-    const isHorizontal=data.length>8||typeof data[0]?.[xKey]==='string';
+    const isHorizontal=data.length>15;
     if(isHorizontal){
       return(
         <ResponsiveContainer width="100%" height={Math.max(h,data.length*36+60)}>
