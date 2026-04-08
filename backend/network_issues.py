@@ -1086,21 +1086,23 @@ def network_issue_logs():
     """Return full pipeline logs: data source, scheduler status, ticket history."""
     logs = []
 
-    # ── 1. Data Source ──────────────────────────────────────────────────
+    # ── 1. Data Source (single query instead of 4 separate COUNT scans) ─
     logs.append({"type": "header", "text": "Data Source"})
     try:
-        kpi_total = db.session.execute(sa_text("SELECT count(*) FROM kpi_data")).scalar()
-        cell_rows = db.session.execute(sa_text(
-            "SELECT count(*) FROM kpi_data WHERE data_level='cell' AND value IS NOT NULL"
-        )).scalar()
-        site_rows = db.session.execute(sa_text(
-            "SELECT count(*) FROM kpi_data WHERE data_level='site' AND value IS NOT NULL"
-        )).scalar()
-        date_range = db.session.execute(sa_text(
-            "SELECT MIN(date), MAX(date) FROM kpi_data WHERE data_level='cell'"
-        )).fetchone()
-        min_d = date_range[0].isoformat() if date_range and date_range[0] else "N/A"
-        max_d = date_range[1].isoformat() if date_range and date_range[1] else "N/A"
+        stats = db.session.execute(sa_text("""
+            SELECT
+                COUNT(*) AS total,
+                COUNT(*) FILTER (WHERE data_level='cell' AND value IS NOT NULL) AS cell_rows,
+                COUNT(*) FILTER (WHERE data_level='site' AND value IS NOT NULL) AS site_rows,
+                MIN(date) FILTER (WHERE data_level='cell') AS min_date,
+                MAX(date) FILTER (WHERE data_level='cell') AS max_date
+            FROM kpi_data
+        """)).fetchone()
+        kpi_total = stats[0] or 0
+        cell_rows = stats[1] or 0
+        site_rows = stats[2] or 0
+        min_d = stats[3].isoformat() if stats[3] else "N/A"
+        max_d = stats[4].isoformat() if stats[4] else "N/A"
         logs.append({"type": "info", "text": f"Source table: kpi_data ({kpi_total:,} total rows)"})
         logs.append({"type": "info", "text": f"Cell-level rows: {cell_rows:,} | Site-level rows: {site_rows:,}"})
         logs.append({"type": "info", "text": f"Date range: {min_d} to {max_d}"})
@@ -1131,31 +1133,39 @@ def network_issue_logs():
     ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
     logs.append({"type": "info", "text": f"Current IST: {ist.strftime('%Y-%m-%d %H:%M:%S')}"})
 
-    # ── 4. Agent Routing ────────────────────────────────────────────────
+    # ── 4. Agent Routing (single query for all ticket counts) ───────────
     logs.append({"type": "header", "text": "Agent Routing"})
     network_agents = User.query.filter(
         User.role == "human_agent",
         User.expertise.in_(["NETWORK_RF", "NETWORK_OPTIMIZATION", "LTE", "5G"])
     ).all()
     if network_agents:
+        agent_ids = [ag.id for ag in network_agents]
+        placeholders = ",".join(str(int(aid)) for aid in agent_ids)
+        ticket_counts_rows = db.session.execute(sa_text(
+            f"SELECT assigned_agent, COUNT(*) FROM network_issue_tickets "
+            f"WHERE assigned_agent IN ({placeholders}) AND status IN ('open','in_progress') "
+            f"GROUP BY assigned_agent"
+        )).fetchall() if agent_ids else []
+        ticket_counts = {row[0]: row[1] for row in ticket_counts_rows}
         for ag in network_agents:
-            assigned = NetworkIssueTicket.query.filter_by(assigned_agent=ag.id).filter(
-                NetworkIssueTicket.status.in_(["open", "in_progress"])
-            ).count()
+            assigned = ticket_counts.get(ag.id, 0)
             logs.append({"type": "info", "text": f"  {ag.name} (id={ag.id}, expertise={ag.expertise}, location={ag.location or 'N/A'}) — {assigned} open tickets"})
     else:
         logs.append({"type": "warn", "text": "No agents with NETWORK_RF/NETWORK_OPTIMIZATION/LTE/5G expertise found"})
     logs.append({"type": "info", "text": "Routing: zone match → capacity check → least loaded agent"})
 
-    # ── 5. Ticket History ───────────────────────────────────────────────
+    # ── 5. Ticket History (batch-fetch agent names) ─────────────────────
     logs.append({"type": "header", "text": "Ticket History"})
     tickets = NetworkIssueTicket.query.order_by(NetworkIssueTicket.created_at.desc()).limit(20).all()
+    # Batch-fetch all assigned agents in one query instead of N separate queries
+    _ticket_agent_ids = list({t.assigned_agent for t in tickets if t.assigned_agent})
+    if _ticket_agent_ids:
+        _ticket_agents = {u.id: u.name for u in User.query.filter(User.id.in_(_ticket_agent_ids)).all()}
+    else:
+        _ticket_agents = {}
     for t in tickets:
-        agent_name = "Unassigned"
-        if t.assigned_agent:
-            ag = db.session.get(User, t.assigned_agent)
-            if ag:
-                agent_name = ag.name
+        agent_name = _ticket_agents.get(t.assigned_agent, "Unassigned") if t.assigned_agent else "Unassigned"
         logs.append({
             "type": "ticket",
             "text": f"#{t.id} | {t.site_id} | {t.priority} | {t.status} | Agent: {agent_name} | Created: {t.created_at.strftime('%Y-%m-%d %H:%M') if t.created_at else 'N/A'}",
