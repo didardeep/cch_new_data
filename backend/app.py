@@ -8509,6 +8509,13 @@ with app.app_context():
 # Schedule daily 07:30/08:00 AM IST jobs for worst cell detection/ticketing
 schedule_daily_job(app)
 
+# ── One-time seed: AI ticket for Gunjan Kaur demo ────────────────────────
+try:
+    from seed_gunjan_ticket import seed_gunjan_ticket
+    seed_gunjan_ticket(app)
+except Exception as e:
+    print(f"[SEED] Gunjan ticket seed skipped: {e}")
+
 # ─── Register Change Workflow Blueprint ───────────────────────────────────
 try:
     from change_workflow import change_workflow_bp
