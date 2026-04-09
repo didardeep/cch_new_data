@@ -1839,8 +1839,8 @@ export default function NetworkAnalyticsDashboard() {
     // ── Phase 1: overview + filters — fast, dismisses spinner ────────────────
     try{
       const [ov,fo]=await Promise.all([
-        fetchWithTimeout(`${base}/api/network/overview-stats?${q}${fr}`,12000),
-        fetchWithTimeout(`${base}/api/network/filters?${['country','state'].filter(k=>filters[k]).map(k=>`${k}=${encodeURIComponent(filters[k])}`).join('&')}`,8000),
+        fetchWithTimeout(`${base}/api/network/overview-stats?${q}${fr}`,25000),
+        fetchWithTimeout(`${base}/api/network/filters?${['country','state'].filter(k=>filters[k]).map(k=>`${k}=${encodeURIComponent(filters[k])}`).join('&')}`,15000),
       ]);
       if(ov)  setOverview(ov);
       if(fo)  setOpts(fo);
@@ -1851,10 +1851,10 @@ export default function NetworkAnalyticsDashboard() {
 
     // ── Phase 2: map + layer data — background, non-blocking ─────────────────
     Promise.allSettled([
-      fetchWithTimeout(`${base}/api/network/map?${q}${fr}`,20000),
-      fetchWithTimeout(`${base}/api/network/ran-analytics?${q}${fr}`,20000),
-      fetchWithTimeout(`${base}/api/network/core-analytics?${q}${fr}`,20000),
-      fetchWithTimeout(`${base}/api/network/transport-analytics?${q}${fr}`,20000),
+      fetchWithTimeout(`${base}/api/network/map?${q}${fr}`,35000),
+      fetchWithTimeout(`${base}/api/network/ran-analytics?${q}${fr}`,35000),
+      fetchWithTimeout(`${base}/api/network/core-analytics?${q}${fr}`,35000),
+      fetchWithTimeout(`${base}/api/network/transport-analytics?${q}${fr}`,35000),
     ]).then(([mp,rn,co,tr])=>{
       if(mp.status==='fulfilled'&&mp.value) setMapData(mp.value);
       if(rn.status==='fulfilled'&&rn.value) setRan(rn.value);
@@ -1864,7 +1864,7 @@ export default function NetworkAnalyticsDashboard() {
     }).catch(()=>{});
   },[qs,fetchWithTimeout]);
 
-  useEffect(()=>{fetchAll(false,true);},[]);// eslint-disable-line 
+  useEffect(()=>{fetchAll(false,false);},[]);// eslint-disable-line — use cache on initial load for speed
   const mounted=useRef(false);
   // Keep refs so filter-change effect can see current page/selKpi without stale closure
   const pageRef=useRef('overview');
