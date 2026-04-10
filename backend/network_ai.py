@@ -28,6 +28,19 @@ NETWORK_AI_VERSION = "2025-03-26-v5"  # bump this to confirm new file is loaded
 # ─────────────────────────────────────────────────────────────────────────────
 network_ai_bp = Blueprint("network_ai", __name__)
 
+# ─── Module-level schema discovery cache (populated on first ai_query call) ──
+_schema_cache = {
+    "populated": False,
+    "available_tables": set(),
+    # revenue_data
+    "rev_data_cols": [], "rev_rev_cols": [], "rev_opex_cols": [], "rev_has_subscribers": False,
+    # core_kpi_data
+    "core_data_cols": [], "core_metric_cols": [],
+    # transport_kpi_data
+    "transport_data_cols": [], "transport_metric_cols": [],
+    # network_issue_tickets
+    "ticket_cols": [],
+}
 
 # ─── Shared helpers (imported lazily from network_analytics) ─────────────────
 
@@ -222,42 +235,42 @@ Tables:
      'technology'       — technology type (text, in str_value)
      'site_category'    — site classification (text, in str_value)
 
+   IMPORTANT: column_name values may have mixed casing (e.g. 'Subscribers', 'Revenue_Jan_L').
+   ALWAYS use ILIKE (case-insensitive) for column_name matching, NEVER use = or LIKE.
+
    Example: Get total revenue per site:
      SELECT f.site_id, SUM(f.num_value) AS total_revenue
      FROM flexible_kpi_uploads f
      WHERE f.kpi_type = 'revenue'
-       AND f.column_name LIKE 'revenue\\_%' AND f.column_type = 'numeric'
+       AND f.column_name ILIKE '%revenue%' AND f.column_type = 'numeric'
      GROUP BY f.site_id ORDER BY total_revenue DESC
 
    Example: Get subscribers for a specific site:
      SELECT f.site_id, f.num_value AS subscribers
      FROM flexible_kpi_uploads f
-     WHERE f.kpi_type = 'revenue' AND f.column_name = 'subscribers'
+     WHERE f.kpi_type = 'revenue' AND f.column_name ILIKE '%subscriber%'
        AND f.site_id = 'GUR_LTE_1500'
 
    Example: Get revenue for a specific month (March):
      SELECT f.site_id, f.num_value AS revenue_mar
      FROM flexible_kpi_uploads f
-     WHERE f.kpi_type = 'revenue' AND f.column_name = 'revenue_mar_l'
+     WHERE f.kpi_type = 'revenue' AND f.column_name ILIKE '%revenue%mar%'
 
    Example: Compare revenue vs OPEX for a site:
      SELECT f.site_id, f.column_name, f.num_value
      FROM flexible_kpi_uploads f
      WHERE f.kpi_type = 'revenue'
-       AND f.column_name IN ('revenue_jan_l','revenue_feb_l','revenue_mar_l','opex_jan_l','opex_feb_l','opex_mar_l')
+       AND (f.column_name ILIKE '%revenue%' OR f.column_name ILIKE '%opex%')
        AND f.site_id = 'GUR_LTE_1500'
 
    === Core KPI data (kpi_type = 'core') ===
-   column_name values for core:
-     'auth_success_rate'           — Authentication Success Rate (numeric, %)
-     'cpu_utilization'             — CPU Utilization (numeric, %)
-     'attach_success_rate'         — Attach Success Rate (numeric, %)
-     'pdp_bearer_setup_success_rate' — PDP Bearer Setup Success Rate (numeric, %)
+   NOTE: Actual column_name values are discovered at runtime — see "ACTUAL COLUMN NAMES in flexible_kpi_uploads (kpi_type='core')" section below.
+   ALWAYS use ILIKE for column_name matching (same as revenue data).
 
    Example: Get core KPIs for a site:
      SELECT f.site_id, f.column_name, f.num_value
      FROM flexible_kpi_uploads f
-     WHERE f.kpi_type = 'core' AND f.site_id = 'GUR_LTE_1500'
+     WHERE f.kpi_type = 'core' AND f.column_name ILIKE '%auth%' AND f.site_id = 'GUR_LTE_1500'
 
 === Natural Language → KPI Mapping Guide ===
 User says "call drop" / "drop rate" / "CDR" / "call failure" → 'E-RAB Call Drop Rate_1' (kpi_data)
@@ -280,61 +293,44 @@ User says "core KPI" / "authentication" / "CPU" / "attach" / "PDP" → core_kpi_
 User says "transport" / "backhaul" / "microwave" / "fiber" / "jitter" → transport_kpi_data table
 User says "link capacity" / "link utilization" / "backhaul latency" → transport_kpi_data table
 User says "network issue" / "worst cell" / "tickets" / "AI tickets" → network_issue_tickets table
+User says "site info" / "location" / "which city" / "which zone" / "site status" / "alarms" → telecom_sites table
 User says "last 7 days" → AND k.date >= CURRENT_DATE - INTERVAL '7 days' AND k.date <= CURRENT_DATE
 User says "last month" → AND k.date >= CURRENT_DATE - INTERVAL '1 month' AND k.date <= CURRENT_DATE
 ALWAYS add AND k.date <= CURRENT_DATE when any date range is used, to exclude future data.
 
 4. transport_kpi_data — Transport/backhaul network KPI data
-   Columns: id, site_id, zone, backhaul_type, link_capacity, avg_util, peak_util,
+   NOTE: Actual columns are discovered at runtime — see "ACTUAL COLUMNS in transport_kpi_data" section below.
+   Typical columns: site_id, zone, backhaul_type, link_capacity, avg_util, peak_util,
             packet_loss, avg_latency, jitter, availability, error_rate, tput_efficiency, alarms
-   - backhaul_type = 'microwave', 'fiber', 'copper'
-   - avg_util / peak_util = utilization percentages
-   - availability = link uptime %
+   Do NOT assume specific column names — use ONLY the columns listed in the runtime discovery section.
 
    Example: Get transport KPIs for a site:
-     SELECT t.site_id, t.backhaul_type, t.link_capacity, t.avg_util, t.packet_loss, t.avg_latency, t.jitter, t.availability
-     FROM transport_kpi_data t WHERE t.site_id = 'GUR_LTE_1500'
-
-   Example: Sites with high packet loss:
-     SELECT t.site_id, t.packet_loss, t.avg_latency, t.backhaul_type
-     FROM transport_kpi_data t WHERE t.packet_loss > 1 ORDER BY t.packet_loss DESC
+     SELECT t.* FROM transport_kpi_data t WHERE t.site_id = 'GUR_LTE_1500'
 
 5. core_kpi_data — Core network KPIs with date (flat table, NOT EAV)
-   Columns: id, site_id, date, auth_sr, cpu_util, attach_sr, pdp_sr
-   - auth_sr = authentication success rate (%)
-   - cpu_util = CPU utilization (%)
-   - attach_sr = device attach success rate (%)
-   - pdp_sr = PDP bearer setup success rate (%)
+   NOTE: Actual columns are discovered at runtime — see "ACTUAL COLUMNS in core_kpi_data" section below.
+   Typical columns: site_id, date, auth_sr, cpu_util, attach_sr, pdp_sr
+   Do NOT assume specific column names — use ONLY the columns listed in the runtime discovery section.
+   If the runtime section is not present, fall back to flexible_kpi_uploads with kpi_type='core'.
 
    Example: Core KPIs for a site over time:
-     SELECT c.date::text AS date, c.auth_sr, c.cpu_util, c.attach_sr, c.pdp_sr
-     FROM core_kpi_data c WHERE c.site_id = 'GUR_LTE_1500' ORDER BY c.date
+     SELECT c.* FROM core_kpi_data c WHERE c.site_id = 'GUR_LTE_1500' ORDER BY c.date
 
 6. revenue_data — Revenue per site (flat table, one row per site)
-   Columns: id, site_id, zone, technology, subscribers, rev_jan, rev_feb, rev_mar,
-            opex_jan, opex_feb, opex_mar, site_category
-   - rev_jan/feb/mar = monthly revenue (NOT daily — there is no date column)
-   - opex_jan/feb/mar = monthly OPEX
-
-   Example: Revenue and subscribers per site:
-     SELECT r.site_id, r.subscribers, r.rev_jan, r.rev_feb, r.rev_mar, r.zone
-     FROM revenue_data r ORDER BY r.subscribers DESC
-
-   Example: Top revenue sites:
-     SELECT r.site_id, (r.rev_jan + r.rev_feb + r.rev_mar) AS total_revenue, r.subscribers
-     FROM revenue_data r ORDER BY total_revenue DESC LIMIT 10
+   NOTE: Actual columns are discovered at runtime — see "ACTUAL COLUMNS in revenue_data" section below.
+   The table may have monthly revenue columns (like rev_jan, rev_feb, ...) and OPEX columns.
+   Do NOT assume specific column names — use ONLY the columns listed in the runtime discovery section.
+   If the runtime section is not present, fall back to flexible_kpi_uploads with kpi_type='revenue'.
 
 7. network_issue_tickets — Auto-generated tickets for worst-performing cells
-   Columns: id, site_id, cells_affected, category, priority, priority_score, sla_hours,
+   NOTE: Actual columns are discovered at runtime — see "ACTUAL COLUMNS in network_issue_tickets" section below.
+   Typical columns: site_id, cells_affected, category, priority, priority_score, sla_hours,
             avg_drop_rate, avg_cssr, avg_tput, violations, status, zone, location,
             assigned_agent, root_cause, recommendation, created_at
-   - status = 'open', 'in_progress', 'resolved'
-   - priority = 'Critical', 'High', 'Medium', 'Low'
-   - violations = number of KPI threshold breaches
+   Do NOT assume specific column names — use ONLY the columns listed in the runtime discovery section.
 
    Example: Open network issue tickets:
-     SELECT n.site_id, n.priority, n.avg_drop_rate, n.avg_cssr, n.avg_tput, n.violations, n.status, n.zone
-     FROM network_issue_tickets n WHERE n.status IN ('open','in_progress') ORDER BY n.priority_score DESC
+     SELECT n.* FROM network_issue_tickets n WHERE n.status IN ('open','in_progress') ORDER BY n.priority_score DESC
 
 === TABLE SELECTION RULE ===
 - RAN performance KPIs (drop rate, throughput, PRB, latency, etc.) → query kpi_data table
@@ -345,6 +341,13 @@ ALWAYS add AND k.date <= CURRENT_DATE when any date range is used, to exclude fu
 - Site info (zone, city, state, technology, location) → query telecom_sites table
 NEVER query kpi_data for revenue/subscriber/OPEX data — it does not exist there.
 If a table returns 0 rows, try the alternative table (e.g., revenue_data → flexible_kpi_uploads).
+
+=== CRITICAL: column_name matching in flexible_kpi_uploads ===
+Column names may have MIXED CASING (e.g., 'Subscribers', 'Revenue_Jan_L', 'OPEX_Feb (L)').
+ALWAYS use ILIKE for column_name matching:
+  CORRECT: f.column_name ILIKE '%revenue%'
+  WRONG:   f.column_name LIKE 'revenue%'  -- case-sensitive, will miss 'Revenue_Jan'
+  WRONG:   f.column_name = 'subscribers'   -- exact match, will miss 'Subscribers'
 """
 
     # ── Dynamic table availability — tell LLM which tables actually exist ──
@@ -376,6 +379,142 @@ If a table returns 0 rows, try the alternative table (e.g., revenue_data → fle
         else:
             _tbl_note += f"  {_tn}: DOES NOT EXIST — data not uploaded yet\n"
     SCHEMA_HINT += _tbl_note
+
+    # ── Dynamic revenue column discovery — tell LLM the EXACT column names ──
+    if 'flexible_kpi_uploads' in _available_tables:
+        try:
+            _rev_cols = _sql(
+                "SELECT DISTINCT column_name, column_type "
+                "FROM flexible_kpi_uploads WHERE kpi_type = 'revenue' "
+                "ORDER BY column_name LIMIT 40"
+            )
+            if _rev_cols:
+                _rcn = "\n=== ACTUAL COLUMN NAMES in flexible_kpi_uploads (kpi_type='revenue') ===\n"
+                _rcn += "These are the REAL column_name values — use these EXACT values in queries.\n"
+                _rcn += "IMPORTANT: ALWAYS use ILIKE (not LIKE or =) for column_name matching.\n"
+                for _rc in _rev_cols:
+                    _rcn += f"  '{_rc['column_name']}' ({_rc['column_type']})\n"
+                _rcn += "Example: WHERE f.column_name ILIKE '%revenue%' (not LIKE or =)\n"
+                _rcn += "Example: WHERE f.column_name ILIKE '%subscriber%' (not = 'subscribers')\n"
+                SCHEMA_HINT += _rcn
+        except Exception:
+            pass
+
+    # ── Dynamic schema discovery → populate module-level _schema_cache ──
+    global _schema_cache
+    _schema_cache["available_tables"] = _available_tables
+
+    if 'revenue_data' in _available_tables:
+        try:
+            _rdc = _sql(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = 'public' AND table_name = 'revenue_data' "
+                "AND column_name NOT IN ('id', 'uploaded_at') "
+                "ORDER BY ordinal_position"
+            )
+            _schema_cache["rev_data_cols"] = [r['column_name'] for r in _rdc]
+            _skip = {'id', 'uploaded_at', 'site_id', 'zone', 'technology', 'site_category', 'subscribers'}
+            _schema_cache["rev_rev_cols"] = [c for c in _schema_cache["rev_data_cols"] if 'rev' in c.lower() and c.lower() not in _skip]
+            _schema_cache["rev_opex_cols"] = [c for c in _schema_cache["rev_data_cols"] if 'opex' in c.lower()]
+            _schema_cache["rev_has_subscribers"] = any(c.lower() == 'subscribers' for c in _schema_cache["rev_data_cols"])
+            if _schema_cache["rev_data_cols"]:
+                _rds = "\n=== ACTUAL COLUMNS in revenue_data table (discovered at runtime) ===\n"
+                _rds += f"  All columns: {', '.join(_schema_cache['rev_data_cols'])}\n"
+                if _schema_cache["rev_rev_cols"]:
+                    _rds += f"  Revenue columns: {', '.join(_schema_cache['rev_rev_cols'])}\n"
+                    _total_ex = ' + '.join(f'COALESCE(r.{c},0)' for c in _schema_cache["rev_rev_cols"])
+                    _rds += f"  Total revenue: SELECT r.site_id, ({_total_ex}) AS total_revenue FROM revenue_data r\n"
+                if _schema_cache["rev_opex_cols"]:
+                    _rds += f"  OPEX columns: {', '.join(_schema_cache['rev_opex_cols'])}\n"
+                if _schema_cache["rev_has_subscribers"]:
+                    _rds += "  Subscribers column: subscribers\n"
+                _rds += "Use ONLY these column names — they are the real ones from the database.\n"
+                SCHEMA_HINT += _rds
+        except Exception:
+            pass
+
+    if 'core_kpi_data' in _available_tables:
+        try:
+            _cdc = _sql(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = 'public' AND table_name = 'core_kpi_data' "
+                "AND column_name NOT IN ('id', 'uploaded_at') "
+                "ORDER BY ordinal_position"
+            )
+            _schema_cache["core_data_cols"] = [r['column_name'] for r in _cdc]
+            _core_skip = {'id', 'uploaded_at', 'site_id', 'date', 'zone', 'city', 'state'}
+            _schema_cache["core_metric_cols"] = [c for c in _schema_cache["core_data_cols"] if c.lower() not in _core_skip]
+            if _schema_cache["core_data_cols"]:
+                _cds = "\n=== ACTUAL COLUMNS in core_kpi_data table (discovered at runtime) ===\n"
+                _cds += f"  All columns: {', '.join(_schema_cache['core_data_cols'])}\n"
+                if _schema_cache["core_metric_cols"]:
+                    _cds += f"  Metric columns: {', '.join(_schema_cache['core_metric_cols'])}\n"
+                    _cds += f"  Example: SELECT c.site_id, c.date::text, {', '.join('c.' + c for c in _schema_cache['core_metric_cols'][:4])} FROM core_kpi_data c\n"
+                _cds += "Use ONLY these column names — they are the real ones from the database.\n"
+                SCHEMA_HINT += _cds
+        except Exception:
+            pass
+
+    if 'transport_kpi_data' in _available_tables:
+        try:
+            _tdc = _sql(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = 'public' AND table_name = 'transport_kpi_data' "
+                "AND column_name NOT IN ('id', 'uploaded_at') "
+                "ORDER BY ordinal_position"
+            )
+            _schema_cache["transport_data_cols"] = [r['column_name'] for r in _tdc]
+            _transport_skip = {'id', 'uploaded_at', 'site_id', 'zone'}
+            _schema_cache["transport_metric_cols"] = [c for c in _schema_cache["transport_data_cols"]
+                                                       if c.lower() not in _transport_skip
+                                                       and c.lower() != 'backhaul_type']
+            if _schema_cache["transport_data_cols"]:
+                _tds = "\n=== ACTUAL COLUMNS in transport_kpi_data table (discovered at runtime) ===\n"
+                _tds += f"  All columns: {', '.join(_schema_cache['transport_data_cols'])}\n"
+                if _schema_cache["transport_metric_cols"]:
+                    _tds += f"  Metric columns: {', '.join(_schema_cache['transport_metric_cols'])}\n"
+                _tds += "Use ONLY these column names — they are the real ones from the database.\n"
+                SCHEMA_HINT += _tds
+        except Exception:
+            pass
+
+    if 'network_issue_tickets' in _available_tables:
+        try:
+            _ntc = _sql(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = 'public' AND table_name = 'network_issue_tickets' "
+                "AND column_name NOT IN ('id') "
+                "ORDER BY ordinal_position"
+            )
+            _schema_cache["ticket_cols"] = [r['column_name'] for r in _ntc]
+            if _schema_cache["ticket_cols"]:
+                _nts = "\n=== ACTUAL COLUMNS in network_issue_tickets table (discovered at runtime) ===\n"
+                _nts += f"  All columns: {', '.join(_schema_cache['ticket_cols'])}\n"
+                _nts += "Use ONLY these column names — they are the real ones from the database.\n"
+                SCHEMA_HINT += _nts
+        except Exception:
+            pass
+
+    _schema_cache["populated"] = True
+
+    # ── Dynamic flexible_kpi_uploads core column discovery ──
+    if 'flexible_kpi_uploads' in _available_tables:
+        try:
+            _core_eav_cols = _sql(
+                "SELECT DISTINCT column_name, column_type "
+                "FROM flexible_kpi_uploads WHERE kpi_type = 'core' "
+                "ORDER BY column_name LIMIT 40"
+            )
+            if _core_eav_cols:
+                _ccn = "\n=== ACTUAL COLUMN NAMES in flexible_kpi_uploads (kpi_type='core') ===\n"
+                _ccn += "These are the REAL column_name values — use these EXACT values in queries.\n"
+                _ccn += "IMPORTANT: ALWAYS use ILIKE (not LIKE or =) for column_name matching.\n"
+                for _cc in _core_eav_cols:
+                    _ccn += f"  '{_cc['column_name']}' ({_cc['column_type']})\n"
+                _ccn += "Example: WHERE f.kpi_type = 'core' AND f.column_name ILIKE '%auth%'\n"
+                SCHEMA_HINT += _ccn
+        except Exception:
+            pass
 
     # ── CHANGE: read session_context for dynamic prompt injection ──
     _sctx = (getattr(ai_session, 'session_context', None) or {}) if ai_session else {}
@@ -1512,6 +1651,17 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
     site_ids = re.findall(r'[A-Za-z]{2,}[_\-][A-Za-z]{2,}[_\-]\d{3,}', prompt)
     site_ids = list(dict.fromkeys(site_ids))
 
+    # ── Read discovered schema from module-level cache ──
+    _rev_data_cols = _schema_cache.get("rev_data_cols", [])
+    _rev_rev_cols = _schema_cache.get("rev_rev_cols", [])
+    _rev_opex_cols = _schema_cache.get("rev_opex_cols", [])
+    _rev_has_subscribers = _schema_cache.get("rev_has_subscribers", False)
+    _core_data_cols = _schema_cache.get("core_data_cols", [])
+    _core_metric_cols = _schema_cache.get("core_metric_cols", [])
+    _transport_data_cols = _schema_cache.get("transport_data_cols", [])
+    _transport_metric_cols = _schema_cache.get("transport_metric_cols", [])
+    _ticket_cols = _schema_cache.get("ticket_cols", [])
+
     KPI_MAP = {
         'cssr':            ('LTE Call Setup Success Rate', 'cssr'),
         'call setup':      ('LTE Call Setup Success Rate', 'cssr'),
@@ -1603,13 +1753,17 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
                         'packet loss', 'tput efficiency', 'error rate'}
     _TICKET_WORDS = {'network issue', 'worst cell', 'ai ticket', 'network ticket',
                      'open issue', 'open ticket', 'issue ticket', 'fault'}
+    _SITE_INFO_WORDS = {'site info', 'site detail', 'site status', 'which city',
+                        'which zone', 'which state', 'site location', 'on air', 'off air',
+                        'alarm', 'alarms', 'critical alarm', 'site technology'}
 
     _is_revenue   = any(w in p for w in _REVENUE_WORDS)
     _is_core      = any(w in p for w in _CORE_WORDS)
     _is_transport = any(w in p for w in _TRANSPORT_WORDS)
     _is_ticket    = any(w in p for w in _TICKET_WORDS)
+    _is_site_info = any(w in p for w in _SITE_INFO_WORDS)
 
-    if _is_revenue or _is_core or _is_transport or _is_ticket:
+    if _is_revenue or _is_core or _is_transport or _is_ticket or _is_site_info:
         site_filter_f = ""
         site_filter_r = ""
         site_filter_t = ""
@@ -1654,12 +1808,13 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
 
             if not _has_rev_tbl:
                 # Fallback: use flexible_kpi_uploads EAV table
+                # NOTE: ILIKE for case-insensitive matching — column_name casing depends on uploaded CSV headers
                 if any(w in p for w in ('subscriber', 'subscribers', 'customer count')):
                     return {
                         "sql": f"""SELECT f.site_id, f.num_value AS subscribers
                             FROM flexible_kpi_uploads f
-                            WHERE f.kpi_type = 'revenue' AND f.column_name = 'subscribers'
-                              AND f.num_value IS NOT NULL {site_filter_f}
+                            WHERE f.kpi_type = 'revenue' AND f.column_name ILIKE '%subscriber%'
+                              AND f.column_type = 'numeric' AND f.num_value IS NOT NULL {site_filter_f}
                             ORDER BY f.num_value {_rev_order} {_limit}""",
                         "query_type": "bar", "chart_type": "bar",
                         "title": f"{'Bottom' if _rev_order=='ASC' else 'Top'} {_rev_n} — Subscribers",
@@ -1670,7 +1825,7 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
                     return {
                         "sql": f"""SELECT f.site_id, SUM(f.num_value) AS total_opex
                             FROM flexible_kpi_uploads f
-                            WHERE f.kpi_type = 'revenue' AND f.column_name LIKE 'opex\\_%'
+                            WHERE f.kpi_type = 'revenue' AND f.column_name ILIKE '%opex%'
                               AND f.column_type = 'numeric' {site_filter_f}
                             GROUP BY f.site_id
                             ORDER BY total_opex {_rev_order} {_limit}""",
@@ -1686,15 +1841,15 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
                             FROM (
                                 SELECT f.site_id, SUM(f.num_value) AS total_rev
                                 FROM flexible_kpi_uploads f
-                                WHERE f.kpi_type = 'revenue' AND f.column_name LIKE 'revenue\\_%'
+                                WHERE f.kpi_type = 'revenue' AND f.column_name ILIKE '%revenue%'
                                   AND f.column_type = 'numeric' {site_filter_f}
                                 GROUP BY f.site_id
                             ) rev
                             JOIN (
                                 SELECT f.site_id, f.num_value AS subscribers
                                 FROM flexible_kpi_uploads f
-                                WHERE f.kpi_type = 'revenue' AND f.column_name = 'subscribers'
-                                  AND f.num_value > 0
+                                WHERE f.kpi_type = 'revenue' AND f.column_name ILIKE '%subscriber%'
+                                  AND f.column_type = 'numeric' AND f.num_value > 0
                             ) sub ON rev.site_id = sub.site_id
                             ORDER BY arpu {_rev_order} {_limit}""",
                         "query_type": "bar", "chart_type": "bar",
@@ -1707,7 +1862,7 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
                     return {
                         "sql": f"""SELECT f.site_id, SUM(f.num_value) AS total_revenue
                             FROM flexible_kpi_uploads f
-                            WHERE f.kpi_type = 'revenue' AND f.column_name LIKE 'revenue\\_%'
+                            WHERE f.kpi_type = 'revenue' AND f.column_name ILIKE '%revenue%'
                               AND f.column_type = 'numeric' {site_filter_f}
                             GROUP BY f.site_id
                             ORDER BY total_revenue {_rev_order} NULLS LAST {_limit}""",
@@ -1717,8 +1872,14 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
                         "response": f"{'Lowest' if _rev_order=='ASC' else 'Top'} {_rev_n} sites by total revenue.",
                     }
 
-            # revenue_data table exists — use flat table queries
-            if any(w in p for w in ('subscriber', 'subscribers', 'customer count')):
+            # revenue_data table exists — build SQL from ACTUAL discovered columns
+            # (no hardcoded column names — adapts to whatever schema the table has)
+            _total_rev_expr = " + ".join(f"COALESCE(r.{c},0)" for c in _rev_rev_cols) if _rev_rev_cols else "0"
+            _total_opex_expr = " + ".join(f"COALESCE(r.{c},0)" for c in _rev_opex_cols) if _rev_opex_cols else "0"
+            _rev_cols_select = ", ".join(f"r.{c}" for c in _rev_rev_cols) if _rev_rev_cols else "NULL AS no_rev_cols"
+            _opex_cols_select = ", ".join(f"r.{c}" for c in _rev_opex_cols) if _rev_opex_cols else "NULL AS no_opex_cols"
+
+            if _rev_has_subscribers and any(w in p for w in ('subscriber', 'subscribers', 'customer count')):
                 return {
                     "sql": f"""SELECT r.site_id, r.subscribers
                         FROM revenue_data r
@@ -1729,23 +1890,22 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
                     "x_axis": "site_id", "y_axes": ["subscribers"],
                     "response": f"{'Lowest' if _rev_order=='ASC' else 'Top'} {_rev_n} sites by subscriber count.",
                 }
-            elif any(w in p for w in ('opex', 'expenditure', 'operating cost')):
+            elif _rev_opex_cols and any(w in p for w in ('opex', 'expenditure', 'operating cost')):
                 return {
-                    "sql": f"""SELECT r.site_id, r.opex_jan, r.opex_feb, r.opex_mar,
-                               (COALESCE(r.opex_jan,0)+COALESCE(r.opex_feb,0)+COALESCE(r.opex_mar,0)) AS total_opex
+                    "sql": f"""SELECT r.site_id, {_opex_cols_select},
+                               ({_total_opex_expr}) AS total_opex
                         FROM revenue_data r
                         WHERE r.site_id IS NOT NULL {site_filter_r}
                         ORDER BY total_opex {_rev_order} {_limit}""",
                     "query_type": "bar", "chart_type": "bar",
                     "title": f"{'Bottom' if _rev_order=='ASC' else 'Top'} {_rev_n} — OPEX",
-                    "x_axis": "site_id", "y_axes": ["opex_jan", "opex_feb", "opex_mar"],
+                    "x_axis": "site_id", "y_axes": _rev_opex_cols[:6],
                     "response": f"{'Lowest' if _rev_order=='ASC' else 'Highest'} {_rev_n} sites by total OPEX.",
                 }
-            elif 'arpu' in p:
+            elif 'arpu' in p and _rev_rev_cols and _rev_has_subscribers:
                 return {
                     "sql": f"""SELECT r.site_id,
-                               ROUND(CAST((COALESCE(r.rev_jan,0) + COALESCE(r.rev_feb,0) + COALESCE(r.rev_mar,0))
-                                   AS NUMERIC) / NULLIF(r.subscribers, 0), 2) AS arpu
+                               ROUND(CAST(({_total_rev_expr}) AS NUMERIC) / NULLIF(r.subscribers, 0), 2) AS arpu
                         FROM revenue_data r
                         WHERE r.subscribers > 0 {site_filter_r}
                         ORDER BY arpu {_rev_order} {_limit}""",
@@ -1754,30 +1914,42 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
                     "x_axis": "site_id", "y_axes": ["arpu"],
                     "response": f"{'Lowest' if _rev_order=='ASC' else 'Top'} {_rev_n} sites by ARPU.",
                 }
-            elif site_ids and is_trend:
-                # Revenue trend — unpivot monthly columns into time series
+            elif site_ids and is_trend and _rev_rev_cols:
+                # Revenue trend — unpivot monthly columns dynamically
                 site_filter_lat = " OR ".join(f"r.site_id = '{s}'" for s in site_ids[:5])
+                # Build LATERAL VALUES from discovered rev + opex columns, paired by index
+                _lat_rows = []
+                for i, rc in enumerate(_rev_rev_cols):
+                    _label = rc.replace('rev_', '').replace('_', ' ').title()
+                    _oc = _rev_opex_cols[i] if i < len(_rev_opex_cols) else "NULL"
+                    _oc_ref = f"r.{_oc}" if _oc != "NULL" else "NULL"
+                    _lat_rows.append(f"('{_label}', {i+1}, r.{rc}, {_oc_ref})")
+                if _lat_rows:
+                    _lat_values = ",\n                            ".join(_lat_rows)
+                    return {
+                        "sql": f"""SELECT r.site_id, t.month_name, t.revenue, t.opex
+                            FROM revenue_data r
+                            CROSS JOIN LATERAL (VALUES
+                            {_lat_values}
+                            ) AS t(month_name, month_ord, revenue, opex)
+                            WHERE ({site_filter_lat})
+                            ORDER BY r.site_id, t.month_ord""",
+                        "query_type": "composed", "chart_type": "composed",
+                        "title": f"Revenue Trend — {', '.join(site_ids[:3])}",
+                        "x_axis": "month_name", "y_axes": ["revenue", "opex"],
+                        "response": f"Monthly revenue & OPEX for {', '.join(site_ids[:3])}.",
+                    }
+            # Default: show revenue with all discovered columns
+            if _rev_rev_cols:
+                _sub_col = "r.subscribers, " if _rev_has_subscribers else ""
+                _meta_cols = []
+                for _mc in ('zone', 'technology'):
+                    if _mc in _rev_data_cols:
+                        _meta_cols.append(f"r.{_mc}")
+                _meta_select = (", " + ", ".join(_meta_cols)) if _meta_cols else ""
                 return {
-                    "sql": f"""SELECT r.site_id, t.month_name, t.revenue, t.opex
-                        FROM revenue_data r
-                        CROSS JOIN LATERAL (VALUES
-                            ('Jan', 1, r.rev_jan, r.opex_jan),
-                            ('Feb', 2, r.rev_feb, r.opex_feb),
-                            ('Mar', 3, r.rev_mar, r.opex_mar)
-                        ) AS t(month_name, month_ord, revenue, opex)
-                        WHERE ({site_filter_lat})
-                        ORDER BY r.site_id, t.month_ord""",
-                    "query_type": "composed", "chart_type": "composed",
-                    "title": f"Revenue Trend — {', '.join(site_ids[:3])}",
-                    "x_axis": "month_name", "y_axes": ["revenue", "opex"],
-                    "response": f"Monthly revenue & OPEX for {', '.join(site_ids[:3])}. Revenue data is monthly (Jan-Mar).",
-                }
-            else:
-                return {
-                    "sql": f"""SELECT r.site_id, r.subscribers,
-                               r.rev_jan, r.rev_feb, r.rev_mar,
-                               (COALESCE(r.rev_jan,0) + COALESCE(r.rev_feb,0) + COALESCE(r.rev_mar,0)) AS total_revenue,
-                               r.zone, r.technology
+                    "sql": f"""SELECT r.site_id, {_sub_col}{_rev_cols_select},
+                               ({_total_rev_expr}) AS total_revenue{_meta_select}
                         FROM revenue_data r
                         WHERE r.site_id IS NOT NULL {site_filter_r}
                         ORDER BY total_revenue {_rev_order} NULLS LAST {_limit}""",
@@ -1803,32 +1975,47 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
 
         # ── Core KPI queries (core_kpi_data → flexible_kpi_uploads fallback) ──
         if _is_core:
-            if _tbl_exists("core_kpi_data"):
+            if _tbl_exists("core_kpi_data") and _core_metric_cols:
+                # Build SQL from ACTUAL discovered columns (no hardcoded names)
+                _core_select = ", ".join(f"c.{c}" for c in _core_metric_cols)
+                _core_avg_select = ", ".join(f"AVG(c.{c}) AS {c}" for c in _core_metric_cols)
+                _core_sort_col = _core_metric_cols[0]  # first metric for sorting
                 date_clause = ""
                 if days:
                     date_clause = f"AND c.date >= CURRENT_DATE - INTERVAL '{days} days' AND c.date <= CURRENT_DATE"
                 if site_ids:
-                    return {
-                        "sql": f"""SELECT c.date::text AS date, c.auth_sr, c.cpu_util, c.attach_sr, c.pdp_sr
-                            FROM core_kpi_data c
-                            WHERE c.site_id = '{site_ids[0]}' {date_clause}
-                            ORDER BY c.date""",
-                        "query_type": "composed", "chart_type": "composed",
-                        "title": f"Core KPIs — {site_ids[0]}",
-                        "x_axis": "date", "y_axes": ["auth_sr", "cpu_util", "attach_sr", "pdp_sr"],
-                        "response": f"Showing core network KPIs for {site_ids[0]}.",
-                    }
+                    _has_date = 'date' in [c.lower() for c in _core_data_cols]
+                    if _has_date:
+                        return {
+                            "sql": f"""SELECT c.date::text AS date, {_core_select}
+                                FROM core_kpi_data c
+                                WHERE LOWER(c.site_id) = LOWER('{site_ids[0]}') {date_clause}
+                                ORDER BY c.date""",
+                            "query_type": "composed", "chart_type": "composed",
+                            "title": f"Core KPIs — {site_ids[0]}",
+                            "x_axis": "date", "y_axes": _core_metric_cols[:6],
+                            "response": f"Showing core network KPIs for {site_ids[0]}.",
+                        }
+                    else:
+                        return {
+                            "sql": f"""SELECT c.site_id, {_core_select}
+                                FROM core_kpi_data c
+                                WHERE LOWER(c.site_id) = LOWER('{site_ids[0]}') {date_clause}""",
+                            "query_type": "bar", "chart_type": "bar",
+                            "title": f"Core KPIs — {site_ids[0]}",
+                            "x_axis": "site_id", "y_axes": _core_metric_cols[:6],
+                            "response": f"Showing core network KPIs for {site_ids[0]}.",
+                        }
                 else:
-                    _core_sort = "auth_sr ASC" if _horder == "ASC" else "auth_sr DESC"
+                    _core_sort = f"{_core_sort_col} {'ASC' if _horder == 'ASC' else 'DESC'}"
                     return {
-                        "sql": f"""SELECT c.site_id, AVG(c.auth_sr) AS auth_sr, AVG(c.cpu_util) AS cpu_util,
-                                   AVG(c.attach_sr) AS attach_sr, AVG(c.pdp_sr) AS pdp_sr
+                        "sql": f"""SELECT c.site_id, {_core_avg_select}
                             FROM core_kpi_data c
                             WHERE c.site_id IS NOT NULL {date_clause}
                             GROUP BY c.site_id ORDER BY {_core_sort} NULLS LAST {_hlimit}""",
                         "query_type": "bar", "chart_type": "bar",
                         "title": f"{'Bottom' if _horder=='ASC' else 'Top'} {_hn} — Core KPIs",
-                        "x_axis": "site_id", "y_axes": ["auth_sr", "cpu_util", "attach_sr", "pdp_sr"],
+                        "x_axis": "site_id", "y_axes": _core_metric_cols[:6],
                         "response": f"{'Worst' if _horder=='ASC' else 'Top'} {_hn} sites by core KPIs.",
                     }
             else:
@@ -1847,32 +2034,44 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
 
         # ── Transport/backhaul queries ──
         if _is_transport:
-            if _tbl_exists("transport_kpi_data"):
-                _trans_sort = "packet_loss" if any(w in p for w in ('packet loss', 'loss')) else \
-                              "avg_latency" if any(w in p for w in ('latency', 'delay')) else \
-                              "jitter" if 'jitter' in p else "packet_loss"
+            if _tbl_exists("transport_kpi_data") and _transport_data_cols:
+                # Build SQL from ACTUAL discovered columns (no hardcoded names)
+                _all_t_select = ", ".join(f"t.{c}" for c in _transport_data_cols)
+                # Dynamic sort: find a matching column by keyword
+                _trans_sort = None
+                for _kw, _col_hint in [('packet loss', 'packet_loss'), ('loss', 'packet_loss'),
+                                        ('latency', 'latency'), ('delay', 'latency'),
+                                        ('jitter', 'jitter'), ('error', 'error'),
+                                        ('utilization', 'util'), ('capacity', 'capacity')]:
+                    if _kw in p:
+                        _trans_sort = next((c for c in _transport_metric_cols if _col_hint in c.lower()), None)
+                        if _trans_sort:
+                            break
+                if not _trans_sort:
+                    _trans_sort = next((c for c in _transport_metric_cols if 'packet_loss' in c.lower()),
+                                      _transport_metric_cols[0] if _transport_metric_cols else 'site_id')
+                # Determine y_axes from discovered metric columns
+                _t_y_axes = _transport_metric_cols[:5] if _transport_metric_cols else ['site_id']
                 if site_ids:
                     return {
-                        "sql": f"""SELECT t.site_id, t.backhaul_type, t.link_capacity, t.avg_util,
-                                   t.peak_util, t.packet_loss, t.avg_latency, t.jitter, t.availability
+                        "sql": f"""SELECT {_all_t_select}
                             FROM transport_kpi_data t
                             WHERE t.site_id IS NOT NULL {site_filter_t}
                             ORDER BY t.site_id""",
                         "query_type": "bar", "chart_type": "bar",
                         "title": f"Transport KPIs — {', '.join(site_ids[:2])}",
-                        "x_axis": "site_id", "y_axes": ["avg_util", "packet_loss", "avg_latency", "jitter"],
+                        "x_axis": "site_id", "y_axes": _t_y_axes,
                         "response": f"Transport/backhaul KPIs for {', '.join(site_ids[:2])}.",
                     }
                 else:
                     return {
-                        "sql": f"""SELECT t.site_id, t.backhaul_type, t.link_capacity, t.avg_util,
-                                   t.peak_util, t.packet_loss, t.avg_latency, t.jitter, t.availability
+                        "sql": f"""SELECT {_all_t_select}
                             FROM transport_kpi_data t
                             WHERE t.site_id IS NOT NULL
                             ORDER BY {_trans_sort} DESC NULLS LAST {_hlimit}""",
                         "query_type": "bar", "chart_type": "bar",
                         "title": f"Top {_hn} — Transport Issues (by {_trans_sort})",
-                        "x_axis": "site_id", "y_axes": ["packet_loss", "avg_latency", "jitter"],
+                        "x_axis": "site_id", "y_axes": _t_y_axes,
                         "response": f"Top {_hn} sites with worst transport KPIs (by {_trans_sort}).",
                     }
             else:
@@ -1884,29 +2083,48 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
 
         # ── Network issue ticket queries ──
         if _is_ticket:
-            if _tbl_exists("network_issue_tickets"):
+            if _tbl_exists("network_issue_tickets") and _ticket_cols:
+                # Build SQL from ACTUAL discovered columns (no hardcoded names)
+                _skip_ticket = {'id', 'updated_at'}
+                _ticket_select_cols = [c for c in _ticket_cols if c.lower() not in _skip_ticket]
+                # Cast timestamp columns to text for JSON serialization
+                _ticket_select_parts = []
+                for c in _ticket_select_cols:
+                    if 'created_at' in c.lower() or 'deadline' in c.lower() or 'updated_at' in c.lower():
+                        _ticket_select_parts.append(f"n.{c}::text AS {c}")
+                    else:
+                        _ticket_select_parts.append(f"n.{c}")
+                _ticket_select = ", ".join(_ticket_select_parts)
+                # Determine y_axes from numeric-looking columns
+                _ticket_y_candidates = [c for c in _ticket_cols if any(k in c.lower() for k in
+                    ('drop_rate', 'cssr', 'tput', 'violations', 'priority_score', 'sla', 'rrc', 'revenue'))]
+                _ticket_y = _ticket_y_candidates[:4] if _ticket_y_candidates else ['site_id']
+                # Check if status column exists
+                _has_status = 'status' in [c.lower() for c in _ticket_cols]
+                _status_filter = "WHERE n.status IN ('open','in_progress')" if _has_status else "WHERE 1=1"
+                # Check if priority_score exists for ordering
+                _has_pscore = 'priority_score' in [c.lower() for c in _ticket_cols]
+                _ticket_order = "n.priority_score DESC" if _has_pscore else "n.site_id"
                 if site_ids:
                     return {
-                        "sql": f"""SELECT n.site_id, n.priority, n.avg_drop_rate, n.avg_cssr, n.avg_tput,
-                                   n.violations, n.status, n.zone, n.created_at::text
+                        "sql": f"""SELECT {_ticket_select}
                             FROM network_issue_tickets n
-                            WHERE n.status IN ('open','in_progress') {site_filter_n}
-                            ORDER BY n.priority_score DESC""",
+                            {_status_filter} {site_filter_n}
+                            ORDER BY {_ticket_order}""",
                         "query_type": "bar", "chart_type": "bar",
                         "title": f"Network Tickets — {', '.join(site_ids[:2])}",
-                        "x_axis": "site_id", "y_axes": ["avg_drop_rate", "avg_cssr", "avg_tput"],
+                        "x_axis": "site_id", "y_axes": _ticket_y,
                         "response": f"Network issue tickets for {', '.join(site_ids[:2])}.",
                     }
                 else:
                     return {
-                        "sql": f"""SELECT n.site_id, n.priority, n.avg_drop_rate, n.avg_cssr, n.avg_tput,
-                                   n.violations, n.status, n.zone, n.created_at::text
+                        "sql": f"""SELECT {_ticket_select}
                             FROM network_issue_tickets n
-                            WHERE n.status IN ('open','in_progress')
-                            ORDER BY n.priority_score DESC {_hlimit}""",
+                            {_status_filter}
+                            ORDER BY {_ticket_order} {_hlimit}""",
                         "query_type": "bar", "chart_type": "bar",
                         "title": f"Top {_hn} Network Issue Tickets",
-                        "x_axis": "site_id", "y_axes": ["avg_drop_rate", "avg_cssr", "avg_tput"],
+                        "x_axis": "site_id", "y_axes": _ticket_y,
                         "response": f"Showing {_hn} highest-priority open tickets.",
                     }
             else:
@@ -1914,6 +2132,75 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
                     "sql": "", "query_type": "bar", "chart_type": "bar",
                     "title": "Network Tickets", "x_axis": "site_id", "y_axes": [],
                     "response": "No network issue tickets found. The AI ticket system generates tickets during the daily 08:00 IST scan.",
+                }
+
+        # ── Site info / alarms queries (telecom_sites table) ──
+        if _is_site_info:
+            if _tbl_exists("telecom_sites"):
+                _is_alarm = any(w in p for w in ('alarm', 'alarms', 'critical alarm'))
+                if _is_alarm:
+                    if site_ids:
+                        return {
+                            "sql": f"""SELECT ts.site_id, ts.zone, ts.city, ts.state, ts.technology,
+                                       ts.site_status, ts.alarms
+                                FROM telecom_sites ts
+                                WHERE ts.alarms IS NOT NULL AND ts.alarms != '0'
+                                  AND ts.site_id IN ({", ".join(f"'{s}'" for s in site_ids[:4])})
+                                GROUP BY ts.site_id, ts.zone, ts.city, ts.state, ts.technology, ts.site_status, ts.alarms
+                                ORDER BY ts.alarms DESC""",
+                            "query_type": "bar", "chart_type": "bar",
+                            "title": f"Alarms — {', '.join(site_ids[:2])}",
+                            "x_axis": "site_id", "y_axes": ["alarms"],
+                            "response": f"Alarm information for {', '.join(site_ids[:2])}.",
+                        }
+                    else:
+                        return {
+                            "sql": f"""SELECT ts.site_id, ts.zone, ts.city, ts.technology,
+                                       ts.site_status, ts.alarms
+                                FROM telecom_sites ts
+                                WHERE ts.alarms IS NOT NULL AND ts.alarms != '0'
+                                GROUP BY ts.site_id, ts.zone, ts.city, ts.technology, ts.site_status, ts.alarms
+                                ORDER BY ts.alarms DESC {_hlimit}""",
+                            "query_type": "bar", "chart_type": "bar",
+                            "title": f"Top {_hn} Sites with Alarms",
+                            "x_axis": "site_id", "y_axes": ["alarms"],
+                            "response": f"Showing {_hn} sites with highest alarm counts.",
+                        }
+                else:
+                    # General site info query
+                    if site_ids:
+                        return {
+                            "sql": f"""SELECT DISTINCT ts.site_id, ts.zone, ts.city, ts.state,
+                                       ts.technology, ts.site_status, ts.latitude, ts.longitude, ts.alarms
+                                FROM telecom_sites ts
+                                WHERE ts.site_id IN ({", ".join(f"'{s}'" for s in site_ids[:4])})
+                                ORDER BY ts.site_id""",
+                            "query_type": "bar", "chart_type": "bar",
+                            "title": f"Site Info — {', '.join(site_ids[:2])}",
+                            "x_axis": "site_id", "y_axes": ["zone", "city", "technology"],
+                            "response": f"Site details for {', '.join(site_ids[:2])}.",
+                        }
+                    else:
+                        # Show sites by status or general overview
+                        _is_off = any(w in p for w in ('off air', 'down', 'inactive'))
+                        _status_filt = "AND ts.site_status = 'off_air'" if _is_off else ""
+                        return {
+                            "sql": f"""SELECT ts.site_id, ts.zone, ts.city, ts.state,
+                                       ts.technology, ts.site_status, ts.alarms
+                                FROM telecom_sites ts
+                                WHERE ts.site_id IS NOT NULL {_status_filt}
+                                GROUP BY ts.site_id, ts.zone, ts.city, ts.state, ts.technology, ts.site_status, ts.alarms
+                                ORDER BY ts.site_id {_hlimit}""",
+                            "query_type": "bar", "chart_type": "bar",
+                            "title": f"{'Off-Air' if _is_off else 'All'} Sites Overview",
+                            "x_axis": "site_id", "y_axes": ["zone", "technology", "site_status"],
+                            "response": f"Showing {'off-air' if _is_off else 'top'} sites.",
+                        }
+            else:
+                return {
+                    "sql": "", "query_type": "bar", "chart_type": "bar",
+                    "title": "Site Info", "x_axis": "site_id", "y_axes": [],
+                    "response": "No telecom_sites data available. Please upload site data first.",
                 }
 
     # ── FIX: Multiple sites + trend → multi_chart (one chart per site, each with ALL KPIs) ──
