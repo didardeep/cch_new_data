@@ -403,6 +403,7 @@ ALWAYS use ILIKE for column_name matching:
     # ── Dynamic schema discovery → populate module-level _schema_cache ──
     global _schema_cache
     _schema_cache["available_tables"] = _available_tables
+    _LOG.info("[DISCOVERY] Available tables: %s", _available_tables)
 
     if 'revenue_data' in _available_tables:
         try:
@@ -496,6 +497,12 @@ ALWAYS use ILIKE for column_name matching:
             pass
 
     _schema_cache["populated"] = True
+    _LOG.info("[DISCOVERY] rev_data_cols=%s rev_rev_cols=%s rev_opex=%s rev_subs=%s",
+              _schema_cache["rev_data_cols"][:5], _schema_cache["rev_rev_cols"][:5],
+              _schema_cache["rev_opex_cols"][:3], _schema_cache["rev_has_subscribers"])
+    _LOG.info("[DISCOVERY] core_metric=%s transport_metric=%s ticket_cols=%d",
+              _schema_cache["core_metric_cols"][:4], _schema_cache["transport_metric_cols"][:4],
+              len(_schema_cache["ticket_cols"]))
 
     # ── Dynamic flexible_kpi_uploads core column discovery ──
     if 'flexible_kpi_uploads' in _available_tables:
@@ -871,7 +878,34 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
             provider  = {"provider": "rule-based-multisite"}
             _LOG.info("Multi-site trend intercepted before LLM: %s", _prompt_sites)
 
-    # 3. LLM handles all queries (revenue, core, transport, tickets, KPIs).
+    # 2b. Non-KPI table queries (revenue, core, transport, tickets, site info)
+    #     Rule-based handlers use dynamic schema discovery and are more reliable
+    #     than LLM for these tables. Intercept BEFORE LLM to avoid wrong SQL.
+    if not ai_result:
+        _REVENUE_KW = {'revenue', 'income', 'earning', 'opex', 'expenditure', 'operating cost',
+                        'subscriber', 'subscribers', 'customer count', 'arpu'}
+        _CORE_KW = {'core kpi', 'core network', 'authentication', 'auth success', 'cpu utilization',
+                     'attach success', 'attach rate', 'pdp bearer', 'pdp setup',
+                     'auth sr', 'attach sr', 'pdp sr', 'cpu util'}
+        _TRANSPORT_KW = {'transport', 'backhaul', 'microwave', 'fiber', 'jitter',
+                          'link capacity', 'link utilization', 'backhaul latency',
+                          'packet loss', 'tput efficiency', 'error rate'}
+        _TICKET_KW = {'network issue', 'worst cell', 'ai ticket', 'network ticket',
+                       'open issue', 'open ticket', 'issue ticket', 'fault'}
+        _SITE_KW = {'site info', 'site detail', 'site status', 'which city',
+                     'which zone', 'which state', 'site location', 'on air', 'off air',
+                     'alarm', 'alarms', 'critical alarm', 'site technology'}
+        _is_non_kpi = (any(w in _p_lower for w in _REVENUE_KW) or
+                       any(w in _p_lower for w in _CORE_KW) or
+                       any(w in _p_lower for w in _TRANSPORT_KW) or
+                       any(w in _p_lower for w in _TICKET_KW) or
+                       any(w in _p_lower for w in _SITE_KW))
+        if _is_non_kpi:
+            ai_result = _rule_based_query(prompt, time_filter, prev_context=None)
+            provider = {"provider": "rule-based-intercept"}
+            _LOG.info("Non-KPI query intercepted before LLM (revenue/core/transport/ticket/site)")
+
+    # 3. LLM handles KPI and general queries.
     #    Dynamic schema (AVAILABLE TABLES section) tells LLM which tables exist.
     #    Rule-based handlers remain as fallback if LLM SQL fails at execution.
     if not ai_result:
@@ -1004,19 +1038,22 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
         rows = _sql_with_timeout(sql, timeout_sec=15)
     except Exception as e:
         _LOG.warning("AI SQL execution failed: %s — SQL: %s", e, sql[:200])
+        rows = []
+
+    # ── 0-rows fallback: if LLM SQL returned nothing, try rule-based ──
+    if not rows:
         try:
             fallback = _rule_based_query(prompt, time_filter)
             sql2 = fallback.get("sql", "")
-            if sql2 and sql2.strip().upper().startswith("SELECT"):
+            if sql2 and sql2 != sql and sql2.strip().upper().startswith("SELECT"):
                 rows = _sql_with_timeout(sql2, timeout_sec=10)
-                ai_result.update(fallback)
-                sql = sql2
-                if not provider:
+                if rows:
+                    ai_result.update(fallback)
+                    sql = sql2
                     provider = {"provider": "rule-based-fallback"}
-            else:
-                rows = []
+                    _LOG.info("Rule-based fallback returned %d rows", len(rows))
         except Exception:
-            rows = []
+            pass
 
     columns = list(rows[0].keys()) if rows else []
     has_geo = any(r.get("lat") or r.get("latitude") for r in rows)
@@ -1790,6 +1827,9 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
         # ── Revenue queries (revenue_data → flexible_kpi_uploads fallback) ──
         if _is_revenue:
             _has_rev_tbl = _tbl_exists("revenue_data")
+            _LOG.info("[REVENUE] has_rev_tbl=%s rev_cols=%s opex_cols=%s subs=%s use_eav=%s",
+                      _has_rev_tbl, _rev_rev_cols[:3], _rev_opex_cols[:3], _rev_has_subscribers,
+                      not _has_rev_tbl or (not _rev_rev_cols and not _rev_has_subscribers))
 
             # Extract "top N" / "bottom N" from prompt
             _top_m = re.search(r'(?:top|best|highest)\s+(\d+)', p)
@@ -1806,7 +1846,9 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
                 _rev_order = "ASC"
             _limit = f"LIMIT {_rev_n}"
 
-            if not _has_rev_tbl:
+            # Use EAV if: revenue_data doesn't exist, OR it exists but discovery found no revenue columns
+            _use_eav_revenue = not _has_rev_tbl or (not _rev_rev_cols and not _rev_has_subscribers)
+            if _use_eav_revenue:
                 # Fallback: use flexible_kpi_uploads EAV table
                 # NOTE: ILIKE for case-insensitive matching — column_name casing depends on uploaded CSV headers
                 if any(w in p for w in ('subscriber', 'subscribers', 'customer count')):
@@ -1957,6 +1999,20 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
                     "title": f"{'Bottom' if _rev_order=='ASC' else 'Top'} {_rev_n} Sites by Revenue",
                     "x_axis": "site_id", "y_axes": ["total_revenue"],
                     "response": f"{'Lowest' if _rev_order=='ASC' else 'Top'} {_rev_n} sites by total revenue.",
+                }
+            else:
+                # revenue_data exists but no recognized rev columns — fall back to EAV
+                return {
+                    "sql": f"""SELECT f.site_id, SUM(f.num_value) AS total_revenue
+                        FROM flexible_kpi_uploads f
+                        WHERE f.kpi_type = 'revenue' AND f.column_name ILIKE '%revenue%'
+                          AND f.column_type = 'numeric' {site_filter_f}
+                        GROUP BY f.site_id
+                        ORDER BY total_revenue {_rev_order} NULLS LAST {_limit}""",
+                    "query_type": "bar", "chart_type": "bar",
+                    "title": f"{'Bottom' if _rev_order=='ASC' else 'Top'} {_rev_n} Sites by Revenue",
+                    "x_axis": "site_id", "y_axes": ["total_revenue"],
+                    "response": f"{'Lowest' if _rev_order=='ASC' else 'Top'} {_rev_n} sites by total revenue (from uploaded data).",
                 }
 
         # ── Shared: extract top/bottom N for non-revenue handlers too ──
