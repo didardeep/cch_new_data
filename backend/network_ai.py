@@ -40,6 +40,9 @@ _schema_cache = {
     "transport_data_cols": [], "transport_metric_cols": [],
     # network_issue_tickets
     "ticket_cols": [],
+    # data freshness — actual max date in kpi_data (may lag behind CURRENT_DATE)
+    "kpi_max_date": None,   # e.g. "2026-03-22"
+    "kpi_max_date_recent": None,  # max date among KPIs that have recent data
 }
 
 # ─── Shared helpers (imported lazily from network_analytics) ─────────────────
@@ -50,6 +53,22 @@ def _sql(query: str, params: dict = None) -> list:
         result = conn.execute(sa_text(query), params or {})
         cols = list(result.keys())
         return [dict(zip(cols, row)) for row in result.fetchall()]
+
+
+def _kpi_date_ref():
+    """Return a SQL expression for the latest KPI data date.
+    If the data lags behind today, returns e.g. '2026-03-22'::date.
+    Otherwise returns CURRENT_DATE."""
+    _max = _schema_cache.get("kpi_max_date_recent")
+    return f"'{_max}'::date" if _max else "CURRENT_DATE"
+
+
+def _kpi_date_clause(days_val, alias='k'):
+    """Build a date range WHERE clause using the actual data max date."""
+    _ref = _kpi_date_ref()
+    if days_val:
+        return f"AND {alias}.date >= {_ref} - INTERVAL '{days_val} days' AND {alias}.date <= {_ref}"
+    return f"AND {alias}.date <= {_ref}"
 
 
 def _get_dynamic_time_filter():
@@ -227,23 +246,27 @@ Tables:
      'revenue_jan_l'    — January revenue in Lakhs (numeric)
      'revenue_feb_l'    — February revenue in Lakhs (numeric)
      'revenue_mar_l'    — March revenue in Lakhs (numeric)
-     ... through 'revenue_dec_l' — pattern: revenue_<mon>_l
+     'revenue_total'    — TOTAL revenue (sum of all months, numeric) — USE THIS for total revenue queries
      'opex_jan_l'       — January OPEX in Lakhs (numeric)
      'opex_feb_l'       — February OPEX in Lakhs (numeric)
-     ... through 'opex_dec_l' — pattern: opex_<mon>_l
+     'opex_mar_l'       — March OPEX in Lakhs (numeric)
+     'opex_total'       — TOTAL OPEX (sum of all months, numeric) — USE THIS for total OPEX queries
+     'difference'       — Revenue minus OPEX (numeric)
      'zone'             — geographic zone (text, in str_value)
      'technology'       — technology type (text, in str_value)
      'site_category'    — site classification (text, in str_value)
 
    IMPORTANT: column_name values may have mixed casing (e.g. 'Subscribers', 'Revenue_Jan_L').
    ALWAYS use ILIKE (case-insensitive) for column_name matching, NEVER use = or LIKE.
+   IMPORTANT: For total revenue, use 'revenue_total' directly — do NOT SUM all revenue columns
+              (that would double-count because revenue_total = jan + feb + mar).
 
-   Example: Get total revenue per site:
-     SELECT f.site_id, SUM(f.num_value) AS total_revenue
+   Example: Get total revenue per site (use revenue_total, NOT SUM of monthly):
+     SELECT f.site_id, f.num_value AS total_revenue
      FROM flexible_kpi_uploads f
      WHERE f.kpi_type = 'revenue'
-       AND f.column_name ILIKE '%revenue%' AND f.column_type = 'numeric'
-     GROUP BY f.site_id ORDER BY total_revenue DESC
+       AND f.column_name ILIKE '%revenue_total%' AND f.column_type = 'numeric'
+     ORDER BY total_revenue DESC
 
    Example: Get subscribers for a specific site:
      SELECT f.site_id, f.num_value AS subscribers
@@ -264,13 +287,20 @@ Tables:
        AND f.site_id = 'GUR_LTE_1500'
 
    === Core KPI data (kpi_type = 'core') ===
-   NOTE: Actual column_name values are discovered at runtime — see "ACTUAL COLUMN NAMES in flexible_kpi_uploads (kpi_type='core')" section below.
-   ALWAYS use ILIKE for column_name matching (same as revenue data).
+   IMPORTANT: Core data uses kpi_name (NOT column_name) for the metric type.
+   kpi_name values: 'Authentication Success Rate', 'CPU Utilization', 'Attach Success Rate', 'PDP Bearer Setup Success Rate'
+   column_name contains DATES (e.g., '2026_03_07_000000'), num_value contains the metric value.
+   ALWAYS use ILIKE for kpi_name matching.
 
-   Example: Get core KPIs for a site:
-     SELECT f.site_id, f.column_name, f.num_value
+   Example: Get average core KPIs per site:
+     SELECT f.site_id,
+       AVG(CASE WHEN f.kpi_name ILIKE '%auth%' THEN f.num_value END) AS auth_sr,
+       AVG(CASE WHEN f.kpi_name ILIKE '%cpu%' THEN f.num_value END) AS cpu_util,
+       AVG(CASE WHEN f.kpi_name ILIKE '%attach%' THEN f.num_value END) AS attach_sr,
+       AVG(CASE WHEN f.kpi_name ILIKE '%pdp%' THEN f.num_value END) AS pdp_sr
      FROM flexible_kpi_uploads f
-     WHERE f.kpi_type = 'core' AND f.column_name ILIKE '%auth%' AND f.site_id = 'GUR_LTE_1500'
+     WHERE f.kpi_type = 'core' AND f.column_type = 'numeric'
+     GROUP BY f.site_id
 
 === Natural Language → KPI Mapping Guide ===
 User says "call drop" / "drop rate" / "CDR" / "call failure" → 'E-RAB Call Drop Rate_1' (kpi_data)
@@ -496,6 +526,41 @@ ALWAYS use ILIKE for column_name matching:
         except Exception:
             pass
 
+    # ── Data freshness — discover actual max date in kpi_data ──
+    # Many KPIs may lag behind CURRENT_DATE. Using CURRENT_DATE in WHERE clauses
+    # would return 0 rows. We discover the actual max date and use it as reference.
+    if 'kpi_data' in _available_tables:
+        try:
+            _date_info = _sql(
+                "SELECT MAX(date)::text AS max_date FROM kpi_data WHERE data_level = 'site'"
+            )
+            if _date_info and _date_info[0].get('max_date'):
+                _schema_cache["kpi_max_date"] = _date_info[0]['max_date']
+                # Also get the "main" max date (excluding KPIs that may have future/synthetic data)
+                _main_dates = _sql(
+                    "SELECT MAX(date)::text AS max_date FROM kpi_data "
+                    "WHERE data_level = 'site' AND kpi_name NOT IN ('Site Revenue','Site Users')"
+                )
+                if _main_dates and _main_dates[0].get('max_date'):
+                    _schema_cache["kpi_max_date_recent"] = _main_dates[0]['max_date']
+                else:
+                    _schema_cache["kpi_max_date_recent"] = _schema_cache["kpi_max_date"]
+            _LOG.info("[DISCOVERY] kpi_max_date=%s kpi_max_date_recent=%s",
+                      _schema_cache["kpi_max_date"], _schema_cache["kpi_max_date_recent"])
+            # Tell LLM about the actual date range so it doesn't use CURRENT_DATE blindly
+            if _schema_cache["kpi_max_date_recent"]:
+                _date_hint = f"\n=== DATA FRESHNESS (CRITICAL — read carefully) ===\n"
+                _date_hint += f"The LATEST date with RAN KPI data is: {_schema_cache['kpi_max_date_recent']}\n"
+                _date_hint += f"Today's date is: {datetime.now().strftime('%Y-%m-%d')}\n"
+                _date_hint += "IMPORTANT: If these dates differ, the data is NOT up-to-date.\n"
+                _date_hint += f"Use '{_schema_cache['kpi_max_date_recent']}'::date instead of CURRENT_DATE as the end date.\n"
+                _date_hint += f"Example: AND k.date >= '{_schema_cache['kpi_max_date_recent']}'::date - INTERVAL '7 days' "
+                _date_hint += f"AND k.date <= '{_schema_cache['kpi_max_date_recent']}'::date\n"
+                _date_hint += "NEVER use CURRENT_DATE if it is more recent than the latest data date.\n"
+                SCHEMA_HINT += _date_hint
+        except Exception as e:
+            _LOG.warning("[DISCOVERY] Failed to get kpi_data date range: %s", e)
+
     _schema_cache["populated"] = True
     _LOG.info("[DISCOVERY] rev_data_cols=%s rev_rev_cols=%s rev_opex=%s rev_subs=%s",
               _schema_cache["rev_data_cols"][:5], _schema_cache["rev_rev_cols"][:5],
@@ -645,6 +710,8 @@ STRICTNESS RULES — FOLLOW THESE EXACTLY:
 9. In UNION ALL queries, NEVER put ORDER BY or LIMIT inside individual SELECT branches. Put ONE ORDER BY at the very end AFTER the last UNION ALL branch.
 10. "a week" / "1 week" = INTERVAL '7 days'. "a month" = INTERVAL '30 days'. Always convert to days.
 11. When user says "for both" or "for site A and site B", you MUST include ALL mentioned sites — never drop any.
+12. NEVER filter by the `hour` column. All site-level data is stored with hour=0 — filtering by hour will always return 0 rows.
+13. NEVER invent or guess site_ids. Use only site_ids the user explicitly stated or that appeared in prior conversation context.
 
 ═══════════════════════════════════════════════════════════
 CHART TYPE — MUST MATCH THE DATA SHAPE:
@@ -782,15 +849,23 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
             sql = re.sub(r"data_level\s*=\s*'cell'", "data_level = 'site'", sql, flags=re.IGNORECASE)
             _LOG.info("[SQL-fix] changed data_level='cell' → 'site'")
 
-        # 4. Ensure k.date <= CURRENT_DATE cap exists when date range is used
-        if re.search(r"CURRENT_DATE\s*-\s*INTERVAL", sql, re.IGNORECASE):
-            if not re.search(r"date\s*<=\s*CURRENT_DATE", sql, re.IGNORECASE):
+        # 4. Replace CURRENT_DATE with actual max data date if data is stale
+        _max_d = _schema_cache.get("kpi_max_date_recent")
+        if _max_d and 'kpi_data' in sql.lower():
+            sql = re.sub(r'\bCURRENT_DATE\b', f"'{_max_d}'::date", sql, flags=re.IGNORECASE)
+            _LOG.info("[SQL-fix] replaced CURRENT_DATE with actual max date %s", _max_d)
+
+        # 4b. Ensure date cap exists when date range is used
+        _date_ref_rx = re.escape(f"'{_max_d}'::date") if _max_d else r"CURRENT_DATE"
+        if re.search(_date_ref_rx + r"\s*-\s*INTERVAL", sql, re.IGNORECASE):
+            if not re.search(r"date\s*<=\s*" + _date_ref_rx, sql, re.IGNORECASE):
+                _cap = f"'{_max_d}'::date" if _max_d else "CURRENT_DATE"
                 sql = re.sub(
-                    r"(CURRENT_DATE\s*-\s*INTERVAL\s*'[^']+'\s*)",
-                    r"\1AND k.date <= CURRENT_DATE ",
+                    r"(" + _date_ref_rx + r"\s*-\s*INTERVAL\s*'[^']+'\s*)",
+                    r"\1AND k.date <= " + _cap + " ",
                     sql, count=1, flags=re.IGNORECASE,
                 )
-                _LOG.info("[SQL-fix] added missing k.date <= CURRENT_DATE cap")
+                _LOG.info("[SQL-fix] added missing date cap")
 
         # 5. Ensure k.value IS NOT NULL exists
         if 'kpi_data' in sql.lower() and 'is not null' not in sql.lower():
@@ -1476,7 +1551,7 @@ def _handle_followup(prompt_orig: str, p: str, prev: dict, time_filter: str) -> 
     if new_sites and not new_kpi and prev_kpi_names:
         site = new_sites[0]
         days = new_days or prev_days or 14
-        date_clause = f"AND k.date >= CURRENT_DATE - INTERVAL '{days} days' AND k.date <= CURRENT_DATE"
+        date_clause = _kpi_date_clause(days)
 
         if len(prev_kpi_names) == 1:
             kpi_name = prev_kpi_names[0]
@@ -1523,7 +1598,7 @@ def _handle_followup(prompt_orig: str, p: str, prev: dict, time_filter: str) -> 
         kpi_name, alias = new_kpi
         days = new_days or prev_days or 14
         site = prev_sites[0]
-        date_clause = f"AND k.date >= CURRENT_DATE - INTERVAL '{days} days' AND k.date <= CURRENT_DATE"
+        date_clause = _kpi_date_clause(days)
         return {
             "sql": f"""SELECT k.date::text AS date, AVG(k.value) AS {alias}
                 FROM kpi_data k
@@ -1631,7 +1706,7 @@ def _handle_followup(prompt_orig: str, p: str, prev: dict, time_filter: str) -> 
             kpi_name, alias = add_kpi
             site = prev_sites[0]
             days = prev_days or 14
-            date_clause = f"AND k.date >= CURRENT_DATE - INTERVAL '{days} days' AND k.date <= CURRENT_DATE"
+            date_clause = _kpi_date_clause(days)
             prev_alias = prev_y[0] if prev_y else 'value'
             prev_kpi   = prev_kpi_names[0]
             new_sql = f"""SELECT k.date::text AS date, k.site_id,
@@ -1851,6 +1926,8 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
             if _use_eav_revenue:
                 # Fallback: use flexible_kpi_uploads EAV table
                 # NOTE: ILIKE for case-insensitive matching — column_name casing depends on uploaded CSV headers
+                # IMPORTANT: Use 'revenue_total' directly if it exists to avoid double-counting
+                #   (SUM of revenue_jan + feb + mar + revenue_total = 2x actual)
                 if any(w in p for w in ('subscriber', 'subscribers', 'customer count')):
                     return {
                         "sql": f"""SELECT f.site_id, f.num_value AS subscribers
@@ -1865,11 +1942,10 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
                     }
                 elif any(w in p for w in ('opex', 'expenditure', 'operating cost')):
                     return {
-                        "sql": f"""SELECT f.site_id, SUM(f.num_value) AS total_opex
+                        "sql": f"""SELECT f.site_id, f.num_value AS total_opex
                             FROM flexible_kpi_uploads f
-                            WHERE f.kpi_type = 'revenue' AND f.column_name ILIKE '%opex%'
+                            WHERE f.kpi_type = 'revenue' AND f.column_name ILIKE '%opex_total%'
                               AND f.column_type = 'numeric' {site_filter_f}
-                            GROUP BY f.site_id
                             ORDER BY total_opex {_rev_order} {_limit}""",
                         "query_type": "bar", "chart_type": "bar",
                         "title": f"{'Bottom' if _rev_order=='ASC' else 'Top'} {_rev_n} — OPEX",
@@ -1879,13 +1955,12 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
                 elif 'arpu' in p:
                     return {
                         "sql": f"""SELECT rev.site_id,
-                                   ROUND(CAST(rev.total_rev AS NUMERIC) / NULLIF(sub.subscribers, 0), 2) AS arpu
+                                   ROUND((CAST(rev.total_rev AS NUMERIC) / NULLIF(sub.subscribers, 0))::numeric, 2) AS arpu
                             FROM (
-                                SELECT f.site_id, SUM(f.num_value) AS total_rev
+                                SELECT f.site_id, f.num_value AS total_rev
                                 FROM flexible_kpi_uploads f
-                                WHERE f.kpi_type = 'revenue' AND f.column_name ILIKE '%revenue%'
+                                WHERE f.kpi_type = 'revenue' AND f.column_name ILIKE '%revenue_total%'
                                   AND f.column_type = 'numeric' {site_filter_f}
-                                GROUP BY f.site_id
                             ) rev
                             JOIN (
                                 SELECT f.site_id, f.num_value AS subscribers
@@ -1900,13 +1975,12 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
                         "response": f"{'Lowest' if _rev_order=='ASC' else 'Top'} {_rev_n} sites by ARPU.",
                     }
                 else:
-                    # Default: aggregate total revenue per site
+                    # Default: use revenue_total if it exists, else SUM monthly columns (exclude total to avoid double-count)
                     return {
-                        "sql": f"""SELECT f.site_id, SUM(f.num_value) AS total_revenue
+                        "sql": f"""SELECT f.site_id, f.num_value AS total_revenue
                             FROM flexible_kpi_uploads f
-                            WHERE f.kpi_type = 'revenue' AND f.column_name ILIKE '%revenue%'
+                            WHERE f.kpi_type = 'revenue' AND f.column_name ILIKE '%revenue_total%'
                               AND f.column_type = 'numeric' {site_filter_f}
-                            GROUP BY f.site_id
                             ORDER BY total_revenue {_rev_order} NULLS LAST {_limit}""",
                         "query_type": "bar", "chart_type": "bar",
                         "title": f"{'Bottom' if _rev_order=='ASC' else 'Top'} {_rev_n} Sites by Revenue",
@@ -1947,7 +2021,7 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
             elif 'arpu' in p and _rev_rev_cols and _rev_has_subscribers:
                 return {
                     "sql": f"""SELECT r.site_id,
-                               ROUND(CAST(({_total_rev_expr}) AS NUMERIC) / NULLIF(r.subscribers, 0), 2) AS arpu
+                               ROUND((({_total_rev_expr})::numeric / NULLIF(r.subscribers, 0))::numeric, 2) AS arpu
                         FROM revenue_data r
                         WHERE r.subscribers > 0 {site_filter_r}
                         ORDER BY arpu {_rev_order} {_limit}""",
@@ -2003,11 +2077,10 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
             else:
                 # revenue_data exists but no recognized rev columns — fall back to EAV
                 return {
-                    "sql": f"""SELECT f.site_id, SUM(f.num_value) AS total_revenue
+                    "sql": f"""SELECT f.site_id, f.num_value AS total_revenue
                         FROM flexible_kpi_uploads f
-                        WHERE f.kpi_type = 'revenue' AND f.column_name ILIKE '%revenue%'
+                        WHERE f.kpi_type = 'revenue' AND f.column_name ILIKE '%revenue_total%'
                           AND f.column_type = 'numeric' {site_filter_f}
-                        GROUP BY f.site_id
                         ORDER BY total_revenue {_rev_order} NULLS LAST {_limit}""",
                     "query_type": "bar", "chart_type": "bar",
                     "title": f"{'Bottom' if _rev_order=='ASC' else 'Top'} {_rev_n} Sites by Revenue",
@@ -2036,9 +2109,7 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
                 _core_select = ", ".join(f"c.{c}" for c in _core_metric_cols)
                 _core_avg_select = ", ".join(f"AVG(c.{c}) AS {c}" for c in _core_metric_cols)
                 _core_sort_col = _core_metric_cols[0]  # first metric for sorting
-                date_clause = ""
-                if days:
-                    date_clause = f"AND c.date >= CURRENT_DATE - INTERVAL '{days} days' AND c.date <= CURRENT_DATE"
+                date_clause = _kpi_date_clause(days, alias='c') if days else ""
                 if site_ids:
                     _has_date = 'date' in [c.lower() for c in _core_data_cols]
                     if _has_date:
@@ -2076,17 +2147,37 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
                     }
             else:
                 # Fallback to flexible_kpi_uploads EAV
-                return {
-                    "sql": f"""SELECT f.site_id, f.column_name, f.num_value
-                        FROM flexible_kpi_uploads f
-                        WHERE f.kpi_type = 'core' AND f.column_type = 'numeric'
-                          {site_filter_f}
-                        ORDER BY f.site_id, f.column_name""",
-                    "query_type": "bar", "chart_type": "bar",
-                    "title": "Core KPIs" + (f" — {', '.join(site_ids[:2])}" if site_ids else ""),
-                    "x_axis": "site_id", "y_axes": ["num_value"],
-                    "response": "Showing core network KPIs (from uploaded data).",
-                }
+                # Core data uses kpi_name for metric type (e.g., 'CPU Utilization')
+                # and column_name for dates. Pivot by kpi_name to show per-site metrics.
+                if site_ids:
+                    return {
+                        "sql": f"""SELECT f.site_id, f.kpi_name, AVG(f.num_value) AS avg_value
+                            FROM flexible_kpi_uploads f
+                            WHERE f.kpi_type = 'core' AND f.column_type = 'numeric'
+                              {site_filter_f}
+                            GROUP BY f.site_id, f.kpi_name
+                            ORDER BY f.site_id, f.kpi_name""",
+                        "query_type": "bar", "chart_type": "bar",
+                        "title": "Core KPIs — " + ', '.join(site_ids[:2]),
+                        "x_axis": "kpi_name", "y_axes": ["avg_value"],
+                        "response": f"Core network KPIs for {', '.join(site_ids[:2])}.",
+                    }
+                else:
+                    return {
+                        "sql": f"""SELECT f.site_id,
+                               AVG(CASE WHEN f.kpi_name ILIKE '%auth%' THEN f.num_value END) AS auth_sr,
+                               AVG(CASE WHEN f.kpi_name ILIKE '%cpu%' THEN f.num_value END) AS cpu_util,
+                               AVG(CASE WHEN f.kpi_name ILIKE '%attach%' THEN f.num_value END) AS attach_sr,
+                               AVG(CASE WHEN f.kpi_name ILIKE '%pdp%' THEN f.num_value END) AS pdp_sr
+                            FROM flexible_kpi_uploads f
+                            WHERE f.kpi_type = 'core' AND f.column_type = 'numeric'
+                            GROUP BY f.site_id
+                            ORDER BY auth_sr {'ASC' if _horder == 'ASC' else 'DESC'} NULLS LAST {_hlimit}""",
+                        "query_type": "bar", "chart_type": "bar",
+                        "title": f"{'Bottom' if _horder=='ASC' else 'Top'} {_hn} — Core KPIs",
+                        "x_axis": "site_id", "y_axes": ["auth_sr", "cpu_util", "attach_sr", "pdp_sr"],
+                        "response": f"{'Worst' if _horder=='ASC' else 'Top'} {_hn} sites by core KPIs.",
+                    }
 
         # ── Transport/backhaul queries ──
         if _is_transport:
@@ -2262,10 +2353,7 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
     # ── FIX: Multiple sites + trend → multi_chart (one chart per site, each with ALL KPIs) ──
     # Previously this incorrectly paired kpi[i] with site[i].
     if len(site_ids) >= 2 and is_trend:
-        date_clause = (
-            f"AND k.date >= CURRENT_DATE - INTERVAL '{days} days' AND k.date <= CURRENT_DATE"
-            if days else "AND k.date <= CURRENT_DATE"
-        )
+        date_clause = _kpi_date_clause(days)
         charts = []
         for site in site_ids[:4]:
             if not detected_kpis:
@@ -2337,10 +2425,7 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
         if len(site_ids) == 1 and len(detected_kpis) == 1:
             kpi_name, alias = detected_kpis[0]
             site        = site_ids[0]
-            date_clause = (
-                f"AND k.date >= CURRENT_DATE - INTERVAL '{days} days' AND k.date <= CURRENT_DATE"
-                if days else "AND k.date <= CURRENT_DATE"
-            )
+            date_clause = _kpi_date_clause(days)
             return {
                 "sql": f"""SELECT k.date::text AS date, AVG(k.value) AS {alias}
                     FROM kpi_data k
@@ -2356,10 +2441,7 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
         # Single site, multiple KPIs
         if len(site_ids) == 1 and len(detected_kpis) >= 2:
             site        = site_ids[0]
-            date_clause = (
-                f"AND k.date >= CURRENT_DATE - INTERVAL '{days} days' AND k.date <= CURRENT_DATE"
-                if days else "AND k.date <= CURRENT_DATE"
-            )
+            date_clause = _kpi_date_clause(days)
             parts_sql = []
             for kpi_name, alias in detected_kpis[:3]:
                 parts_sql.append(f"""SELECT k.date::text AS date, k.site_id,
@@ -2394,10 +2476,7 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
 
     if is_trend and detected_kpis:
         kpi_name, alias = detected_kpis[0]
-        date_clause = (
-            f"AND k.date >= CURRENT_DATE - INTERVAL '{days} days' AND k.date <= CURRENT_DATE"
-            if days else "AND k.date <= CURRENT_DATE"
-        )
+        date_clause = _kpi_date_clause(days)
         return {
             "sql": f"""SELECT k.date::text AS date, AVG(k.value) AS {alias},
                        MIN(k.value) AS min_val, MAX(k.value) AS max_val

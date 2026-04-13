@@ -773,6 +773,8 @@ class KpiData(db.Model):
     __table_args__ = (
         db.Index("idx_kpi_site_name_date", "site_id", "kpi_name", "date"),
         db.Index("idx_kpi_data_level", "data_level", "kpi_name"),
+        # Full composite index: covers every chart query (site_id + kpi_name + data_level + date)
+        db.Index("idx_kpi_full_lookup", "site_id", "kpi_name", "data_level", "date"),
     )
 
 

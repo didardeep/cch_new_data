@@ -141,63 +141,32 @@ const isConnectionSummary = (msg) => {
 
 function SpeedTestCard({ msgId, groupId, disabled, disableGroup, addMessage, fetchSolution, saveMessage, stateRef, updateMessage, initialPhase, initialResults, initialReported }) {
   const [phase, setPhase]       = useState(initialPhase   || 'idle');
-  const [results, setResults]   = useState(initialResults || null);
   const [reported, setReported] = useState(initialReported || false);
-  const iframeRef               = useRef(null);
   const isFirstRender           = useRef(true);
 
-  // Persist phase/results/reported into the cache whenever they change.
+  // Persist phase/reported into the cache whenever they change.
   useEffect(() => {
     if (isFirstRender.current) { isFirstRender.current = false; return; }
-    if (updateMessage && msgId) updateMessage(msgId, { phase, results, reported });
-  }, [phase, results, reported, msgId, updateMessage]);
+    if (updateMessage && msgId) updateMessage(msgId, { phase, reported });
+  }, [phase, reported, msgId, updateMessage]);
 
-  // Listen for postMessage from our self-hosted speed test iframe
+  // Auto-set to running once mounted (OpenSpeedTest iframe is always shown)
   useEffect(() => {
-    const handler = (e) => {
-      if (!e.data || e.data.type !== 'speedtest-results') return;
-      const { download, upload, ping } = e.data;
-      setResults({ download, upload, ping });
-      setPhase('done');
-    };
-    window.addEventListener('message', handler);
-    return () => window.removeEventListener('message', handler);
-  }, []);
+    if (phase === 'idle') setPhase('running');
+  }, [phase]);
 
-  // Send auth token into iframe once it loads
-  const handleIframeLoad = () => {
-    const token = getToken();
-    if (iframeRef.current && token) {
-      iframeRef.current.contentWindow.postMessage({ type: 'set-token', token }, '*');
-    }
-    setPhase('running');
-  };
-
-  const handleUseResults = () => {
-    if (!results || reported) return;
-    const parts = [];
-    if (results.download != null) parts.push(`Download: ${results.download} Mbps`);
-    if (results.upload   != null) parts.push(`Upload: ${results.upload} Mbps`);
-    if (results.ping     != null) parts.push(`Ping: ${results.ping} ms`);
-    const summary = `Speed test results — ${parts.join(', ')}`;
+  const handleDone = () => {
+    if (reported) return;
     setReported(true);
+    setPhase('done');
     disableGroup(groupId);
+    const summary = 'User completed a speed test via OpenSpeedTest';
     saveMessage('user', summary, { current_step: stateRef.current.step });
     stateRef.current.diagnosisSummary = (stateRef.current.diagnosisSummary ? stateRef.current.diagnosisSummary + ' | ' : '') + summary;
-    addMessage({ type: 'user', text: summary });
-    addMessage({ type: 'bot', html: `Thanks! Using your speed test results to provide a tailored solution.` });
+    addMessage({ type: 'user', text: 'Speed test completed' });
+    addMessage({ type: 'bot', html: `Thanks for running the speed test! Let me provide a tailored solution based on your issue.` });
     fetchSolution(`${summary}. Please help diagnose and fix my original issue.`);
   };
-
-  const quality = (dl) => {
-    if (!dl) return null;
-    if (dl >= 100) return { label: 'Excellent', color: '#00875a' };
-    if (dl >= 50)  return { label: 'Good',      color: '#00875a' };
-    if (dl >= 20)  return { label: 'Fair',       color: '#c87d0a' };
-    if (dl >= 5)   return { label: 'Poor',       color: '#c42b1c' };
-    return { label: 'Very Poor', color: '#c42b1c' };
-  };
-  const q = quality(results?.download);
 
   return (
     <div className="speed-test-card" style={{ padding: '12px 14px' }}>
@@ -207,51 +176,34 @@ function SpeedTestCard({ msgId, groupId, disabled, disableGroup, addMessage, fet
           <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/>
         </svg>
         <span className="speed-test-card__title" style={{ fontSize: 12 }}>Network Speed Test</span>
-        {phase === 'done' && q && (
-          <span style={{ marginLeft: 'auto', fontSize: 10, fontWeight: 700, color: q.color, background: q.color + '18', padding: '2px 8px', borderRadius: 99 }}>
-            {q.label}
-          </span>
-        )}
       </div>
 
-      {/* Compact iframe — hidden when results already exist (restored from cache) */}
-      {phase !== 'done' && (
-        <div style={{ borderRadius: 10, overflow: 'hidden', border: '1px solid #1e3a5f', marginBottom: 8, height: 220 }}>
-          <iframe
-            ref={iframeRef}
-            src={`${API_BASE}/api/speedtest-widget?Run`}
-            title="Speed Test"
-            onLoad={handleIframeLoad}
-            style={{ width: '100%', height: '100%', border: 'none', display: 'block' }}
-          />
-        </div>
-      )}
-
-      {/* Results row — shown after test completes */}
-      {phase === 'done' && results && !reported && (
-        <div style={{ background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: 8, padding: '8px 12px', marginBottom: 8, display: 'flex', alignItems: 'center', gap: 8 }}>
-          <div style={{ flex: 1, fontSize: 11, color: '#166534', fontWeight: 600 }}>
-            ⬇ {results.download} &nbsp;⬆ {results.upload} &nbsp;📡 {results.ping ?? '—'} ms
+      {/* OpenSpeedTest iframe — hidden after user clicks Done */}
+      {!reported && (
+        <div style={{ marginTop: 8 }}>
+          <div style={{ position: 'relative', width: '100%', maxWidth: 720, margin: '0 auto', paddingBottom: '30%', minHeight: 200, borderRadius: 10, overflow: 'hidden', border: '1px solid #1e3a5f' }}>
+            <iframe
+              src="https://openspeedtest.com/speedtest"
+              title="Speed Test"
+              sandbox="allow-scripts allow-same-origin"
+              style={{ border: 'none', position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', minHeight: 200, overflow: 'hidden' }}
+            />
           </div>
-          <button
-            onClick={handleUseResults}
-            disabled={disabled}
-            style={{ background: '#00875a', color: '#fff', border: 'none', borderRadius: 7, padding: '6px 14px', fontSize: 11, fontWeight: 700, fontFamily: 'inherit', cursor: disabled ? 'not-allowed' : 'pointer', whiteSpace: 'nowrap' }}
-          >
-            Use Results &amp; Get Help
-          </button>
+          <div style={{ marginTop: 10, display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+            <button
+              onClick={handleDone}
+              disabled={disabled}
+              style={{ background: disabled ? '#8596ab' : '#005EB8', color: '#fff', border: 'none', borderRadius: 8, padding: '9px 20px', fontSize: 13, fontWeight: 600, fontFamily: 'inherit', cursor: disabled ? 'not-allowed' : 'pointer' }}
+            >
+              Done — Get Help
+            </button>
+          </div>
         </div>
       )}
 
       {reported && (
         <div style={{ background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: 8, padding: '8px 12px', marginBottom: 8, fontSize: 11, color: '#166534', fontWeight: 600 }}>
-          ✓ Results submitted — AI is analysing your connection.
-        </div>
-      )}
-
-      {phase === 'running' && (
-        <div style={{ fontSize: 10, color: '#8596ab', textAlign: 'center' }}>
-          Test running — results will auto-detect when complete
+          ✓ Speed test completed — AI is analysing your issue.
         </div>
       )}
     </div>
@@ -1219,7 +1171,7 @@ export default function ChatSupport() {
 
     if (stateRef.current.step === 'conversation') {
       setIsTyping(true);
-      let clf = { is_satisfied: false, mentions_signal: false };
+      let clf = { is_satisfied: false, mentions_signal: false, needs_diagnosis: false };
       try { clf = await chatApiCall('/api/classify-response', { text }); } catch {}
       setIsTyping(false);
       if (clf.is_satisfied) {
@@ -1228,8 +1180,15 @@ export default function ChatSupport() {
         setTimeout(() => { addMessage({ type: 'bot', html: `What would you like to do next?` }); addMessage({ type: 'post-actions', groupId: nextId() }); }, 800);
         stateRef.current.step = 'resolved'; return;
       }
-      if (clf.mentions_signal && isMobileNetworkIssue(stateRef.current.sectorName, stateRef.current.subprocessName) && !stateRef.current.diagnosisRan) {
-        addMessage({ type: 'bot', html: `It sounds like you're experiencing signal issues. Would you like to run a signal diagnosis?` });
+      // For mobile network issues: always offer diagnosis after the 1st failed solution
+      // (user already selected a network sub-issue so we know it's relevant)
+      if (isMobileNetworkIssue(stateRef.current.sectorName, stateRef.current.subprocessName) && !stateRef.current.diagnosisRan) {
+        const _subType = (stateRef.current.subprocessSubType || '').toLowerCase();
+        const _diagMsg = _subType.includes('call drop') ? `It looks like you're still experiencing call drops. A signal diagnosis can help identify the cause. Would you like to run one?`
+          : _subType.includes('call failure') ? `It looks like your calls are still failing to connect. Let me run a signal diagnosis to check your network. Would you like to proceed?`
+          : _subType.includes('internet') || _subType.includes('mobile data') ? `It sounds like your speed/data issue persists. A signal diagnosis can help pinpoint the problem. Would you like to run one?`
+          : `It sounds like you're still experiencing network issues. Would you like to run a signal diagnosis?`;
+        addMessage({ type: 'bot', html: _diagMsg });
         addMessage({ type: 'signal-offer', groupId: nextId() }); stateRef.current.step = 'signal-offer'; return;
       }
       stateRef.current.step = 'query';
@@ -1240,12 +1199,19 @@ export default function ChatSupport() {
       addMessage({ type: 'system', text: `Language detected: ${stateRef.current.language}` });
     }
 
+    // For mobile network issues at query step: also offer diagnosis if not yet offered
+    // (catches the case where user describes a new network issue mid-conversation)
     if (stateRef.current.attempt > 0 && !stateRef.current.diagnosisRan && isMobileNetworkIssue(stateRef.current.sectorName, stateRef.current.subprocessName)) {
-      let clf2 = { mentions_signal: false };
+      let clf2 = { mentions_signal: false, needs_diagnosis: false };
       try { clf2 = await chatApiCall('/api/classify-response', { text }); } catch {}
-      if (clf2.mentions_signal) {
+      if (clf2.needs_diagnosis || clf2.mentions_signal) {
         saveUserOnce({ current_step: stateRef.current.step });
-        addMessage({ type: 'bot', html: `It sounds like you're experiencing signal issues. Would you like to run a signal diagnosis?` });
+        const _subType2 = (stateRef.current.subprocessSubType || '').toLowerCase();
+        const _diagMsg2 = _subType2.includes('call drop') ? `It looks like you're still experiencing call drops. A signal diagnosis can help identify the cause. Would you like to run one?`
+          : _subType2.includes('call failure') ? `It looks like your calls are still failing to connect. Let me run a signal diagnosis to check your network. Would you like to proceed?`
+          : _subType2.includes('internet') || _subType2.includes('mobile data') ? `It sounds like your speed/data issue persists. A signal diagnosis can help pinpoint the problem. Would you like to run one?`
+          : `It sounds like you're still experiencing network issues. Would you like to run a signal diagnosis?`;
+        addMessage({ type: 'bot', html: _diagMsg2 });
         addMessage({ type: 'signal-offer', groupId: nextId() }); stateRef.current.step = 'signal-offer'; return;
       }
     }
