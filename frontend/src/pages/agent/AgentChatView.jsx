@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { apiGet, apiPost, apiPut, getToken } from '../../api';
+import { useTheme } from '../../ThemeContext';
 import { io } from 'socket.io-client';
 
 /* ── SVG icon set ─────────────────────────────────────────────────────── */
@@ -87,24 +88,24 @@ const BUBBLE = {
   bot: {
     wrapper: { alignSelf: 'flex-start', alignItems: 'flex-start' },
     bubble: {
-      background: '#eff6ff',
-      color: '#1e293b',
+      background: 'var(--primary-glow, rgba(77,163,255,0.08))',
+      color: 'var(--text, #1e293b)',
       borderRadius: '4px 16px 16px 16px',
-      border: '1px solid #bfdbfe',
+      border: '1px solid var(--border, #bfdbfe)',
     },
-    labelColor: '#1d4ed8',
+    labelColor: 'var(--primary, #1d4ed8)',
     icon: IC.bot,
     label: 'AI Assistant',
   },
   customer: {
     wrapper: { alignSelf: 'flex-start', alignItems: 'flex-start' },
     bubble: {
-      background: '#f1f5f9',
-      color: '#1e293b',
+      background: 'var(--bg, #f1f5f9)',
+      color: 'var(--text, #1e293b)',
       borderRadius: '4px 16px 16px 16px',
-      border: '1px solid #e2e8f0',
+      border: '1px solid var(--border, #e2e8f0)',
     },
-    labelColor: '#475569',
+    labelColor: 'var(--text-muted, #475569)',
     icon: IC.customer,
     label: 'Customer',
   },
@@ -118,10 +119,10 @@ function renderRichMessage(p) {
       const names = Object.values(p.sectors || {});
       if (!names.length) return null;
       return (
-        <div style={{ background: '#f7f9fc', border: '1px solid #d8e0ec', borderRadius: 10, padding: '12px 14px', width: '100%' }}>
-          <div style={{ fontSize: 11, color: '#00338d', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 8 }}>Sector Menu</div>
+        <div style={{ background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 10, padding: '12px 14px', width: '100%' }}>
+          <div style={{ fontSize: 11, color: 'var(--primary)', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 8 }}>Sector Menu</div>
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-            {names.map((n, i) => <div key={i} style={{ background: '#e8eef8', color: '#00338d', borderRadius: 6, padding: '5px 12px', fontSize: 12, fontWeight: 600 }}>{n}</div>)}
+            {names.map((n, i) => <div key={i} style={{ background: 'var(--primary-glow, rgba(77,163,255,0.12))', color: 'var(--primary)', borderRadius: 6, padding: '5px 12px', fontSize: 12, fontWeight: 600 }}>{n}</div>)}
           </div>
         </div>
       );
@@ -130,10 +131,10 @@ function renderRichMessage(p) {
       const names = Object.values(p.subprocesses || {});
       if (!names.length) return null;
       return (
-        <div style={{ background: '#f7f9fc', border: '1px solid #d8e0ec', borderRadius: 10, padding: '12px 14px', width: '100%' }}>
-          <div style={{ fontSize: 11, color: '#00338d', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 8 }}>Issue Categories</div>
+        <div style={{ background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 10, padding: '12px 14px', width: '100%' }}>
+          <div style={{ fontSize: 11, color: 'var(--primary)', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 8 }}>Issue Categories</div>
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-            {names.map((n, i) => <div key={i} style={{ background: '#e8eef8', color: '#00338d', borderRadius: 6, padding: '5px 12px', fontSize: 12, fontWeight: 600 }}>{n}</div>)}
+            {names.map((n, i) => <div key={i} style={{ background: 'var(--primary-glow, rgba(77,163,255,0.12))', color: 'var(--primary)', borderRadius: 6, padding: '5px 12px', fontSize: 12, fontWeight: 600 }}>{n}</div>)}
           </div>
         </div>
       );
@@ -142,10 +143,10 @@ function renderRichMessage(p) {
       const opts = p.options || [];
       if (!opts.length) return null;
       return (
-        <div style={{ background: '#f7f9fc', border: '1px solid #d8e0ec', borderRadius: 10, padding: '12px 14px', width: '100%' }}>
-          <div style={{ fontSize: 11, color: '#00338d', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 8 }}>Sub-Issue Options</div>
+        <div style={{ background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 10, padding: '12px 14px', width: '100%' }}>
+          <div style={{ fontSize: 11, color: 'var(--primary)', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 8 }}>Sub-Issue Options</div>
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-            {opts.map((n, i) => <div key={i} style={{ background: '#e8eef8', color: '#00338d', borderRadius: 6, padding: '5px 12px', fontSize: 12, fontWeight: 600 }}>{n}</div>)}
+            {opts.map((n, i) => <div key={i} style={{ background: 'var(--primary-glow, rgba(77,163,255,0.12))', color: 'var(--primary)', borderRadius: 6, padding: '5px 12px', fontSize: 12, fontWeight: 600 }}>{n}</div>)}
           </div>
         </div>
       );
@@ -155,7 +156,7 @@ function renderRichMessage(p) {
       return (
         <div style={{ background: '#f0f7ff', border: '1px solid #bfdbfe', borderLeft: '4px solid #1d4ed8', borderRadius: 10, padding: '14px 16px', width: '100%' }}>
           <div style={{ fontSize: 11, color: '#1d4ed8', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 8 }}>AI Solution</div>
-          <div style={{ fontSize: 13, color: '#1e293b', lineHeight: 1.7 }} dangerouslySetInnerHTML={{ __html: html }} />
+          <div style={{ fontSize: 13, color: 'var(--text)', lineHeight: 1.7 }} dangerouslySetInnerHTML={{ __html: html }} />
         </div>
       );
     }
@@ -167,26 +168,26 @@ function renderRichMessage(p) {
       const lineQuality = conn.line_quality || null;
       const qualityColor = lineQuality === 'good' ? '#00875a' : lineQuality === 'poor' ? '#c42b1c' : '#c87d0a';
       return (
-        <div style={{ background: '#f7f9fc', border: '1px solid #d8e0ec', borderLeft: '4px solid #00338d', borderRadius: 12, padding: '16px 18px', width: '100%' }}>
-          <div style={{ fontWeight: 700, fontSize: 14, color: '#0f1d33', marginBottom: 6 }}>Billing & Plan Details</div>
-          <div style={{ background: '#fff', border: '1px solid #d8e0ec', borderRadius: 10, padding: '12px 14px', marginTop: 10 }}>
-            <div style={{ fontSize: 11, color: '#00338d', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.04em', marginBottom: 6 }}>Plan Details</div>
+        <div style={{ background: 'var(--bg)', border: '1px solid var(--border)', borderLeft: '4px solid var(--primary)', borderRadius: 12, padding: '16px 18px', width: '100%' }}>
+          <div style={{ fontWeight: 700, fontSize: 14, color: 'var(--text)', marginBottom: 6 }}>Billing & Plan Details</div>
+          <div style={{ background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 10, padding: '12px 14px', marginTop: 10 }}>
+            <div style={{ fontSize: 11, color: 'var(--primary)', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.04em', marginBottom: 6 }}>Plan Details</div>
             {errors.billing ? <div style={{ color: '#c42b1c', fontSize: 12 }}>{errors.billing}</div> : (
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: '8px 12px', fontSize: 12, color: '#1a2b42' }}>
-                <div><span style={{ color: '#8596ab' }}>Plan:</span> <strong>{billing.plan_name || 'Not on record'}</strong></div>
-                <div><span style={{ color: '#8596ab' }}>Speed:</span> <strong>{planSpeed != null ? `${planSpeed} Mbps` : 'Not on record'}</strong></div>
-                <div><span style={{ color: '#8596ab' }}>Account:</span> <strong style={{ color: accountActive ? '#0f1d33' : '#c42b1c' }}>{accountActive ? 'Active' : 'Inactive'}</strong></div>
-                <div><span style={{ color: '#8596ab' }}>Bill Paid:</span> <strong style={{ color: billing.bill_paid === false ? '#c42b1c' : '#0f1d33' }}>{billing.bill_paid === false ? 'No' : 'Yes'}</strong></div>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: '8px 12px', fontSize: 12, color: 'var(--text)' }}>
+                <div><span style={{ color: 'var(--text-secondary)' }}>Plan:</span> <strong>{billing.plan_name || 'Not on record'}</strong></div>
+                <div><span style={{ color: 'var(--text-secondary)' }}>Speed:</span> <strong>{planSpeed != null ? `${planSpeed} Mbps` : 'Not on record'}</strong></div>
+                <div><span style={{ color: 'var(--text-secondary)' }}>Account:</span> <strong style={{ color: accountActive ? '#0f1d33' : '#c42b1c' }}>{accountActive ? 'Active' : 'Inactive'}</strong></div>
+                <div><span style={{ color: 'var(--text-secondary)' }}>Bill Paid:</span> <strong style={{ color: billing.bill_paid === false ? '#c42b1c' : '#0f1d33' }}>{billing.bill_paid === false ? 'No' : 'Yes'}</strong></div>
               </div>
             )}
           </div>
           {(syncSpeed != null || lineQuality) && (
-            <div style={{ background: '#fff', border: '1px solid #d8e0ec', borderRadius: 10, padding: '12px 14px', marginTop: 8 }}>
-              <div style={{ fontSize: 11, color: '#00338d', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.04em', marginBottom: 6 }}>Connection Check</div>
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: '8px 12px', fontSize: 12, color: '#1a2b42' }}>
-                {syncSpeed != null && <div><span style={{ color: '#8596ab' }}>Sync Speed:</span> <strong>{syncSpeed} Mbps</strong></div>}
-                {lineQuality && <div><span style={{ color: '#8596ab' }}>Line Quality:</span> <strong style={{ color: qualityColor }}>{lineQuality.charAt(0).toUpperCase() + lineQuality.slice(1)}</strong></div>}
-                {conn.router_status && <div><span style={{ color: '#8596ab' }}>Router:</span> <strong>{conn.router_status}</strong></div>}
+            <div style={{ background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 10, padding: '12px 14px', marginTop: 8 }}>
+              <div style={{ fontSize: 11, color: 'var(--primary)', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.04em', marginBottom: 6 }}>Connection Check</div>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: '8px 12px', fontSize: 12, color: 'var(--text)' }}>
+                {syncSpeed != null && <div><span style={{ color: 'var(--text-secondary)' }}>Sync Speed:</span> <strong>{syncSpeed} Mbps</strong></div>}
+                {lineQuality && <div><span style={{ color: 'var(--text-secondary)' }}>Line Quality:</span> <strong style={{ color: qualityColor }}>{lineQuality.charAt(0).toUpperCase() + lineQuality.slice(1)}</strong></div>}
+                {conn.router_status && <div><span style={{ color: 'var(--text-secondary)' }}>Router:</span> <strong>{conn.router_status}</strong></div>}
                 {conn.area_outage && <div style={{ color: '#c42b1c', fontWeight: 700 }}>⚠ Area outage detected</div>}
               </div>
             </div>
@@ -205,12 +206,12 @@ function renderRichMessage(p) {
       const r = p.results;
       return (
         <div style={{ background: '#f7f9fc', border: '1px solid #d8e0ec', borderRadius: 10, padding: '14px 16px', width: '100%' }}>
-          <div style={{ fontWeight: 700, fontSize: 13, color: '#0f1d33', marginBottom: r ? 10 : 4 }}>Speed Test</div>
+          <div style={{ fontWeight: 700, fontSize: 13, color: 'var(--text)', marginBottom: r ? 10 : 4 }}>Speed Test</div>
           {r ? (
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(100px, 1fr))', gap: 10 }}>
-              {r.download != null && <div><div style={{ color: '#8596ab', fontSize: 11 }}>Download</div><div style={{ fontSize: 18, fontWeight: 800 }}>{r.download} Mbps</div></div>}
-              {r.upload != null && <div><div style={{ color: '#8596ab', fontSize: 11 }}>Upload</div><div style={{ fontSize: 18, fontWeight: 800 }}>{r.upload} Mbps</div></div>}
-              {r.ping != null && <div><div style={{ color: '#8596ab', fontSize: 11 }}>Ping</div><div style={{ fontSize: 18, fontWeight: 800 }}>{r.ping} ms</div></div>}
+              {r.download != null && <div><div style={{ color: 'var(--text-secondary)', fontSize: 11 }}>Download</div><div style={{ fontSize: 18, fontWeight: 800 }}>{r.download} Mbps</div></div>}
+              {r.upload != null && <div><div style={{ color: 'var(--text-secondary)', fontSize: 11 }}>Upload</div><div style={{ fontSize: 18, fontWeight: 800 }}>{r.upload} Mbps</div></div>}
+              {r.ping != null && <div><div style={{ color: 'var(--text-secondary)', fontSize: 11 }}>Ping</div><div style={{ fontSize: 18, fontWeight: 800 }}>{r.ping} ms</div></div>}
             </div>
           ) : <div style={{ fontSize: 12, color: '#3d5068' }}>A speed test was performed during this session.</div>}
         </div>
@@ -227,7 +228,7 @@ function renderRichMessage(p) {
             <div style={{ background: colorMap[st], color: '#fff', borderRadius: 12, padding: '3px 12px', fontSize: 12, fontWeight: 700 }}>Signal: {d.overall_label || 'Unknown'}</div>
             {d.is_busy_hour && <div style={{ background: '#c87d0a', color: '#fff', borderRadius: 12, padding: '3px 12px', fontSize: 12, fontWeight: 700 }}>Peak Hours</div>}
           </div>
-          <div style={{ fontSize: 13, color: '#1a2b42', lineHeight: 1.6 }}>{d.summary}</div>
+          <div style={{ fontSize: 13, color: 'var(--text)', lineHeight: 1.6 }}>{d.summary}</div>
           {d.nearest_sites?.length > 0 && (
             <div style={{ marginTop: 12, borderTop: '1px solid #d8e0ec', paddingTop: 12 }}>
               <div style={{ fontSize: 11, fontWeight: 700, color: '#00338D', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 8 }}>Nearest Tower Sites</div>
@@ -239,7 +240,7 @@ function renderRichMessage(p) {
                       <span style={{ fontWeight: 700, fontSize: 13 }}>{site.site_id}</span>
                       <span style={{ fontSize: 11, fontWeight: 700, color: sc, background: site.status === 'ON AIR' ? 'rgba(0,135,90,0.08)' : 'rgba(196,43,28,0.08)', padding: '2px 8px', borderRadius: 6 }}>{site.status}</span>
                     </div>
-                    <div style={{ fontSize: 12, color: '#3d5068' }}><span style={{ color: '#8596ab' }}>Distance:</span> {site.distance_km} km{site.alarm && site.alarm !== 'None' ? ` | Alarm: ${site.alarm}` : ''}</div>
+                    <div style={{ fontSize: 12, color: '#3d5068' }}><span style={{ color: 'var(--text-secondary)' }}>Distance:</span> {site.distance_km} km{site.alarm && site.alarm !== 'None' ? ` | Alarm: ${site.alarm}` : ''}</div>
                     {site.solution && site.solution !== 'No action required' && <div style={{ fontSize: 12, color: '#00338D', marginTop: 4, fontWeight: 600 }}>Action: {site.solution}</div>}
                   </div>
                 );
@@ -277,7 +278,7 @@ function renderRichMessage(p) {
       );
     case 'signal-offer':
       return (
-        <div style={{ background: '#f7f9fc', border: '1px solid #d8e0ec', borderRadius: 10, padding: '12px 14px', width: '100%', fontSize: 12, color: '#3d5068' }}>
+        <div style={{ background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 10, padding: '12px 14px', width: '100%', fontSize: 12, color: '#3d5068' }}>
           A signal diagnosis was offered to the customer.
         </div>
       );
@@ -303,6 +304,7 @@ function renderRichMessage(p) {
 export default function AgentChatView() {
   const { sessionId } = useParams();
   const navigate = useNavigate();
+  const { isDark } = useTheme();
 
   const [session, setSession] = useState(null);
   const [messages, setMessages] = useState([]);
@@ -500,8 +502,8 @@ export default function AgentChatView() {
 
   if (error) return (
     <div style={{
-      background: '#fef2f2', border: '1px solid #fecaca',
-      borderRadius: 10, padding: 20, color: '#dc2626',
+      background: isDark ? 'rgba(239,68,68,0.12)' : '#fef2f2', border: `1px solid ${isDark ? 'rgba(239,68,68,0.3)' : '#fecaca'}`,
+      borderRadius: 10, padding: 20, color: isDark ? '#f87171' : '#dc2626',
     }}>
       {error}
     </div>
@@ -517,7 +519,7 @@ export default function AgentChatView() {
         minWidth: 0,          /* prevents flex child from overflowing parent */
         display: 'flex',
         flexDirection: 'column',
-        background: '#fff',
+        background: 'var(--bg-card)',
         borderRadius: 12,
         boxShadow: '0 2px 8px rgba(0,0,0,0.07)',
         border: '1px solid var(--border)',
@@ -588,9 +590,9 @@ export default function AgentChatView() {
 
         {session?.status === 'escalated' && (
           <div style={{
-            background: '#ecfeff',
-            borderBottom: '1px solid #a5f3fc',
-            color: '#0e7490',
+            background: isDark ? 'rgba(34,211,238,0.1)' : '#ecfeff',
+            borderBottom: `1px solid ${isDark ? 'rgba(34,211,238,0.25)' : '#a5f3fc'}`,
+            color: isDark ? '#67e8f9' : '#0e7490',
             padding: '8px 16px',
             fontSize: 12,
             display: 'flex',
@@ -629,12 +631,12 @@ export default function AgentChatView() {
               return (
                 <div key={msg.id} style={{
                   alignSelf: 'center',
-                  background: '#fffbeb',
-                  border: '1px solid #fde68a',
+                  background: isDark ? 'rgba(251,191,36,0.12)' : '#fffbeb',
+                  border: `1px solid ${isDark ? 'rgba(251,191,36,0.3)' : '#fde68a'}`,
                   borderRadius: 8,
                   padding: '7px 14px',
                   fontSize: 11,
-                  color: '#92400e',
+                  color: isDark ? '#fbbf24' : '#92400e',
                   fontWeight: 600,
                   display: 'flex', alignItems: 'center', gap: 6,
                 }}>
@@ -650,12 +652,12 @@ export default function AgentChatView() {
               return (
                 <div key={msg.id} style={{ alignSelf: 'flex-start', maxWidth: '72%' }}>
                   <div style={{
-                    background: '#f8fafc',
-                    border: '1px solid #e2e8f0',
+                    background: 'var(--bg)',
+                    border: '1px solid var(--border)',
                     borderRadius: 10,
                     padding: 10,
                   }}>
-                    <div style={{ fontSize: 11, color: '#475569', marginBottom: 6 }}>Customer screenshot</div>
+                    <div style={{ fontSize: 11, color: 'var(--text-secondary)', marginBottom: 6 }}>Customer screenshot</div>
                     <img src={imageSrc} alt="Customer screenshot" style={{ maxWidth: '100%', borderRadius: 8 }} />
                   </div>
                 </div>
@@ -728,17 +730,17 @@ export default function AgentChatView() {
         {session && !session.diagnosis_ran && !diagnosisRequestSent &&
           session.subprocess_name?.toLowerCase().includes('network') && (
           <div style={{
-            borderTop: '1px solid #fde68a',
-            background: '#fffbeb',
+            borderTop: `1px solid ${isDark ? 'rgba(251,191,36,0.3)' : '#fde68a'}`,
+            background: isDark ? 'rgba(251,191,36,0.08)' : '#fffbeb',
             padding: '10px 20px',
             display: 'flex', alignItems: 'center', justifyContent: 'space-between',
             gap: 12, flexShrink: 0,
           }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#b45309" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke={isDark ? '#fbbf24' : '#b45309'} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                 <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
               </svg>
-              <span style={{ fontSize: 12, color: '#92400e', fontWeight: 600 }}>
+              <span style={{ fontSize: 12, color: isDark ? '#fbbf24' : '#92400e', fontWeight: 600 }}>
                 No signal diagnosis was run during bot chat
               </span>
             </div>
@@ -769,13 +771,13 @@ export default function AgentChatView() {
 
         {diagnosisRequestSent && !session?.diagnosis_ran && (
           <div style={{
-            borderTop: '1px solid #fde68a',
-            background: '#fffbeb',
+            borderTop: `1px solid ${isDark ? 'rgba(251,191,36,0.3)' : '#fde68a'}`,
+            background: isDark ? 'rgba(251,191,36,0.08)' : '#fffbeb',
             padding: '9px 20px',
-            fontSize: 12, color: '#92400e', fontWeight: 600,
+            fontSize: 12, color: isDark ? '#fbbf24' : '#92400e', fontWeight: 600,
             display: 'flex', alignItems: 'center', gap: 7, flexShrink: 0,
           }}>
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#b45309" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke={isDark ? '#fbbf24' : '#b45309'} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
               <polyline points="20 6 9 17 4 12"/>
             </svg>
             Diagnosis request sent — waiting for customer to complete
@@ -784,13 +786,13 @@ export default function AgentChatView() {
 
         {session?.diagnosis_ran && (
           <div style={{
-            borderTop: '1px solid #bbf7d0',
-            background: '#f0fdf4',
+            borderTop: `1px solid ${isDark ? 'rgba(34,197,94,0.3)' : '#bbf7d0'}`,
+            background: isDark ? 'rgba(34,197,94,0.08)' : '#f0fdf4',
             padding: '9px 20px',
-            fontSize: 12, color: '#15803d', fontWeight: 600,
+            fontSize: 12, color: isDark ? '#4ade80' : '#15803d', fontWeight: 600,
             display: 'flex', alignItems: 'center', gap: 7, flexShrink: 0,
           }}>
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#15803d" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke={isDark ? '#4ade80' : '#15803d'} strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
               <polyline points="20 6 9 17 4 12"/>
             </svg>
             Signal diagnosis completed — results visible in chat
@@ -803,7 +805,7 @@ export default function AgentChatView() {
           padding: '14px 20px',
           display: 'flex', gap: 10, alignItems: 'flex-end',
           flexShrink: 0,
-          background: '#fafbfc',
+          background: isDark ? 'var(--bg)' : '#fafbfc',
         }}>
           <textarea
             value={newMessage}
@@ -822,7 +824,7 @@ export default function AgentChatView() {
               lineHeight: 1.5,
               outline: 'none',
               color: 'var(--text)',
-              background: '#fff',
+              background: 'var(--bg-card)',
               transition: 'border-color 0.2s',
             }}
             onFocus={e => (e.target.style.borderColor = 'var(--primary, #00338d)')}
@@ -857,9 +859,9 @@ export default function AgentChatView() {
           style={{
             display: 'flex', alignItems: 'center', justifyContent: 'center',
             gap: 8, padding: '10px 12px', borderRadius: 10,
-            background: ending || session?.status === 'resolved' ? '#f1f5f9' : '#fee2e2',
-            color: ending || session?.status === 'resolved' ? '#94a3b8' : '#b91c1c',
-            border: '1px solid #fecaca',
+            background: ending || session?.status === 'resolved' ? (isDark ? 'rgba(148,163,184,0.1)' : '#f1f5f9') : (isDark ? 'rgba(239,68,68,0.12)' : '#fee2e2'),
+            color: ending || session?.status === 'resolved' ? '#94a3b8' : (isDark ? '#f87171' : '#b91c1c'),
+            border: `1px solid ${isDark ? 'rgba(239,68,68,0.3)' : '#fecaca'}`,
             fontSize: 12, fontWeight: 700,
             cursor: ending || session?.status === 'resolved' ? 'not-allowed' : 'pointer',
           }}
@@ -882,8 +884,8 @@ export default function AgentChatView() {
             label: 'Customer Info',
             sublabel: customer?.name || '—',
             iconColor: 'var(--primary, #00338d)',
-            iconBg: '#eff6ff',
-            hoverBorder: '#1a56db',
+            iconBg: isDark ? 'rgba(77,163,255,0.12)' : '#eff6ff',
+            hoverBorder: isDark ? '#4da3ff' : '#1a56db',
           },
           {
             key: 'session',
@@ -891,8 +893,8 @@ export default function AgentChatView() {
             label: 'Session Details',
             sublabel: session ? `#${session.id} · ${(session.status || '').toUpperCase()}` : '—',
             iconColor: 'var(--primary, #00338d)',
-            iconBg: '#eef2ff',
-            hoverBorder: '#1a56db',
+            iconBg: isDark ? 'rgba(77,163,255,0.12)' : '#eef2ff',
+            hoverBorder: isDark ? '#4da3ff' : '#1a56db',
           },
           {
             key: 'query',
@@ -901,9 +903,9 @@ export default function AgentChatView() {
             sublabel: session?.query_text
               ? session.query_text.slice(0, 28) + (session.query_text.length > 28 ? '…' : '')
               : 'Not recorded',
-            iconColor: '#1d4ed8',
-            iconBg: '#eff6ff',
-            hoverBorder: '#1d4ed8',
+            iconColor: isDark ? '#60a5fa' : '#1d4ed8',
+            iconBg: isDark ? 'rgba(96,165,250,0.12)' : '#eff6ff',
+            hoverBorder: isDark ? '#60a5fa' : '#1d4ed8',
           },
           {
             key: 'summary',
@@ -912,18 +914,18 @@ export default function AgentChatView() {
             sublabel: session?.summary
               ? session.summary.slice(0, 28) + (session.summary.length > 28 ? '…' : '')
               : 'Not available',
-            iconColor: '#15803d',
-            iconBg: '#f0fdf4',
-            hoverBorder: '#15803d',
+            iconColor: isDark ? '#4ade80' : '#15803d',
+            iconBg: isDark ? 'rgba(34,197,94,0.12)' : '#f0fdf4',
+            hoverBorder: isDark ? '#4ade80' : '#15803d',
           },
           {
             key: 'legend',
             icon: IC.chat,
             label: 'Message Legend',
             sublabel: 'Colour reference guide',
-            iconColor: '#475569',
-            iconBg: '#f1f5f9',
-            hoverBorder: '#475569',
+            iconColor: isDark ? '#94a3b8' : '#475569',
+            iconBg: isDark ? 'rgba(148,163,184,0.12)' : '#f1f5f9',
+            hoverBorder: isDark ? '#94a3b8' : '#475569',
           },
         ].map(p => (
           <button
@@ -932,7 +934,7 @@ export default function AgentChatView() {
             style={{
               display: 'flex', alignItems: 'center', gap: 12,
               padding: '11px 14px',
-              background: '#fff',
+              background: 'var(--bg-card)',
               border: '1px solid var(--border)',
               borderRadius: 10,
               cursor: 'pointer',
@@ -991,7 +993,7 @@ export default function AgentChatView() {
           <div
             onClick={e => e.stopPropagation()}
             style={{
-              background: '#fff',
+              background: 'var(--bg-card)',
               borderRadius: 16,
               width: 420, maxWidth: '90vw',
               maxHeight: '82vh',
@@ -1002,11 +1004,11 @@ export default function AgentChatView() {
             {/* Modal header */}
             {(() => {
               const HEADERS = {
-                customer: { icon: IC.customer, bg: '#eff6ff', color: 'var(--primary,#00338d)', title: 'Customer Info' },
-                session:  { icon: IC.clip,     bg: '#eef2ff', color: 'var(--primary,#00338d)', title: 'Session Details' },
-                query:    { icon: IC.question, bg: '#eff6ff', color: '#1d4ed8',                title: 'Original Query' },
-                summary:  { icon: IC.notes,    bg: '#f0fdf4', color: '#15803d',                title: 'AI Summary' },
-                legend:   { icon: IC.chat,     bg: '#f1f5f9', color: '#475569',                title: 'Message Legend' },
+                customer: { icon: IC.customer, bg: isDark ? 'rgba(77,163,255,0.12)' : '#eff6ff', color: 'var(--primary,#00338d)', title: 'Customer Info' },
+                session:  { icon: IC.clip,     bg: isDark ? 'rgba(77,163,255,0.12)' : '#eef2ff', color: 'var(--primary,#00338d)', title: 'Session Details' },
+                query:    { icon: IC.question, bg: isDark ? 'rgba(96,165,250,0.12)' : '#eff6ff', color: isDark ? '#60a5fa' : '#1d4ed8',                title: 'Original Query' },
+                summary:  { icon: IC.notes,    bg: isDark ? 'rgba(34,197,94,0.12)' : '#f0fdf4', color: isDark ? '#4ade80' : '#15803d',                title: 'AI Summary' },
+                legend:   { icon: IC.chat,     bg: isDark ? 'rgba(148,163,184,0.12)' : '#f1f5f9', color: isDark ? '#94a3b8' : '#475569',                title: 'Message Legend' },
               };
               const h = HEADERS[activePanel];
               return (
@@ -1014,7 +1016,7 @@ export default function AgentChatView() {
                   display: 'flex', alignItems: 'center', justifyContent: 'space-between',
                   padding: '16px 20px',
                   borderBottom: '1px solid var(--border)',
-                  position: 'sticky', top: 0, background: '#fff', zIndex: 1,
+                  position: 'sticky', top: 0, background: 'var(--bg-card)', zIndex: 1,
                   borderRadius: '16px 16px 0 0',
                 }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
@@ -1032,9 +1034,9 @@ export default function AgentChatView() {
                     onClick={() => setActivePanel(null)}
                     style={{
                       width: 28, height: 28, borderRadius: 6,
-                      background: '#f1f5f9', border: 'none',
+                      background: isDark ? 'rgba(148,163,184,0.12)' : '#f1f5f9', border: 'none',
                       cursor: 'pointer', display: 'flex', alignItems: 'center',
-                      justifyContent: 'center', color: '#64748b',
+                      justifyContent: 'center', color: isDark ? '#94a3b8' : '#64748b',
                       fontSize: 14, fontWeight: 700, lineHeight: 1,
                     }}
                   >
@@ -1057,12 +1059,12 @@ export default function AgentChatView() {
                   ].map(([label, value]) => (
                     <div key={label} style={{
                       padding: '12px 14px',
-                      background: '#f8fafc',
+                      background: isDark ? 'rgba(148,163,184,0.06)' : '#f8fafc',
                       borderRadius: 9,
                       border: '1px solid var(--border)',
                     }}>
                       <div style={{
-                        fontSize: 10, color: '#94a3b8',
+                        fontSize: 10, color: 'var(--text-muted)',
                         textTransform: 'uppercase', letterSpacing: 1, marginBottom: 5, fontWeight: 600,
                       }}>
                         {label}
@@ -1095,9 +1097,9 @@ export default function AgentChatView() {
                       display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start',
                       gap: 12,
                       padding: '11px 0',
-                      borderBottom: i < arr.length - 1 ? '1px solid #f1f5f9' : 'none',
+                      borderBottom: i < arr.length - 1 ? `1px solid ${isDark ? 'var(--border)' : '#f1f5f9'}` : 'none',
                     }}>
-                      <span style={{ fontSize: 12, color: '#64748b', fontWeight: 500, flexShrink: 0, width: 90 }}>
+                      <span style={{ fontSize: 12, color: 'var(--text-muted)', fontWeight: 500, flexShrink: 0, width: 90 }}>
                         {label}
                       </span>
                       <span style={{
@@ -1118,11 +1120,11 @@ export default function AgentChatView() {
               {activePanel === 'query' && (
                 session?.query_text ? (
                   <div style={{
-                    background: '#eff6ff', borderRadius: 10,
+                    background: isDark ? 'rgba(77,163,255,0.08)' : '#eff6ff', borderRadius: 10,
                     padding: '14px 16px',
-                    border: '1px solid #bfdbfe',
+                    border: `1px solid ${isDark ? 'rgba(77,163,255,0.25)' : '#bfdbfe'}`,
                   }}>
-                    <p style={{ margin: 0, fontSize: 13, color: '#1e293b', lineHeight: 1.8, wordBreak: 'break-word' }}>
+                    <p style={{ margin: 0, fontSize: 13, color: 'var(--text)', lineHeight: 1.8, wordBreak: 'break-word' }}>
                       {session.query_text}
                     </p>
                   </div>
@@ -1137,11 +1139,11 @@ export default function AgentChatView() {
               {activePanel === 'summary' && (
                 session?.summary ? (
                   <div style={{
-                    background: '#f0fdf4', borderRadius: 10,
+                    background: isDark ? 'rgba(34,197,94,0.08)' : '#f0fdf4', borderRadius: 10,
                     padding: '14px 16px',
-                    border: '1px solid #bbf7d0',
+                    border: `1px solid ${isDark ? 'rgba(34,197,94,0.25)' : '#bbf7d0'}`,
                   }}>
-                    <p style={{ margin: 0, fontSize: 13, color: '#1e293b', lineHeight: 1.8, wordBreak: 'break-word' }}>
+                    <p style={{ margin: 0, fontSize: 13, color: 'var(--text)', lineHeight: 1.8, wordBreak: 'break-word' }}>
                       {session.summary}
                     </p>
                   </div>
@@ -1156,14 +1158,14 @@ export default function AgentChatView() {
               {activePanel === 'legend' && (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
                   {[
-                    { color: 'var(--primary, #00338d)', bg: '#eff6ff', label: 'Agent (you)',   desc: 'Messages sent by you as the support agent' },
-                    { color: '#1d4ed8',                  bg: '#dbeafe', label: 'AI Assistant', desc: 'Automated responses generated by the AI bot' },
-                    { color: '#475569',                  bg: '#f1f5f9', label: 'Customer',     desc: 'Messages sent by the customer' },
+                    { color: 'var(--primary, #00338d)', bg: isDark ? 'rgba(77,163,255,0.12)' : '#eff6ff', label: 'Agent (you)',   desc: 'Messages sent by you as the support agent' },
+                    { color: isDark ? '#60a5fa' : '#1d4ed8',                  bg: isDark ? 'rgba(96,165,250,0.12)' : '#dbeafe', label: 'AI Assistant', desc: 'Automated responses generated by the AI bot' },
+                    { color: isDark ? '#94a3b8' : '#475569',                  bg: isDark ? 'rgba(148,163,184,0.12)' : '#f1f5f9', label: 'Customer',     desc: 'Messages sent by the customer' },
                   ].map(({ color, bg, label, desc }) => (
                     <div key={label} style={{
                       display: 'flex', alignItems: 'center', gap: 14,
                       padding: '12px 14px',
-                      background: '#f8fafc',
+                      background: isDark ? 'rgba(148,163,184,0.06)' : '#f8fafc',
                       borderRadius: 9,
                       border: '1px solid var(--border)',
                     }}>
@@ -1174,7 +1176,7 @@ export default function AgentChatView() {
                       }} />
                       <div>
                         <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--text)' }}>{label}</div>
-                        <div style={{ fontSize: 11, color: '#64748b', marginTop: 2 }}>{desc}</div>
+                        <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 2 }}>{desc}</div>
                       </div>
                     </div>
                   ))}

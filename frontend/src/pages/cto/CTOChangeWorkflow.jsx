@@ -4,10 +4,10 @@ import { useTheme } from '../../ThemeContext';
 
 /* ── Constants ─────────────────────────────────────────────────────────────── */
 const TYPE_STYLE = {
-  standard:  { bg: '#f0fdf4', color: '#16a34a', border: '#bbf7d0', label: 'Standard' },
-  normal:    { bg: '#eff6ff', color: '#2563eb', border: '#bfdbfe', label: 'Normal' },
-  urgent:    { bg: '#fff7ed', color: '#ea580c', border: '#fed7aa', label: 'Urgent' },
-  emergency: { bg: '#fef2f2', color: '#dc2626', border: '#fecaca', label: 'Emergency' },
+  standard:  { bg: 'rgba(22,163,106,0.1)', color: '#16a34a', border: 'rgba(22,163,106,0.3)', label: 'Standard' },
+  normal:    { bg: 'rgba(37,99,235,0.1)', color: '#2563eb', border: 'rgba(37,99,235,0.3)', label: 'Normal' },
+  urgent:    { bg: 'rgba(234,88,12,0.1)', color: '#ea580c', border: 'rgba(234,88,12,0.3)', label: 'Urgent' },
+  emergency: { bg: 'rgba(220,38,38,0.1)', color: '#dc2626', border: 'rgba(220,38,38,0.3)', label: 'Emergency' },
 };
 
 const STATUS_META = {
@@ -63,7 +63,7 @@ function SLATimer({ deadline, slaHours, status }) {
       <div style={{ fontSize: 15, fontWeight: 800, fontFamily: "'IBM Plex Mono',monospace", color }}>
         {breached ? 'SLA Breached' : `+${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`}
       </div>
-      <div style={{ width: 80, height: 3, borderRadius: 2, background: '#e2e8f0', marginTop: 3, marginLeft: 'auto' }}>
+      <div style={{ width: 80, height: 3, borderRadius: 2, background: 'var(--border)', marginTop: 3, marginLeft: 'auto' }}>
         <div style={{ width: `${Math.min(pct, 100)}%`, height: '100%', borderRadius: 2, background: color, transition: 'width 1s' }} />
       </div>
       {slaHours && <div style={{ fontSize: 8, color: '#94a3b8', marginTop: 2 }}>{slaHours}h SLA</div>}
@@ -113,10 +113,10 @@ function ReviewModal({ cr, onClose, onDone, isDark }) {
         </div>
 
         {cr.approved_by_name && (
-          <div style={{ background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: 8, padding: '10px 14px', marginBottom: 12, fontSize: 12 }}>
+          <div style={{ background: 'rgba(22,163,106,0.08)', border: '1px solid rgba(22,163,106,0.25)', borderRadius: 8, padding: '10px 14px', marginBottom: 12, fontSize: 12 }}>
             <div style={{ fontWeight: 700, color: '#16a34a', fontSize: 11, marginBottom: 2 }}>MANAGER APPROVED</div>
-            <div style={{ color: '#0f172a' }}>By: {cr.approved_by_name} {cr.approved_at ? `on ${new Date(cr.approved_at).toLocaleString()}` : ''}</div>
-            {cr.approval_remark && <div style={{ color: '#475569', marginTop: 4 }}>{cr.approval_remark}</div>}
+            <div style={{ color: isDark ? '#e2e8f0' : '#0f172a' }}>By: {cr.approved_by_name} {cr.approved_at ? `on ${new Date(cr.approved_at).toLocaleString()}` : ''}</div>
+            {cr.approval_remark && <div style={{ color: isDark ? '#94a3b8' : '#475569', marginTop: 4 }}>{cr.approval_remark}</div>}
           </div>
         )}
 
@@ -235,7 +235,7 @@ function RemarksModal({ cr, onClose, isDark }) {
           );
         })}
         <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 16 }}>
-          <button onClick={onClose} style={{ padding: '8px 20px', borderRadius: 7, fontSize: 13, fontWeight: 600, cursor: 'pointer', background: '#00338D', color: '#fff', border: 'none' }}>Close</button>
+          <button onClick={onClose} style={{ padding: '8px 20px', borderRadius: 7, fontSize: 13, fontWeight: 600, cursor: 'pointer', background: 'var(--primary, #00338D)', color: '#fff', border: 'none' }}>Close</button>
         </div>
       </div>
     </div>
@@ -363,7 +363,7 @@ export default function CTOChangeWorkflow() {
       ) : (
         filtered.map(cr => {
           const terminal = ['closed', 'cto_rejected', 'rejected', 'auto_rejected', 'failed'].includes(cr.status);
-          const ts = terminal ? { bg: '#f1f5f9', color: '#94a3b8', border: '#e2e8f0', label: cr.change_type ? cr.change_type.charAt(0).toUpperCase() + cr.change_type.slice(1) : 'Standard' } : (TYPE_STYLE[cr.change_type] || TYPE_STYLE.standard);
+          const ts = terminal ? { bg: 'rgba(148,163,184,0.1)', color: '#94a3b8', border: 'rgba(148,163,184,0.3)', label: cr.change_type ? cr.change_type.charAt(0).toUpperCase() + cr.change_type.slice(1) : 'Standard' } : (TYPE_STYLE[cr.change_type] || TYPE_STYLE.standard);
           const meta = STATUS_META[cr.status] || { label: cr.status, color: '#64748b' };
           const isPending = cr.status === 'pending_cto';
 

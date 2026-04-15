@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { apiGet, apiCall } from '../../api';
+import { useTheme } from '../../ThemeContext';
 import CRFormModal from './CRFormModal';
 
 /* ── Icons ──────────────────────────────────────────────────────────────────── */
@@ -52,7 +53,7 @@ function SlaTimer({ deadline, slaHours, status }) {
         <span style={{color}}>{IC.clock}</span>
         <span style={{fontSize:13,fontWeight:700,color,fontFamily:'monospace',letterSpacing:1}}>{breached?'+':''}{h}:{m}:{s}</span>
       </div>
-      <div style={{background:'#e2e8f0',borderRadius:4,height:4,overflow:'hidden',width:120}}>
+      <div style={{background:'var(--border)',borderRadius:4,height:4,overflow:'hidden',width:120}}>
         <div style={{height:'100%',width:`${Math.min(pct,100)}%`,background:color,borderRadius:4,transition:'width 1s linear'}}/>
       </div>
       <div style={{fontSize:10,color:'#94a3b8',marginTop:2}}>{breached?'SLA Breached':`${Math.round(pct)}% elapsed`}</div>
@@ -64,10 +65,10 @@ function SlaTimer({ deadline, slaHours, status }) {
 function Modal({ title, onClose, children }) {
   return (
     <div style={{position:'fixed',inset:0,background:'rgba(15,23,42,0.45)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:1000}}>
-      <div style={{background:'#fff',borderRadius:12,width:900,maxWidth:'95vw',maxHeight:'90vh',overflowY:'auto',boxShadow:'0 20px 60px rgba(0,0,0,.15)'}}>
-        <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',padding:'16px 24px',borderBottom:'1px solid #e2e8f0'}}>
-          <h3 style={{margin:0,fontSize:16,fontWeight:700,color:'#0f172a'}}>{title}</h3>
-          <button onClick={onClose} style={{border:'none',background:'#f1f5f9',borderRadius:6,width:28,height:28,cursor:'pointer',display:'flex',alignItems:'center',justifyContent:'center'}}>{IC.x}</button>
+      <div style={{background:'var(--bg-card)',borderRadius:12,width:900,maxWidth:'95vw',maxHeight:'90vh',overflowY:'auto',boxShadow:'0 20px 60px rgba(0,0,0,.15)'}}>
+        <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',padding:'16px 24px',borderBottom:'1px solid var(--border)'}}>
+          <h3 style={{margin:0,fontSize:16,fontWeight:700,color:'var(--text)'}}>{title}</h3>
+          <button onClick={onClose} style={{border:'none',background:'var(--bg)',borderRadius:6,width:28,height:28,cursor:'pointer',display:'flex',alignItems:'center',justifyContent:'center'}}>{IC.x}</button>
         </div>
         <div style={{padding:24}}>{children}</div>
       </div>
@@ -85,10 +86,10 @@ function RcaPoints({ text }) {
         const cleaned = line.replace(/^\d+[\.\)]\s*/, '');
         const bm = cleaned.match(/^\*\*(.+?)\*\*[:\s]*(.*)/);
         return (
-          <div key={i} style={{display:'flex',gap:10,padding:'10px 14px',background:'#f8fafc',borderLeft:'3px solid #00338D',borderRadius:6,border:'1px solid #e2e8f0'}}>
-            <span style={{width:24,height:24,borderRadius:'50%',background:'#00338D',color:'#fff',display:'flex',alignItems:'center',justifyContent:'center',fontSize:11,fontWeight:800,flexShrink:0}}>{i+1}</span>
+          <div key={i} style={{display:'flex',gap:10,padding:'10px 14px',background:'var(--bg)',borderLeft:'3px solid #00338D',borderRadius:6,border:'1px solid var(--border)'}}>
+            <span style={{width:24,height:24,borderRadius:'50%',background:'var(--primary)',color:'#fff',display:'flex',alignItems:'center',justifyContent:'center',fontSize:11,fontWeight:800,flexShrink:0}}>{i+1}</span>
             <div style={{fontSize:12,lineHeight:1.6,color:'#334155'}}>
-              {bm ? <><b style={{color:'#0f172a'}}>{bm[1]}:</b> {bm[2]}</> : cleaned}
+              {bm ? <><b style={{color:'var(--text)'}}>{bm[1]}:</b> {bm[2]}</> : cleaned}
             </div>
           </div>
         );
@@ -101,8 +102,8 @@ function RcaPoints({ text }) {
 function TrendChart({ kpiName, data, color = '#00338D' }) {
   const [RC, setRC] = useState(null);
   useEffect(() => { import('recharts').then(m => setRC(m)); }, []);
-  if (!RC || !data?.length) return <div style={{background:'#f8fafc',border:'1px solid #e2e8f0',borderRadius:8,padding:12,height:180}}>
-    <div style={{fontSize:11,fontWeight:700,color:'#475569',marginBottom:6}}>{kpiName}</div>
+  if (!RC || !data?.length) return <div style={{background:'var(--bg)',border:'1px solid var(--border)',borderRadius:8,padding:12,height:180}}>
+    <div style={{fontSize:11,fontWeight:700,color:'var(--text-secondary)',marginBottom:6}}>{kpiName}</div>
     <div style={{fontSize:11,color:'#94a3b8'}}>{data?.length?'Loading...':'No data'}</div>
   </div>;
   const { ResponsiveContainer, ComposedChart, Area, Line, XAxis, YAxis, Tooltip, CartesianGrid, ReferenceLine } = RC;
@@ -133,20 +134,20 @@ function TrendChart({ kpiName, data, color = '#00338D' }) {
   }
   const Dot=(p)=>{if(!dropIdx.has(p.index))return null;return<g><circle cx={p.cx} cy={p.cy} r={5} fill="#dc262644"/><circle cx={p.cx} cy={p.cy} r={3} fill="#dc2626" stroke="#fff" strokeWidth={1.5}/></g>;};
   return (
-    <div style={{background:'#fff',border:'1px solid #e2e8f0',borderRadius:10,padding:'10px 12px',height:200,boxShadow:'0 1px 3px rgba(0,0,0,.04)'}}>
+    <div style={{background:'var(--bg-card)',border:'1px solid var(--border)',borderRadius:10,padding:'10px 12px',height:200,boxShadow:'0 1px 3px rgba(0,0,0,.04)'}}>
       <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:4}}>
-        <span style={{fontSize:11,fontWeight:700,color:'#1e293b'}}>{kpiName}</span>
+        <span style={{fontSize:11,fontWeight:700,color:'var(--text)'}}>{kpiName}</span>
         {dropIdx.size>0&&<span style={{fontSize:8,padding:'1px 6px',borderRadius:8,background:'#fef2f2',color:'#dc2626',fontWeight:700}}>{dropIdx.size} drop{dropIdx.size>1?'s':''}</span>}
       </div>
-      <div style={{display:'flex',gap:10,marginBottom:3,fontSize:9,color:'#64748b'}}>
-        <span>Avg: <b style={{color:'#1e293b'}}>{avg.toFixed(1)}</b></span>
+      <div style={{display:'flex',gap:10,marginBottom:3,fontSize:9,color:'var(--text-muted)'}}>
+        <span>Avg: <b style={{color:'var(--text)'}}>{avg.toFixed(1)}</b></span>
         <span>Min: <b style={{color:'#dc2626'}}>{minV.toFixed(1)}</b></span>
         <span>Max: <b style={{color:'#16a34a'}}>{maxV.toFixed(1)}</b></span>
       </div>
       <ResponsiveContainer width="100%" height={140}>
         <ComposedChart data={data} margin={{top:5,right:5,bottom:0,left:-5}}>
           <defs><linearGradient id={gid} x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor={color} stopOpacity={.25}/><stop offset="100%" stopColor={color} stopOpacity={.02}/></linearGradient></defs>
-          <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" vertical={false}/>
+          <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" vertical={false}/>
           <XAxis dataKey="label" tick={{fontSize:7,fill:'#94a3b8'}} axisLine={false} tickLine={false} interval="preserveStartEnd" tickFormatter={v=>v?.length>10?v.slice(5,10):v}/>
           <YAxis tick={{fontSize:8,fill:'#94a3b8'}} axisLine={false} tickLine={false} width={36}/>
           <Tooltip contentStyle={{fontSize:10,borderRadius:8}}/>
@@ -213,12 +214,12 @@ function AIDiagnosisModal({ ticket, onClose }) {
   const TargetButtons = ({ onClick, current }) => (
     <div style={{display:'flex',gap:5,marginBottom:12,flexWrap:'wrap'}}>
       <button onClick={()=>onClick('site')} style={{padding:'5px 14px',borderRadius:16,fontSize:10,fontWeight:700,cursor:'pointer',
-        background:current==='site'?'#00338D':'#f1f5f9',color:current==='site'?'#fff':'#475569',border:current==='site'?'none':'1px solid #e2e8f0'}}>
+        background:current==='site'?'var(--primary)':'var(--bg)',color:current==='site'?'#fff':'var(--text-secondary)',border:current==='site'?'none':'1px solid var(--border)'}}>
          {ticket.site_id}
       </button>
       {cells.map((c, i) => (
         <button key={c} onClick={()=>onClick(c)} style={{padding:'5px 14px',borderRadius:16,fontSize:10,fontWeight:700,cursor:'pointer',
-          background:current===c?'#7C3AED':'#f1f5f9',color:current===c?'#fff':'#475569',border:current===c?'none':'1px solid #e2e8f0'}}>
+          background:current===c?'#7C3AED':'var(--bg)',color:current===c?'#fff':'var(--text-secondary)',border:current===c?'none':'1px solid var(--border)'}}>
            {cellSiteIds[i] || c}
         </button>
       ))}
@@ -228,10 +229,10 @@ function AIDiagnosisModal({ ticket, onClose }) {
   return (
     <Modal title={`AI Network Diagnosis — ${ticket.site_id}`} onClose={onClose}>
       {/* Tabs */}
-      <div style={{display:'flex',gap:4,marginBottom:16,borderBottom:'2px solid #e2e8f0',paddingBottom:8}}>
+      <div style={{display:'flex',gap:4,marginBottom:16,borderBottom:'2px solid var(--border)',paddingBottom:8}}>
         {[['trends',' Trend Analysis'],['rca',' Root Cause Analysis'],['rec',' Final Recommendations']].map(([k,l])=>(
           <button key={k} onClick={()=>setTab(k)} style={{padding:'7px 18px',borderRadius:8,fontSize:12,fontWeight:700,cursor:'pointer',
-            background:tab===k?'#00338D':'transparent',color:tab===k?'#fff':'#475569',border:'none'}}>{l}</button>
+            background:tab===k?'var(--primary)':'transparent',color:tab===k?'#fff':'var(--text-secondary)',border:'none'}}>{l}</button>
         ))}
       </div>
 
@@ -242,7 +243,7 @@ function AIDiagnosisModal({ ticket, onClose }) {
           <div style={{display:'flex',gap:5,marginBottom:12}}>
             {['month','week','day','hour'].map(p=>(
               <button key={p} onClick={()=>setPeriod(p)} style={{padding:'4px 12px',borderRadius:14,fontSize:10,fontWeight:700,cursor:'pointer',
-                background:period===p?'#0f172a':'#f1f5f9',color:period===p?'#fff':'#64748b',border:period===p?'none':'1px solid #e2e8f0'}}>
+                background:period===p?'var(--text)':'var(--bg)',color:period===p?'var(--bg)':'var(--text-muted)',border:period===p?'none':'1px solid var(--border)'}}>
                 {p==='day'?'Daily':p==='hour'?'Hourly':p==='week'?'Weekly':'Monthly'}
               </button>
             ))}
@@ -263,7 +264,7 @@ function AIDiagnosisModal({ ticket, onClose }) {
           <TargetButtons onClick={t=>{setTarget(t);if(!rca[t])runRCA(t);}} current={target}/>
           {rcaLoading ? <div style={{textAlign:'center',padding:40,color:'#94a3b8'}}>Analyzing...</div> : (
             <div>
-              {!rca[target] && <button onClick={()=>runRCA(target)} style={{padding:'8px 20px',borderRadius:8,fontSize:12,fontWeight:700,background:'#00338D',color:'#fff',border:'none',cursor:'pointer',marginBottom:12}}> Run Root Cause Analysis</button>}
+              {!rca[target] && <button onClick={()=>runRCA(target)} style={{padding:'8px 20px',borderRadius:8,fontSize:12,fontWeight:700,background:'var(--primary)',color:'#fff',border:'none',cursor:'pointer',marginBottom:12}}> Run Root Cause Analysis</button>}
               <RcaPoints text={rca[target]}/>
             </div>
           )}
@@ -300,8 +301,8 @@ function MiniPipeline({ status }) {
       {CR_STAGES.map((s,i) => (
         <div key={s} style={{display:'flex',alignItems:'center',flex:1}}>
           <div style={{width:24,height:24,borderRadius:'50%',display:'flex',alignItems:'center',justifyContent:'center',fontSize:9,fontWeight:800,
-            background:i<=stage?(isFail&&i===stage?'#dc2626':'#00338D'):'#e2e8f0',color:i<=stage?'#fff':'#94a3b8'}}>{i+1}</div>
-          {i<5&&<div style={{flex:1,height:2,background:i<stage?'#00338D':'#e2e8f0'}}/>}
+            background:i<=stage?(isFail&&i===stage?'#dc2626':'var(--primary)'):'var(--border)',color:i<=stage?'#fff':'#94a3b8'}}>{i+1}</div>
+          {i<5&&<div style={{flex:1,height:2,background:i<stage?'var(--primary)':'var(--border)'}}/>}
           <div style={{position:'absolute',marginTop:32,fontSize:7,color:'#94a3b8',textTransform:'uppercase',width:60,textAlign:'center',marginLeft:-18}}></div>
         </div>
       ))}
@@ -354,24 +355,24 @@ function ParamChangeModal({ ticket, onClose }) {
       {submitted ? (
         <div style={{textAlign:'center',padding:'24px 16px'}}>
           <div style={{width:64,height:64,borderRadius:'50%',background:'linear-gradient(135deg,#ecfdf5,#d1fae5)',display:'flex',alignItems:'center',justifyContent:'center',fontSize:28,margin:'0 auto 16px',boxShadow:'0 4px 12px rgba(22,163,74,0.2)'}}></div>
-          <h3 style={{margin:'0 0 6px',fontSize:17,fontWeight:700,color:'#0f172a'}}>Change Request Raised!</h3>
-          <p style={{margin:'0 0 8px',fontSize:13,color:'#475569'}}>
+          <h3 style={{margin:'0 0 6px',fontSize:17,fontWeight:700,color:'var(--text)'}}>Change Request Raised!</h3>
+          <p style={{margin:'0 0 8px',fontSize:13,color:'var(--text-secondary)'}}>
             Routed to <b>{managerInfo ? `Manager ${managerInfo.name}` : 'manager'}</b> for approval.
           </p>
-          {managerInfo && <p style={{margin:'0 0 4px',fontSize:11,color:'#64748b'}}>Email: {managerInfo.email}</p>}
-          {cr && <p style={{fontSize:12,color:'#00338D',fontFamily:'monospace',fontWeight:700,margin:'8px 0'}}>{cr.cr_number}</p>}
+          {managerInfo && <p style={{margin:'0 0 4px',fontSize:11,color:'var(--text-muted)'}}>Email: {managerInfo.email}</p>}
+          {cr && <p style={{fontSize:12,color:'var(--primary)',fontFamily:'monospace',fontWeight:700,margin:'8px 0'}}>{cr.cr_number}</p>}
           {cr && <MiniPipeline status={cr.status}/>}
           <p style={{fontSize:11,color:'#94a3b8',margin:'12px 0'}}>Approval deadline: 30% of remaining SLA time</p>
-          <button onClick={onClose} style={{padding:'8px 24px',borderRadius:8,fontSize:12,fontWeight:700,background:'#00338D',color:'#fff',border:'none',cursor:'pointer',marginTop:8}}>Done</button>
+          <button onClick={onClose} style={{padding:'8px 24px',borderRadius:8,fontSize:12,fontWeight:700,background:'var(--primary)',color:'#fff',border:'none',cursor:'pointer',marginTop:8}}>Done</button>
         </div>
       ) : loading ? (
         <div style={{textAlign:'center',padding:40,color:'#94a3b8'}}>Loading...</div>
       ) : cr ? (
         /* Show existing CR status */
         <div>
-          <div style={{background:'#f8fafc',border:'1px solid #e2e8f0',borderRadius:10,padding:'14px 16px',marginBottom:16}}>
+          <div style={{background:'var(--bg)',border:'1px solid var(--border)',borderRadius:10,padding:'14px 16px',marginBottom:16}}>
             <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:6}}>
-              <span style={{fontFamily:'monospace',fontSize:12,fontWeight:800,color:'#00338D'}}>{cr.cr_number}</span>
+              <span style={{fontFamily:'monospace',fontSize:12,fontWeight:800,color:'var(--primary)'}}>{cr.cr_number}</span>
               <span style={{fontSize:11,fontWeight:700,padding:'2px 8px',borderRadius:4,
                 background:`${CR_STATUS_COLOR[cr.status]||'#64748b'}15`,color:CR_STATUS_COLOR[cr.status]||'#64748b',
                 border:`1px solid ${CR_STATUS_COLOR[cr.status]||'#64748b'}30`}}>
@@ -384,46 +385,46 @@ function ParamChangeModal({ ticket, onClose }) {
               <div><span style={{color:'#94a3b8'}}>Created: </span>{cr.created_at ? new Date(cr.created_at).toLocaleString() : '—'}</div>
             </div>
             {change?.approval_deadline && (
-              <div style={{fontSize:10,color:'#d97706',marginTop:6,padding:'4px 8px',background:'#fffbeb',borderRadius:4}}>
+              <div style={{fontSize:10,color:'#d97706',marginTop:6,padding:'4px 8px',background:'rgba(245,158,11,0.08)',borderRadius:4}}>
                 Approval deadline: {new Date(change.approval_deadline).toLocaleString()}
               </div>
             )}
             {cr.approval_remark && <div style={{fontSize:11,color:'#374151',background:'#f0fdf4',border:'1px solid #bbf7d0',borderRadius:6,padding:'6px 10px',marginTop:8}}><b>Manager Note:</b> {cr.approval_remark}</div>}
           </div>
           {change && (
-            <div style={{background:'#f8fafc',borderRadius:8,padding:'10px 14px',border:'1px solid #e2e8f0'}}>
+            <div style={{background:'var(--bg)',borderRadius:8,padding:'10px 14px',border:'1px solid var(--border)'}}>
               <div style={{fontSize:10,color:'#94a3b8',fontWeight:700,textTransform:'uppercase',marginBottom:4}}>Proposed Change</div>
               <div style={{fontSize:12,color:'#334155',lineHeight:1.5}}>{change.proposed_change}</div>
             </div>
           )}
-          <button onClick={onClose} style={{marginTop:16,padding:'8px 24px',borderRadius:8,fontSize:12,fontWeight:600,background:'#f1f5f9',color:'#475569',border:'1px solid #e2e8f0',cursor:'pointer'}}>Close</button>
+          <button onClick={onClose} style={{marginTop:16,padding:'8px 24px',borderRadius:8,fontSize:12,fontWeight:600,background:'var(--bg)',color:'var(--text-secondary)',border:'1px solid var(--border)',cursor:'pointer'}}>Close</button>
         </div>
       ) : (
         /* Submit form */
         <div>
-          <div style={{fontSize:12,fontWeight:700,color:'#0f172a',marginBottom:6}}>Propose Parameter Change</div>
-          <div style={{fontSize:10,color:'#64748b',marginBottom:10}}>
+          <div style={{fontSize:12,fontWeight:700,color:'var(--text)',marginBottom:6}}>Propose Parameter Change</div>
+          <div style={{fontSize:10,color:'var(--text-muted)',marginBottom:10}}>
             Site: <b>{ticket.site_id}</b> · Cells: {ticket.cell_count} · SLA: {ticket.sla_hours}h · Priority: {ticket.priority}
           </div>
           <label style={{fontSize:11,fontWeight:600,color:'#334155',display:'block',marginBottom:3}}>Proposed Change *</label>
           <textarea value={proposed} onChange={e=>setProposed(e.target.value)} rows={3}
             placeholder="e.g., Increase E-tilt from 3° to 5° for GUR_LTE_0900 to reduce overshooting..."
-            style={{width:'100%',padding:'8px 10px',borderRadius:8,border:'1px solid #e2e8f0',fontSize:12,fontFamily:'inherit',resize:'vertical',outline:'none',boxSizing:'border-box',marginBottom:10}}/>
+            style={{width:'100%',padding:'8px 10px',borderRadius:8,border:'1px solid var(--border)',fontSize:12,fontFamily:'inherit',resize:'vertical',outline:'none',boxSizing:'border-box',marginBottom:10}}/>
           <label style={{fontSize:11,fontWeight:600,color:'#334155',display:'block',marginBottom:3}}>Impact Assessment</label>
           <textarea value={impact} onChange={e=>setImpact(e.target.value)} rows={2}
             placeholder="Expected impact on network KPIs..."
-            style={{width:'100%',padding:'8px 10px',borderRadius:8,border:'1px solid #e2e8f0',fontSize:12,fontFamily:'inherit',resize:'vertical',outline:'none',boxSizing:'border-box',marginBottom:10}}/>
+            style={{width:'100%',padding:'8px 10px',borderRadius:8,border:'1px solid var(--border)',fontSize:12,fontFamily:'inherit',resize:'vertical',outline:'none',boxSizing:'border-box',marginBottom:10}}/>
           <label style={{fontSize:11,fontWeight:600,color:'#334155',display:'block',marginBottom:3}}>Rollback Plan</label>
           <textarea value={rollback} onChange={e=>setRollback(e.target.value)} rows={2}
             placeholder="Steps to revert if change fails..."
-            style={{width:'100%',padding:'8px 10px',borderRadius:8,border:'1px solid #e2e8f0',fontSize:12,fontFamily:'inherit',resize:'vertical',outline:'none',boxSizing:'border-box',marginBottom:10}}/>
+            style={{width:'100%',padding:'8px 10px',borderRadius:8,border:'1px solid var(--border)',fontSize:12,fontFamily:'inherit',resize:'vertical',outline:'none',boxSizing:'border-box',marginBottom:10}}/>
           {errMsg && <div style={{color:'#dc2626',fontSize:11,marginBottom:8}}>{errMsg}</div>}
           <div style={{display:'flex',gap:8}}>
             <button onClick={submit} disabled={submitting||!proposed.trim()}
-              style={{padding:'8px 20px',borderRadius:8,fontSize:12,fontWeight:700,background:'#00338D',color:'#fff',border:'none',cursor:'pointer'}}>
+              style={{padding:'8px 20px',borderRadius:8,fontSize:12,fontWeight:700,background:'var(--primary)',color:'#fff',border:'none',cursor:'pointer'}}>
               {submitting?' Submitting...':'Submit & Route to Manager'}
             </button>
-            <button onClick={onClose} style={{padding:'8px 20px',borderRadius:8,fontSize:12,fontWeight:600,background:'#f1f5f9',color:'#475569',border:'1px solid #e2e8f0',cursor:'pointer'}}>Cancel</button>
+            <button onClick={onClose} style={{padding:'8px 20px',borderRadius:8,fontSize:12,fontWeight:600,background:'var(--bg)',color:'var(--text-secondary)',border:'1px solid var(--border)',cursor:'pointer'}}>Cancel</button>
           </div>
           <div style={{fontSize:9,color:'#94a3b8',marginTop:8}}>Approval deadline = 30% of remaining SLA · Routes to least-loaded manager</div>
         </div>
@@ -436,6 +437,7 @@ function ParamChangeModal({ ticket, onClose }) {
    MAIN PAGE
    ═══════════════════════════════════════════════════════════════════════════════ */
 export default function NetworkIssues() {
+  const { isDark } = useTheme();
   const [tickets, setTickets] = useState([]);
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState('All');
@@ -866,25 +868,25 @@ export default function NetworkIssues() {
       {/* Header */}
       <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:16}}>
         <div>
-          <h2 style={{margin:0,fontSize:20,fontWeight:800,color:'#0f172a',display:'flex',alignItems:'center',gap:8}}>
-            <span style={{width:4,height:28,background:'#00338D',borderRadius:2,display:'inline-block'}}/>
+          <h2 style={{margin:0,fontSize:20,fontWeight:800,color:'var(--text)',display:'flex',alignItems:'center',gap:8}}>
+            <span style={{width:4,height:28,background:'var(--primary)',borderRadius:2,display:'inline-block'}}/>
             Network Issues — Worst Cell Offenders
           </h2>
-          <p style={{margin:'4px 0 0',fontSize:12,color:'#64748b'}}>{openCount} open · {resolvedCount} resolved · {myTickets.length} total</p>
+          <p style={{margin:'4px 0 0',fontSize:12,color:'var(--text-muted)'}}>{openCount} open · {resolvedCount} resolved · {myTickets.length} total</p>
         </div>
         <div style={{display:'flex',gap:8}}>
-          <button onClick={fetchLogs} style={{display:'flex',alignItems:'center',gap:5,padding:'7px 14px',borderRadius:8,fontSize:12,fontWeight:600,background:'#f8fafc',color:'#475569',border:'1px solid #e2e8f0',cursor:'pointer'}}>
+          <button onClick={fetchLogs} style={{display:'flex',alignItems:'center',gap:5,padding:'7px 14px',borderRadius:8,fontSize:12,fontWeight:600,background:'var(--bg)',color:'var(--text-secondary)',border:'1px solid var(--border)',cursor:'pointer'}}>
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
             System Logs
           </button>
-          <button onClick={fetchRouting} style={{display:'flex',alignItems:'center',gap:5,padding:'7px 14px',borderRadius:8,fontSize:12,fontWeight:600,background:'#f8fafc',color:'#475569',border:'1px solid #e2e8f0',cursor:'pointer'}}>
+          <button onClick={fetchRouting} style={{display:'flex',alignItems:'center',gap:5,padding:'7px 14px',borderRadius:8,fontSize:12,fontWeight:600,background:'var(--bg)',color:'var(--text-secondary)',border:'1px solid var(--border)',cursor:'pointer'}}>
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8.5" cy="7" r="4"/><line x1="20" y1="8" x2="20" y2="14"/><line x1="23" y1="11" x2="17" y2="11"/></svg>
             Today's Routing
           </button>
-          <button onClick={triggerJob} disabled={triggering} style={{display:'flex',alignItems:'center',gap:5,padding:'7px 16px',borderRadius:8,fontSize:12,fontWeight:600,background:'#00338D',color:'#fff',border:'none',cursor:'pointer'}}>
+          <button onClick={triggerJob} disabled={triggering} style={{display:'flex',alignItems:'center',gap:5,padding:'7px 16px',borderRadius:8,fontSize:12,fontWeight:600,background:'var(--primary)',color:'#fff',border:'none',cursor:'pointer'}}>
             {triggering?' Scanning...':' Refresh Worst Cells'}
           </button>
-          <button onClick={fetchAll} style={{display:'flex',alignItems:'center',gap:5,padding:'7px 12px',borderRadius:8,fontSize:12,fontWeight:600,background:'#f8fafc',color:'#475569',border:'1px solid #e2e8f0',cursor:'pointer'}}>
+          <button onClick={fetchAll} style={{display:'flex',alignItems:'center',gap:5,padding:'7px 12px',borderRadius:8,fontSize:12,fontWeight:600,background:'var(--bg)',color:'var(--text-secondary)',border:'1px solid var(--border)',cursor:'pointer'}}>
             {IC.refresh} Refresh
           </button>
         </div>
@@ -901,7 +903,7 @@ export default function NetworkIssues() {
 
       {/* Priority legend */}
       <div style={{display:'flex',gap:14,marginBottom:14}}>
-        {Object.entries(P_CFG).map(([k,v])=>(<span key={k} style={{display:'flex',alignItems:'center',gap:4,fontSize:11,color:'#64748b'}}><span style={{width:10,height:10,borderRadius:2,background:v.bar}}/>{v.label}</span>))}
+        {Object.entries(P_CFG).map(([k,v])=>(<span key={k} style={{display:'flex',alignItems:'center',gap:4,fontSize:11,color:'var(--text-muted)'}}><span style={{width:10,height:10,borderRadius:2,background:v.bar}}/>{v.label}</span>))}
       </div>
 
       {/* Ticket cards */}
@@ -913,14 +915,14 @@ export default function NetworkIssues() {
         const pc = P_CFG[t.priority] || P_CFG.Low;
 
         return (
-          <div key={t.id} style={{background:'#fff',borderRadius:10,border:'1px solid #e2e8f0',marginBottom:12,borderLeft:`4px solid ${pc.bar}`,boxShadow:'0 1px 3px rgba(0,0,0,.04)'}}>
+          <div key={t.id} style={{background:'var(--bg-card)',borderRadius:10,border:'1px solid var(--border)',marginBottom:12,borderLeft:`4px solid ${pc.bar}`,boxShadow:'0 1px 3px rgba(0,0,0,.04)'}}>
             {/* Main row */}
             <div style={{display:'grid',gridTemplateColumns:'180px 1fr 80px 90px 140px 140px',alignItems:'center',padding:'14px 18px',gap:12}}>
               {/* Site + Cells */}
               <div>
-                <div style={{fontSize:10,fontWeight:700,color:'#00338D',textTransform:'uppercase',letterSpacing:'.5px'}}>Site</div>
-                <div style={{fontSize:14,fontWeight:800,color:'#0f172a'}}>{t.site_id}</div>
-                <div style={{fontSize:10,color:'#64748b',marginTop:2}}>
+                <div style={{fontSize:10,fontWeight:700,color:'var(--primary)',textTransform:'uppercase',letterSpacing:'.5px'}}>Site</div>
+                <div style={{fontSize:14,fontWeight:800,color:'var(--text)'}}>{t.site_id}</div>
+                <div style={{fontSize:10,color:'var(--text-muted)',marginTop:2}}>
                   {t.cell_count} cell{t.cell_count!==1?'s':''} · {t.zone}
                 </div>
               </div>
@@ -933,7 +935,7 @@ export default function NetworkIssues() {
                     color:t.category==='Severe Worst'?'#7C3AED':'#dc2626'}}>{t.category}</span>
                   <span style={{fontSize:10,color:'#94a3b8'}}>{t.location}</span>
                 </div>
-                <div style={{display:'flex',gap:10,fontSize:10,color:'#64748b'}}>
+                <div style={{display:'flex',gap:10,fontSize:10,color:'var(--text-muted)'}}>
                   <span>Drop: <b style={{color:t.avg_drop_rate>1.5?'#dc2626':'#16a34a'}}>{f(t.avg_drop_rate,2)}%</b></span>
                   <span>CSSR: <b style={{color:t.avg_cssr<98.5?'#dc2626':'#16a34a'}}>{f(t.avg_cssr,1)}%</b></span>
                   <span>Tput: <b style={{color:t.avg_tput<8?'#dc2626':'#16a34a'}}>{f(t.avg_tput,1)}Mbps</b></span>
@@ -951,7 +953,7 @@ export default function NetworkIssues() {
               {/* Status */}
               <div style={{textAlign:'center'}}>
                 <span style={{padding:'3px 12px',borderRadius:12,fontSize:10,fontWeight:700,
-                  background:t.status==='open'?'#dbeafe':t.status==='in_progress'?'#fef3c7':t.status==='resolved'?'#dcfce7':'#f1f5f9',
+                  background:t.status==='open'?'rgba(37,99,235,0.1)':t.status==='in_progress'?'rgba(217,119,6,0.1)':t.status==='resolved'?'rgba(22,163,106,0.1)':'var(--bg)',
                   color:t.status==='open'?'#2563eb':t.status==='in_progress'?'#d97706':t.status==='resolved'?'#16a34a':'#64748b'}}>
                   {t.status==='in_progress'?'In Progress':t.status.charAt(0).toUpperCase()+t.status.slice(1)}
                 </span>
@@ -964,7 +966,7 @@ export default function NetworkIssues() {
               <div style={{fontSize:11}}>
                 {t.agent_name ? (
                   <div>
-                    <div style={{fontWeight:700,color:'#0f172a'}}>{t.agent_name}</div>
+                    <div style={{fontWeight:700,color:'var(--text)'}}>{t.agent_name}</div>
                     <div style={{fontSize:9,color:'#94a3b8'}}>{t.agent_eid}</div>
                   </div>
                 ) : <span style={{color:'#94a3b8'}}>Unassigned</span>}
@@ -973,15 +975,15 @@ export default function NetworkIssues() {
 
             {/* Action buttons */}
             <div style={{display:'flex',alignItems:'center',gap:8,padding:'8px 18px 14px',flexWrap:'wrap'}}>
-              <button onClick={()=>setDiagTicket(t)} style={{display:'flex',alignItems:'center',gap:5,padding:'6px 14px',borderRadius:8,fontSize:11,fontWeight:600,background:'#f8fafc',color:'#475569',border:'1px solid #e2e8f0',cursor:'pointer'}}>
+              <button onClick={()=>setDiagTicket(t)} style={{display:'flex',alignItems:'center',gap:5,padding:'6px 14px',borderRadius:8,fontSize:11,fontWeight:600,background:'var(--bg)',color:'var(--text-secondary)',border:'1px solid var(--border)',cursor:'pointer'}}>
                 {IC.cpu} AI Diagnosis
               </button>
-              <button onClick={()=>downloadPdf(t)} disabled={pdfLoading===t.id} style={{display:'flex',alignItems:'center',gap:5,padding:'6px 14px',borderRadius:8,fontSize:11,fontWeight:600,background:'#f8fafc',color:'#475569',border:'1px solid #e2e8f0',cursor:pdfLoading===t.id?'wait':'pointer',opacity:pdfLoading===t.id?0.6:1}}>
+              <button onClick={()=>downloadPdf(t)} disabled={pdfLoading===t.id} style={{display:'flex',alignItems:'center',gap:5,padding:'6px 14px',borderRadius:8,fontSize:11,fontWeight:600,background:'var(--bg)',color:'var(--text-secondary)',border:'1px solid var(--border)',cursor:pdfLoading===t.id?'wait':'pointer',opacity:pdfLoading===t.id?0.6:1}}>
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
                 {pdfLoading===t.id ? 'Generating PDF...' : 'Download PDF'}
               </button>
               {t.status !== 'resolved' && (
-                <button onClick={()=>setParamTicket(t)} style={{display:'flex',alignItems:'center',gap:5,padding:'6px 14px',borderRadius:8,fontSize:11,fontWeight:600,background:'#f8fafc',color:'#475569',border:'1px solid #e2e8f0',cursor:'pointer'}}>
+                <button onClick={()=>setParamTicket(t)} style={{display:'flex',alignItems:'center',gap:5,padding:'6px 14px',borderRadius:8,fontSize:11,fontWeight:600,background:'var(--bg)',color:'var(--text-secondary)',border:'1px solid var(--border)',cursor:'pointer'}}>
                   {IC.tune} Parameter Change
                 </button>
               )}
@@ -1011,13 +1013,13 @@ export default function NetworkIssues() {
       {/* Today's Routing Modal */}
       {showRouting && (
         <div style={{position:'fixed',inset:0,background:'rgba(15,23,42,0.45)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:1000}} onClick={()=>setShowRouting(false)}>
-          <div onClick={e=>e.stopPropagation()} style={{background:'#fff',borderRadius:12,width:880,maxWidth:'95vw',maxHeight:'85vh',overflowY:'auto',boxShadow:'0 20px 60px rgba(0,0,0,.15)'}}>
-            <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',padding:'16px 24px',borderBottom:'1px solid #e2e8f0'}}>
+          <div onClick={e=>e.stopPropagation()} style={{background:'var(--bg-card)',borderRadius:12,width:880,maxWidth:'95vw',maxHeight:'85vh',overflowY:'auto',boxShadow:'0 20px 60px rgba(0,0,0,.15)'}}>
+            <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',padding:'16px 24px',borderBottom:'1px solid var(--border)'}}>
               <div>
-                <h3 style={{margin:0,fontSize:16,fontWeight:700,color:'#0f172a'}}>Today's Routing</h3>
-                <p style={{margin:'2px 0 0',fontSize:11,color:'#64748b'}}>Tickets created or updated today — {routingData.length} ticket{routingData.length!==1?'s':''}</p>
+                <h3 style={{margin:0,fontSize:16,fontWeight:700,color:'var(--text)'}}>Today's Routing</h3>
+                <p style={{margin:'2px 0 0',fontSize:11,color:'var(--text-muted)'}}>Tickets created or updated today — {routingData.length} ticket{routingData.length!==1?'s':''}</p>
               </div>
-              <button onClick={()=>setShowRouting(false)} style={{border:'none',background:'#f1f5f9',borderRadius:6,width:28,height:28,cursor:'pointer',display:'flex',alignItems:'center',justifyContent:'center'}}>{IC.x}</button>
+              <button onClick={()=>setShowRouting(false)} style={{border:'none',background:'var(--bg)',borderRadius:6,width:28,height:28,cursor:'pointer',display:'flex',alignItems:'center',justifyContent:'center'}}>{IC.x}</button>
             </div>
             <div style={{padding:20}}>
               {routingLoading ? (
@@ -1027,34 +1029,34 @@ export default function NetworkIssues() {
               ) : (
                 <table style={{width:'100%',borderCollapse:'collapse',fontSize:12}}>
                   <thead>
-                    <tr style={{borderBottom:'2px solid #e2e8f0'}}>
-                      <th style={{textAlign:'left',padding:'8px 10px',fontWeight:700,color:'#475569',fontSize:11,textTransform:'uppercase'}}>Ticket</th>
-                      <th style={{textAlign:'left',padding:'8px 10px',fontWeight:700,color:'#475569',fontSize:11,textTransform:'uppercase'}}>Type</th>
-                      <th style={{textAlign:'left',padding:'8px 10px',fontWeight:700,color:'#475569',fontSize:11,textTransform:'uppercase'}}>Site</th>
-                      <th style={{textAlign:'left',padding:'8px 10px',fontWeight:700,color:'#475569',fontSize:11,textTransform:'uppercase'}}>Cells</th>
-                      <th style={{textAlign:'left',padding:'8px 10px',fontWeight:700,color:'#475569',fontSize:11,textTransform:'uppercase'}}>Priority</th>
-                      <th style={{textAlign:'left',padding:'8px 10px',fontWeight:700,color:'#475569',fontSize:11,textTransform:'uppercase'}}>Status</th>
-                      <th style={{textAlign:'left',padding:'8px 10px',fontWeight:700,color:'#475569',fontSize:11,textTransform:'uppercase'}}>Assigned Agent</th>
+                    <tr style={{borderBottom:'2px solid var(--border)'}}>
+                      <th style={{textAlign:'left',padding:'8px 10px',fontWeight:700,color:'var(--text-secondary)',fontSize:11,textTransform:'uppercase'}}>Ticket</th>
+                      <th style={{textAlign:'left',padding:'8px 10px',fontWeight:700,color:'var(--text-secondary)',fontSize:11,textTransform:'uppercase'}}>Type</th>
+                      <th style={{textAlign:'left',padding:'8px 10px',fontWeight:700,color:'var(--text-secondary)',fontSize:11,textTransform:'uppercase'}}>Site</th>
+                      <th style={{textAlign:'left',padding:'8px 10px',fontWeight:700,color:'var(--text-secondary)',fontSize:11,textTransform:'uppercase'}}>Cells</th>
+                      <th style={{textAlign:'left',padding:'8px 10px',fontWeight:700,color:'var(--text-secondary)',fontSize:11,textTransform:'uppercase'}}>Priority</th>
+                      <th style={{textAlign:'left',padding:'8px 10px',fontWeight:700,color:'var(--text-secondary)',fontSize:11,textTransform:'uppercase'}}>Status</th>
+                      <th style={{textAlign:'left',padding:'8px 10px',fontWeight:700,color:'var(--text-secondary)',fontSize:11,textTransform:'uppercase'}}>Assigned Agent</th>
                     </tr>
                   </thead>
                   <tbody>
                     {routingData.map((r,i) => {
                       const prc = P_CFG[r.priority] || P_CFG.Low;
                       return (
-                        <tr key={r.ticket_id||i} style={{borderBottom:'1px solid #f1f5f9',background:i%2===0?'#fff':'#f8fafc'}}>
-                          <td style={{padding:'8px 10px',fontWeight:700,color:'#00338D',fontFamily:'monospace'}}>#{r.ticket_id}</td>
+                        <tr key={r.ticket_id||i} style={{borderBottom:'1px solid var(--border)',background:i%2===0?'var(--bg-card)':'var(--bg)'}}>
+                          <td style={{padding:'8px 10px',fontWeight:700,color:'var(--primary)',fontFamily:'monospace'}}>#{r.ticket_id}</td>
                           <td style={{padding:'8px 10px'}}><span style={{padding:'2px 8px',borderRadius:10,fontSize:10,fontWeight:700,
                             background:r.type==='created'?'#16A34A18':r.type==='updated'?'#0091DA18':'#94a3b818',
                             color:r.type==='created'?'#16A34A':r.type==='updated'?'#0091DA':'#94a3b8'}}>
                             {r.type==='created'?'New':r.type==='updated'?'Updated':'Existing'}</span></td>
-                          <td style={{padding:'8px 10px',fontWeight:600,color:'#0f172a'}}>{r.site_id}<br/><span style={{fontSize:10,color:'#64748b'}}>{r.zone}{r.location?' · '+r.location:''}</span></td>
-                          <td style={{padding:'8px 10px',color:'#475569'}}>{r.cell_count} cell{r.cell_count!==1?'s':''}</td>
+                          <td style={{padding:'8px 10px',fontWeight:600,color:'var(--text)'}}>{r.site_id}<br/><span style={{fontSize:10,color:'var(--text-muted)'}}>{r.zone}{r.location?' · '+r.location:''}</span></td>
+                          <td style={{padding:'8px 10px',color:'var(--text-secondary)'}}>{r.cell_count} cell{r.cell_count!==1?'s':''}</td>
                           <td style={{padding:'8px 10px'}}><span style={{padding:'2px 8px',borderRadius:10,fontSize:10,fontWeight:700,background:prc.bar+'18',color:prc.bar}}>{r.priority}</span></td>
                           <td style={{padding:'8px 10px'}}><span style={{padding:'2px 8px',borderRadius:10,fontSize:10,fontWeight:700,
                             background:r.status==='resolved'?'#16A34A18':r.status==='in_progress'?'#F59E0B18':'#00338D18',
                             color:r.status==='resolved'?'#16A34A':r.status==='in_progress'?'#F59E0B':'#00338D'}}>
                             {(r.status||'open').replace('_',' ')}</span></td>
-                          <td style={{padding:'8px 10px'}}><span style={{fontWeight:600,color:'#0f172a'}}>{r.agent_name || 'Unassigned'}</span>{r.agent_email?<><br/><span style={{fontSize:10,color:'#64748b'}}>{r.agent_email}</span></>:null}</td>
+                          <td style={{padding:'8px 10px'}}><span style={{fontWeight:600,color:'var(--text)'}}>{r.agent_name || 'Unassigned'}</span>{r.agent_email?<><br/><span style={{fontSize:10,color:'var(--text-muted)'}}>{r.agent_email}</span></>:null}</td>
                         </tr>
                       );
                     })}
@@ -1069,13 +1071,13 @@ export default function NetworkIssues() {
       {/* System Logs Modal */}
       {showLogs && (
         <div style={{position:'fixed',inset:0,background:'rgba(15,23,42,0.45)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:1000}} onClick={()=>setShowLogs(false)}>
-          <div onClick={e=>e.stopPropagation()} style={{background:'#fff',borderRadius:12,width:780,maxWidth:'95vw',maxHeight:'85vh',overflowY:'auto',boxShadow:'0 20px 60px rgba(0,0,0,.15)'}}>
-            <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',padding:'16px 24px',borderBottom:'1px solid #e2e8f0'}}>
+          <div onClick={e=>e.stopPropagation()} style={{background:'var(--bg-card)',borderRadius:12,width:780,maxWidth:'95vw',maxHeight:'85vh',overflowY:'auto',boxShadow:'0 20px 60px rgba(0,0,0,.15)'}}>
+            <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',padding:'16px 24px',borderBottom:'1px solid var(--border)'}}>
               <div>
-                <h3 style={{margin:0,fontSize:16,fontWeight:700,color:'#0f172a'}}>AI Ticket System Logs</h3>
-                <p style={{margin:'2px 0 0',fontSize:11,color:'#64748b'}}>Data pipeline, scheduler status, and ticket history</p>
+                <h3 style={{margin:0,fontSize:16,fontWeight:700,color:'var(--text)'}}>AI Ticket System Logs</h3>
+                <p style={{margin:'2px 0 0',fontSize:11,color:'var(--text-muted)'}}>Data pipeline, scheduler status, and ticket history</p>
               </div>
-              <button onClick={()=>setShowLogs(false)} style={{border:'none',background:'#f1f5f9',borderRadius:6,width:28,height:28,cursor:'pointer',display:'flex',alignItems:'center',justifyContent:'center'}}>{IC.x}</button>
+              <button onClick={()=>setShowLogs(false)} style={{border:'none',background:'var(--bg)',borderRadius:6,width:28,height:28,cursor:'pointer',display:'flex',alignItems:'center',justifyContent:'center'}}>{IC.x}</button>
             </div>
             <div style={{padding:'16px 24px',fontFamily:'monospace',fontSize:12,lineHeight:1.8}}>
               {logsLoading ? (
@@ -1084,16 +1086,16 @@ export default function NetworkIssues() {
                 <div style={{textAlign:'center',padding:40,color:'#94a3b8',fontSize:13}}>No logs available.</div>
               ) : logsData.map((log, i) => {
                 if (log.type === 'header') return (
-                  <div key={i} style={{margin:i>0?'16px 0 6px':'0 0 6px',padding:'6px 10px',background:'#00338D',color:'#fff',borderRadius:6,fontSize:11,fontWeight:700,letterSpacing:'0.05em',textTransform:'uppercase'}}>
+                  <div key={i} style={{margin:i>0?'16px 0 6px':'0 0 6px',padding:'6px 10px',background:'var(--primary)',color:'#fff',borderRadius:6,fontSize:11,fontWeight:700,letterSpacing:'0.05em',textTransform:'uppercase'}}>
                     {log.text}
                   </div>
                 );
                 const colors = {
-                  info: {bg:'#f0f9ff',color:'#0369a1',icon:'i'},
-                  warn: {bg:'#fffbeb',color:'#b45309',icon:'!'},
-                  error: {bg:'#fef2f2',color:'#dc2626',icon:'x'},
-                  detail: {bg:'#f8fafc',color:'#475569',icon:'>'},
-                  ticket: {bg:'#f0fdf4',color:'#166534',icon:'#'},
+                  info: {bg:'rgba(3,105,161,0.08)',color:'#0369a1',icon:'i'},
+                  warn: {bg:'rgba(180,83,9,0.08)',color:'#b45309',icon:'!'},
+                  error: {bg:'rgba(220,38,38,0.08)',color:'#dc2626',icon:'x'},
+                  detail: {bg:'var(--bg)',color:'var(--text-secondary)',icon:'>'},
+                  ticket: {bg:'rgba(22,101,52,0.08)',color:'#166534',icon:'#'},
                 };
                 const c = colors[log.type] || colors.info;
                 return (

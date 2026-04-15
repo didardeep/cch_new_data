@@ -4,10 +4,10 @@ import { useTheme } from '../../ThemeContext';
 
 /* ── Constants ─────────────────────────────────────────────────────────────── */
 const TYPE_STYLE = {
-  standard:  { bg: '#f0fdf4', color: '#16a34a', border: '#bbf7d0', label: 'Standard' },
-  normal:    { bg: '#fffbeb', color: '#d97706', border: '#fde68a', label: 'Normal' },
-  urgent:    { bg: '#fff7ed', color: '#ea580c', border: '#fed7aa', label: 'Urgent' },
-  emergency: { bg: '#fef2f2', color: '#dc2626', border: '#fecaca', label: 'Emergency' },
+  standard:  { bg: 'rgba(52,211,153,0.12)', color: '#16a34a', border: 'rgba(52,211,153,0.3)', label: 'Standard' },
+  normal:    { bg: 'rgba(251,191,36,0.12)', color: '#d97706', border: 'rgba(251,191,36,0.3)', label: 'Normal' },
+  urgent:    { bg: 'rgba(249,115,22,0.12)', color: '#ea580c', border: 'rgba(249,115,22,0.3)', label: 'Urgent' },
+  emergency: { bg: 'rgba(248,113,113,0.12)', color: '#dc2626', border: 'rgba(248,113,113,0.3)', label: 'Emergency' },
 };
 
 const STATUS_META = {
@@ -82,7 +82,7 @@ function SLATimer({ deadline, slaHours, status }) {
       <div style={{ fontSize: 15, fontWeight: 800, fontFamily: "'IBM Plex Mono',monospace", color }}>
         {breached ? 'SLA Breached' : `+${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`}
       </div>
-      <div style={{ width: 80, height: 3, borderRadius: 2, background: '#e2e8f0', marginTop: 3, marginLeft: 'auto' }}>
+      <div style={{ width: 80, height: 3, borderRadius: 2, background: isDark ? '#334155' : '#e2e8f0', marginTop: 3, marginLeft: 'auto' }}>
         <div style={{ width: `${Math.min(pct, 100)}%`, height: '100%', borderRadius: 2, background: color, transition: 'width 1s' }} />
       </div>
       {slaHours && <div style={{ fontSize: 8, color: '#94a3b8', marginTop: 2 }}>{slaHours}h SLA</div>}
@@ -245,7 +245,7 @@ function ActionModal({ cr, action, onClose, onDone, isDark }) {
         </div>
 
         {cr.manager_proposed_changes && action === 'implement' && (
-          <div style={{ background: '#f5f3ff', border: '1px solid #c4b5fd', borderRadius: 8, padding: '10px 14px', marginBottom: 12, fontSize: 12, color: '#0f172a' }}>
+          <div style={{ background: isDark ? 'rgba(124,58,237,0.12)' : '#f5f3ff', border: `1px solid ${isDark ? 'rgba(124,58,237,0.3)' : '#c4b5fd'}`, borderRadius: 8, padding: '10px 14px', marginBottom: 12, fontSize: 12, color: isDark ? '#e2e8f0' : '#0f172a' }}>
             <div style={{ fontWeight: 700, color: '#7c3aed', fontSize: 11, marginBottom: 4 }}>MANAGER PROPOSED MODIFICATIONS</div>
             {cr.manager_proposed_changes}
           </div>
@@ -321,7 +321,7 @@ export default function ChangeWorkflow() {
       <div style={{ display: 'flex', gap: 0, marginBottom: 20, borderRadius: 10, overflow: 'hidden', border: `1px solid ${isDark ? '#334155' : '#e2e8f0'}`, width: 'fit-content' }}>
         <button onClick={() => { setSection('customer'); setFilter(''); }} style={{
           padding: '10px 24px', fontSize: 13, fontWeight: 700, cursor: 'pointer', border: 'none',
-          background: section === 'customer' ? '#00338D' : (isDark ? '#1e293b' : '#f8fafc'),
+          background: section === 'customer' ? (isDark ? '#4da3ff' : '#00338D') : (isDark ? '#1e293b' : '#f8fafc'),
           color: section === 'customer' ? '#fff' : (isDark ? '#94a3b8' : '#64748b'),
           display: 'flex', alignItems: 'center', gap: 8,
         }}>
@@ -394,7 +394,7 @@ export default function ChangeWorkflow() {
         filtered.map(cr => {
           const meta = STATUS_META[cr.status] || STATUS_META.created;
           const isClosed = ['closed', 'rejected', 'auto_rejected', 'cto_rejected'].includes(cr.status);
-          const ts = isClosed ? { bg: '#f1f5f9', color: '#94a3b8', border: '#e2e8f0', label: cr.change_type ? cr.change_type.charAt(0).toUpperCase() + cr.change_type.slice(1) : '' } : TYPE_STYLE[cr.change_type];
+          const ts = isClosed ? { bg: isDark ? '#0f172a' : '#f1f5f9', color: '#94a3b8', border: isDark ? '#334155' : '#e2e8f0', label: cr.change_type ? cr.change_type.charAt(0).toUpperCase() + cr.change_type.slice(1) : '' } : TYPE_STYLE[cr.change_type];
           const act = getAction(cr.status);
           const isExpanded = expandedId === cr.id;
 
@@ -421,7 +421,7 @@ export default function ChangeWorkflow() {
                 {/* Domain chips */}
                 {cr.telecom_domain_primary && (
                   <div style={{ display: 'flex', gap: 4, marginBottom: 6 }}>
-                    <span style={{ fontSize: 9, fontWeight: 700, padding: '2px 8px', borderRadius: 4, background: '#00338D', color: '#fff' }}>{cr.telecom_domain_primary}</span>
+                    <span style={{ fontSize: 9, fontWeight: 700, padding: '2px 8px', borderRadius: 4, background: isDark ? '#4da3ff' : '#00338D', color: '#fff' }}>{cr.telecom_domain_primary}</span>
                     {(cr.telecom_domain_secondary || '').split(',').filter(Boolean).map(d => (
                       <span key={d} style={{ fontSize: 9, fontWeight: 600, padding: '2px 8px', borderRadius: 4, background: isDark ? '#152238' : '#f1f5f9', color: isDark ? '#64748b' : '#94a3b8', border: `1px solid ${isDark ? '#334155' : '#e2e8f0'}` }}>{d.trim()}</span>
                     ))}
@@ -479,13 +479,13 @@ export default function ChangeWorkflow() {
                     {act && (
                       <button onClick={() => { setActionCR(cr); setActionType(act); }} style={{
                         padding: '6px 14px', borderRadius: 7, fontSize: 12, fontWeight: 600, cursor: 'pointer',
-                        background: act === 'resubmit' ? '#7c3aed' : '#00338D', color: '#fff', border: 'none',
+                        background: act === 'resubmit' ? '#7c3aed' : (isDark ? '#4da3ff' : '#00338D'), color: '#fff', border: 'none',
                       }}>
                         {act === 'implement' ? 'Mark Implemented' : act === 'close' ? 'Close CR' : 'Resubmit'}
                       </button>
                     )}
                     {!act && !['closed', 'rejected', 'auto_rejected'].includes(cr.status) && (
-                      <span style={{ fontSize: 11, color: '#f59e0b', fontWeight: 600, padding: '4px 10px', background: '#fffbeb', borderRadius: 6, border: '1px solid #fde68a' }}>
+                      <span style={{ fontSize: 11, color: '#f59e0b', fontWeight: 600, padding: '4px 10px', background: isDark ? 'rgba(251,191,36,0.12)' : '#fffbeb', borderRadius: 6, border: `1px solid ${isDark ? 'rgba(251,191,36,0.3)' : '#fde68a'}` }}>
                         {cr.status === 'classified' ? 'Awaiting Validation' : cr.status === 'validated' ? 'Awaiting Approval' : cr.status === 'pending_cto' ? 'Awaiting CTO' : 'Processing'}
                       </span>
                     )}
@@ -568,8 +568,8 @@ export default function ChangeWorkflow() {
             {remarksCR.implementation_notes && (
               <div style={{ marginBottom: 14 }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
-                  <div style={{ width: 4, height: 4, borderRadius: '50%', background: '#00338D' }} />
-                  <span style={{ fontSize: 11, fontWeight: 700, color: '#00338D', textTransform: 'uppercase' }}>Implementation — {remarksCR.implemented_by_name || 'Agent'}</span>
+                  <div style={{ width: 4, height: 4, borderRadius: '50%', background: isDark ? '#4da3ff' : '#00338D' }} />
+                  <span style={{ fontSize: 11, fontWeight: 700, color: isDark ? '#4da3ff' : '#00338D', textTransform: 'uppercase' }}>Implementation — {remarksCR.implemented_by_name || 'Agent'}</span>
                 </div>
                 <div style={{ background: isDark ? '#0f172a' : '#eff6ff', border: `1px solid ${isDark ? '#334155' : '#bfdbfe'}`, borderRadius: 8, padding: '10px 14px', fontSize: 13, color: isDark ? '#e2e8f0' : '#0f172a', lineHeight: 1.5 }}>
                   {remarksCR.implementation_notes}
@@ -580,8 +580,8 @@ export default function ChangeWorkflow() {
             {remarksCR.closure_notes && (
               <div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
-                  <div style={{ width: 4, height: 4, borderRadius: '50%', background: '#475569' }} />
-                  <span style={{ fontSize: 11, fontWeight: 700, color: '#475569', textTransform: 'uppercase' }}>Closure Notes</span>
+                  <div style={{ width: 4, height: 4, borderRadius: '50%', background: isDark ? '#94a3b8' : '#475569' }} />
+                  <span style={{ fontSize: 11, fontWeight: 700, color: isDark ? '#94a3b8' : '#475569', textTransform: 'uppercase' }}>Closure Notes</span>
                 </div>
                 <div style={{ background: isDark ? '#0f172a' : '#f8fafc', border: `1px solid ${isDark ? '#334155' : '#e2e8f0'}`, borderRadius: 8, padding: '10px 14px', fontSize: 13, color: isDark ? '#e2e8f0' : '#0f172a', lineHeight: 1.5 }}>
                   {remarksCR.closure_notes}
@@ -590,7 +590,7 @@ export default function ChangeWorkflow() {
             )}
 
             <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 16 }}>
-              <button onClick={() => setRemarksCR(null)} style={{ padding: '8px 20px', borderRadius: 7, fontSize: 13, fontWeight: 600, cursor: 'pointer', background: '#00338D', color: '#fff', border: 'none' }}>Close</button>
+              <button onClick={() => setRemarksCR(null)} style={{ padding: '8px 20px', borderRadius: 7, fontSize: 13, fontWeight: 600, cursor: 'pointer', background: isDark ? '#4da3ff' : '#00338D', color: '#fff', border: 'none' }}>Close</button>
             </div>
           </div>
         </div>

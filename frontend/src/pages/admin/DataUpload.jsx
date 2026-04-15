@@ -424,13 +424,13 @@ export default function DataUpload() {
           <h3>Site Data Upload</h3>
         </div>
         <div className="section-card-body">
-          <p style={{ fontSize: 13, color: '#64748b', marginBottom: 16 }}>
+          <p style={{ fontSize: 13, color: 'var(--text-muted)', marginBottom: 16 }}>
             Upload an Excel file (.xlsx) containing site data.
           </p>
           <div style={{ display: 'flex', gap: 16, alignItems: 'center', marginBottom: 16 }}>
-            <div style={{ background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 8, padding: '10px 16px' }}>
-              <div style={{ fontSize: 12, color: '#64748b' }}>Sites in database</div>
-              <div style={{ fontSize: 20, fontWeight: 700, color: '#00338D' }}>{siteCount}</div>
+            <div style={{ background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 8, padding: '10px 16px' }}>
+              <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>Sites in database</div>
+              <div style={{ fontSize: 20, fontWeight: 700, color: 'var(--primary)' }}>{siteCount}</div>
             </div>
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
@@ -450,7 +450,7 @@ export default function DataUpload() {
           {siteResult && (
             <div style={{ marginTop: 14, background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: 8, padding: 12, fontSize: 13 }}>
               <strong style={{ color: '#16a34a' }}>Upload Successful</strong>
-              <div style={{ marginTop: 6, color: '#475569' }}>
+              <div style={{ marginTop: 6, color: 'var(--text-secondary)' }}>
                 Total rows processed: {siteResult.total ?? 0}
               </div>
               {siteResult.skipped?.length > 0 && (
@@ -473,13 +473,13 @@ export default function DataUpload() {
             <h3>Site Level Data Upload</h3>
           </div>
           <div className="section-card-body">
-            <p style={{ fontSize: 13, color: '#64748b', marginBottom: 12 }}>
+            <p style={{ fontSize: 13, color: 'var(--text-muted)', marginBottom: 12 }}>
               Upload an Excel workbook (.xlsx/.xlsm) with <strong>27 sheets</strong>. Each sheet name = KPI name.<br/>
               Sheet columns: <strong>Site_ID</strong>, then <strong>date columns</strong> with values.
             </p>
-            <div style={{ background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 8, padding: '10px 14px', marginBottom: 12 }}>
-              <div style={{ fontSize: 12, color: '#64748b' }}>Site-level KPIs uploaded: <strong style={{ color: '#00338D' }}>{siteKpiList.length}</strong></div>
-              <div style={{ fontSize: 12, color: '#64748b' }}>Total records: <strong style={{ color: '#00338D' }}>{totalSiteRows.toLocaleString()}</strong></div>
+            <div style={{ background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 8, padding: '10px 14px', marginBottom: 12 }}>
+              <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>Site-level KPIs uploaded: <strong style={{ color: 'var(--primary)' }}>{siteKpiList.length}</strong></div>
+              <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>Total records: <strong style={{ color: 'var(--primary)' }}>{totalSiteRows.toLocaleString()}</strong></div>
             </div>
             <input type="file" accept=".xlsx,.xlsm"
               onChange={e => { setSiteLevelFile(e.target.files[0]); setSiteLevelResult(null); setError(''); setSuccess(''); }}
@@ -498,7 +498,7 @@ export default function DataUpload() {
             {siteLevelResult && (
               <div style={{ marginTop: 14, background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: 8, padding: 12, fontSize: 13 }}>
                 <strong style={{ color: '#16a34a' }}>Upload Successful</strong>
-                <div style={{ marginTop: 6, color: '#475569' }}>
+                <div style={{ marginTop: 6, color: 'var(--text-secondary)' }}>
                   {siteLevelResult.message || 'Site-level KPI upload completed.'}
                 </div>
                 {siteLevelResult.errors?.length > 0 && (
@@ -517,13 +517,13 @@ export default function DataUpload() {
             <h3>Cell Level Data Upload</h3>
           </div>
           <div className="section-card-body">
-            <p style={{ fontSize: 13, color: '#64748b', marginBottom: 12 }}>
+            <p style={{ fontSize: 13, color: 'var(--text-muted)', marginBottom: 12 }}>
               Upload an Excel workbook (.xlsx/.xlsm) with <strong>27 sheets</strong>. Each sheet name = KPI name.<br/>
               Sheet columns: <strong>Site_ID, Cell_ID, Cell_Site_ID</strong>, then <strong>date columns</strong> with values.
             </p>
-            <div style={{ background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 8, padding: '10px 14px', marginBottom: 12 }}>
-              <div style={{ fontSize: 12, color: '#64748b' }}>Cell-level KPIs uploaded: <strong style={{ color: '#00338D' }}>{cellKpiList.length}</strong></div>
-              <div style={{ fontSize: 12, color: '#64748b' }}>Total records: <strong style={{ color: '#00338D' }}>{totalCellRows.toLocaleString()}</strong></div>
+            <div style={{ background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 8, padding: '10px 14px', marginBottom: 12 }}>
+              <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>Cell-level KPIs uploaded: <strong style={{ color: 'var(--primary)' }}>{cellKpiList.length}</strong></div>
+              <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>Total records: <strong style={{ color: 'var(--primary)' }}>{totalCellRows.toLocaleString()}</strong></div>
             </div>
             <input type="file" accept=".xlsx,.xlsm"
               onChange={e => { setCellLevelFile(e.target.files[0]); setCellLevelResult(null); setError(''); setSuccess(''); }}
@@ -542,7 +542,7 @@ export default function DataUpload() {
             {cellLevelResult && (
               <div style={{ marginTop: 14, background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: 8, padding: 12, fontSize: 13 }}>
                 <strong style={{ color: '#16a34a' }}>Upload Successful</strong>
-                <div style={{ marginTop: 6, color: '#475569' }}>
+                <div style={{ marginTop: 6, color: 'var(--text-secondary)' }}>
                   {cellLevelResult.message || 'Cell-level KPI upload completed.'}
                 </div>
                 {cellLevelResult.errors?.length > 0 && (
@@ -557,18 +557,18 @@ export default function DataUpload() {
       </div>
 
       {/* ── Network Analytics KPI Upload ─────────────────────────────── */}
-      <div className="section-card" style={{ marginBottom: 24, borderTop: '3px solid #00338D' }}>
+      <div className="section-card" style={{ marginBottom: 24, borderTop: '3px solid var(--primary)' }}>
         <div className="section-card-header" style={{ background: 'linear-gradient(135deg, #f0f4ff 0%, #e8f0fe 100%)' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#00338D" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--primary)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
               <circle cx="12" cy="12" r="2"/><path d="M16.24 7.76a6 6 0 010 8.49M7.76 16.24a6 6 0 010-8.49M20.49 3.51a12 12 0 010 16.99M3.51 20.49a12 12 0 010-16.99"/>
             </svg>
-            <h3 style={{ color: '#00338D', margin: 0 }}>Network Analytics KPI Upload</h3>
-            <span style={{ marginLeft: 8, background: '#00338D', color: '#fff', fontSize: 10, fontWeight: 700, padding: '2px 8px', borderRadius: 20 }}>NEW</span>
+            <h3 style={{ color: 'var(--primary)', margin: 0 }}>Network Analytics KPI Upload</h3>
+            <span style={{ marginLeft: 8, background: 'var(--primary)', color: '#fff', fontSize: 10, fontWeight: 700, padding: '2px 8px', borderRadius: 20 }}>NEW</span>
           </div>
         </div>
         <div className="section-card-body">
-          <p style={{ fontSize: 13, color: '#64748b', marginBottom: 12 }}>
+          <p style={{ fontSize: 13, color: 'var(--text-muted)', marginBottom: 12 }}>
             Upload a flat Excel/CSV file for the <strong>Predictive Network Analysis</strong> dashboard visible to agents.
             Each row = one KPI snapshot. Columns are detected automatically — no fixed schema required.
           </p>
@@ -579,9 +579,9 @@ export default function DataUpload() {
             Packet_Loss, Latency, Call_Drop_Rate, Availability, Traffic_Volume
           </div>
           <div style={{ display: 'flex', gap: 16, alignItems: 'center', marginBottom: 14 }}>
-            <div style={{ background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 8, padding: '10px 16px' }}>
-              <div style={{ fontSize: 12, color: '#64748b' }}>Unique sites in analytics DB</div>
-              <div style={{ fontSize: 20, fontWeight: 700, color: '#00338D' }}>{networkKpiCount}</div>
+            <div style={{ background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 8, padding: '10px 16px' }}>
+              <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>Unique sites in analytics DB</div>
+              <div style={{ fontSize: 20, fontWeight: 700, color: 'var(--primary)' }}>{networkKpiCount}</div>
             </div>
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
@@ -590,7 +590,7 @@ export default function DataUpload() {
               style={{ fontSize: 13 }} />
             <button className="btn btn-primary btn-sm" onClick={uploadNetworkKpi}
               disabled={!networkKpiFile || uploading.networkKpi}
-              style={{ background: '#00338D', borderColor: '#00338D' }}>
+              style={{ background: 'var(--primary)', borderColor: 'var(--primary)' }}>
               {uploading.networkKpi ? 'Uploading...' : 'Upload Network KPI Data'}
             </button>
             <button className="btn btn-sm" onClick={deleteNetworkKpi}
@@ -603,25 +603,25 @@ export default function DataUpload() {
             <div style={{ marginTop: 14, background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: 8, padding: 12, fontSize: 13 }}>
               <strong style={{ color: '#16a34a' }}>Upload Successful</strong>
               <div style={{ marginTop: 8, display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))', gap: 8 }}>
-                <div style={{ background: '#fff', border: '1px solid #e2e8f0', borderRadius: 6, padding: '8px 12px' }}>
-                  <div style={{ fontSize: 11, color: '#64748b' }}>Records Processed</div>
-                  <div style={{ fontSize: 18, fontWeight: 700, color: '#00338D' }}>{(networkKpiResult.records_processed ?? 0).toLocaleString()}</div>
+                <div style={{ background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 6, padding: '8px 12px' }}>
+                  <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>Records Processed</div>
+                  <div style={{ fontSize: 18, fontWeight: 700, color: 'var(--primary)' }}>{(networkKpiResult.records_processed ?? 0).toLocaleString()}</div>
                 </div>
-                <div style={{ background: '#fff', border: '1px solid #e2e8f0', borderRadius: 6, padding: '8px 12px' }}>
-                  <div style={{ fontSize: 11, color: '#64748b' }}>Columns Detected</div>
-                  <div style={{ fontSize: 18, fontWeight: 700, color: '#00338D' }}>{(networkKpiResult.columns_detected ?? []).length}</div>
+                <div style={{ background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 6, padding: '8px 12px' }}>
+                  <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>Columns Detected</div>
+                  <div style={{ fontSize: 18, fontWeight: 700, color: 'var(--primary)' }}>{(networkKpiResult.columns_detected ?? []).length}</div>
                 </div>
                 {networkKpiResult.time_range?.from && (
-                  <div style={{ background: '#fff', border: '1px solid #e2e8f0', borderRadius: 6, padding: '8px 12px', gridColumn: 'span 2' }}>
-                    <div style={{ fontSize: 11, color: '#64748b' }}>Data Time Range</div>
-                    <div style={{ fontSize: 12, fontWeight: 600, color: '#475569' }}>
+                  <div style={{ background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 6, padding: '8px 12px', gridColumn: 'span 2' }}>
+                    <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>Data Time Range</div>
+                    <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-secondary)' }}>
                       {networkKpiResult.time_range.from?.slice(0, 19)} → {networkKpiResult.time_range.to?.slice(0, 19)}
                     </div>
                   </div>
                 )}
               </div>
               {networkKpiResult.extra_columns?.length > 0 && (
-                <div style={{ marginTop: 8, fontSize: 12, color: '#475569' }}>
+                <div style={{ marginTop: 8, fontSize: 12, color: 'var(--text-secondary)' }}>
                   Extra columns stored in JSONB: <em>{networkKpiResult.extra_columns.join(', ')}</em>
                 </div>
               )}
@@ -643,8 +643,8 @@ export default function DataUpload() {
                   background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 8,
                   padding: '10px 14px', display: 'flex', justifyContent: 'space-between', alignItems: 'center',
                 }}>
-                  <span style={{ fontSize: 13, fontWeight: 600, color: '#0f172a' }}>{k.name}</span>
-                  <span style={{ fontSize: 12, color: '#64748b' }}>{k.rows.toLocaleString()} rows</span>
+                  <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--text)' }}>{k.name}</span>
+                  <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>{k.rows.toLocaleString()} rows</span>
                 </div>
               ))}
             </div>
@@ -664,8 +664,8 @@ export default function DataUpload() {
                   background: '#fdf4ff', border: '1px solid #e9d5ff', borderRadius: 8,
                   padding: '10px 14px', display: 'flex', justifyContent: 'space-between', alignItems: 'center',
                 }}>
-                  <span style={{ fontSize: 13, fontWeight: 600, color: '#0f172a' }}>{k.name}</span>
-                  <span style={{ fontSize: 12, color: '#64748b' }}>{k.rows.toLocaleString()} rows</span>
+                  <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--text)' }}>{k.name}</span>
+                  <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>{k.rows.toLocaleString()} rows</span>
                 </div>
               ))}
             </div>
@@ -683,7 +683,7 @@ export default function DataUpload() {
           </div>
         </div>
         <div className="section-card-body">
-          <p style={{ fontSize: 13, color: '#64748b', marginBottom: 12 }}>
+          <p style={{ fontSize: 13, color: 'var(--text-muted)', marginBottom: 12 }}>
             Upload your Core Network KPI file (Excel or CSV) for the <strong>Core Network tab</strong> in the
             agent's Network Analysis dashboard. Only <code>Site_ID</code> is mandatory — all other columns
             (Auth Success Rate, CPU Utilization, Attach Success Rate, PDP Bearer SR, or any custom columns)
@@ -702,8 +702,8 @@ export default function DataUpload() {
                 { label: 'Total Records', value: (coreKpiStatus.total_rows ?? 0).toLocaleString(), color: '#059669' },
                 ...(coreKpiStatus.date_range?.from ? [{ label: 'Date Range', value: `${coreKpiStatus.date_range.from} → ${coreKpiStatus.date_range.to}`, color: '#0369a1' }] : []),
               ].map((s, i) => (
-                <div key={i} style={{ background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 8, padding: '10px 16px' }}>
-                  <div style={{ fontSize: 11, color: '#64748b' }}>{s.label}</div>
+                <div key={i} style={{ background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 8, padding: '10px 16px' }}>
+                  <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{s.label}</div>
                   <div style={{ fontSize: 20, fontWeight: 700, color: s.color }}>{s.value}</div>
                 </div>
               ))}
@@ -712,8 +712,8 @@ export default function DataUpload() {
 
           {/* Detected columns */}
           {coreKpiStatus?.columns?.length > 0 && (
-            <div style={{ background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 8, padding: '10px 14px', marginBottom: 14 }}>
-              <div style={{ fontSize: 11, color: '#64748b', fontWeight: 700, marginBottom: 8, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Stored Columns</div>
+            <div style={{ background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 8, padding: '10px 14px', marginBottom: 14 }}>
+              <div style={{ fontSize: 11, color: 'var(--text-muted)', fontWeight: 700, marginBottom: 8, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Stored Columns</div>
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
                 {coreKpiStatus.columns.map((c, i) => (
                   <span key={i} style={{ display: 'inline-flex', alignItems: 'center', gap: 4, padding: '2px 8px', borderRadius: 12, fontSize: 11, fontWeight: 600, background: '#ede9fe', border: '1px solid #ddd6fe', color: '#5b21b6', margin: '2px 0' }}>
@@ -754,14 +754,14 @@ export default function DataUpload() {
                   { label: 'Unique Sites', value: coreKpiResult.unique_sites ?? 0 },
                   { label: 'Columns Found', value: (coreKpiResult.columns_detected ?? []).length },
                 ].map((s, i) => (
-                  <div key={i} style={{ background: '#fff', border: '1px solid #e2e8f0', borderRadius: 6, padding: '8px 12px' }}>
-                    <div style={{ fontSize: 11, color: '#64748b' }}>{s.label}</div>
+                  <div key={i} style={{ background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 6, padding: '8px 12px' }}>
+                    <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{s.label}</div>
                     <div style={{ fontSize: 18, fontWeight: 700, color: '#7c3aed' }}>{typeof s.value === 'number' ? s.value.toLocaleString() : s.value}</div>
                   </div>
                 ))}
               </div>
               {coreKpiResult.columns_detected?.length > 0 && (
-                <div style={{ marginTop: 10, fontSize: 12, color: '#475569' }}>
+                <div style={{ marginTop: 10, fontSize: 12, color: 'var(--text-secondary)' }}>
                   <strong>Auto-detected columns:</strong> {coreKpiResult.columns_detected.join(', ')}
                 </div>
               )}
@@ -774,7 +774,7 @@ export default function DataUpload() {
               <span style={{ fontSize: 18 }}>🔌</span>
               <div>
                 <h4 style={{ margin: 0, color: '#5b21b6', fontSize: 14, fontWeight: 700 }}>Transport KPI Upload</h4>
-                <p style={{ margin: 0, fontSize: 12, color: '#64748b', marginTop: 2 }}>
+                <p style={{ margin: 0, fontSize: 12, color: 'var(--text-muted)', marginTop: 2 }}>
                   Only <code>Site_ID</code> is mandatory — Zone, Backhaul Type, Utilization, Latency, Jitter, Packet Loss etc. are <strong>auto-detected</strong>.
                 </p>
               </div>
@@ -788,8 +788,8 @@ export default function DataUpload() {
                   { label: 'Total Records',      value: (transportStatus.total_rows ?? 0).toLocaleString(),   color: '#6d28d9' },
                   { label: 'Columns Detected',   value: transportStatus.unique_columns ?? 0,                  color: '#059669' },
                 ].map((s, i) => (
-                  <div key={i} style={{ background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 8, padding: '9px 14px' }}>
-                    <div style={{ fontSize: 11, color: '#64748b' }}>{s.label}</div>
+                  <div key={i} style={{ background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 8, padding: '9px 14px' }}>
+                    <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{s.label}</div>
                     <div style={{ fontSize: 18, fontWeight: 700, color: s.color }}>{s.value}</div>
                   </div>
                 ))}
@@ -798,8 +798,8 @@ export default function DataUpload() {
 
             {/* Detected columns badges */}
             {transportStatus?.columns?.length > 0 && (
-              <div style={{ background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 8, padding: '9px 13px', marginBottom: 14 }}>
-                <div style={{ fontSize: 11, color: '#64748b', fontWeight: 700, marginBottom: 7, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Stored Columns</div>
+              <div style={{ background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 8, padding: '9px 13px', marginBottom: 14 }}>
+                <div style={{ fontSize: 11, color: 'var(--text-muted)', fontWeight: 700, marginBottom: 7, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Stored Columns</div>
                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
                   {transportStatus.columns.map((c, i) => (
                     <span key={i} style={{ display: 'inline-flex', alignItems: 'center', gap: 4, padding: '2px 8px', borderRadius: 12, fontSize: 11, fontWeight: 600, background: '#ede9fe', border: '1px solid #ddd6fe', color: '#5b21b6' }}>
@@ -856,14 +856,14 @@ export default function DataUpload() {
                     { label: 'Unique Sites',      value: transportResult.unique_sites ?? 0 },
                     { label: 'Columns Detected',  value: (transportResult.columns_detected ?? []).length },
                   ].map((s, i) => (
-                    <div key={i} style={{ background: '#fff', border: '1px solid #e2e8f0', borderRadius: 6, padding: '8px 12px' }}>
-                      <div style={{ fontSize: 11, color: '#64748b' }}>{s.label}</div>
+                    <div key={i} style={{ background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 6, padding: '8px 12px' }}>
+                      <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{s.label}</div>
                       <div style={{ fontSize: 18, fontWeight: 700, color: '#5b21b6' }}>{typeof s.value === 'number' ? s.value.toLocaleString() : s.value}</div>
                     </div>
                   ))}
                 </div>
                 {transportResult.columns_detected?.length > 0 && (
-                  <div style={{ marginTop: 10, fontSize: 12, color: '#475569' }}>
+                  <div style={{ marginTop: 10, fontSize: 12, color: 'var(--text-secondary)' }}>
                     <strong>Auto-detected columns:</strong> {transportResult.columns_detected.join(', ')}
                   </div>
                 )}
@@ -883,7 +883,7 @@ export default function DataUpload() {
           </div>
         </div>
         <div className="section-card-body">
-          <p style={{ fontSize: 13, color: '#64748b', marginBottom: 12 }}>
+          <p style={{ fontSize: 13, color: 'var(--text-muted)', marginBottom: 12 }}>
             Upload your Revenue &amp; Financial KPI file (Excel or CSV) for the <strong>Revenue tab</strong> in the
             agent's Network Analysis dashboard. Only <code>Site_ID</code> is mandatory — typical columns like
             Revenue, OpEx, Subscribers, EBITDA, Site Category, Zone are all <strong>auto-detected</strong>.
@@ -901,8 +901,8 @@ export default function DataUpload() {
                 { label: 'Columns Detected', value: revenueKpiStatus.unique_columns ?? 0, color: '#047857' },
                 { label: 'Total Records', value: (revenueKpiStatus.total_rows ?? 0).toLocaleString(), color: '#7c3aed' },
               ].map((s, i) => (
-                <div key={i} style={{ background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 8, padding: '10px 16px' }}>
-                  <div style={{ fontSize: 11, color: '#64748b' }}>{s.label}</div>
+                <div key={i} style={{ background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 8, padding: '10px 16px' }}>
+                  <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{s.label}</div>
                   <div style={{ fontSize: 20, fontWeight: 700, color: s.color }}>{s.value}</div>
                 </div>
               ))}
@@ -911,8 +911,8 @@ export default function DataUpload() {
 
           {/* Detected columns */}
           {revenueKpiStatus?.columns?.length > 0 && (
-            <div style={{ background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 8, padding: '10px 14px', marginBottom: 14 }}>
-              <div style={{ fontSize: 11, color: '#64748b', fontWeight: 700, marginBottom: 8, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Stored Columns</div>
+            <div style={{ background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 8, padding: '10px 14px', marginBottom: 14 }}>
+              <div style={{ fontSize: 11, color: 'var(--text-muted)', fontWeight: 700, marginBottom: 8, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Stored Columns</div>
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
                 {revenueKpiStatus.columns.map((c, i) => (
                   <span key={i} style={{ display: 'inline-flex', alignItems: 'center', gap: 4, padding: '2px 8px', borderRadius: 12, fontSize: 11, fontWeight: 600, background: '#dcfce7', border: '1px solid #bbf7d0', color: '#166534', margin: '2px 0' }}>
@@ -953,14 +953,14 @@ export default function DataUpload() {
                   { label: 'Unique Sites', value: revenueKpiResult.unique_sites ?? 0 },
                   { label: 'Columns Found', value: (revenueKpiResult.columns_detected ?? []).length },
                 ].map((s, i) => (
-                  <div key={i} style={{ background: '#fff', border: '1px solid #e2e8f0', borderRadius: 6, padding: '8px 12px' }}>
-                    <div style={{ fontSize: 11, color: '#64748b' }}>{s.label}</div>
+                  <div key={i} style={{ background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 6, padding: '8px 12px' }}>
+                    <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{s.label}</div>
                     <div style={{ fontSize: 18, fontWeight: 700, color: '#059669' }}>{typeof s.value === 'number' ? s.value.toLocaleString() : s.value}</div>
                   </div>
                 ))}
               </div>
               {revenueKpiResult.columns_detected?.length > 0 && (
-                <div style={{ marginTop: 10, fontSize: 12, color: '#475569' }}>
+                <div style={{ marginTop: 10, fontSize: 12, color: 'var(--text-secondary)' }}>
                   <strong>Auto-detected columns:</strong> {revenueKpiResult.columns_detected.join(', ')}
                 </div>
               )}
@@ -983,7 +983,7 @@ export default function DataUpload() {
           {/* Status */}
           <div style={{ display: 'flex', gap: 12, marginBottom: 16, flexWrap: 'wrap' }}>
             {[
-              { label: 'Records in DB', value: businessKpiStatus?.total_records ?? 0, color: '#00338D' },
+              { label: 'Records in DB', value: businessKpiStatus?.total_records ?? 0, color: 'var(--primary)' },
               { label: 'Sites with Data', value: businessKpiStatus?.total_sites ?? 0, color: '#10b981' },
             ].map((s, i) => (
               <div key={i} style={{ background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 8, padding: '10px 18px', minWidth: 140 }}>
@@ -1029,14 +1029,14 @@ export default function DataUpload() {
                   { label: 'Records Inserted', value: businessKpiResult.inserted ?? 0 },
                   { label: 'KPIs Processed', value: businessKpiResult.kpis_processed ?? 0 },
                 ].map((s, i) => (
-                  <div key={i} style={{ background: '#fff', border: '1px solid #e2e8f0', borderRadius: 6, padding: '8px 12px' }}>
-                    <div style={{ fontSize: 11, color: '#64748b' }}>{s.label}</div>
+                  <div key={i} style={{ background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 6, padding: '8px 12px' }}>
+                    <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{s.label}</div>
                     <div style={{ fontSize: 18, fontWeight: 700, color: '#059669' }}>{s.value.toLocaleString()}</div>
                   </div>
                 ))}
               </div>
               {businessKpiResult.kpi_summary?.map((k, i) => (
-                <div key={i} style={{ marginTop: 6, fontSize: 12, color: '#475569' }}>
+                <div key={i} style={{ marginTop: 6, fontSize: 12, color: 'var(--text-secondary)' }}>
                   <strong>{k.name}:</strong> {k.rows.toLocaleString()} rows
                 </div>
               ))}

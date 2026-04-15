@@ -903,7 +903,7 @@ function CoreTab({ data, loading, onRetry }) {
               </div>
               <div style={{ height: 48, display: 'flex', alignItems: 'flex-end', gap: 3, opacity: 0.5 }}>
                 {authSparkline.map((v, i) => (
-                  <div key={i} title={`${trend.slice(-8)[i]?.date || ''}: ${v}`} style={{ flex: 1, background: '#fff', borderRadius: '2px 2px 0 0', height: `${Math.max(15, (v / maxAuthSpark) * 100)}%`, cursor: 'pointer' }} />
+                  <div key={i} title={`${trend.slice(-8)[i]?.date || ''}: ${v}`} style={{ flex: 1, background: 'rgba(255,255,255,0.7)', borderRadius: '2px 2px 0 0', height: `${Math.max(15, (v / maxAuthSpark) * 100)}%`, cursor: 'pointer' }} />
                 ))}
               </div>
             </div>

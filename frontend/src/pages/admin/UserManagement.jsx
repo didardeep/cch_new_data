@@ -3,10 +3,10 @@ import { API_BASE, apiGet, apiPost, apiPut, apiDelete, getToken } from '../../ap
 
 /* ── Customer tier config ───────────────────────────────────────────────────── */
 const TIER_CFG = {
-  platinum: { bg: '#f5f3ff', color: '#6d28d9', border: '#c4b5fd', label: 'Platinum', priority: 'Critical' },
-  gold:     { bg: '#fffbeb', color: '#b45309', border: '#fde68a', label: 'Gold',     priority: 'High'     },
-  silver:   { bg: '#f1f5f9', color: '#475569', border: '#cbd5e1', label: 'Silver',   priority: 'Medium'   },
-  bronze:   { bg: '#fff7ed', color: '#c2410c', border: '#fdba74', label: 'Bronze',   priority: 'Low'      },
+  platinum: { bg: 'rgba(109,40,217,0.12)', color: '#a78bfa', border: 'rgba(109,40,217,0.3)', label: 'Platinum', priority: 'Critical' },
+  gold:     { bg: 'rgba(245,158,11,0.12)', color: '#f59e0b', border: 'rgba(245,158,11,0.3)', label: 'Gold',     priority: 'High'     },
+  silver:   { bg: 'rgba(148,163,184,0.12)', color: '#94a3b8', border: 'rgba(148,163,184,0.3)', label: 'Silver',   priority: 'Medium'   },
+  bronze:   { bg: 'rgba(249,115,22,0.12)', color: '#f97316', border: 'rgba(249,115,22,0.3)', label: 'Bronze',   priority: 'Low'      },
 };
 
 function TierBadge({ tier }) {
@@ -171,10 +171,10 @@ function StaffTab() {
 
       {uploadResult && (
         <div style={{
-          background: uploadResult.type === 'success' ? '#ecfdf5' : '#fef2f2',
-          border: `1px solid ${uploadResult.type === 'success' ? '#a7f3d0' : '#fecaca'}`,
+          background: uploadResult.type === 'success' ? 'var(--success-bg, rgba(52,211,153,0.12))' : 'var(--danger-bg, rgba(248,113,113,0.12))',
+          border: `1px solid ${uploadResult.type === 'success' ? 'var(--success)' : 'var(--danger)'}`,
           borderRadius: 8, padding: '12px 16px', marginBottom: 16, fontSize: 13,
-          color: uploadResult.type === 'success' ? '#047857' : '#dc2626',
+          color: uploadResult.type === 'success' ? 'var(--success)' : 'var(--danger)',
         }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
             <span style={{ fontWeight: 600 }}>{uploadResult.message}</span>
@@ -195,8 +195,8 @@ function StaffTab() {
       )}
 
       {showAdd && (
-        <div style={{ background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 10, padding: 20, margin: '0 0 16px' }}>
-          <h4 style={{ fontSize: 15, fontWeight: 700, marginBottom: 14, color: '#1e293b' }}>Add New Staff User</h4>
+        <div style={{ background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 10, padding: 20, margin: '0 0 16px' }}>
+          <h4 style={{ fontSize: 15, fontWeight: 700, marginBottom: 14, color: 'var(--text)' }}>Add New Staff User</h4>
           {addError && <div className="form-error" style={{ marginBottom: 10 }}>{addError}</div>}
           <form onSubmit={handleAdd} style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
             <div className="form-group" style={{ margin: 0 }}>
@@ -329,14 +329,14 @@ function StaffTab() {
                       </div>
                     ) : deleteConfirm === u.id ? (
                       <div style={{ display: 'flex', gap: 4 }}>
-                        <button className="btn btn-sm" style={{ background: '#fef2f2', color: '#dc2626', border: '1px solid #fecaca', borderRadius: 6, fontSize: 11, padding: '4px 10px', cursor: 'pointer', fontFamily: 'inherit', fontWeight: 500 }}
+                        <button className="btn btn-sm" style={{ background: 'var(--danger-bg, rgba(248,113,113,0.12))', color: 'var(--danger)', border: '1px solid var(--danger)', borderRadius: 6, fontSize: 11, padding: '4px 10px', cursor: 'pointer', fontFamily: 'inherit', fontWeight: 500 }}
                           onClick={() => handleDelete(u.id)}>Confirm</button>
                         <button className="btn btn-ghost btn-sm" onClick={() => setDeleteConfirm(null)}>No</button>
                       </div>
                     ) : (
                       <div style={{ display: 'flex', gap: 4 }}>
                         <button className="btn btn-outline btn-sm" onClick={() => handleEdit(u)}>Edit</button>
-                        <button className="btn btn-sm" style={{ background: '#fef2f2', color: '#dc2626', border: '1px solid #fecaca', borderRadius: 6, fontSize: 11, padding: '4px 10px', cursor: 'pointer', fontFamily: 'inherit', fontWeight: 500 }}
+                        <button className="btn btn-sm" style={{ background: 'var(--danger-bg, rgba(248,113,113,0.12))', color: 'var(--danger)', border: '1px solid var(--danger)', borderRadius: 6, fontSize: 11, padding: '4px 10px', cursor: 'pointer', fontFamily: 'inherit', fontWeight: 500 }}
                           onClick={() => setDeleteConfirm(u.id)}>Delete</button>
                       </div>
                     )}
@@ -409,8 +409,8 @@ function CustomersTab() {
             key={key}
             onClick={() => setTierFilter(tierFilter === key ? '' : key)}
             style={{
-              background: tierFilter === key ? cfg.bg : '#fff',
-              border: `2px solid ${tierFilter === key ? cfg.border : '#e2e8f0'}`,
+              background: tierFilter === key ? cfg.bg : 'var(--bg-card)',
+              border: `2px solid ${tierFilter === key ? cfg.border : 'var(--border)'}`,
               borderRadius: 10, padding: '14px 16px', cursor: 'pointer',
               transition: 'all 0.15s',
             }}
@@ -418,7 +418,7 @@ function CustomersTab() {
             <div style={{ fontSize: 11, fontWeight: 700, color: cfg.color, textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 6 }}>
               {cfg.label}
             </div>
-            <div style={{ fontSize: 26, fontWeight: 800, color: '#0f172a', lineHeight: 1 }}>
+            <div style={{ fontSize: 26, fontWeight: 800, color: 'var(--text)', lineHeight: 1 }}>
               {tierCounts[key] || 0}
             </div>
             <div style={{ fontSize: 11, color: '#94a3b8', marginTop: 4 }}>
@@ -547,7 +547,7 @@ export default function UserManagement() {
       </div>
 
       {/* Tab toggle */}
-      <div style={{ display: 'flex', gap: 2, marginBottom: 20, background: '#f1f5f9', borderRadius: 10, padding: 4, width: 'fit-content' }}>
+      <div style={{ display: 'flex', gap: 2, marginBottom: 20, background: 'var(--bg)', borderRadius: 10, padding: 4, width: 'fit-content' }}>
         {[
           { key: 'staff',     label: 'Staff & Agents' },
           { key: 'customers', label: 'Customers & Tiers' },
@@ -558,8 +558,8 @@ export default function UserManagement() {
             style={{
               padding: '8px 20px', borderRadius: 8, border: 'none', cursor: 'pointer',
               fontSize: 13, fontWeight: 600, transition: 'all 0.15s',
-              background: tab === key ? '#fff' : 'transparent',
-              color: tab === key ? '#00338D' : '#64748b',
+              background: tab === key ? 'var(--bg-card)' : 'transparent',
+              color: tab === key ? 'var(--primary)' : 'var(--text-muted)',
               boxShadow: tab === key ? '0 1px 4px rgba(0,0,0,0.08)' : 'none',
               fontFamily: 'inherit',
             }}

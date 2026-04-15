@@ -181,7 +181,7 @@ export default function CTOMap() {
         .cto-marker-alert { animation: ctoAlarmPulse 1.6s ease-in-out infinite; }
       `}</style>
 
-      <div style={{ position: 'relative', height: '84vh', width: '100%', background: '#e2e8f0' }}>
+      <div style={{ position: 'relative', height: '84vh', width: '100%', background: 'var(--border, #e2e8f0)' }}>
 
         {/* ── Search bar overlay ── */}
         <div style={{ position: 'absolute', top: 12, right: 12, zIndex: 1000, width: 280 }}>
@@ -199,14 +199,14 @@ export default function CTOMap() {
               width: '100%', padding: '9px 14px', borderRadius: 10,
               border: '1px solid #cbd5e1', fontSize: 13, fontWeight: 500,
               boxShadow: '0 2px 12px rgba(0,0,0,0.12)',
-              outline: 'none', background: '#fff', boxSizing: 'border-box',
+              outline: 'none', background: 'var(--bg-card, #fff)', boxSizing: 'border-box', color: 'var(--text)',
             }}
           />
           {results.length > 0 && (
             <div style={{
-              background: '#fff', borderRadius: 10, marginTop: 4,
+              background: 'var(--bg-card, #fff)', borderRadius: 10, marginTop: 4,
               boxShadow: '0 4px 20px rgba(0,0,0,0.15)',
-              border: '1px solid #e2e8f0', overflow: 'hidden',
+              border: '1px solid var(--border)', overflow: 'hidden',
             }}>
               {results.map(s => (
                 <div
@@ -215,15 +215,15 @@ export default function CTOMap() {
                   style={{
                     padding: '8px 14px', cursor: 'pointer', fontSize: 13,
                     display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-                    borderBottom: '1px solid #f1f5f9', background: '#fff',
+                    borderBottom: '1px solid var(--border)', background: 'var(--bg-card, #fff)',
                   }}
-                  onMouseEnter={e => e.currentTarget.style.background = '#f8fafc'}
-                  onMouseLeave={e => e.currentTarget.style.background = '#fff'}
+                  onMouseEnter={e => e.currentTarget.style.background = 'var(--bg, #f8fafc)'}
+                  onMouseLeave={e => e.currentTarget.style.background = 'var(--bg-card, #fff)'}
                 >
                   <span style={{ fontWeight: 600, color: '#002266' }}>{s.site_id}</span>
                   <span style={{
                     fontSize: 11, padding: '2px 7px', borderRadius: 999, fontWeight: 600,
-                    background: ['down','off_air'].includes(String(s.status).toLowerCase()) ? '#fee2e2' : '#dcfce7',
+                    background: ['down','off_air'].includes(String(s.status).toLowerCase()) ? 'rgba(220,38,38,0.1)' : 'rgba(22,163,106,0.1)',
                     color:      ['down','off_air'].includes(String(s.status).toLowerCase()) ? '#dc2626' : '#16a34a',
                   }}>
                     {statusLabel(s.status)}

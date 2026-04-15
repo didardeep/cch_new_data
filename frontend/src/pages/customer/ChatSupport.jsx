@@ -306,7 +306,7 @@ function LiveConnectionCard({ groupId, disabled, autoStart, saveMessage, stateRe
       )}
 
       {phase === 'running' && (
-        <div style={{ fontSize: 10, color: '#8596ab', textAlign: 'center' }}>
+        <div style={{ fontSize: 10, color: 'var(--text-muted)', textAlign: 'center' }}>
           Test running — results will auto-detect when complete
         </div>
       )}
@@ -332,12 +332,12 @@ function ConnectionCheckOffer({ msgId, groupId, disabled, queryText, disableGrou
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#005EB8" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
           <path d="M1 6s4-2 11-2 11 2 11 2"/><path d="M1 10s4-2 11-2 11 2 11 2"/><circle cx="12" cy="15" r="3"/>
         </svg>
-        <span style={{ fontWeight: 700, fontSize: 14, color: '#00338D' }}>Connection issue detected</span>
+        <span style={{ fontWeight: 700, fontSize: 14, color: 'var(--primary)' }}>Connection issue detected</span>
       </div>
 
       {!showWidget && (
         <>
-          <p style={{ fontSize: 13, color: '#3d5068', margin: '0 0 14px', lineHeight: 1.6 }}>
+          <p style={{ fontSize: 13, color: 'var(--text-secondary)', margin: '0 0 14px', lineHeight: 1.6 }}>
             It looks like you're experiencing a network issue. Would you like to run a quick live connection check first?
           </p>
           <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
@@ -1574,38 +1574,38 @@ export default function ChatSupport() {
       case 'location-question':
         return (
           <div key={msg.id} style={{ background: 'rgba(0,145,218,0.12)', border: '1px solid rgba(0,145,218,0.25)', borderRadius: 10, padding: '20px 22px', margin: '6px 0', textAlign: 'center' }}>
-            <div style={{ fontWeight: 700, fontSize: 14, color: '#00338D', marginBottom: 8 }}>Location Check</div>
-            <div style={{ fontSize: 13, color: '#3d5068', marginBottom: 16, lineHeight: 1.6 }}>Are you currently at the same location where you're experiencing this issue?</div>
+            <div style={{ fontWeight: 700, fontSize: 14, color: 'var(--primary)', marginBottom: 8 }}>Location Check</div>
+            <div style={{ fontSize: 13, color: 'var(--text-secondary)', marginBottom: 16, lineHeight: 1.6 }}>Are you currently at the same location where you're experiencing this issue?</div>
             <div style={{ display: 'flex', gap: 10, justifyContent: 'center' }}>
               <button onClick={() => !isDisabled && msg.onYes && msg.onYes()} disabled={isDisabled} style={{ background: isDisabled ? '#8596ab' : '#0091DA', color: '#fff', border: 'none', borderRadius: 8, padding: '11px 26px', fontSize: 13, fontWeight: 600, cursor: isDisabled ? 'not-allowed' : 'pointer' }}>Yes, I'm here</button>
-              <button onClick={() => !isDisabled && msg.onNo && msg.onNo()} disabled={isDisabled} style={{ background: isDisabled ? '#8596ab' : '#fff', color: isDisabled ? '#fff' : '#0091DA', border: '1px solid #0091DA', borderRadius: 8, padding: '11px 26px', fontSize: 13, fontWeight: 600, cursor: isDisabled ? 'not-allowed' : 'pointer' }}>No, different location</button>
+              <button onClick={() => !isDisabled && msg.onNo && msg.onNo()} disabled={isDisabled} style={{ background: isDisabled ? '#8596ab' : 'var(--bg-card)', color: isDisabled ? '#fff' : '#0091DA', border: '1px solid #0091DA', borderRadius: 8, padding: '11px 26px', fontSize: 13, fontWeight: 600, cursor: isDisabled ? 'not-allowed' : 'pointer' }}>No, different location</button>
             </div>
           </div>
         );
       case 'location-prompt':
         return (
           <div key={msg.id} style={{ background: 'rgba(0,145,218,0.12)', borderRadius: 10, padding: '20px 22px', margin: '6px 0', textAlign: 'center', boxShadow: '0 2px 8px rgba(0,145,218,0.25)' }}>
-            <div style={{ fontWeight: 700, fontSize: 14, color: '#0f1d33', marginBottom: 8 }}>Location Access Required</div>
-            <div style={{ fontSize: 13, color: '#3d5068', marginBottom: 16, lineHeight: 1.6 }}>To diagnose your issue, we need your current location. This is <strong>required</strong> to continue.</div>
+            <div style={{ fontWeight: 700, fontSize: 14, color: 'var(--text)', marginBottom: 8 }}>Location Access Required</div>
+            <div style={{ fontSize: 13, color: 'var(--text-secondary)', marginBottom: 16, lineHeight: 1.6 }}>To diagnose your issue, we need your current location. This is <strong>required</strong> to continue.</div>
             <button onClick={() => !isDisabled && msg.onShare && msg.onShare()} disabled={isDisabled} style={{ background: isDisabled ? '#a0c4e8' : '#0091DA', color: '#fff', border: 'none', borderRadius: 8, padding: '11px 26px', fontSize: 13, fontWeight: 700, fontFamily: 'inherit', cursor: isDisabled ? 'not-allowed' : 'pointer', margin: '0 auto', display: 'flex', alignItems: 'center', gap: 8 }}>Share My Location</button>
           </div>
         );
       case 'location-required':
         return (
-          <div key={msg.id} style={{ background: '#fff', border: '1px solid #d8e0ec', borderLeft: '3px solid #c42b1c', borderRadius: 10, padding: '20px 22px', margin: '6px 0', textAlign: 'center' }}>
+          <div key={msg.id} style={{ background: 'var(--bg-card)', border: '1px solid var(--border)', borderLeft: '3px solid #c42b1c', borderRadius: 10, padding: '20px 22px', margin: '6px 0', textAlign: 'center' }}>
             <div style={{ fontWeight: 700, fontSize: 14, color: '#c42b1c', marginBottom: 8 }}>Location Access Denied</div>
-            <div style={{ fontSize: 12, color: '#8596ab', marginBottom: 16 }}>Please allow location access in your browser settings, then try again.</div>
+            <div style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 16 }}>Please allow location access in your browser settings, then try again.</div>
             <button onClick={() => !isDisabled && msg.onRetry && msg.onRetry()} disabled={isDisabled} style={{ background: isDisabled ? '#8596ab' : '#c42b1c', color: '#fff', border: 'none', borderRadius: 8, padding: '11px 26px', fontSize: 13, fontWeight: 600, fontFamily: 'inherit', cursor: isDisabled ? 'not-allowed' : 'pointer', display: 'block', margin: '0 auto' }}>Try Again</button>
           </div>
         );
       case 'location-success': {
         const hasCoords = typeof msg.latitude === 'number' && typeof msg.longitude === 'number';
         return (
-          <div key={msg.id} style={{ background: '#fff', border: '1px solid #d8e0ec', borderLeft: '3px solid #00875a', borderRadius: 10, padding: '14px 18px', margin: '6px 0', display: 'flex', alignItems: 'center', gap: 14 }}>
+          <div key={msg.id} style={{ background: 'var(--bg-card)', border: '1px solid var(--border)', borderLeft: '3px solid #00875a', borderRadius: 10, padding: '14px 18px', margin: '6px 0', display: 'flex', alignItems: 'center', gap: 14 }}>
             <div style={{ fontSize: 18, color: '#00875a', fontWeight: 700 }}>&#10003;</div>
             <div>
               <div style={{ fontWeight: 700, fontSize: 13, color: '#00875a' }}>Location Captured Successfully</div>
-              {hasCoords && <div style={{ fontSize: 12, color: '#3d5068', marginTop: 4 }}>Lat: <strong>{msg.latitude?.toFixed(6)}</strong> &nbsp;|&nbsp; Long: <strong>{msg.longitude?.toFixed(6)}</strong></div>}
+              {hasCoords && <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginTop: 4 }}>Lat: <strong>{msg.latitude?.toFixed(6)}</strong> &nbsp;|&nbsp; Long: <strong>{msg.longitude?.toFixed(6)}</strong></div>}
             </div>
           </div>
         );
@@ -1613,12 +1613,12 @@ export default function ChatSupport() {
       case 'signal-codes':
         return (
           <div key={msg.id} style={{ background: 'rgba(0,145,218,0.12)', borderRadius: 10, padding: '18px 20px', margin: '6px 0', boxShadow: '0 2px 8px rgba(0,145,218,0.25)' }}>
-            <div style={{ fontWeight: 700, fontSize: 14, color: '#0f1d33', marginBottom: 10 }}>Signal Diagnosis</div>
-            <div style={{ fontSize: 13, color: '#3d5068', lineHeight: 1.6, marginBottom: 12 }}>Dial one of these codes on your phone and take a screenshot:</div>
+            <div style={{ fontWeight: 700, fontSize: 14, color: 'var(--text)', marginBottom: 10 }}>Signal Diagnosis</div>
+            <div style={{ fontSize: 13, color: 'var(--text-secondary)', lineHeight: 1.6, marginBottom: 12 }}>Dial one of these codes on your phone and take a screenshot:</div>
             {[{ code: '*#0011#', desc: 'Samsung' }, { code: '*#*#4636#*#*', desc: 'Android' }, { code: '*3001#12345#*', desc: 'iPhone' }].map((item, i) => (
               <div key={i} style={{ background: 'rgba(0,145,218,0.1)', border: '1px solid rgba(0,145,218,0.25)', borderRadius: 8, padding: '9px 14px', display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
-                <code style={{ fontWeight: 700, color: '#0f1d33', fontSize: 14 }}>{item.code}</code>
-                <span style={{ fontSize: 11, color: '#8596ab' }}>{item.desc}</span>
+                <code style={{ fontWeight: 700, color: 'var(--text)', fontSize: 14 }}>{item.code}</code>
+                <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{item.desc}</span>
               </div>
             ))}
           </div>
@@ -1626,13 +1626,13 @@ export default function ChatSupport() {
       case 'screenshot-upload':
         return (
           <div key={msg.id} style={{ background: 'rgba(0,145,218,0.12)', borderRadius: 10, padding: '16px 20px', margin: '6px 0', textAlign: 'center', boxShadow: '0 2px 8px rgba(0,145,218,0.25)' }}>
-            <div style={{ fontSize: 13, color: '#3d5068', marginBottom: 14 }}>Upload your signal information screenshot:</div>
+            <div style={{ fontSize: 13, color: 'var(--text-secondary)', marginBottom: 14 }}>Upload your signal information screenshot:</div>
             <button onClick={() => { if (!isDisabled && !screenshotUploading) { fileInputRef.current?.click(); fileInputRef.current._groupId = msg.groupId; } }} disabled={isDisabled || screenshotUploading}
               style={{ background: isDisabled ? '#a0c4e8' : '#0091DA', color: '#fff', border: 'none', borderRadius: 8, padding: '11px 24px', fontSize: 13, fontWeight: 700, fontFamily: 'inherit', cursor: isDisabled ? 'not-allowed' : 'pointer', display: 'inline-flex', alignItems: 'center', gap: 8 }}>
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
               Upload Screenshot
             </button>
-            <div style={{ fontSize: 11, color: '#8596ab', marginTop: 8 }}>PNG, JPG, JPEG (max 5MB)</div>
+            <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 8 }}>PNG, JPG, JPEG (max 5MB)</div>
           </div>
         );
       case 'broadband-diagnostic': {
@@ -1640,16 +1640,16 @@ export default function ChatSupport() {
         const planSpeed = msg.planSpeed || billing.plan_speed_mbps || null;
         const accountActive = billing.account_active !== false;
         return (
-          <div key={msg.id} style={{ background: '#f7f9fc', border: '1px solid #d8e0ec', borderLeft: '4px solid #00338d', borderRadius: 12, padding: '16px 18px', margin: '8px 0' }}>
-            <div style={{ fontWeight: 700, fontSize: 14, color: '#0f1d33', marginBottom: 6 }}>Billing & Plan Details</div>
-            <div style={{ background: '#fff', border: '1px solid #d8e0ec', borderRadius: 10, padding: '12px 14px', marginTop: 10 }}>
-              <div style={{ fontSize: 11, letterSpacing: '0.04em', color: '#00338d', fontWeight: 700, textTransform: 'uppercase', marginBottom: 6 }}>Plan Details</div>
+          <div key={msg.id} style={{ background: 'var(--bg)', border: '1px solid var(--border)', borderLeft: '4px solid var(--primary)', borderRadius: 12, padding: '16px 18px', margin: '8px 0' }}>
+            <div style={{ fontWeight: 700, fontSize: 14, color: 'var(--text)', marginBottom: 6 }}>Billing & Plan Details</div>
+            <div style={{ background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 10, padding: '12px 14px', marginTop: 10 }}>
+              <div style={{ fontSize: 11, letterSpacing: '0.04em', color: 'var(--primary)', fontWeight: 700, textTransform: 'uppercase', marginBottom: 6 }}>Plan Details</div>
               {errors.billing ? <div style={{ color: '#c42b1c', fontSize: 12 }}>{errors.billing}</div> : (
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: '8px 12px', fontSize: 12, color: '#1a2b42' }}>
-                  <div><span style={{ color: '#8596ab' }}>Plan:</span> <strong>{billing.plan_name || 'Not on record'}</strong></div>
-                  <div><span style={{ color: '#8596ab' }}>Speed:</span> <strong>{planSpeed != null ? `${planSpeed} Mbps` : 'Not on record'}</strong></div>
-                  <div><span style={{ color: '#8596ab' }}>Account:</span> <strong style={{ color: accountActive ? '#0f1d33' : '#c42b1c' }}>{accountActive ? 'Active' : 'Inactive'}</strong></div>
-                  <div><span style={{ color: '#8596ab' }}>Bill Paid:</span> <strong style={{ color: billing.bill_paid === false ? '#c42b1c' : '#0f1d33' }}>{billing.bill_paid === false ? 'No' : 'Yes'}</strong></div>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: '8px 12px', fontSize: 12, color: 'var(--text)' }}>
+                  <div><span style={{ color: 'var(--text-muted)' }}>Plan:</span> <strong>{billing.plan_name || 'Not on record'}</strong></div>
+                  <div><span style={{ color: 'var(--text-muted)' }}>Speed:</span> <strong>{planSpeed != null ? `${planSpeed} Mbps` : 'Not on record'}</strong></div>
+                  <div><span style={{ color: 'var(--text-muted)' }}>Account:</span> <strong style={{ color: accountActive ? 'var(--text)' : '#c42b1c' }}>{accountActive ? 'Active' : 'Inactive'}</strong></div>
+                  <div><span style={{ color: 'var(--text-muted)' }}>Bill Paid:</span> <strong style={{ color: billing.bill_paid === false ? '#c42b1c' : 'var(--text)' }}>{billing.bill_paid === false ? 'No' : 'Yes'}</strong></div>
                 </div>
               )}
             </div>
@@ -1657,32 +1657,32 @@ export default function ChatSupport() {
         );
       }
       case 'user-image':
-        return <div key={msg.id} style={{ display: 'flex', justifyContent: 'flex-end' }}><div style={{ maxWidth: 240, borderRadius: 12, overflow: 'hidden', border: '1px solid #d8e0ec' }}><img src={msg.imageSrc} alt="Uploaded screenshot" style={{ width: '100%', display: 'block' }} /></div></div>;
+        return <div key={msg.id} style={{ display: 'flex', justifyContent: 'flex-end' }}><div style={{ maxWidth: 240, borderRadius: 12, overflow: 'hidden', border: '1px solid var(--border)' }}><img src={msg.imageSrc} alt="Uploaded screenshot" style={{ width: '100%', display: 'block' }} /></div></div>;
       case 'diagnosis-result': {
         const d = msg.diagnosis;
         const overallColor = { green: '#00875a', amber: '#c87d0a', red: '#c42b1c', unknown: '#8596ab' };
-        const overallBg = { green: '#f0fdf4', amber: '#fffbeb', red: '#fef2f2', unknown: '#f7f9fc' };
+        const overallBg = { green: 'rgba(0,135,90,0.08)', amber: 'rgba(200,125,10,0.08)', red: 'rgba(196,43,28,0.08)', unknown: 'var(--bg)' };
         const status = d.overall_status || 'unknown';
         return (
-          <div key={msg.id} style={{ background: overallBg[status], border: '1px solid #d8e0ec', borderLeft: `4px solid ${overallColor[status]}`, borderRadius: 10, padding: '18px 20px', margin: '6px 0' }}>
+          <div key={msg.id} style={{ background: overallBg[status], border: '1px solid var(--border)', borderLeft: `4px solid ${overallColor[status]}`, borderRadius: 10, padding: '18px 20px', margin: '6px 0' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10 }}>
               <div style={{ background: overallColor[status], color: '#fff', borderRadius: 12, padding: '4px 14px', fontSize: 12, fontWeight: 700 }}>Signal: {d.overall_label || 'Unknown'}</div>
               {d.is_busy_hour && <div style={{ background: '#c87d0a', color: '#fff', borderRadius: 12, padding: '4px 14px', fontSize: 12, fontWeight: 700 }}>Peak Hours</div>}
             </div>
-            <div style={{ fontSize: 13, color: '#1a2b42', lineHeight: 1.6 }}>{d.summary}</div>
+            <div style={{ fontSize: 13, color: 'var(--text)', lineHeight: 1.6 }}>{d.summary}</div>
             {d.nearest_sites?.length > 0 && (
-              <div style={{ marginTop: 14, borderTop: '1px solid #d8e0ec', paddingTop: 14 }}>
-                <div style={{ fontSize: 12, fontWeight: 700, color: '#00338D', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 10 }}>Nearest Tower Sites</div>
+              <div style={{ marginTop: 14, borderTop: '1px solid var(--border)', paddingTop: 14 }}>
+                <div style={{ fontSize: 12, fontWeight: 700, color: 'var(--primary)', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 10 }}>Nearest Tower Sites</div>
                 {d.nearest_sites.map((site, idx) => {
                   const sc = site.status === 'ON AIR' ? '#00875a' : '#c42b1c';
                   return (
-                    <div key={idx} style={{ background: '#fff', border: '1px solid #d8e0ec', borderRadius: 8, padding: '12px 14px', marginBottom: idx < d.nearest_sites.length - 1 ? 8 : 0 }}>
+                    <div key={idx} style={{ background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 8, padding: '12px 14px', marginBottom: idx < d.nearest_sites.length - 1 ? 8 : 0 }}>
                       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
-                        <span style={{ fontWeight: 700, fontSize: 13, color: '#0f1d33' }}>{site.site_id}</span>
+                        <span style={{ fontWeight: 700, fontSize: 13, color: 'var(--text)' }}>{site.site_id}</span>
                         <span style={{ fontSize: 11, fontWeight: 700, color: sc, background: site.status === 'ON AIR' ? 'rgba(0,135,90,0.08)' : 'rgba(196,43,28,0.08)', padding: '2px 10px', borderRadius: 6 }}>{site.status}</span>
                       </div>
-                      <div style={{ fontSize: 12, color: '#3d5068', lineHeight: 1.5 }}><span style={{ color: '#8596ab' }}>Distance:</span> {site.distance_km} km{site.alarm && site.alarm !== 'None' ? ` | Alarm: ${site.alarm}` : ''}</div>
-                      {site.solution && site.solution !== 'No action required' && <div style={{ fontSize: 12, color: '#00338D', marginTop: 4, fontWeight: 600 }}>Action: {site.solution}</div>}
+                      <div style={{ fontSize: 12, color: 'var(--text-secondary)', lineHeight: 1.5 }}><span style={{ color: 'var(--text-muted)' }}>Distance:</span> {site.distance_km} km{site.alarm && site.alarm !== 'None' ? ` | Alarm: ${site.alarm}` : ''}</div>
+                      {site.solution && site.solution !== 'No action required' && <div style={{ fontSize: 12, color: 'var(--primary)', marginTop: 4, fontWeight: 600 }}>Action: {site.solution}</div>}
                     </div>
                   );
                 })}
@@ -1728,7 +1728,7 @@ export default function ChatSupport() {
             <div className="handoff-row"><span className="h-label">Issue Type</span><span className="h-value">{msg.subprocessName}</span></div>
             <div className="handoff-row"><span className="h-label">Complaint</span><span className="h-value">{msg.queryText}</span></div>
             {msg.assignedAgent
-              ? <><div className="handoff-row"><span className="h-label">Status</span><span className="h-value" style={{ color: '#22c55e', fontWeight: 700 }}>Agent Assigned</span></div><div style={{ background: '#eff6ff', border: '1px solid #bfdbfe', borderRadius: 8, padding: '10px 14px', margin: '10px 0 6px' }}><div style={{ fontSize: 14, fontWeight: 700 }}>{msg.assignedAgent.name}</div>{msg.assignedAgent.phone && <div style={{ fontSize: 13, color: '#0ea5e9', marginTop: 4 }}>Phone: {msg.assignedAgent.phone}</div>}</div></>
+              ? <><div className="handoff-row"><span className="h-label">Status</span><span className="h-value" style={{ color: '#22c55e', fontWeight: 700 }}>Agent Assigned</span></div><div style={{ background: 'var(--primary-glow, #eff6ff)', border: '1px solid var(--border)', borderRadius: 8, padding: '10px 14px', margin: '10px 0 6px' }}><div style={{ fontSize: 14, fontWeight: 700 }}>{msg.assignedAgent.name}</div>{msg.assignedAgent.phone && <div style={{ fontSize: 13, color: '#0ea5e9', marginTop: 4 }}>Phone: {msg.assignedAgent.phone}</div>}</div></>
               : <div className="handoff-row"><span className="h-label">Status</span><span className="h-value status-pending">Pending Agent Assignment</span></div>
             }
             <div className="handoff-ref">Reference No: {msg.refNum}</div>
@@ -1737,12 +1737,12 @@ export default function ChatSupport() {
       case 'live-agent-message':
         return (
           <div key={msg.id} style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', maxWidth: '80%' }}>
-            <div style={{ fontSize: 10, color: '#00338d', fontWeight: 600, marginBottom: 4, display: 'flex', alignItems: 'center', gap: 4 }}>
+            <div style={{ fontSize: 10, color: 'var(--primary)', fontWeight: 600, marginBottom: 4, display: 'flex', alignItems: 'center', gap: 4 }}>
               <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
               Support Agent
               {msg.timestamp && <span style={{ opacity: 0.6, fontWeight: 400 }}>· {new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>}
             </div>
-            <div style={{ background: '#eff6ff', border: '1px solid #93c5fd', borderRadius: '4px 16px 16px 16px', padding: '10px 14px', fontSize: 13, color: '#1e293b', lineHeight: 1.6, wordBreak: 'break-word' }}>{msg.text}</div>
+            <div style={{ background: 'var(--primary-glow, #eff6ff)', border: '1px solid var(--border)', borderRadius: '4px 16px 16px 16px', padding: '10px 14px', fontSize: 13, color: 'var(--text)', lineHeight: 1.6, wordBreak: 'break-word' }}>{msg.text}</div>
           </div>
         );
       case 'agent-resolved':
@@ -1752,7 +1752,7 @@ export default function ChatSupport() {
               <div style={{ width: 36, height: 36, borderRadius: '50%', background: '#22c55e', display: 'flex', alignItems: 'center', justifyContent: 'center' }}><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg></div>
               <div><div style={{ fontWeight: 700, fontSize: 15, color: '#15803d' }}>Issue Resolved</div><div style={{ fontSize: 11, color: '#16a34a', marginTop: 2 }}>Your support ticket has been closed</div></div>
             </div>
-            <p style={{ margin: '0 0 16px', fontSize: 13, color: '#1e293b', lineHeight: 1.65 }}>{msg.botMessage}</p>
+            <p style={{ margin: '0 0 16px', fontSize: 13, color: 'var(--text)', lineHeight: 1.65 }}>{msg.botMessage}</p>
             <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
               <button className="action-btn menu-btn" onClick={() => !isDisabled && handleBackToMenu(msg.groupId)}>Main Menu</button>
               <button className="action-btn exit-btn" onClick={() => !isDisabled && handleExit(msg.groupId)}>Exit Chat</button>
@@ -1813,29 +1813,29 @@ export default function ChatSupport() {
                   style={{
                     display: 'flex', justifyContent: 'space-between', alignItems: 'center',
                     padding: '12px 16px', margin: '6px 0', borderRadius: 10, cursor: 'pointer',
-                    background: idx === currentFbIdx ? '#eff6ff' : '#f8fafc',
-                    border: idx === currentFbIdx ? '2px solid #3b82f6' : '1px solid #e2e8f0',
+                    background: idx === currentFbIdx ? 'var(--primary-glow, #eff6ff)' : 'var(--bg)',
+                    border: idx === currentFbIdx ? '2px solid var(--primary)' : '1px solid var(--border)',
                     transition: 'all 0.15s',
                   }}
                 >
                   <div>
-                    <div style={{ fontWeight: 600, fontSize: 13, color: '#1e293b' }}>
+                    <div style={{ fontWeight: 600, fontSize: 13, color: 'var(--text)' }}>
                       Ticket #{s.ticket_id} — {s.subprocess_name || s.sector_name || 'Support'}
                     </div>
-                    <div style={{ fontSize: 11, color: '#64748b', marginTop: 2 }}>
+                    <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 2 }}>
                       {s.query_text ? (s.query_text.length > 80 ? s.query_text.slice(0, 80) + '...' : s.query_text) : 'No description'}
                     </div>
                   </div>
-                  <div style={{ fontSize: 11, color: '#94a3b8', whiteSpace: 'nowrap', marginLeft: 12 }}>
+                  <div style={{ fontSize: 11, color: 'var(--text-muted)', whiteSpace: 'nowrap', marginLeft: 12 }}>
                     {s.resolved_at ? new Date(s.resolved_at).toLocaleDateString() : ''}
                   </div>
                 </div>
               ))}
             </div>
-            <p style={{ fontSize: 12, color: '#64748b', marginBottom: 8 }}>Click a session above, then rate below</p>
+            <p style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 8 }}>Click a session above, then rate below</p>
             {/* Rating form inline */}
-            <div style={{ width: '100%', background: '#f0f4ff', borderRadius: 10, padding: '16px', border: '1px solid #c7d2fe' }}>
-              <div style={{ fontWeight: 600, fontSize: 13, color: '#1e293b', marginBottom: 8 }}>
+            <div style={{ width: '100%', background: 'var(--bg)', borderRadius: 10, padding: '16px', border: '1px solid var(--border)' }}>
+              <div style={{ fontWeight: 600, fontSize: 13, color: 'var(--text)', marginBottom: 8 }}>
                 Rate: Ticket #{session.ticket_id} — {session.subprocess_name || session.sector_name || 'Support'}
               </div>
               <div style={{ display: 'flex', gap: 6, marginBottom: 10 }}>
@@ -1847,7 +1847,7 @@ export default function ChatSupport() {
                     }}
                   >&#9733;</button>
                 ))}
-                <span style={{ fontSize: 12, color: '#64748b', alignSelf: 'center', marginLeft: 4 }}>
+                <span style={{ fontSize: 12, color: 'var(--text-muted)', alignSelf: 'center', marginLeft: 4 }}>
                   {fbRating > 0 ? `${fbRating}/5` : ''}
                 </span>
               </div>
@@ -1857,7 +1857,7 @@ export default function ChatSupport() {
                 onChange={e => setFbComment(e.target.value)}
                 rows={2}
                 style={{
-                  width: '100%', borderRadius: 8, border: '1px solid #e2e8f0', padding: '8px 12px',
+                  width: '100%', borderRadius: 8, border: '1px solid var(--border)', padding: '8px 12px',
                   fontSize: 13, resize: 'none', marginBottom: 10, fontFamily: 'inherit',
                 }}
               />
@@ -1866,7 +1866,7 @@ export default function ChatSupport() {
                 disabled={fbRating === 0 || fbSubmitting}
                 style={{
                   width: '100%', padding: '10px', borderRadius: 8, fontWeight: 600, fontSize: 13,
-                  background: fbRating > 0 ? '#3b82f6' : '#e2e8f0',
+                  background: fbRating > 0 ? 'var(--primary)' : 'var(--border)',
                   color: fbRating > 0 ? '#fff' : '#94a3b8',
                   border: 'none', cursor: fbRating > 0 ? 'pointer' : 'not-allowed',
                 }}
@@ -1885,12 +1885,12 @@ export default function ChatSupport() {
         <div className="gate-card resume-gate" style={{ maxWidth: 460 }}>
           <div className="gate-icon" style={{ fontSize: 32 }}>&#9733;</div>
           <h2 className="gate-title">Rate Your Experience ({current}/{total})</h2>
-          <div style={{ width: '100%', background: '#f0f4ff', borderRadius: 10, padding: '16px', border: '1px solid #c7d2fe', marginBottom: 16 }}>
-            <div style={{ fontWeight: 600, fontSize: 13, color: '#1e293b' }}>
+          <div style={{ width: '100%', background: 'var(--bg)', borderRadius: 10, padding: '16px', border: '1px solid var(--border)', marginBottom: 16 }}>
+            <div style={{ fontWeight: 600, fontSize: 13, color: 'var(--text)' }}>
               Ticket #{session.ticket_id} — {session.subprocess_name || session.sector_name || 'Support'}
             </div>
             {session.query_text && (
-              <div style={{ fontSize: 12, color: '#64748b', marginTop: 4 }}>
+              <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 4 }}>
                 {session.query_text.length > 100 ? session.query_text.slice(0, 100) + '...' : session.query_text}
               </div>
             )}
@@ -1911,7 +1911,7 @@ export default function ChatSupport() {
             onChange={e => setFbComment(e.target.value)}
             rows={2}
             style={{
-              width: '100%', borderRadius: 8, border: '1px solid #e2e8f0', padding: '8px 12px',
+              width: '100%', borderRadius: 8, border: '1px solid var(--border)', padding: '8px 12px',
               fontSize: 13, resize: 'none', marginBottom: 12, fontFamily: 'inherit',
             }}
           />
@@ -1920,7 +1920,7 @@ export default function ChatSupport() {
             disabled={fbRating === 0 || fbSubmitting}
             style={{
               width: '100%', padding: '10px', borderRadius: 8, fontWeight: 600, fontSize: 13,
-              background: fbRating > 0 ? '#3b82f6' : '#e2e8f0',
+              background: fbRating > 0 ? 'var(--primary)' : 'var(--border)',
               color: fbRating > 0 ? '#fff' : '#94a3b8',
               border: 'none', cursor: fbRating > 0 ? 'pointer' : 'not-allowed',
             }}
