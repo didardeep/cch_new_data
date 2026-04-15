@@ -17,25 +17,26 @@ def register_socket_handlers(socketio, app):
     """Register all SocketIO event handlers on the given socketio instance."""
 
     @socketio.on("connect")
-    def handle_socket_connect(auth_data=None):
-        """Reject WebSocket connections without a valid JWT."""
+    def handle_socket_connect(auth=None):
+        """
+        Validate JWT on WebSocket connect.
+        Flask-SocketIO 5.x passes the client's auth payload as the first arg.
+        If token is missing or invalid, reject the connection (return False).
+        """
         token = None
-        if auth_data and isinstance(auth_data, dict):
-            token = auth_data.get("token")
+        if auth and isinstance(auth, dict):
+            token = auth.get("token")
         if not token:
             return False
 
-        with app.app_context():
-            user = validate_socket_token(token)
-            if not user:
-                return False
-
-        from flask import request as flask_request
-        flask_request.socket_user = user.to_dict()
+        user = validate_socket_token(token)
+        if not user:
+            return False
+        # Connection accepted — user is authenticated
 
     @socketio.on("join_session")
     def handle_join_session(data):
-        """Join a chat room. Token already validated on connect."""
+        """Join a chat room so this client receives session-specific messages."""
         session_id = data.get("session_id") if data else None
         if session_id:
             join_room(f"session_{session_id}")

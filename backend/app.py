@@ -1756,11 +1756,13 @@ def add_chat_message(session_id):
     session.last_message_at = datetime.now(timezone.utc)  # ← keeps session timestamp fresh
 
     db.session.commit()
-    return jsonify({"message": msg.to_dict()})
-# ═══════════════════════════════════════════════════════════════════
-# ADD THIS NEW ROUTE to app.py
-# Place it right after the add_chat_message route
-# ═══════════════════════════════════════════════════════════════════
+
+    # Push to WebSocket so the agent sees customer messages in real-time
+    msg_dict = msg.to_dict()
+    msg_dict["session_id"] = session_id
+    socketio.emit("new_message", msg_dict, room=f"session_{session_id}")
+
+    return jsonify({"message": msg_dict})
 
 @app.route("/api/chat/session/<int:session_id>/location", methods=["POST"])
 @jwt_required()
@@ -7587,6 +7589,13 @@ def agent_resolve_ticket(ticket_id):
 
     db.session.commit()
 
+    # Push session_updated via WebSocket so customer UI updates instantly
+    if chat_session:
+        socketio.emit("session_updated", {
+            "session_id": ticket.chat_session_id,
+            "status": "resolved",
+        }, room=f"session_{ticket.chat_session_id}")
+
     # ── Notify customer via Email ──
     customer_user = User.query.get(ticket.user_id)
     if customer_user and customer_user.email:
@@ -8037,7 +8046,13 @@ def agent_send_message(session_id):
         assigned_ticket.first_response_at = datetime.now(timezone.utc)
 
     db.session.commit()
-    return jsonify({"message": msg.to_dict()}), 201
+
+    # Push to WebSocket so the customer sees agent messages in real-time
+    msg_dict = msg.to_dict()
+    msg_dict["session_id"] = session_id
+    socketio.emit("new_message", msg_dict, room=f"session_{session_id}")
+
+    return jsonify({"message": msg_dict}), 201
 
 
 # ── SLA Alert Helper ────────────────────────────────────────────────────────────

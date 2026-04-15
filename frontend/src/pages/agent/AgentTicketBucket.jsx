@@ -19,10 +19,10 @@ const IC = {
 
 /* ── Customer tier config ────────────────────────────────────────────────────────── */
 const TIER_CFG = {
-  platinum: { bg: '#f5f3ff', color: '#6d28d9', border: '#c4b5fd', label: 'Platinum' },
-  gold:     { bg: '#fffbeb', color: '#b45309', border: '#fde68a', label: 'Gold'     },
-  silver:   { bg: '#f1f5f9', color: '#475569', border: '#cbd5e1', label: 'Silver'   },
-  bronze:   { bg: '#fff7ed', color: '#c2410c', border: '#fdba74', label: 'Bronze'   },
+  platinum: { bg: 'rgba(109,40,217,0.12)', color: '#a78bfa', border: 'rgba(109,40,217,0.3)', label: 'Platinum' },
+  gold:     { bg: 'rgba(245,158,11,0.12)', color: '#f59e0b', border: 'rgba(245,158,11,0.3)', label: 'Gold'     },
+  silver:   { bg: 'rgba(148,163,184,0.12)', color: '#94a3b8', border: 'rgba(148,163,184,0.3)', label: 'Silver'   },
+  bronze:   { bg: 'rgba(249,115,22,0.12)', color: '#f97316', border: 'rgba(249,115,22,0.3)', label: 'Bronze'   },
 };
 
 /* ── Priority config ────────────────────────────────────────────────────────────── */
@@ -123,7 +123,7 @@ function SlaTimer({ deadline, slaHours, status, resolvedAt, slaBreached }) {
 function Modal({ title, onClose, width = 560, children }) {
   return (
     <div style={{ position: 'fixed', inset: 0, background: 'rgba(15,23,42,0.45)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 }}>
-      <div style={{ background: '#fff', borderRadius: 'var(--radius-lg)', width, maxWidth: '92vw', maxHeight: '88vh', overflowY: 'auto', boxShadow: 'var(--shadow-lg)' }}>
+      <div style={{ background: 'var(--bg-card)', borderRadius: 'var(--radius-lg)', width, maxWidth: '92vw', maxHeight: '88vh', overflowY: 'auto', boxShadow: 'var(--shadow-lg)' }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '18px 24px', borderBottom: '1px solid var(--border)' }}>
           <h3 style={{ margin: 0, fontSize: 16, fontWeight: 700, color: 'var(--text)' }}>{title}</h3>
           <button onClick={onClose} style={{ border: 'none', background: 'var(--bg)', borderRadius: 6, width: 28, height: 28, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--text-secondary)' }}>{IC.x}</button>
@@ -182,7 +182,7 @@ function Customer360Modal({ customerId, onClose }) {
 
           {/* Location */}
           {data.location && (
-            <div style={{ padding: '10px 14px', background: 'var(--success-bg)', border: '1px solid #a7f3d0', borderRadius: 'var(--radius-sm)', marginBottom: 14 }}>
+            <div style={{ padding: '10px 14px', background: 'var(--success-bg)', border: '1px solid var(--success)', borderRadius: 'var(--radius-sm)', marginBottom: 14 }}>
               <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--success)', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 4 }}>Last Known Location</div>
               <div style={{ fontSize: 13, color: 'var(--text)' }}>Lat: {data.location.latitude?.toFixed(4)}, Lng: {data.location.longitude?.toFixed(4)}</div>
             </div>
@@ -342,16 +342,16 @@ function RcaPointsList({ text }) {
           display: 'flex',
           gap: 12,
           padding: '12px 15px',
-          background: '#f8fafc',
-          border: '1px solid #e2e8f0',
-          borderLeft: '3px solid #00338D',
+          background: 'var(--bg)',
+          border: '1px solid var(--border)',
+          borderLeft: '3px solid var(--primary)',
           borderRadius: '0 8px 8px 0',
           lineHeight: 1.7,
         }}>
           {/* Numbered circle */}
           <div style={{
             minWidth: 24, height: 24, borderRadius: '50%',
-            background: '#00338D', color: '#fff',
+            background: 'var(--primary)', color: '#fff',
             fontSize: 11, fontWeight: 700,
             display: 'flex', alignItems: 'center', justifyContent: 'center',
             flexShrink: 0, marginTop: 2,
@@ -359,9 +359,9 @@ function RcaPointsList({ text }) {
             {p.index}
           </div>
           {/* Content */}
-          <div style={{ flex: 1, minWidth: 0, fontSize: 13.5, color: '#334155', wordBreak: 'break-word' }}>
+          <div style={{ flex: 1, minWidth: 0, fontSize: 13.5, color: 'var(--text-secondary)', wordBreak: 'break-word' }}>
             {p.title
-              ? <><span style={{ fontWeight: 700, color: '#0f172a' }}>{p.title}: </span><span>{renderInlineBold(p.body)}</span></>
+              ? <><span style={{ fontWeight: 700, color: 'var(--text)' }}>{p.title}: </span><span>{renderInlineBold(p.body)}</span></>
               : <span>{renderInlineBold(p.raw)}</span>
             }
           </div>
@@ -784,9 +784,9 @@ function NetworkDiagnosisModal({ ticket, onClose }) {
           <button key={t.key} onClick={() => setTab(t.key)} style={{
             padding: '7px 14px', borderRadius: 6, fontSize: 12, fontWeight: 600,
             border: '1px solid', cursor: 'pointer',
-            background: tab === t.key ? '#00338D' : '#fff',
-            color:      tab === t.key ? '#fff'    : '#475569',
-            borderColor: tab === t.key ? '#00338D' : '#e2e8f0',
+            background: tab === t.key ? 'var(--primary)' : 'var(--bg-card)',
+            color:      tab === t.key ? '#fff'    : 'var(--text-secondary)',
+            borderColor: tab === t.key ? 'var(--primary)' : 'var(--border)',
           }}>
             {t.label}
           </button>
@@ -796,9 +796,9 @@ function NetworkDiagnosisModal({ ticket, onClose }) {
       {sitesLoading ? (
         <div className="page-loader" style={{ height: 200 }}><div className="spinner" /></div>
       ) : sitesError ? (
-        <div style={{ textAlign: 'center', padding: 40, color: '#dc2626' }}>
+        <div style={{ textAlign: 'center', padding: 40, color: 'var(--danger)' }}>
           <p style={{ fontWeight: 600, margin: '0 0 8px' }}>Unable to load site data</p>
-          <p style={{ fontSize: 13, color: '#64748b', margin: 0 }}>{sitesError}</p>
+          <p style={{ fontSize: 13, color: 'var(--text-muted)', margin: 0 }}>{sitesError}</p>
         </div>
       ) : (
         <>
@@ -810,9 +810,9 @@ function NetworkDiagnosisModal({ ticket, onClose }) {
             <div>
               <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
                 <thead>
-                  <tr style={{ background: '#f8fafc', borderBottom: '2px solid #e2e8f0' }}>
+                  <tr style={{ background: 'var(--bg)', borderBottom: '2px solid var(--border)' }}>
                     {['#', 'Site ID', 'Latitude', 'Longitude', 'Zone', 'Status', 'Alarms', 'Solution'].map(h => (
-                      <th key={h} style={{ padding: '10px 12px', textAlign: 'left', fontSize: 11, fontWeight: 700, color: '#64748b', textTransform: 'uppercase', letterSpacing: '0.05em' }}>{h}</th>
+                      <th key={h} style={{ padding: '10px 12px', textAlign: 'left', fontSize: 11, fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>{h}</th>
                     ))}
                   </tr>
                 </thead>
@@ -820,9 +820,9 @@ function NetworkDiagnosisModal({ ticket, onClose }) {
                   {sites.map((s, i) => {
                     const isOffAir = (s.site_status || '').toLowerCase() === 'off_air';
                     return (
-                      <tr key={s.site_id} style={{ borderBottom: '1px solid #f1f5f9', background: i === 0 ? '#eff6ff' : '#fff' }}>
+                      <tr key={s.site_id} style={{ borderBottom: '1px solid var(--border-light)', background: i === 0 ? 'var(--primary-glow)' : 'var(--bg-card)' }}>
                         <td style={{ padding: '10px 12px', fontWeight: 700 }}>{i + 1}</td>
-                        <td style={{ padding: '10px 12px', fontWeight: 600, color: '#00338D' }}>{s.site_id}</td>
+                        <td style={{ padding: '10px 12px', fontWeight: 600, color: 'var(--primary)' }}>{s.site_id}</td>
                         <td style={{ padding: '10px 12px' }}>{s.latitude?.toFixed(5)}</td>
                         <td style={{ padding: '10px 12px' }}>{s.longitude?.toFixed(5)}</td>
                         <td style={{ padding: '10px 12px' }}>{s.zone || 'N/A'}</td>
@@ -850,7 +850,7 @@ function NetworkDiagnosisModal({ ticket, onClose }) {
                 </tbody>
               </table>
               {customer && (
-                <div style={{ marginTop: 12, fontSize: 12, color: '#64748b' }}>
+                <div style={{ marginTop: 12, fontSize: 12, color: 'var(--text-muted)' }}>
                   Customer Location: {customer.latitude?.toFixed(5)}, {customer.longitude?.toFixed(5)}
                 </div>
               )}
@@ -866,9 +866,9 @@ function NetworkDiagnosisModal({ ticket, onClose }) {
                   <button key={lv.key} onClick={() => { setTrendLevel(lv.key); setTrends(null); }} style={{
                     padding: '8px 18px', borderRadius: 8, fontSize: 13, fontWeight: 700,
                     border: '2px solid', cursor: 'pointer',
-                    background: trendLevel === lv.key ? '#00338D' : '#fff',
-                    color:      trendLevel === lv.key ? '#fff' : '#00338D',
-                    borderColor: '#00338D',
+                    background: trendLevel === lv.key ? 'var(--primary)' : 'var(--bg-card)',
+                    color:      trendLevel === lv.key ? '#fff' : 'var(--primary)',
+                    borderColor: 'var(--primary)',
                   }}>
                     {lv.label}
                   </button>
@@ -881,9 +881,9 @@ function NetworkDiagnosisModal({ ticket, onClose }) {
                   <button key={p} onClick={() => setTrendPeriod(p)} style={{
                     padding: '5px 12px', borderRadius: 5, fontSize: 11, fontWeight: 600,
                     border: '1px solid', cursor: 'pointer',
-                    background:  trendPeriod === p ? '#0f172a' : '#fff',
-                    color:       trendPeriod === p ? '#fff' : '#475569',
-                    borderColor: trendPeriod === p ? '#0f172a' : '#e2e8f0',
+                    background:  trendPeriod === p ? 'var(--text)' : 'var(--bg-card)',
+                    color:       trendPeriod === p ? 'var(--bg-card)' : 'var(--text-secondary)',
+                    borderColor: trendPeriod === p ? 'var(--text)' : 'var(--border)',
                   }}>
                     {PERIOD_LABELS[p]}
                   </button>
@@ -1031,13 +1031,13 @@ function NetworkDiagnosisModal({ ticket, onClose }) {
           </div>
           <div style={{ marginBottom: 12 }}>
             <div style={{ fontSize: 11, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 6 }}>Active Alarms</div>
-            <div style={{ background: '#fff7ed', border: '1px solid #fed7aa', borderRadius: 8, padding: 12, fontSize: 13, lineHeight: 1.6 }}>
+            <div style={{ background: 'var(--warning-bg)', border: '1px solid var(--warning)', borderRadius: 8, padding: 12, fontSize: 13, lineHeight: 1.6, color: 'var(--text)' }}>
               {solutionSite.alarms || 'No active alarms'}
             </div>
           </div>
           <div>
             <div style={{ fontSize: 11, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 6 }}>Recommended Solution</div>
-            <div style={{ background: '#eff6ff', border: '1px solid #bfdbfe', borderRadius: 8, padding: 12, fontSize: 13, lineHeight: 1.7, whiteSpace: 'pre-wrap' }}>
+            <div style={{ background: 'var(--primary-glow)', border: '1px solid var(--primary)', borderRadius: 8, padding: 12, fontSize: 13, lineHeight: 1.7, whiteSpace: 'pre-wrap', color: 'var(--text)' }}>
               {solutionSite.solution || 'No solution available for this site.'}
             </div>
           </div>
@@ -1164,21 +1164,21 @@ function TrendMiniChart({ kpiName, data, color = '#00338D' }) {
   };
 
   return (
-    <div style={{ background: '#ffffff', border: '1px solid #e2e8f0', borderRadius: 10, padding: '12px 14px', height: 210,
-      boxShadow: '0 1px 4px rgba(0,0,0,.04)', transition: 'box-shadow .2s' }}
-      onMouseEnter={e=>e.currentTarget.style.boxShadow='0 4px 16px rgba(0,51,141,.1)'}
-      onMouseLeave={e=>e.currentTarget.style.boxShadow='0 1px 4px rgba(0,0,0,.04)'}>
+    <div style={{ background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 10, padding: '12px 14px', height: 210,
+      boxShadow: 'var(--shadow-sm)', transition: 'box-shadow .2s' }}
+      onMouseEnter={e=>e.currentTarget.style.boxShadow='var(--shadow-md)'}
+      onMouseLeave={e=>e.currentTarget.style.boxShadow='var(--shadow-sm)'}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
-        <span style={{ fontSize: 11.5, fontWeight: 700, color: '#1e293b' }}>{kpiName}</span>
-        {dropIdx.size > 0 && <span style={{ fontSize: 8, padding: '1px 6px', borderRadius: 8, background: '#fef2f2', color: '#dc2626', fontWeight: 700 }}>
+        <span style={{ fontSize: 11.5, fontWeight: 700, color: 'var(--text)' }}>{kpiName}</span>
+        {dropIdx.size > 0 && <span style={{ fontSize: 8, padding: '1px 6px', borderRadius: 8, background: 'var(--danger-bg)', color: 'var(--danger)', fontWeight: 700 }}>
           {dropIdx.size} drop{dropIdx.size>1?'s':''}
         </span>}
       </div>
       {/* Stats row */}
-      <div style={{ display: 'flex', gap: 12, marginBottom: 4, fontSize: 9, color: '#64748b' }}>
-        <span>Avg: <b style={{color:'#1e293b'}}>{avg.toFixed(1)}</b></span>
-        <span>Min: <b style={{color:'#dc2626'}}>{minV.toFixed(1)}</b></span>
-        <span>Max: <b style={{color:'#16a34a'}}>{maxV.toFixed(1)}</b></span>
+      <div style={{ display: 'flex', gap: 12, marginBottom: 4, fontSize: 9, color: 'var(--text-muted)' }}>
+        <span>Avg: <b style={{color:'var(--text)'}}>{avg.toFixed(1)}</b></span>
+        <span>Min: <b style={{color:'var(--danger)'}}>{minV.toFixed(1)}</b></span>
+        <span>Max: <b style={{color:'var(--success)'}}>{maxV.toFixed(1)}</b></span>
       </div>
       <ResponsiveContainer width="100%" height={145}>
         <ComposedChart data={data} margin={{top:5,right:5,bottom:0,left:-5}}>
@@ -1359,10 +1359,10 @@ function ParameterChangeModal({ ticket, onClose }) {
           <p style={{ margin: '0 0 4px', fontSize: 13, color: '#475569', lineHeight: 1.55 }}>
             Routed to <strong>{managerName ? `Manager ${managerName}` : 'your manager'}</strong> for approval.
           </p>
-          {change?.assigned_manager?.email && <p style={{ margin: '0 0 4px', fontSize: 11, color: '#64748b' }}>Email: {change.assigned_manager.email}</p>}
-          {cr && <p style={{ margin: '0 0 8px', fontSize: 12, color: '#00338D', fontFamily: 'monospace', fontWeight: 700 }}>{cr.cr_number}</p>}
-          {change?.approval_deadline && <p style={{ margin: '0 0 4px', fontSize: 11, color: '#d97706', background: '#fffbeb', padding: '4px 10px', borderRadius: 6, display: 'inline-block' }}>Approval deadline: {new Date(change.approval_deadline).toLocaleString()}</p>}
-          <p style={{ margin: '8px 0 20px', fontSize: 12, color: '#94a3b8' }}>
+          {change?.assigned_manager?.email && <p style={{ margin: '0 0 4px', fontSize: 11, color: 'var(--text-muted)' }}>Email: {change.assigned_manager.email}</p>}
+          {cr && <p style={{ margin: '0 0 8px', fontSize: 12, color: 'var(--primary)', fontFamily: 'monospace', fontWeight: 700 }}>{cr.cr_number}</p>}
+          {change?.approval_deadline && <p style={{ margin: '0 0 4px', fontSize: 11, color: 'var(--warning)', background: 'var(--warning-bg)', padding: '4px 10px', borderRadius: 6, display: 'inline-block' }}>Approval deadline: {new Date(change.approval_deadline).toLocaleString()}</p>}
+          <p style={{ margin: '8px 0 20px', fontSize: 12, color: 'var(--text-muted)' }}>
             Approval window: 30% of remaining SLA time
           </p>
           {cr && <MiniPipeline status={cr.status} />}
@@ -1415,7 +1415,7 @@ function ParameterChangeModal({ ticket, onClose }) {
                   </div>
                   <textarea value={implNotes} onChange={e => setImplNotes(e.target.value)}
                     rows={2} placeholder="Implementation notes (optional)..."
-                    style={{ width: '100%', borderRadius: 6, border: '1px solid #86efac', padding: '6px 10px', fontSize: 12, resize: 'none', boxSizing: 'border-box', fontFamily: 'inherit', marginBottom: 8 }}
+                    style={{ width: '100%', borderRadius: 6, border: '1px solid var(--success)', padding: '6px 10px', fontSize: 12, resize: 'none', boxSizing: 'border-box', fontFamily: 'inherit', marginBottom: 8, background: 'var(--bg-card)', color: 'var(--text)' }}
                   />
                   <div style={{ display: 'flex', gap: 8 }}>
                     <button onClick={() => implement('success')} disabled={implLoading}
@@ -1423,7 +1423,7 @@ function ParameterChangeModal({ ticket, onClose }) {
                       {implLoading ? '…' : '✓ Implementation Successful'}
                     </button>
                     <button onClick={() => implement('failed')} disabled={implLoading}
-                      style={{ flex: 1, padding: '7px 0', borderRadius: 6, fontSize: 12, fontWeight: 700, background: '#fff', color: '#dc2626', border: '1px solid #fca5a5', cursor: 'pointer' }}>
+                      style={{ flex: 1, padding: '7px 0', borderRadius: 6, fontSize: 12, fontWeight: 700, background: 'var(--bg-card)', color: 'var(--danger)', border: '1px solid var(--danger)', cursor: 'pointer' }}>
                       {implLoading ? '…' : '✕ Implementation Failed'}
                     </button>
                   </div>
@@ -1432,13 +1432,13 @@ function ParameterChangeModal({ ticket, onClose }) {
 
               {/* ── Rollback panel ── */}
               {crFailed && (
-                <div style={{ marginTop: 12, background: '#fffbeb', border: '1px solid #fde68a', borderRadius: 8, padding: '12px 14px' }}>
-                  <div style={{ fontSize: 13, fontWeight: 700, color: '#92400e', marginBottom: 8 }}>
+                <div style={{ marginTop: 12, background: 'var(--warning-bg)', border: '1px solid var(--warning)', borderRadius: 8, padding: '12px 14px' }}>
+                  <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--warning)', marginBottom: 8 }}>
                     ↩ Implementation Failed — Execute Rollback
                   </div>
                   <textarea value={implNotes} onChange={e => setImplNotes(e.target.value)}
                     rows={2} placeholder="Describe rollback steps taken..."
-                    style={{ width: '100%', borderRadius: 6, border: '1px solid #fde68a', padding: '6px 10px', fontSize: 12, resize: 'none', boxSizing: 'border-box', fontFamily: 'inherit', marginBottom: 8 }}
+                    style={{ width: '100%', borderRadius: 6, border: '1px solid var(--warning)', padding: '6px 10px', fontSize: 12, resize: 'none', boxSizing: 'border-box', fontFamily: 'inherit', marginBottom: 8, background: 'var(--bg-card)', color: 'var(--text)' }}
                   />
                   <button onClick={rollbackCR} disabled={implLoading}
                     style={{ width: '100%', padding: '8px 0', borderRadius: 6, fontSize: 12, fontWeight: 700, background: '#92400e', color: '#fff', border: 'none', cursor: 'pointer' }}>
@@ -1649,7 +1649,7 @@ export default function AgentTicketBucket() {
               <div
                 key={ticket.id}
                 style={{
-                  background: '#fff',
+                  background: 'var(--bg-card)',
                   border: '1px solid var(--border)',
                   borderLeft: `4px solid ${isResolved ? 'var(--border)' : pc.bar}`,
                   borderRadius: 'var(--radius)',

@@ -82,7 +82,7 @@ const PERSIST_TYPES = new Set([
   'connection-check-offer','live-connection','resolution','diagnosis-result',
   'handoff','post-actions','unsat-options','email-action','email-sent',
   'agent-resolved','broadband-diagnostic','thankyou','exit-box',
-  'non-telecom-warning','live-agent-message','user-image',
+  'non-telecom-warning','user-image',
 ]);
 
 function sanitizePayload(value) {
