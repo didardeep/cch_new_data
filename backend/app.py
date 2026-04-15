@@ -30,6 +30,7 @@ import urllib.error
 from sqlalchemy import case as sql_case, text
 from sqlalchemy.orm import joinedload
 from models import db, bcrypt, User, ChatSession, ChatMessage, Ticket, Feedback, SystemSetting, SlaAlert, TelecomSite, KpiData, ParameterChange, ChangeRequest, FlexibleKpiUpload
+from auth_utils import token_required, role_required
 # Add this import after other imports
 from whatsapp_integration import send_whatsapp_message, format_chat_summary_for_whatsapp, format_ticket_alert_for_whatsapp
 import network_prompts
@@ -8597,6 +8598,11 @@ def _warm_cto_cache():
         except Exception as e:
             print(f"[CACHE WARM] error: {e}")
     threading.Thread(target=_warm, daemon=True).start()
+
+
+# ─── SocketIO Authentication (see socket_handlers.py) ────────────────────────
+from socket_handlers import register_socket_handlers
+register_socket_handlers(socketio, app)
 
 
 if __name__ == "__main__":

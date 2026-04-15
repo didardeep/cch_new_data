@@ -138,7 +138,7 @@ function ReviewModal({ cr, onClose, onDone, isDark }) {
           <div style={{ marginBottom: 14 }}>
             <button onClick={async () => {
               try {
-                const token = localStorage.getItem('token');
+                const token = sessionStorage.getItem('token');
                 const resp = await fetch(`/api/cr/${cr.id}/pdf`, { headers: { 'Authorization': `Bearer ${token}` } });
                 if (!resp.ok) throw new Error('Download failed');
                 const blob = await resp.blob();
@@ -421,7 +421,7 @@ export default function CTOChangeWorkflow() {
                   {cr.pdf_filename && (
                     <button onClick={async () => {
                       try {
-                        const token = localStorage.getItem('token');
+                        const token = sessionStorage.getItem('token');
                         const resp = await fetch(`/api/cr/${cr.id}/pdf`, { headers: { 'Authorization': `Bearer ${token}` } });
                         if (!resp.ok) throw new Error('Failed');
                         const blob = await resp.blob();

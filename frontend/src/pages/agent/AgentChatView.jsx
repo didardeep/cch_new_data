@@ -386,11 +386,11 @@ export default function AgentChatView() {
   useEffect(() => {
     const token = getToken();
     if (!token) return;
-    const s = io(SOCKET_URL, { transports: ['websocket', 'polling'] });
+    const s = io(SOCKET_URL, { transports: ['websocket', 'polling'], auth: { token } });
     socketRef.current = s;
     s.on('connect', () => {
       setWsConnected(true);
-      s.emit('join_session', { session_id: parseInt(sessionId, 10), token });
+      s.emit('join_session', { session_id: parseInt(sessionId, 10) });
     });
     s.on('disconnect', () => setWsConnected(false));
     s.on('new_message', (m) => {

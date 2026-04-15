@@ -107,24 +107,24 @@ const cacheKey = (sessionId) => `${CACHE_PREFIX}${sessionId}`;
 
 function loadCachedSession(sessionId) {
   if (!sessionId) return null;
-  try { const raw = localStorage.getItem(cacheKey(sessionId)); return raw ? JSON.parse(raw) : null; }
+  try { const raw = sessionStorage.getItem(cacheKey(sessionId)); return raw ? JSON.parse(raw) : null; }
   catch { return null; }
 }
 
 function saveCachedSession(sessionId, payload) {
   if (!sessionId) return;
-  try { localStorage.setItem(cacheKey(sessionId), JSON.stringify(payload)); } catch {}
+  try { sessionStorage.setItem(cacheKey(sessionId), JSON.stringify(payload)); } catch {}
 }
 
 function clearCachedSession(sessionId) {
   if (!sessionId) return;
-  try { localStorage.removeItem(cacheKey(sessionId)); } catch {}
+  try { sessionStorage.removeItem(cacheKey(sessionId)); } catch {}
 }
 
 function clearStoredSession() {
   // Only remove the active-session pointer — keep the cache intact so the
   // user can resume any previous chat from the Dashboard with full UI state.
-  localStorage.removeItem('chat_session_id');
+  sessionStorage.removeItem('chat_session_id');
 }
 
 const isConnectionSummary = (msg) => {
@@ -484,7 +484,7 @@ export default function ChatSupport() {
       const data = await chatApiCall('/api/chat/session', payload);
       if (data.session) {
         sessionIdRef.current = data.session.id;
-        localStorage.setItem('chat_session_id', String(data.session.id));
+        sessionStorage.setItem('chat_session_id', String(data.session.id));
         if (forceNew) clearCachedSession(sessionIdRef.current);
         joinSocketSession();
       }
@@ -797,7 +797,7 @@ export default function ChatSupport() {
     if (!token) return false;
     try {
       let data = null;
-      const storedId = forcedSessionId || localStorage.getItem('chat_session_id');
+      const storedId = forcedSessionId || sessionStorage.getItem('chat_session_id');
       if (storedId) {
         const resp = await fetch(`${API_BASE}/api/chat/session/${storedId}`, { headers: { 'Authorization': `Bearer ${token}` } });
         if (resp.ok) data = await resp.json();
@@ -815,7 +815,7 @@ export default function ChatSupport() {
         }
 
         sessionIdRef.current = data.session.id;
-        localStorage.setItem('chat_session_id', String(data.session.id));
+        sessionStorage.setItem('chat_session_id', String(data.session.id));
         const cache = loadCachedSession(sessionIdRef.current);
         const dbMsgs = data.messages?.length ? data.messages : [];
 
@@ -903,7 +903,7 @@ export default function ChatSupport() {
   useEffect(() => {
     const token = getToken();
     if (!token) return;
-    const s = io(SOCKET_URL, { transports: ['websocket', 'polling'] });
+    const s = io(SOCKET_URL, { transports: ['websocket', 'polling'], auth: { token } });
     socketRef.current = s;
     s.on('connect', () => { joinSocketSession(); });
     s.on('new_message', (m) => {
@@ -1458,15 +1458,15 @@ export default function ChatSupport() {
       try {
         const fbData = await apiGet('/api/customer/pending-feedback');
         if (fbData?.sessions?.length) {
-          localStorage.removeItem('chat_session_id');
+          sessionStorage.removeItem('chat_session_id');
           setPendingFeedback(fbData.sessions);
           setCurrentFbIdx(0);
           setInitPhase('feedback-gate');
           return;
         }
       } catch {}
-      // If there's an active session in localStorage, auto-resume it on refresh.
-      const storedId = localStorage.getItem('chat_session_id');
+      // If there's an active session in sessionStorage, auto-resume it on refresh.
+      const storedId = sessionStorage.getItem('chat_session_id');
       if (storedId) {
         const restored = await restoreSession({ sessionId: storedId });
         if (restored) return;

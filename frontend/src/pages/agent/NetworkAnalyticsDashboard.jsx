@@ -1824,7 +1824,7 @@ export default function NetworkAnalyticsDashboard() {
     const ctrl=new AbortController();
     const tid=setTimeout(()=>ctrl.abort(),ms);
     return fetch(url,{
-      headers:{Authorization:`Bearer ${localStorage.getItem('token')}`},
+      headers:{Authorization:`Bearer ${sessionStorage.getItem('token')}`},
       signal:ctrl.signal,
     }).then(r=>{clearTimeout(tid);return r.ok?r.json():Promise.reject(r.status);})
       .catch(e=>{clearTimeout(tid);console.warn('fetch failed',url,e);return null;});
