@@ -394,6 +394,11 @@ _schema_cache = {
     "kpi_max_date_recent": None,  # max date among KPIs that have recent data
 }
 
+# ─── Cached dynamic SCHEMA_HINT (avoid re-discovering on every query) ────────
+_dynamic_hint_cache = {"hint": None, "ts": 0}
+_HINT_CACHE_TTL = 300  # 5 minutes — dynamic schema discovery is expensive
+_ml_auto_triggered = False  # only auto-trigger ML pipeline once per session
+
 # ─── Shared helpers (imported lazily from network_analytics) ─────────────────
 
 def _sql(query: str, params: dict = None) -> list:
@@ -847,258 +852,208 @@ ALWAYS use ILIKE for column_name matching:
   WRONG:   f.column_name = 'subscribers'   -- exact match, will miss 'Subscribers'
 """
 
-    # ── Dynamic table availability — tell LLM which tables actually exist ──
-    try:
-        _tbl_rows = _sql(
-            "SELECT table_name FROM information_schema.tables "
-            "WHERE table_schema = 'public' AND table_name IN "
-            "('revenue_data','core_kpi_data','transport_kpi_data',"
-            "'network_issue_tickets','flexible_kpi_uploads','kpi_data','telecom_sites',"
-            "'site_kpi_summary')"
-        )
-        _available_tables = {r['table_name'] for r in _tbl_rows}
-    except Exception:
-        _available_tables = set()
+    # ── Use cached dynamic hint if still fresh (avoid re-discovering every query) ──
+    global _dynamic_hint_cache, _ml_auto_triggered
+    if _dynamic_hint_cache["hint"] and (time.time() - _dynamic_hint_cache["ts"]) < _HINT_CACHE_TTL:
+        SCHEMA_HINT += _dynamic_hint_cache["hint"]
+        _LOG.debug("[DISCOVERY] Using cached schema hint (age=%.0fs)", time.time() - _dynamic_hint_cache["ts"])
+    else:
+      # ── Build dynamic hint from scratch (runs ~10 discovery queries) ──────
+      _dyn_hint = ""
+      _discovery_start = time.time()
 
-    _tbl_note = "\n=== AVAILABLE TABLES (real-time, checked just now) ===\n"
-    for _tn, _fb in [
-        ('kpi_data', None),
-        ('telecom_sites', None),
-        ('site_kpi_summary', "kpi_data (raw, no ML categories)"),
-        ('revenue_data', "flexible_kpi_uploads WHERE kpi_type='revenue'"),
-        ('core_kpi_data', "flexible_kpi_uploads WHERE kpi_type='core'"),
-        ('transport_kpi_data', None),
-        ('network_issue_tickets', None),
-        ('flexible_kpi_uploads', None),
-    ]:
-        if _tn in _available_tables:
-            _tbl_note += f"  {_tn}: EXISTS — use it\n"
-        elif _fb:
-            _tbl_note += f"  {_tn}: DOES NOT EXIST — use {_fb} instead\n"
-        else:
-            _tbl_note += f"  {_tn}: DOES NOT EXIST — data not uploaded yet\n"
-    SCHEMA_HINT += _tbl_note
+      try:
+          _tbl_rows = _sql(
+              "SELECT table_name FROM information_schema.tables "
+              "WHERE table_schema = 'public' AND table_name IN "
+              "('revenue_data','core_kpi_data','transport_kpi_data',"
+              "'network_issue_tickets','flexible_kpi_uploads','kpi_data','telecom_sites',"
+              "'site_kpi_summary')"
+          )
+          _available_tables = {r['table_name'] for r in _tbl_rows}
+      except Exception:
+          _available_tables = set()
 
-    # ── Dynamic revenue column discovery — tell LLM the EXACT column names ──
-    if 'flexible_kpi_uploads' in _available_tables:
-        try:
-            _rev_cols = _sql(
-                "SELECT DISTINCT column_name, column_type "
-                "FROM flexible_kpi_uploads WHERE kpi_type = 'revenue' "
-                "ORDER BY column_name LIMIT 40"
-            )
-            if _rev_cols:
-                _rcn = "\n=== ACTUAL COLUMN NAMES in flexible_kpi_uploads (kpi_type='revenue') ===\n"
-                _rcn += "These are the REAL column_name values — use these EXACT values in queries.\n"
-                _rcn += "IMPORTANT: ALWAYS use ILIKE (not LIKE or =) for column_name matching.\n"
-                for _rc in _rev_cols:
-                    _rcn += f"  '{_rc['column_name']}' ({_rc['column_type']})\n"
-                _rcn += "Example: WHERE f.column_name ILIKE '%revenue%' (not LIKE or =)\n"
-                _rcn += "Example: WHERE f.column_name ILIKE '%subscriber%' (not = 'subscribers')\n"
-                SCHEMA_HINT += _rcn
-        except Exception:
-            pass
+      _tbl_note = "\n=== AVAILABLE TABLES ===\n"
+      for _tn, _fb in [
+          ('kpi_data', None), ('telecom_sites', None),
+          ('site_kpi_summary', "kpi_data (raw, no ML categories)"),
+          ('revenue_data', "flexible_kpi_uploads WHERE kpi_type='revenue'"),
+          ('core_kpi_data', "flexible_kpi_uploads WHERE kpi_type='core'"),
+          ('transport_kpi_data', None), ('network_issue_tickets', None),
+          ('flexible_kpi_uploads', None),
+      ]:
+          if _tn in _available_tables:
+              _tbl_note += f"  {_tn}: EXISTS\n"
+          elif _fb:
+              _tbl_note += f"  {_tn}: NOT EXISTS — use {_fb}\n"
+          else:
+              _tbl_note += f"  {_tn}: NOT EXISTS\n"
+      _dyn_hint += _tbl_note
 
-    # ── Dynamic schema discovery → populate module-level _schema_cache ──
-    global _schema_cache
-    _schema_cache["available_tables"] = _available_tables
-    _LOG.info("[DISCOVERY] Available tables: %s", _available_tables)
+      global _schema_cache
+      _schema_cache["available_tables"] = _available_tables
 
-    if 'revenue_data' in _available_tables:
-        try:
-            _rdc = _sql(
-                "SELECT column_name FROM information_schema.columns "
-                "WHERE table_schema = 'public' AND table_name = 'revenue_data' "
-                "AND column_name NOT IN ('id', 'uploaded_at') "
-                "ORDER BY ordinal_position"
-            )
-            _schema_cache["rev_data_cols"] = [r['column_name'] for r in _rdc]
-            _skip = {'id', 'uploaded_at', 'site_id', 'zone', 'technology', 'site_category', 'subscribers'}
-            _schema_cache["rev_rev_cols"] = [c for c in _schema_cache["rev_data_cols"] if 'rev' in c.lower() and c.lower() not in _skip]
-            _schema_cache["rev_opex_cols"] = [c for c in _schema_cache["rev_data_cols"] if 'opex' in c.lower()]
-            _schema_cache["rev_has_subscribers"] = any(c.lower() == 'subscribers' for c in _schema_cache["rev_data_cols"])
-            if _schema_cache["rev_data_cols"]:
-                _rds = "\n=== ACTUAL COLUMNS in revenue_data table (discovered at runtime) ===\n"
-                _rds += f"  All columns: {', '.join(_schema_cache['rev_data_cols'])}\n"
-                if _schema_cache["rev_rev_cols"]:
-                    _rds += f"  Revenue columns: {', '.join(_schema_cache['rev_rev_cols'])}\n"
-                    _total_ex = ' + '.join(f'COALESCE(r.{c},0)' for c in _schema_cache["rev_rev_cols"])
-                    _rds += f"  Total revenue: SELECT r.site_id, ({_total_ex}) AS total_revenue FROM revenue_data r\n"
-                if _schema_cache["rev_opex_cols"]:
-                    _rds += f"  OPEX columns: {', '.join(_schema_cache['rev_opex_cols'])}\n"
-                if _schema_cache["rev_has_subscribers"]:
-                    _rds += "  Subscribers column: subscribers\n"
-                _rds += "Use ONLY these column names — they are the real ones from the database.\n"
-                SCHEMA_HINT += _rds
-        except Exception:
-            pass
+      # Revenue column discovery
+      if 'flexible_kpi_uploads' in _available_tables:
+          try:
+              _rev_cols = _sql(
+                  "SELECT DISTINCT column_name, column_type "
+                  "FROM flexible_kpi_uploads WHERE kpi_type = 'revenue' "
+                  "ORDER BY column_name LIMIT 40"
+              )
+              if _rev_cols:
+                  _rcn = "\n=== ACTUAL COLUMN NAMES in flexible_kpi_uploads (kpi_type='revenue') ===\n"
+                  _rcn += "Use ILIKE for column_name matching.\n"
+                  for _rc in _rev_cols:
+                      _rcn += f"  '{_rc['column_name']}' ({_rc['column_type']})\n"
+                  _dyn_hint += _rcn
+          except Exception:
+              pass
 
-    if 'core_kpi_data' in _available_tables:
-        try:
-            _cdc = _sql(
-                "SELECT column_name FROM information_schema.columns "
-                "WHERE table_schema = 'public' AND table_name = 'core_kpi_data' "
-                "AND column_name NOT IN ('id', 'uploaded_at') "
-                "ORDER BY ordinal_position"
-            )
-            _schema_cache["core_data_cols"] = [r['column_name'] for r in _cdc]
-            _core_skip = {'id', 'uploaded_at', 'site_id', 'date', 'zone', 'city', 'state'}
-            _schema_cache["core_metric_cols"] = [c for c in _schema_cache["core_data_cols"] if c.lower() not in _core_skip]
-            if _schema_cache["core_data_cols"]:
-                _cds = "\n=== ACTUAL COLUMNS in core_kpi_data table (discovered at runtime) ===\n"
-                _cds += f"  All columns: {', '.join(_schema_cache['core_data_cols'])}\n"
-                if _schema_cache["core_metric_cols"]:
-                    _cds += f"  Metric columns: {', '.join(_schema_cache['core_metric_cols'])}\n"
-                    _cds += f"  Example: SELECT c.site_id, c.date::text, {', '.join('c.' + c for c in _schema_cache['core_metric_cols'][:4])} FROM core_kpi_data c\n"
-                _cds += "Use ONLY these column names — they are the real ones from the database.\n"
-                SCHEMA_HINT += _cds
-        except Exception:
-            pass
+      if 'revenue_data' in _available_tables:
+          try:
+              _rdc = _sql(
+                  "SELECT column_name FROM information_schema.columns "
+                  "WHERE table_schema = 'public' AND table_name = 'revenue_data' "
+                  "AND column_name NOT IN ('id', 'uploaded_at') ORDER BY ordinal_position"
+              )
+              _schema_cache["rev_data_cols"] = [r['column_name'] for r in _rdc]
+              _skip = {'id', 'uploaded_at', 'site_id', 'zone', 'technology', 'site_category', 'subscribers'}
+              _schema_cache["rev_rev_cols"] = [c for c in _schema_cache["rev_data_cols"] if 'rev' in c.lower() and c.lower() not in _skip]
+              _schema_cache["rev_opex_cols"] = [c for c in _schema_cache["rev_data_cols"] if 'opex' in c.lower()]
+              _schema_cache["rev_has_subscribers"] = any(c.lower() == 'subscribers' for c in _schema_cache["rev_data_cols"])
+              if _schema_cache["rev_data_cols"]:
+                  _rds = f"\n=== ACTUAL COLUMNS in revenue_data ===\n  {', '.join(_schema_cache['rev_data_cols'])}\n"
+                  _dyn_hint += _rds
+          except Exception:
+              pass
 
-    if 'transport_kpi_data' in _available_tables:
-        try:
-            _tdc = _sql(
-                "SELECT column_name FROM information_schema.columns "
-                "WHERE table_schema = 'public' AND table_name = 'transport_kpi_data' "
-                "AND column_name NOT IN ('id', 'uploaded_at') "
-                "ORDER BY ordinal_position"
-            )
-            _schema_cache["transport_data_cols"] = [r['column_name'] for r in _tdc]
-            _transport_skip = {'id', 'uploaded_at', 'site_id', 'zone'}
-            _schema_cache["transport_metric_cols"] = [c for c in _schema_cache["transport_data_cols"]
-                                                       if c.lower() not in _transport_skip
-                                                       and c.lower() != 'backhaul_type']
-            if _schema_cache["transport_data_cols"]:
-                _tds = "\n=== ACTUAL COLUMNS in transport_kpi_data table (discovered at runtime) ===\n"
-                _tds += f"  All columns: {', '.join(_schema_cache['transport_data_cols'])}\n"
-                if _schema_cache["transport_metric_cols"]:
-                    _tds += f"  Metric columns: {', '.join(_schema_cache['transport_metric_cols'])}\n"
-                _tds += "Use ONLY these column names — they are the real ones from the database.\n"
-                SCHEMA_HINT += _tds
-        except Exception:
-            pass
+      if 'core_kpi_data' in _available_tables:
+          try:
+              _cdc = _sql(
+                  "SELECT column_name FROM information_schema.columns "
+                  "WHERE table_schema = 'public' AND table_name = 'core_kpi_data' "
+                  "AND column_name NOT IN ('id', 'uploaded_at') ORDER BY ordinal_position"
+              )
+              _schema_cache["core_data_cols"] = [r['column_name'] for r in _cdc]
+              _core_skip = {'id', 'uploaded_at', 'site_id', 'date', 'zone', 'city', 'state'}
+              _schema_cache["core_metric_cols"] = [c for c in _schema_cache["core_data_cols"] if c.lower() not in _core_skip]
+              if _schema_cache["core_data_cols"]:
+                  _dyn_hint += f"\n=== ACTUAL COLUMNS in core_kpi_data ===\n  {', '.join(_schema_cache['core_data_cols'])}\n"
+          except Exception:
+              pass
 
-    if 'network_issue_tickets' in _available_tables:
-        try:
-            _ntc = _sql(
-                "SELECT column_name FROM information_schema.columns "
-                "WHERE table_schema = 'public' AND table_name = 'network_issue_tickets' "
-                "AND column_name NOT IN ('id') "
-                "ORDER BY ordinal_position"
-            )
-            _schema_cache["ticket_cols"] = [r['column_name'] for r in _ntc]
-            if _schema_cache["ticket_cols"]:
-                _nts = "\n=== ACTUAL COLUMNS in network_issue_tickets table (discovered at runtime) ===\n"
-                _nts += f"  All columns: {', '.join(_schema_cache['ticket_cols'])}\n"
-                _nts += "Use ONLY these column names — they are the real ones from the database.\n"
-                SCHEMA_HINT += _nts
-        except Exception:
-            pass
+      if 'transport_kpi_data' in _available_tables:
+          try:
+              _tdc = _sql(
+                  "SELECT column_name FROM information_schema.columns "
+                  "WHERE table_schema = 'public' AND table_name = 'transport_kpi_data' "
+                  "AND column_name NOT IN ('id', 'uploaded_at') ORDER BY ordinal_position"
+              )
+              _schema_cache["transport_data_cols"] = [r['column_name'] for r in _tdc]
+              _transport_skip = {'id', 'uploaded_at', 'site_id', 'zone'}
+              _schema_cache["transport_metric_cols"] = [c for c in _schema_cache["transport_data_cols"]
+                                                         if c.lower() not in _transport_skip and c.lower() != 'backhaul_type']
+              if _schema_cache["transport_data_cols"]:
+                  _dyn_hint += f"\n=== ACTUAL COLUMNS in transport_kpi_data ===\n  {', '.join(_schema_cache['transport_data_cols'])}\n"
+          except Exception:
+              pass
 
-    # ── Data freshness — discover actual max date in kpi_data ──
-    # Many KPIs may lag behind CURRENT_DATE. Using CURRENT_DATE in WHERE clauses
-    # would return 0 rows. We discover the actual max date and use it as reference.
-    if 'kpi_data' in _available_tables:
-        try:
-            _date_info = _sql(
-                "SELECT MAX(date)::text AS max_date FROM kpi_data WHERE data_level = 'site'"
-            )
-            if _date_info and _date_info[0].get('max_date'):
-                _schema_cache["kpi_max_date"] = _date_info[0]['max_date']
-                # Also get the "main" max date (excluding KPIs that may have future/synthetic data)
-                _main_dates = _sql(
-                    "SELECT MAX(date)::text AS max_date FROM kpi_data "
-                    "WHERE data_level = 'site' AND kpi_name NOT IN ('Site Revenue','Site Users')"
-                )
-                if _main_dates and _main_dates[0].get('max_date'):
-                    _schema_cache["kpi_max_date_recent"] = _main_dates[0]['max_date']
-                else:
-                    _schema_cache["kpi_max_date_recent"] = _schema_cache["kpi_max_date"]
-            _LOG.info("[DISCOVERY] kpi_max_date=%s kpi_max_date_recent=%s",
-                      _schema_cache["kpi_max_date"], _schema_cache["kpi_max_date_recent"])
-            # Tell LLM about the actual date range so it doesn't use CURRENT_DATE blindly
-            if _schema_cache["kpi_max_date_recent"]:
-                _date_hint = f"\n=== DATA FRESHNESS (CRITICAL — read carefully) ===\n"
-                _date_hint += f"The LATEST date with RAN KPI data is: {_schema_cache['kpi_max_date_recent']}\n"
-                _date_hint += f"Today's date is: {datetime.now().strftime('%Y-%m-%d')}\n"
-                _date_hint += "IMPORTANT: If these dates differ, the data is NOT up-to-date.\n"
-                _date_hint += f"Use '{_schema_cache['kpi_max_date_recent']}'::date instead of CURRENT_DATE as the end date.\n"
-                _date_hint += f"Example: AND k.date >= '{_schema_cache['kpi_max_date_recent']}'::date - INTERVAL '7 days' "
-                _date_hint += f"AND k.date <= '{_schema_cache['kpi_max_date_recent']}'::date\n"
-                _date_hint += "NEVER use CURRENT_DATE if it is more recent than the latest data date.\n"
-                SCHEMA_HINT += _date_hint
-        except Exception as e:
-            _LOG.warning("[DISCOVERY] Failed to get kpi_data date range: %s", e)
+      if 'network_issue_tickets' in _available_tables:
+          try:
+              _ntc = _sql(
+                  "SELECT column_name FROM information_schema.columns "
+                  "WHERE table_schema = 'public' AND table_name = 'network_issue_tickets' "
+                  "AND column_name NOT IN ('id') ORDER BY ordinal_position"
+              )
+              _schema_cache["ticket_cols"] = [r['column_name'] for r in _ntc]
+              if _schema_cache["ticket_cols"]:
+                  _dyn_hint += f"\n=== ACTUAL COLUMNS in network_issue_tickets ===\n  {', '.join(_schema_cache['ticket_cols'])}\n"
+          except Exception:
+              pass
 
-    _schema_cache["populated"] = True
-    _LOG.info("[DISCOVERY] rev_data_cols=%s rev_rev_cols=%s rev_opex=%s rev_subs=%s",
-              _schema_cache["rev_data_cols"][:5], _schema_cache["rev_rev_cols"][:5],
-              _schema_cache["rev_opex_cols"][:3], _schema_cache["rev_has_subscribers"])
-    _LOG.info("[DISCOVERY] core_metric=%s transport_metric=%s ticket_cols=%d",
-              _schema_cache["core_metric_cols"][:4], _schema_cache["transport_metric_cols"][:4],
-              len(_schema_cache["ticket_cols"]))
+      # Data freshness
+      if 'kpi_data' in _available_tables:
+          try:
+              _date_info = _sql("SELECT MAX(date)::text AS max_date FROM kpi_data WHERE data_level = 'site'")
+              if _date_info and _date_info[0].get('max_date'):
+                  _schema_cache["kpi_max_date"] = _date_info[0]['max_date']
+                  _main_dates = _sql(
+                      "SELECT MAX(date)::text AS max_date FROM kpi_data "
+                      "WHERE data_level = 'site' AND kpi_name NOT IN ('Site Revenue','Site Users')"
+                  )
+                  _schema_cache["kpi_max_date_recent"] = (_main_dates[0]['max_date'] if _main_dates and _main_dates[0].get('max_date')
+                                                          else _schema_cache["kpi_max_date"])
+                  if _schema_cache["kpi_max_date_recent"]:
+                      _dyn_hint += f"\n=== DATA FRESHNESS ===\n"
+                      _dyn_hint += f"Latest KPI data date: {_schema_cache['kpi_max_date_recent']}\n"
+                      _dyn_hint += f"Today: {datetime.now().strftime('%Y-%m-%d')}\n"
+                      _dyn_hint += f"Use '{_schema_cache['kpi_max_date_recent']}'::date instead of CURRENT_DATE.\n"
+          except Exception:
+              pass
 
-    # ── Dynamic flexible_kpi_uploads core column discovery ──
-    if 'flexible_kpi_uploads' in _available_tables:
-        try:
-            _core_eav_cols = _sql(
-                "SELECT DISTINCT column_name, column_type "
-                "FROM flexible_kpi_uploads WHERE kpi_type = 'core' "
-                "ORDER BY column_name LIMIT 40"
-            )
-            if _core_eav_cols:
-                _ccn = "\n=== ACTUAL COLUMN NAMES in flexible_kpi_uploads (kpi_type='core') ===\n"
-                _ccn += "These are the REAL column_name values — use these EXACT values in queries.\n"
-                _ccn += "IMPORTANT: ALWAYS use ILIKE (not LIKE or =) for column_name matching.\n"
-                for _cc in _core_eav_cols:
-                    _ccn += f"  '{_cc['column_name']}' ({_cc['column_type']})\n"
-                _ccn += "Example: WHERE f.kpi_type = 'core' AND f.column_name ILIKE '%auth%'\n"
-                SCHEMA_HINT += _ccn
-        except Exception:
-            pass
+      _schema_cache["populated"] = True
 
-    # ── Dynamic site_kpi_summary discovery — tell LLM about ML categories ──
-    # Auto-trigger ML pipeline if table is empty (first-time or after data refresh)
-    _sks_row_count = 0
-    if 'site_kpi_summary' in _available_tables:
-        try:
-            _sks_info = _sql(
-                "SELECT COUNT(*) AS row_count, "
-                "MIN(date)::text AS min_date, MAX(date)::text AS max_date, "
-                "COUNT(DISTINCT site_id) AS site_count, "
-                "COUNT(DISTINCT kpi_name) AS kpi_count, "
-                "COUNT(*) FILTER (WHERE health_label = 'critical') AS critical_count, "
-                "COUNT(*) FILTER (WHERE health_label = 'degraded') AS degraded_count, "
-                "COUNT(*) FILTER (WHERE health_label = 'healthy') AS healthy_count, "
-                "COUNT(*) FILTER (WHERE is_anomaly = true) AS anomaly_count "
-                "FROM site_kpi_summary"
-            )
-            _sks_row_count = _sks_info[0].get('row_count', 0) if _sks_info else 0
-            if _sks_row_count > 0:
-                _si = _sks_info[0]
-                _sks_hint = "\n=== ML-CATEGORIZED SUMMARY (site_kpi_summary) ===\n"
-                _sks_hint += f"Total rows: {_si['row_count']} | Sites: {_si['site_count']} | KPIs: {_si['kpi_count']}\n"
-                _sks_hint += f"Date range: {_si['min_date']} to {_si['max_date']}\n"
-                _sks_hint += f"Health distribution: {_si['healthy_count']} healthy, {_si['degraded_count']} degraded, {_si['critical_count']} critical\n"
-                _sks_hint += f"Anomalies detected: {_si['anomaly_count']}\n"
-                _sks_hint += "PREFER this table for performance/health queries — it has ML-generated labels.\n"
-                _sks_hint += f"For date references in this table, use '{_si['max_date']}'::date as the latest date.\n"
-                SCHEMA_HINT += _sks_hint
-                _LOG.info("[DISCOVERY] site_kpi_summary: %d rows, %s to %s, %d anomalies",
-                          _si['row_count'], _si['min_date'], _si['max_date'], _si['anomaly_count'])
-        except Exception as e:
-            _LOG.debug("[DISCOVERY] site_kpi_summary check failed: %s", e)
+      # Flexible KPI core columns
+      if 'flexible_kpi_uploads' in _available_tables:
+          try:
+              _core_eav_cols = _sql(
+                  "SELECT DISTINCT column_name, column_type "
+                  "FROM flexible_kpi_uploads WHERE kpi_type = 'core' ORDER BY column_name LIMIT 40"
+              )
+              if _core_eav_cols:
+                  _ccn = "\n=== ACTUAL COLUMN NAMES in flexible_kpi_uploads (kpi_type='core') ===\n"
+                  for _cc in _core_eav_cols:
+                      _ccn += f"  '{_cc['column_name']}' ({_cc['column_type']})\n"
+                  _dyn_hint += _ccn
+          except Exception:
+              pass
 
-    # Auto-run ML pipeline in background if summary table is empty
-    if _sks_row_count == 0 and 'kpi_data' in _available_tables:
-        try:
-            from ml_pipeline import run_ml_pipeline_async, get_pipeline_status
-            _ml_st = get_pipeline_status()
-            if not _ml_st.get("running"):
-                _LOG.info("[AUTO-ML] site_kpi_summary is empty — triggering ML pipeline in background")
-                run_ml_pipeline_async(current_app._get_current_object())
-        except Exception as e:
-            _LOG.debug("[AUTO-ML] Failed to auto-trigger ML pipeline: %s", e)
+      # site_kpi_summary ML discovery
+      _sks_row_count = 0
+      if 'site_kpi_summary' in _available_tables:
+          try:
+              _sks_info = _sql(
+                  "SELECT COUNT(*) AS row_count, "
+                  "MIN(date)::text AS min_date, MAX(date)::text AS max_date, "
+                  "COUNT(DISTINCT site_id) AS site_count, "
+                  "COUNT(DISTINCT kpi_name) AS kpi_count, "
+                  "COUNT(*) FILTER (WHERE health_label = 'critical') AS critical_count, "
+                  "COUNT(*) FILTER (WHERE health_label = 'degraded') AS degraded_count, "
+                  "COUNT(*) FILTER (WHERE health_label = 'healthy') AS healthy_count, "
+                  "COUNT(*) FILTER (WHERE is_anomaly = true) AS anomaly_count "
+                  "FROM site_kpi_summary"
+              )
+              _sks_row_count = _sks_info[0].get('row_count', 0) if _sks_info else 0
+              if _sks_row_count > 0:
+                  _si = _sks_info[0]
+                  _dyn_hint += f"\n=== ML-CATEGORIZED SUMMARY (site_kpi_summary) ===\n"
+                  _dyn_hint += f"Rows: {_si['row_count']} | Sites: {_si['site_count']} | KPIs: {_si['kpi_count']}\n"
+                  _dyn_hint += f"Date range: {_si['min_date']} to {_si['max_date']}\n"
+                  _dyn_hint += f"Health: {_si['healthy_count']} healthy, {_si['degraded_count']} degraded, {_si['critical_count']} critical\n"
+                  _dyn_hint += f"Anomalies: {_si['anomaly_count']}\n"
+                  _dyn_hint += "PREFER this table for health/performance/anomaly queries.\n"
+                  _dyn_hint += f"Use '{_si['max_date']}'::date as latest date for this table.\n"
+          except Exception:
+              pass
+
+      # Auto-trigger ML pipeline ONCE if summary empty
+      if _sks_row_count == 0 and 'kpi_data' in _available_tables and not _ml_auto_triggered:
+          try:
+              from ml_pipeline import run_ml_pipeline_async, get_pipeline_status
+              if not get_pipeline_status().get("running"):
+                  _LOG.info("[AUTO-ML] site_kpi_summary empty — triggering ML pipeline")
+                  run_ml_pipeline_async(current_app._get_current_object())
+                  _ml_auto_triggered = True
+          except Exception:
+              pass
+
+      # Cache the dynamic hint
+      _dynamic_hint_cache["hint"] = _dyn_hint
+      _dynamic_hint_cache["ts"] = time.time()
+      SCHEMA_HINT += _dyn_hint
+      _LOG.info("[DISCOVERY] Schema discovery completed in %.2fs", time.time() - _discovery_start)
 
     # ── CHANGE: read session_context for dynamic prompt injection ──
     _sctx = (getattr(ai_session, 'session_context', None) or {}) if ai_session else {}

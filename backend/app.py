@@ -27,6 +27,7 @@ import urllib.request
 import urllib.parse
 import urllib.error
 
+import threading
 from sqlalchemy import case as sql_case, text
 from sqlalchemy.orm import joinedload
 from models import db, bcrypt, User, ChatSession, ChatMessage, Ticket, Feedback, SystemSetting, SlaAlert, TelecomSite, KpiData, ParameterChange, ChangeRequest, FlexibleKpiUpload
@@ -8554,20 +8555,33 @@ def api_ml_pipeline_status():
     """Get current ML pipeline status."""
     return jsonify(get_pipeline_status())
 
-# Create site_kpi_summary table & auto-run ML pipeline if empty
+# Create site_kpi_summary table
 with app.app_context():
     try:
         from models import SiteKpiSummary
         SiteKpiSummary.__table__.create(db.engine, checkfirst=True)
-        # Auto-trigger ML pipeline on startup if table is empty
-        _sks_count = db.session.execute(db.text("SELECT COUNT(*) FROM site_kpi_summary")).scalar()
-        if _sks_count == 0:
-            print("[ML] site_kpi_summary is empty — auto-running ML pipeline in background...")
-            run_ml_pipeline_async(app)
-        else:
-            print(f"[ML] site_kpi_summary has {_sks_count} rows — ML pipeline not needed")
+        print("[ML] site_kpi_summary table ready")
     except Exception as _sks_err:
-        print(f"[WARN] site_kpi_summary setup skipped: {_sks_err}")
+        print(f"[WARN] site_kpi_summary table creation skipped: {_sks_err}")
+
+# Auto-run ML pipeline after startup if summary table is empty.
+# Uses a delayed thread so the app is fully initialized before running.
+def _auto_ml_on_startup():
+    """Check site_kpi_summary after a short delay and run ML if empty."""
+    import time as _t
+    _t.sleep(3)  # wait for app to fully start
+    try:
+        with app.app_context():
+            _count = db.session.execute(text("SELECT COUNT(*) FROM site_kpi_summary")).scalar()
+            if _count == 0:
+                print("[ML] site_kpi_summary is empty — auto-running ML pipeline in background...")
+                run_ml_pipeline_async(app)
+            else:
+                print(f"[ML] site_kpi_summary has {_count} rows — ML pipeline not needed")
+    except Exception as e:
+        print(f"[ML] Auto-ML check skipped: {e}")
+
+threading.Thread(target=_auto_ml_on_startup, daemon=True, name="ml-auto-check").start()
 
 # ─── Register Network Issues Blueprint ─────────────────────────────────────
 from network_issues import network_issues_bp, NetworkIssueTicket, schedule_daily_job
