@@ -7,8 +7,20 @@ import {
   RadarChart, Radar, PolarGrid, PolarAngleAxis,
   ScatterChart, Scatter, ZAxis,
 } from 'recharts';
+import io from 'socket.io-client';
 import { apiGet, apiPost, apiDelete } from '../../api';
 import { useTheme } from '../../ThemeContext';
+
+const SOCKET_URL = process.env.REACT_APP_API_URL || 'http://localhost:5500';
+
+// ── Progress stage labels ────────────────────────────────────────────────────
+const PROGRESS_LABELS = {
+  understanding: 'Analyzing your question...',
+  generating: 'Generating SQL query...',
+  executing: 'Running query on database...',
+  rendering: 'Preparing visualization...',
+  complete: 'Done',
+};
 
 // ── Themes ─────────────────────────────────────────────────────────────────
 const T_LIGHT = {
@@ -39,6 +51,11 @@ const SUGGESTED = [
   { label:'Congestion',    prompt:'Show top 10 sites where DL PRB Utilization (1BH) is highest along with their LTE DL - Usr Ave Throughput and Ave RRC Connected Ue' },
   { label:'Availability',  prompt:'Show sites with lowest Availability along with their E-RAB Call Drop Rate_1 and LTE Call Setup Success Rate' },
   { label:'Compare zones', prompt:'Compare all zones by average E-RAB Call Drop Rate_1, LTE DL - Usr Ave Throughput, DL PRB Utilization (1BH), and LTE Call Setup Success Rate' },
+  // ML-powered prompts
+  { label:'Critical sites',   prompt:'Show all sites with health_label critical in the last 7 days with their health_score and anomaly status from site_kpi_summary' },
+  { label:'Anomalies',        prompt:'Show all anomalies detected in the last 7 days with site_id, kpi_name, avg_value, anomaly_score, and health_label from site_kpi_summary' },
+  { label:'Site health',      prompt:'Show health score trend for top 5 underperformer sites over the last 7 days from site_kpi_summary' },
+  { label:'Zone health',      prompt:'Compare all zones by average health_score, count of critical sites, and count of anomalies from site_kpi_summary' },
 ];
 
 const CSS = `
@@ -414,7 +431,35 @@ function InlineChart({result,T,chartId}) {
             <tbody>
               {data.slice(0,100).map((row,i)=>(
                 <tr key={i} style={{borderBottom:`1px solid ${T.border}`,background:i%2===0?T.surface2:'transparent'}}>
-                  {columns.map(c=><td key={c} style={{padding:'3px 7px',textAlign:'center',fontFamily:"'IBM Plex Mono',monospace",fontSize:9.5}}>{row[c]==null?'—':typeof row[c]==='number'?f(row[c],2):String(row[c])}</td>)}
+                  {columns.map(c=>{
+                    const v=row[c];
+                    // ML category badges
+                    if(c==='health_label'&&typeof v==='string'){
+                      const hlColors={healthy:{bg:'#16A34A22',color:'#16A34A'},degraded:{bg:'#D9770622',color:'#D97706'},critical:{bg:'#DC262622',color:'#DC2626'},unknown:{bg:'#94A3B822',color:'#94A3B8'}};
+                      const hl=hlColors[v]||hlColors.unknown;
+                      return<td key={c} style={{padding:'3px 7px',textAlign:'center'}}><span style={{fontSize:9,fontWeight:700,padding:'2px 8px',borderRadius:8,background:hl.bg,color:hl.color,textTransform:'uppercase'}}>{v}</span></td>;
+                    }
+                    if(c==='site_tier'&&typeof v==='string'){
+                      const stColors={top_performer:{bg:'#16A34A22',color:'#16A34A',icon:'★'},good:{bg:'#0091DA22',color:'#0091DA',icon:'●'},average:{bg:'#D9770622',color:'#D97706',icon:'◆'},underperformer:{bg:'#DC262622',color:'#DC2626',icon:'▼'},unknown:{bg:'#94A3B822',color:'#94A3B8',icon:'?'}};
+                      const st=stColors[v]||stColors.unknown;
+                      return<td key={c} style={{padding:'3px 7px',textAlign:'center'}}><span style={{fontSize:9,fontWeight:700,padding:'2px 8px',borderRadius:8,background:st.bg,color:st.color}}>{st.icon} {v.replace(/_/g,' ')}</span></td>;
+                    }
+                    if(c==='is_anomaly'){
+                      const isA=v===true||v==='true'||v===1;
+                      return<td key={c} style={{padding:'3px 7px',textAlign:'center'}}>{isA?<span style={{fontSize:9,fontWeight:700,padding:'2px 8px',borderRadius:8,background:'#DC262622',color:'#DC2626'}}>ANOMALY</span>:<span style={{fontSize:9,color:T.muted}}>normal</span>}</td>;
+                    }
+                    if(c==='health_score'&&v!=null){
+                      const score=parseFloat(v);
+                      const hsColor=score>=70?'#16A34A':score>=40?'#D97706':'#DC2626';
+                      return<td key={c} style={{padding:'3px 7px',textAlign:'center'}}><div style={{display:'flex',alignItems:'center',justifyContent:'center',gap:4}}><div style={{width:28,height:5,borderRadius:3,background:T.border,overflow:'hidden'}}><div style={{width:`${Math.min(100,score)}%`,height:'100%',borderRadius:3,background:hsColor}}/></div><span style={{fontSize:9.5,fontWeight:700,fontFamily:"'IBM Plex Mono',monospace",color:hsColor}}>{f(score,1)}</span></div></td>;
+                    }
+                    if(c==='anomaly_score'&&v!=null){
+                      const as=parseFloat(v);
+                      const asColor=as<-0.2?'#DC2626':as<0?'#D97706':'#16A34A';
+                      return<td key={c} style={{padding:'3px 7px',textAlign:'center',fontFamily:"'IBM Plex Mono',monospace",fontSize:9.5,color:asColor,fontWeight:600}}>{f(as,3)}</td>;
+                    }
+                    return<td key={c} style={{padding:'3px 7px',textAlign:'center',fontFamily:"'IBM Plex Mono',monospace",fontSize:9.5}}>{v==null?'—':typeof v==='number'?f(v,2):String(v)}</td>;
+                  })}
                 </tr>))}
             </tbody>
           </table>
@@ -448,11 +493,41 @@ export default function NetworkAiChat() {
   const [loading, setLoading]           = useState(false);
   const [sessionsLoading, setSessLoad]  = useState(true);
   const [sidebarOpen, setSidebarOpen]   = useState(true);
+  const [progress, setProgress]         = useState(null); // {stage, message}
 
-  const endRef  = useRef(null);
+  const endRef   = useRef(null);
   const inputRef = useRef(null);
+  const socketRef = useRef(null);
 
   useEffect(()=>{ endRef.current?.scrollIntoView({behavior:'smooth'}); },[messages]);
+
+  // ── WebSocket connection for AI progress streaming ────────────────────────
+  useEffect(() => {
+    const token = sessionStorage.getItem('token');
+    if (!token) return;
+    const s = io(SOCKET_URL, {
+      transports: ['websocket', 'polling'],
+      auth: { token },
+    });
+    socketRef.current = s;
+
+    s.on('ai_progress', (data) => {
+      if (data.stage === 'complete') {
+        setProgress(null);
+      } else {
+        setProgress({ stage: data.stage, message: PROGRESS_LABELS[data.stage] || data.message });
+      }
+    });
+
+    return () => { s.disconnect(); };
+  }, []);
+
+  // Join AI session room when active session changes
+  useEffect(() => {
+    if (activeSessionId && socketRef.current?.connected) {
+      socketRef.current.emit('join_ai_session', { session_id: activeSessionId });
+    }
+  }, [activeSessionId]);
 
   useEffect(()=>{
     apiGet('/api/network/ai-sessions')
@@ -499,6 +574,10 @@ export default function NetworkAiChat() {
         sid = r.session.id;
         setSessions(prev=>[r.session,...prev]);
         setActiveId(sid);
+        // Join WebSocket room for progress updates
+        if(socketRef.current?.connected){
+          socketRef.current.emit('join_ai_session',{session_id:sid});
+        }
       }catch{ return; }
     }
 
@@ -506,6 +585,7 @@ export default function NetworkAiChat() {
     setMessages(prev=>[...prev,userMsg]);
     setInput('');
     setLoading(true);
+    setProgress({ stage:'understanding', message:PROGRESS_LABELS.understanding });
 
     try{
       const result = await apiPost('/api/network/ai-query',{
@@ -519,6 +599,7 @@ export default function NetworkAiChat() {
         role:'assistant',
         content:result.response||'Here are the results.',
         payload:result,
+        elapsed: result.elapsed_seconds,
         created_at:new Date().toISOString(),
       };
       setMessages(prev=>[...prev,assistantMsg]);
@@ -536,6 +617,7 @@ export default function NetworkAiChat() {
       }]);
     }
     setLoading(false);
+    setProgress(null);
   },[activeSessionId,loading]);
 
   const formatTime = (iso)=>{
@@ -639,8 +721,16 @@ export default function NetworkAiChat() {
                       boxShadow:m.role==='user'?'0 2px 12px rgba(0,51,141,.2)':T.cardShadow,
                       border:m.role==='user'?'none':`1px solid ${T.border}`,
                     }}>
-                      <div style={{fontSize:9,fontWeight:700,marginBottom:4,opacity:.6,textTransform:'uppercase'}}>
-                        {m.role==='user'?'You':'AI Assistant'}
+                      <div style={{display:'flex',alignItems:'center',gap:6,marginBottom:4}}>
+                        <span style={{fontSize:9,fontWeight:700,opacity:.6,textTransform:'uppercase'}}>
+                          {m.role==='user'?'You':'AI Assistant'}
+                        </span>
+                        {m.role==='assistant'&&m.payload?.query_type==='informational'&&(
+                          <span style={{fontSize:8,padding:'1px 6px',borderRadius:6,background:T.teal+'22',color:T.teal,fontWeight:600}}>Knowledge</span>
+                        )}
+                        {m.role==='assistant'&&m.payload?.provider&&m.payload.query_type!=='informational'&&(
+                          <span style={{fontSize:8,padding:'1px 6px',borderRadius:6,background:T.kpmgBlue+'15',color:T.kpmgBlue,fontWeight:600}}>SQL</span>
+                        )}
                       </div>
 
                       <div style={{fontSize:12.5,lineHeight:1.65,whiteSpace:'pre-wrap'}}>{m.content}</div>
@@ -654,25 +744,51 @@ export default function NetworkAiChat() {
                         ))
                       )}
                       {/* Single chart */}
-                      {m.role==='assistant'&&m.payload&&m.payload.chart_type!=='multi_chart'&&(m.payload.data?.length>0||m.payload.error)&&(
+                      {m.role==='assistant'&&m.payload&&m.payload.chart_type!=='multi_chart'&&m.payload.chart_type!=='none'&&(m.payload.data?.length>0||m.payload.error)&&(
                         <InlineChart result={m.payload} T={T}/>
                       )}
 
-                      <div style={{fontSize:8.5,opacity:.4,marginTop:6,textAlign:m.role==='user'?'right':'left'}}>
-                        {m.created_at?new Date(m.created_at).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}):''}
+                      {/* Elapsed time + timestamp */}
+                      <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginTop:6}}>
+                        <div style={{fontSize:8.5,opacity:.4,textAlign:m.role==='user'?'right':'left'}}>
+                          {m.created_at?new Date(m.created_at).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}):''}
+                        </div>
+                        {m.role==='assistant'&&m.elapsed!=null&&(
+                          <span style={{fontSize:8,color:T.muted,fontWeight:500}}>{m.elapsed}s</span>
+                        )}
                       </div>
                     </div>
                   </div>
                 ))}
 
                 {loading&&(
-                  <div style={{display:'flex',justifyContent:'flex-start',marginBottom:16}}>
-                    <div style={{padding:'14px 20px',borderRadius:'18px 18px 18px 4px',background:T.surface,border:`1px solid ${T.border}`,boxShadow:T.cardShadow}}>
-                      <div style={{display:'flex',gap:5}}>
-                        {[0,1,2].map(i=>(
-                          <span key={i} style={{width:7,height:7,borderRadius:'50%',background:T.kpmgBlue,animation:`bounce .6s ${i*0.15}s infinite`}}/>
-                        ))}
+                  <div style={{display:'flex',justifyContent:'flex-start',marginBottom:16,animation:'fadeIn .3s ease'}}>
+                    <div style={{padding:'14px 20px',borderRadius:'18px 18px 18px 4px',background:T.surface,border:`1px solid ${T.border}`,boxShadow:T.cardShadow,minWidth:220}}>
+                      <div style={{display:'flex',alignItems:'center',gap:10}}>
+                        <div style={{display:'flex',gap:4}}>
+                          {[0,1,2].map(i=>(
+                            <span key={i} style={{width:7,height:7,borderRadius:'50%',background:T.kpmgBlue,animation:`bounce .6s ${i*0.15}s infinite`}}/>
+                          ))}
+                        </div>
+                        {progress&&(
+                          <span style={{fontSize:11,color:T.textSub,fontWeight:500,animation:'fadeIn .3s ease'}}>
+                            {progress.message}
+                          </span>
+                        )}
                       </div>
+                      {/* Progress bar */}
+                      {progress&&(
+                        <div style={{marginTop:8,height:3,borderRadius:2,background:T.border,overflow:'hidden'}}>
+                          <div style={{
+                            height:'100%',borderRadius:2,
+                            background:`linear-gradient(90deg,${T.kpmgBlue},${T.blue3})`,
+                            width: progress.stage==='understanding'?'25%':
+                                   progress.stage==='generating'?'50%':
+                                   progress.stage==='executing'?'75%':'95%',
+                            transition:'width 0.5s ease',
+                          }}/>
+                        </div>
+                      )}
                     </div>
                   </div>
                 )}

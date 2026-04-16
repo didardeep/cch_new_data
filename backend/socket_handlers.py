@@ -40,3 +40,10 @@ def register_socket_handlers(socketio, app):
         session_id = data.get("session_id") if data else None
         if session_id:
             join_room(f"session_{session_id}")
+
+    @socketio.on("join_ai_session")
+    def handle_join_ai_session(data):
+        """Join an AI chat room for receiving query progress updates."""
+        session_id = data.get("session_id") if data else None
+        if session_id:
+            join_room(f"ai_session_{session_id}")

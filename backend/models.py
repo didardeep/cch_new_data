@@ -843,3 +843,59 @@ class FlexibleKpiMeta(db.Model):
         db.UniqueConstraint("kpi_type", "upload_batch", "column_name",
                             name="uq_flex_meta_type_batch_col"),
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ML-Categorized KPI Summary — populated by ml_pipeline.py
+# ─────────────────────────────────────────────────────────────────────────────
+class SiteKpiSummary(db.Model):
+    """
+    Pre-categorized daily KPI summary per site.
+    Populated by the ML pipeline (K-Means, Isolation Forest, composite health score).
+    The Network AI chatbot queries this table instead of raw kpi_data for faster,
+    more accurate results with semantic labels.
+    """
+    __tablename__ = "site_kpi_summary"
+
+    id             = db.Column(db.Integer, primary_key=True)
+    site_id        = db.Column(db.String(50), nullable=False, index=True)
+    date           = db.Column(db.Date, nullable=False)
+    kpi_name       = db.Column(db.String(100), nullable=False, index=True)
+
+    # Aggregated values (daily)
+    avg_value      = db.Column(db.Float)
+    min_value      = db.Column(db.Float)
+    max_value      = db.Column(db.Float)
+    stddev_value   = db.Column(db.Float)
+    sample_count   = db.Column(db.Integer, default=0)
+
+    # ML: K-Means per-KPI health label
+    health_label   = db.Column(db.String(20))   # 'healthy', 'degraded', 'critical'
+    health_confidence = db.Column(db.Float)      # distance to centroid (lower = more confident)
+
+    # ML: Isolation Forest anomaly detection
+    is_anomaly     = db.Column(db.Boolean, default=False)
+    anomaly_score  = db.Column(db.Float)         # -1 to 0 (more negative = more anomalous)
+
+    # ML: K-Means multi-KPI site performance tier
+    site_tier      = db.Column(db.String(30))    # 'top_performer', 'good', 'average', 'underperformer'
+
+    # Composite health score (weighted across all KPIs)
+    health_score   = db.Column(db.Float)         # 0-100
+
+    # Zone context
+    zone           = db.Column(db.String(100))
+
+    # Pipeline metadata
+    pipeline_version = db.Column(db.String(30))
+    created_at     = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (
+        db.Index("idx_sks_site_date", "site_id", "date"),
+        db.Index("idx_sks_kpi_date", "kpi_name", "date"),
+        db.Index("idx_sks_health", "health_label", "kpi_name"),
+        db.Index("idx_sks_tier", "site_tier"),
+        db.Index("idx_sks_anomaly", "is_anomaly", "kpi_name", "date"),
+        db.Index("idx_sks_zone_kpi", "zone", "kpi_name", "date"),
+        db.UniqueConstraint("site_id", "date", "kpi_name", name="uq_sks_site_date_kpi"),
+    )

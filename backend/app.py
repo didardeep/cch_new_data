@@ -8511,8 +8511,63 @@ from network_analytics import network_bp, clear_analytics_cache
 app.register_blueprint(network_bp)
 
 # ─── Register Network AI Blueprint ───────────────────────────────────────────
-from network_ai import network_ai_bp
+from network_ai import network_ai_bp, ensure_db_optimizations
 app.register_blueprint(network_ai_bp)
+
+# ─── Database optimizations (indexes, materialized views) ────────────────────
+with app.app_context():
+    try:
+        ensure_db_optimizations()
+    except Exception as _db_opt_err:
+        print(f"[WARN] DB optimization skipped: {_db_opt_err}")
+
+# ─── ML Pipeline endpoints ───────────────────────────────────────────────────
+from ml_pipeline import run_ml_pipeline, run_ml_pipeline_async, get_pipeline_status
+
+@app.route("/api/ml/run-pipeline", methods=["POST"])
+@jwt_required()
+def api_run_ml_pipeline():
+    """Trigger the ML categorization pipeline (background).
+    Only managers and CTOs can trigger this."""
+    uid = get_jwt_identity()
+    user = db.session.get(User, int(uid))
+    if not user or user.role not in ('manager', 'cto'):
+        return jsonify({"error": "Only managers/CTOs can trigger the ML pipeline"}), 403
+    result = run_ml_pipeline_async(app)
+    return jsonify(result)
+
+@app.route("/api/ml/run-pipeline-sync", methods=["POST"])
+@jwt_required()
+def api_run_ml_pipeline_sync():
+    """Trigger the ML pipeline synchronously (blocks until done).
+    Use for smaller datasets or when you need the result immediately."""
+    uid = get_jwt_identity()
+    user = db.session.get(User, int(uid))
+    if not user or user.role not in ('manager', 'cto'):
+        return jsonify({"error": "Only managers/CTOs can trigger the ML pipeline"}), 403
+    result = run_ml_pipeline(app)
+    return jsonify(result)
+
+@app.route("/api/ml/status", methods=["GET"])
+@jwt_required()
+def api_ml_pipeline_status():
+    """Get current ML pipeline status."""
+    return jsonify(get_pipeline_status())
+
+# Create site_kpi_summary table & auto-run ML pipeline if empty
+with app.app_context():
+    try:
+        from models import SiteKpiSummary
+        SiteKpiSummary.__table__.create(db.engine, checkfirst=True)
+        # Auto-trigger ML pipeline on startup if table is empty
+        _sks_count = db.session.execute(db.text("SELECT COUNT(*) FROM site_kpi_summary")).scalar()
+        if _sks_count == 0:
+            print("[ML] site_kpi_summary is empty — auto-running ML pipeline in background...")
+            run_ml_pipeline_async(app)
+        else:
+            print(f"[ML] site_kpi_summary has {_sks_count} rows — ML pipeline not needed")
+    except Exception as _sks_err:
+        print(f"[WARN] site_kpi_summary setup skipped: {_sks_err}")
 
 # ─── Register Network Issues Blueprint ─────────────────────────────────────
 from network_issues import network_issues_bp, NetworkIssueTicket, schedule_daily_job

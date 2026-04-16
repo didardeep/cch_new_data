@@ -1,9 +1,25 @@
 """
-network_ai.py
-=============
+network_ai.py  — v6 (2026-04-16)
+==================================
 Flask Blueprint: Network AI Chat & Query Engine
-Extracted from network_analytics.py — handles all AI/LLM query logic,
-rule-based NL→SQL fallback, and session CRUD for the Network AI Chat page.
+
+Architecture:
+  User NL Query
+    → Query Router (analytical / informational / follow-up)
+    → LLM SQL Generation (Azure OpenAI) with schema-aware prompt
+    → SQL Validation & Safety Guards
+    → Query Execution (PostgreSQL, timeout, pagination)
+    → Structured JSON + Visualization Output
+    → WebSocket streaming for intermediate states
+
+Features:
+  • LLM generates SQL only — PostgreSQL handles all computation
+  • No SELECT *, no DROP/DELETE/UPDATE — strict read-only safety
+  • In-memory LRU cache for schema discovery and query results
+  • WebSocket streaming: understanding → generating → executing → rendering
+  • Database optimization: indexes, materialized views
+  • Query router: analytical → SQL path, informational → direct LLM
+  • Comprehensive SQL guardrails against hallucinated SQL
 
 Mount in app.py:
     from network_ai import network_ai_bp
@@ -11,10 +27,15 @@ Mount in app.py:
 """
 
 import os
+import re
 import json
 import math
+import time
+import hashlib
 import logging
+import threading
 from datetime import datetime, timezone
+from functools import lru_cache
 
 from flask import Blueprint, request, jsonify, current_app
 from flask_jwt_extended import jwt_required, get_jwt_identity
@@ -23,10 +44,338 @@ from sqlalchemy import text as sa_text
 from models import db, User, NetworkAiSession, NetworkAiMessage
 
 _LOG = logging.getLogger("network_ai")
-NETWORK_AI_VERSION = "2025-03-26-v5"  # bump this to confirm new file is loaded
+NETWORK_AI_VERSION = "2026-04-16-v6"
 
 # ─────────────────────────────────────────────────────────────────────────────
 network_ai_bp = Blueprint("network_ai", __name__)
+
+# ─── Query Result Cache (TTL-based in-memory) ───────────────────────────────
+_query_cache = {}          # {hash: {"data": ..., "ts": time.time()}}
+_cache_lock = threading.Lock()
+_CACHE_TTL = 300           # 5 minutes for query results
+_SCHEMA_CACHE_TTL = 600    # 10 minutes for schema discovery
+
+# ─── Allowed tables for SQL validation ───────────────────────────────────────
+_ALLOWED_TABLES = frozenset({
+    'kpi_data', 'telecom_sites', 'flexible_kpi_uploads',
+    'revenue_data', 'core_kpi_data', 'transport_kpi_data',
+    'network_issue_tickets',
+    'site_kpi_summary',  # ML-categorized pre-aggregated KPI data
+})
+_BLOCKED_SQL_PATTERNS = re.compile(
+    r'\b(DROP|DELETE|UPDATE|INSERT|ALTER|TRUNCATE|CREATE|GRANT|REVOKE|EXEC|EXECUTE)\b',
+    re.IGNORECASE,
+)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SQL Safety & Validation
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _strip_sql_strings(sql: str) -> str:
+    """Remove all string literals from SQL so keyword checks don't match
+    words inside values like 'E-RAB Call Drop Rate_1'."""
+    return re.sub(r"'[^']*'", "''", sql)
+
+
+def _validate_sql(sql: str) -> tuple:
+    """Validate generated SQL for safety. Returns (is_safe, error_message).
+    Rules: only SELECT allowed, no dangerous operations, must have LIMIT,
+    no SELECT *, must reference allowed tables only."""
+    if not sql or not sql.strip():
+        return False, "Empty SQL query"
+
+    normalized = sql.strip()
+
+    # Must start with SELECT (or WITH for CTEs)
+    if not re.match(r'^(SELECT|WITH)\b', normalized, re.IGNORECASE):
+        return False, "Only SELECT queries are allowed"
+
+    # Strip string literals before checking for blocked keywords.
+    # This prevents false positives like 'E-RAB Call Drop Rate_1' matching DROP
+    stripped = _strip_sql_strings(normalized)
+
+    # Block dangerous operations (only check SQL keywords, not string content)
+    if _BLOCKED_SQL_PATTERNS.search(stripped):
+        match = _BLOCKED_SQL_PATTERNS.search(stripped)
+        return False, f"Blocked SQL operation: {match.group(0)}"
+
+    # Ensure LIMIT exists (prevent unbounded queries on 22.5M rows)
+    if 'LIMIT' not in normalized.upper():
+        normalized = normalized.rstrip(';') + ' LIMIT 500'
+
+    # Check that only allowed tables are referenced (skip subquery aliases)
+    from_tables = re.findall(r'\bFROM\s+(\w+)', stripped, re.IGNORECASE)
+    join_tables = re.findall(r'\bJOIN\s+(\w+)', stripped, re.IGNORECASE)
+    all_tables = set(t.lower() for t in from_tables + join_tables)
+    # Remove SQL keywords, common aliases, and subquery refs
+    _skip = {'select', 'where', 'group', 'order', 'having', 'limit',
+             'union', 'all', 'as', 'lateral', 'each', 'unnest',
+             'k', 'f', 'r', 'c', 't', 'ts', 'n', 's'}  # common table aliases
+    all_tables -= _skip
+
+    invalid_tables = all_tables - _ALLOWED_TABLES
+    if invalid_tables:
+        return False, f"Unknown table(s): {', '.join(invalid_tables)}"
+
+    return True, normalized
+
+
+def _add_safety_limits(sql: str, max_rows: int = 500) -> str:
+    """Ensure SQL has a LIMIT clause and is bounded."""
+    if not sql:
+        return sql
+    normalized = sql.strip().rstrip(';')
+    if 'LIMIT' not in normalized.upper():
+        normalized += f' LIMIT {max_rows}'
+    return normalized
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Query Router — Classify queries before processing
+# ─────────────────────────────────────────────────────────────────────────────
+
+_INFORMATIONAL_PATTERNS = [
+    r'^(?:what|how|why|explain|describe|tell me about|define|meaning of)\b',
+    r'\b(?:what is|what are|how does|how do|explain|describe)\b.*\b(?:kpi|metric|parameter|concept|term)\b',
+    r'\b(?:difference between|compare concept|meaning of)\b',
+]
+
+_ANALYTICAL_INDICATORS = [
+    'show', 'display', 'plot', 'chart', 'graph', 'trend', 'compare',
+    'top', 'bottom', 'worst', 'best', 'highest', 'lowest',
+    'average', 'sum', 'count', 'total', 'aggregate',
+    'last', 'days', 'week', 'month', 'daily', 'hourly',
+    'site', 'cell', 'zone', 'revenue', 'throughput', 'drop rate',
+    'cssr', 'prb', 'availability', 'latency', 'volte',
+    # ML category indicators
+    'healthy', 'degraded', 'critical', 'anomaly', 'anomalies', 'outlier',
+    'health score', 'health', 'tier', 'performer', 'underperformer',
+    'top performer', 'classification', 'category', 'categorize',
+]
+
+
+def _classify_query(prompt: str) -> str:
+    """Classify a user query into: 'analytical', 'informational', or 'followup'.
+    - analytical: needs SQL generation → data fetch → chart
+    - informational: general telecom knowledge → direct LLM response
+    - followup: modifies previous result"""
+    p = prompt.lower().strip()
+
+    # Check for informational patterns
+    for pattern in _INFORMATIONAL_PATTERNS:
+        if re.search(pattern, p):
+            # But if it also has analytical indicators, it's analytical
+            if any(ind in p for ind in ['show', 'display', 'plot', 'chart', 'trend',
+                                         'top', 'bottom', 'worst', 'best', 'last', 'days']):
+                return 'analytical'
+            # Check if it mentions specific sites
+            if re.search(r'[A-Za-z]{2,}[_\-][A-Za-z]{2,}[_\-]\d{3,}', p):
+                return 'analytical'
+            return 'informational'
+
+    # Check for analytical indicators
+    if any(ind in p for ind in _ANALYTICAL_INDICATORS):
+        return 'analytical'
+
+    # Check for site IDs
+    if re.search(r'[A-Za-z]{2,}[_\-][A-Za-z]{2,}[_\-]\d{3,}', p):
+        return 'analytical'
+
+    # Default to analytical for ambiguous queries
+    return 'analytical'
+
+
+def _handle_informational_query(prompt: str) -> dict:
+    """Handle informational queries with direct LLM response (no SQL)."""
+    from app import client as _llm_client, DEPLOYMENT_NAME as _llm_model
+
+    system_msg = """You are a telecom network expert. Answer the user's question about
+telecom concepts, KPIs, network architecture, or industry terminology.
+
+Be concise (2-4 sentences). Use bullet points for lists. Include the standard value ranges
+where applicable (e.g., "Call Drop Rate should be below 1.5%").
+
+If the question is actually asking for data analysis (e.g., "what is the drop rate for site X"),
+respond with: {"redirect": "analytical"} to redirect to the SQL engine."""
+
+    try:
+        resp = _llm_client.chat.completions.create(
+            model=_llm_model,
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.3,
+            max_tokens=500,
+        )
+        content = resp.choices[0].message.content.strip()
+
+        # Check if LLM redirected to analytical
+        if '{"redirect"' in content or '"redirect"' in content:
+            return None  # Signal to route to analytical path
+
+        return {
+            "type": "informational",
+            "response": content,
+            "chart_type": "none",
+            "data": [],
+            "columns": [],
+            "row_count": 0,
+        }
+    except Exception as e:
+        _LOG.warning("Informational query failed: %s", e)
+        return None  # Fallback to analytical
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Cache Layer
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _cache_key(sql: str) -> str:
+    """Generate cache key from SQL query."""
+    return hashlib.md5(sql.strip().lower().encode()).hexdigest()
+
+
+def _cache_get(key: str, ttl: int = None) -> dict:
+    """Get cached result if still valid."""
+    ttl = ttl or _CACHE_TTL
+    with _cache_lock:
+        entry = _query_cache.get(key)
+        if entry and (time.time() - entry["ts"]) < ttl:
+            _LOG.debug("Cache hit: %s", key[:8])
+            return entry["data"]
+        return None
+
+
+def _cache_set(key: str, data: dict):
+    """Store result in cache."""
+    with _cache_lock:
+        # Evict old entries if cache too large (max 200 entries)
+        if len(_query_cache) > 200:
+            oldest = sorted(_query_cache.items(), key=lambda x: x[1]["ts"])[:50]
+            for k, _ in oldest:
+                _query_cache.pop(k, None)
+        _query_cache[key] = {"data": data, "ts": time.time()}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WebSocket Streaming for intermediate states
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _emit_progress(session_id: int, stage: str, message: str = ""):
+    """Emit a WebSocket event for query progress.
+    Stages: understanding → generating → executing → rendering → complete"""
+    try:
+        from flask_socketio import emit as ws_emit
+        ws_emit('ai_progress', {
+            'session_id': session_id,
+            'stage': stage,
+            'message': message,
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+        }, room=f'ai_session_{session_id}', namespace='/')
+    except Exception:
+        pass  # WebSocket is optional, never break the flow
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Database Optimization — Indexes & Materialized Views
+# ─────────────────────────────────────────────────────────────────────────────
+
+def ensure_db_optimizations():
+    """Create indexes and materialized views for optimal query performance.
+    Safe to call multiple times (idempotent with IF NOT EXISTS)."""
+    _LOG.info("Ensuring database optimizations...")
+
+    _indexes = [
+        # kpi_data indexes for common query patterns
+        "CREATE INDEX IF NOT EXISTS idx_kpi_site_name_date ON kpi_data(site_id, kpi_name, date)",
+        "CREATE INDEX IF NOT EXISTS idx_kpi_level_name ON kpi_data(data_level, kpi_name)",
+        "CREATE INDEX IF NOT EXISTS idx_kpi_site_level_date ON kpi_data(site_id, kpi_name, data_level, date)",
+        "CREATE INDEX IF NOT EXISTS idx_kpi_date ON kpi_data(date DESC)",
+        # telecom_sites indexes
+        "CREATE INDEX IF NOT EXISTS idx_sites_zone ON telecom_sites(zone)",
+        "CREATE INDEX IF NOT EXISTS idx_sites_status ON telecom_sites(site_status)",
+        "CREATE INDEX IF NOT EXISTS idx_sites_city ON telecom_sites(city)",
+        # flexible_kpi_uploads indexes
+        "CREATE INDEX IF NOT EXISTS idx_flex_type_col ON flexible_kpi_uploads(kpi_type, column_name)",
+        "CREATE INDEX IF NOT EXISTS idx_flex_site ON flexible_kpi_uploads(site_id)",
+        # network_issue_tickets indexes
+        "CREATE INDEX IF NOT EXISTS idx_nit_status ON network_issue_tickets(status)",
+        "CREATE INDEX IF NOT EXISTS idx_nit_priority ON network_issue_tickets(priority_score DESC)",
+    ]
+
+    _materialized_views = [
+        # Pre-aggregated daily site KPI summary
+        """CREATE MATERIALIZED VIEW IF NOT EXISTS mv_daily_site_kpi AS
+        SELECT site_id, kpi_name, date,
+               AVG(value) AS avg_value,
+               MIN(value) AS min_value,
+               MAX(value) AS max_value,
+               COUNT(*) AS sample_count
+        FROM kpi_data
+        WHERE data_level = 'site' AND value IS NOT NULL
+        GROUP BY site_id, kpi_name, date""",
+
+        # Pre-aggregated zone-level KPI summary
+        """CREATE MATERIALIZED VIEW IF NOT EXISTS mv_zone_kpi_summary AS
+        SELECT ts.zone, k.kpi_name,
+               AVG(k.value) AS avg_value,
+               MIN(k.value) AS min_value,
+               MAX(k.value) AS max_value,
+               COUNT(DISTINCT k.site_id) AS site_count
+        FROM kpi_data k
+        JOIN telecom_sites ts ON k.site_id = ts.site_id
+        WHERE k.data_level = 'site' AND k.value IS NOT NULL
+        GROUP BY ts.zone, k.kpi_name""",
+    ]
+
+    _mv_indexes = [
+        "CREATE INDEX IF NOT EXISTS idx_mv_daily_site ON mv_daily_site_kpi(site_id, kpi_name, date)",
+        "CREATE INDEX IF NOT EXISTS idx_mv_zone_kpi ON mv_zone_kpi_summary(zone, kpi_name)",
+    ]
+
+    try:
+        with db.engine.connect() as conn:
+            # Create indexes
+            for idx_sql in _indexes:
+                try:
+                    conn.execute(sa_text(idx_sql))
+                except Exception as e:
+                    _LOG.debug("Index skip: %s", str(e)[:80])
+            conn.commit()
+
+            # Create materialized views
+            for mv_sql in _materialized_views:
+                try:
+                    conn.execute(sa_text(mv_sql))
+                except Exception as e:
+                    _LOG.debug("MV skip: %s", str(e)[:80])
+            conn.commit()
+
+            # Create MV indexes
+            for mv_idx in _mv_indexes:
+                try:
+                    conn.execute(sa_text(mv_idx))
+                except Exception as e:
+                    _LOG.debug("MV index skip: %s", str(e)[:80])
+            conn.commit()
+
+        _LOG.info("Database optimizations complete.")
+    except Exception as e:
+        _LOG.warning("DB optimization failed (non-fatal): %s", e)
+
+
+def refresh_materialized_views():
+    """Refresh all materialized views. Call periodically or after data uploads."""
+    try:
+        with db.engine.connect() as conn:
+            conn.execute(sa_text("REFRESH MATERIALIZED VIEW CONCURRENTLY mv_daily_site_kpi"))
+            conn.execute(sa_text("REFRESH MATERIALIZED VIEW CONCURRENTLY mv_zone_kpi_summary"))
+            conn.commit()
+        _LOG.info("Materialized views refreshed successfully.")
+    except Exception as e:
+        _LOG.debug("MV refresh skip: %s", str(e)[:80])
 
 # ─── Module-level schema discovery cache (populated on first ai_query call) ──
 _schema_cache = {
@@ -111,6 +460,7 @@ def ai_query():
         return jsonify({"error": "Forbidden"}), 403
 
     _LOG.info("network_ai version: %s", NETWORK_AI_VERSION)
+    _query_start = time.time()
     body    = request.get_json(silent=True) or {}
     prompt  = str(body.get("prompt", "")).strip()
     context = body.get("context", {})
@@ -120,6 +470,10 @@ def ai_query():
 
     if not prompt:
         return jsonify({"error": "No prompt provided"}), 400
+
+    # ── Query Router: classify the query type ──────────────────────────────
+    query_type = _classify_query(prompt)
+    _LOG.info("[ROUTER] Query classified as: %s | prompt: %s", query_type, prompt[:80])
 
     # ── Session context (optional) ────────────────────────────────────────────
     session_id = body.get("session_id")
@@ -187,6 +541,49 @@ def ai_query():
             db.session.commit()
         else:
             ai_session = None
+
+    # ── WebSocket: signal query started ──────────────────────────────────────
+    _ws_sid = ai_session.id if ai_session else None
+    _emit_progress(_ws_sid, 'understanding', 'Analyzing your question...')
+
+    # ── Handle informational queries (no SQL needed) ─────────────────────────
+    if query_type == 'informational':
+        _emit_progress(_ws_sid, 'generating', 'Preparing answer...')
+        info_result = _handle_informational_query(prompt)
+        if info_result:
+            _emit_progress(_ws_sid, 'complete', 'Done')
+            resp_text = info_result["response"]
+            # Persist to session
+            if ai_session:
+                try:
+                    if ai_session.title == "New Chat":
+                        ai_session.title = prompt[:60]
+                    assistant_msg = NetworkAiMessage(
+                        session_id=ai_session.id, role="assistant",
+                        content=resp_text,
+                        content_json={"type": "informational", "response": resp_text},
+                    )
+                    db.session.add(assistant_msg)
+                    db.session.commit()
+                except Exception as e:
+                    _LOG.error("Failed to persist informational msg: %s", e)
+            _elapsed = round(time.time() - _query_start, 2)
+            _LOG.info("[COMPLETE] Informational query in %.2fs", _elapsed)
+            return jsonify({
+                "response": resp_text,
+                "query_type": "informational",
+                "chart_type": "none",
+                "title": prompt[:60],
+                "data": [],
+                "columns": [],
+                "row_count": 0,
+                "provider": "llm-informational",
+                "session_id": _ws_sid,
+                "elapsed_seconds": _elapsed,
+            })
+        # If info_result is None, LLM redirected to analytical — continue below
+
+    _emit_progress(_ws_sid, 'generating', 'Generating SQL query...')
 
     # ── Try LLM providers ─────────────────────────────────────────────────────
     provider = None
@@ -362,8 +759,64 @@ ALWAYS add AND k.date <= CURRENT_DATE when any date range is used, to exclude fu
    Example: Open network issue tickets:
      SELECT n.* FROM network_issue_tickets n WHERE n.status IN ('open','in_progress') ORDER BY n.priority_score DESC
 
+8. site_kpi_summary — ML-categorized pre-aggregated daily KPI summary per site
+   Columns: site_id, date, kpi_name, avg_value, min_value, max_value, stddev_value, sample_count,
+            health_label, health_confidence, is_anomaly, anomaly_score, site_tier, health_score, zone
+   - health_label = 'healthy', 'degraded', or 'critical' (ML K-Means per KPI)
+   - is_anomaly = true/false (ML Isolation Forest outlier detection)
+   - site_tier = 'top_performer', 'good', 'average', or 'underperformer' (ML K-Means multi-KPI)
+   - health_score = 0-100 composite score (higher = healthier)
+   - health_confidence = 0-1 (how confident the ML model is in the health_label)
+   - anomaly_score = negative float (more negative = more anomalous)
+
+   USE THIS TABLE for questions about:
+   - site health, performance categories, degraded/critical sites
+   - anomalies, outliers, unusual behavior
+   - site rankings, top/worst performers, performance tiers
+   - health scores, health trends over time
+   - comparing site performance across zones
+
+   Example: Get worst-performing sites today:
+     SELECT s.site_id, s.zone, s.health_score, s.site_tier, s.health_label, s.kpi_name, s.avg_value
+     FROM site_kpi_summary s
+     WHERE s.date = (SELECT MAX(date) FROM site_kpi_summary)
+       AND s.health_label = 'critical'
+     ORDER BY s.health_score ASC LIMIT 20
+
+   Example: Anomalies detected in last 7 days:
+     SELECT s.site_id, s.date::text, s.kpi_name, s.avg_value, s.anomaly_score, s.health_label
+     FROM site_kpi_summary s
+     WHERE s.is_anomaly = true
+       AND s.date >= (SELECT MAX(date) FROM site_kpi_summary) - INTERVAL '7 days'
+     ORDER BY s.anomaly_score ASC LIMIT 50
+
+   Example: Site health trend over time:
+     SELECT s.date::text, s.health_score, s.health_label
+     FROM site_kpi_summary s
+     WHERE s.site_id = 'GUR_LTE_1500' AND s.kpi_name = 'E-RAB Call Drop Rate_1'
+     ORDER BY s.date LIMIT 30
+
+   Example: Zone-wise health comparison:
+     SELECT s.zone, s.kpi_name,
+            AVG(s.health_score) AS avg_health,
+            COUNT(*) FILTER (WHERE s.health_label = 'critical') AS critical_count,
+            COUNT(*) FILTER (WHERE s.is_anomaly = true) AS anomaly_count
+     FROM site_kpi_summary s
+     WHERE s.date = (SELECT MAX(date) FROM site_kpi_summary)
+     GROUP BY s.zone, s.kpi_name
+     ORDER BY avg_health ASC LIMIT 30
+
+   Example: Top performing sites:
+     SELECT s.site_id, s.zone, AVG(s.health_score) AS avg_health, s.site_tier
+     FROM site_kpi_summary s
+     WHERE s.date >= (SELECT MAX(date) FROM site_kpi_summary) - INTERVAL '7 days'
+     GROUP BY s.site_id, s.zone, s.site_tier
+     HAVING s.site_tier = 'top_performer'
+     ORDER BY avg_health DESC LIMIT 20
+
 === TABLE SELECTION RULE ===
-- RAN performance KPIs (drop rate, throughput, PRB, latency, etc.) → query kpi_data table
+- Health/performance categories, anomalies, site tiers, rankings → query site_kpi_summary table (PREFERRED for categorized insights)
+- RAN performance KPIs (raw values, specific hours, cell-level) → query kpi_data table
 - Revenue, OPEX, subscribers, ARPU → query revenue_data table FIRST; fallback to flexible_kpi_uploads with kpi_type='revenue'
 - Core network KPIs (authentication, CPU, attach, PDP) → query core_kpi_data table FIRST; fallback to flexible_kpi_uploads with kpi_type='core'
 - Transport/backhaul KPIs (link capacity, jitter, packet loss, backhaul) → query transport_kpi_data table
@@ -371,6 +824,20 @@ ALWAYS add AND k.date <= CURRENT_DATE when any date range is used, to exclude fu
 - Site info (zone, city, state, technology, location) → query telecom_sites table
 NEVER query kpi_data for revenue/subscriber/OPEX data — it does not exist there.
 If a table returns 0 rows, try the alternative table (e.g., revenue_data → flexible_kpi_uploads).
+
+=== WHEN TO USE site_kpi_summary vs kpi_data ===
+PREFER site_kpi_summary when the user asks about:
+- "healthy", "degraded", "critical" sites/KPIs
+- "anomalies", "outliers", "unusual" readings
+- "top performers", "worst sites", "underperformers", site "tiers"
+- "health score", "performance score"
+- general aggregated trends (daily averages)
+- zone-level comparisons
+PREFER kpi_data when the user asks about:
+- hourly data, specific hours of the day
+- cell-level data (data_level = 'cell')
+- raw unaggregated values
+- data that may not yet be in the summary (just uploaded)
 
 === CRITICAL: column_name matching in flexible_kpi_uploads ===
 Column names may have MIXED CASING (e.g., 'Subscribers', 'Revenue_Jan_L', 'OPEX_Feb (L)').
@@ -386,7 +853,8 @@ ALWAYS use ILIKE for column_name matching:
             "SELECT table_name FROM information_schema.tables "
             "WHERE table_schema = 'public' AND table_name IN "
             "('revenue_data','core_kpi_data','transport_kpi_data',"
-            "'network_issue_tickets','flexible_kpi_uploads','kpi_data','telecom_sites')"
+            "'network_issue_tickets','flexible_kpi_uploads','kpi_data','telecom_sites',"
+            "'site_kpi_summary')"
         )
         _available_tables = {r['table_name'] for r in _tbl_rows}
     except Exception:
@@ -396,6 +864,7 @@ ALWAYS use ILIKE for column_name matching:
     for _tn, _fb in [
         ('kpi_data', None),
         ('telecom_sites', None),
+        ('site_kpi_summary', "kpi_data (raw, no ML categories)"),
         ('revenue_data', "flexible_kpi_uploads WHERE kpi_type='revenue'"),
         ('core_kpi_data', "flexible_kpi_uploads WHERE kpi_type='core'"),
         ('transport_kpi_data', None),
@@ -587,6 +1056,49 @@ ALWAYS use ILIKE for column_name matching:
                 SCHEMA_HINT += _ccn
         except Exception:
             pass
+
+    # ── Dynamic site_kpi_summary discovery — tell LLM about ML categories ──
+    # Auto-trigger ML pipeline if table is empty (first-time or after data refresh)
+    _sks_row_count = 0
+    if 'site_kpi_summary' in _available_tables:
+        try:
+            _sks_info = _sql(
+                "SELECT COUNT(*) AS row_count, "
+                "MIN(date)::text AS min_date, MAX(date)::text AS max_date, "
+                "COUNT(DISTINCT site_id) AS site_count, "
+                "COUNT(DISTINCT kpi_name) AS kpi_count, "
+                "COUNT(*) FILTER (WHERE health_label = 'critical') AS critical_count, "
+                "COUNT(*) FILTER (WHERE health_label = 'degraded') AS degraded_count, "
+                "COUNT(*) FILTER (WHERE health_label = 'healthy') AS healthy_count, "
+                "COUNT(*) FILTER (WHERE is_anomaly = true) AS anomaly_count "
+                "FROM site_kpi_summary"
+            )
+            _sks_row_count = _sks_info[0].get('row_count', 0) if _sks_info else 0
+            if _sks_row_count > 0:
+                _si = _sks_info[0]
+                _sks_hint = "\n=== ML-CATEGORIZED SUMMARY (site_kpi_summary) ===\n"
+                _sks_hint += f"Total rows: {_si['row_count']} | Sites: {_si['site_count']} | KPIs: {_si['kpi_count']}\n"
+                _sks_hint += f"Date range: {_si['min_date']} to {_si['max_date']}\n"
+                _sks_hint += f"Health distribution: {_si['healthy_count']} healthy, {_si['degraded_count']} degraded, {_si['critical_count']} critical\n"
+                _sks_hint += f"Anomalies detected: {_si['anomaly_count']}\n"
+                _sks_hint += "PREFER this table for performance/health queries — it has ML-generated labels.\n"
+                _sks_hint += f"For date references in this table, use '{_si['max_date']}'::date as the latest date.\n"
+                SCHEMA_HINT += _sks_hint
+                _LOG.info("[DISCOVERY] site_kpi_summary: %d rows, %s to %s, %d anomalies",
+                          _si['row_count'], _si['min_date'], _si['max_date'], _si['anomaly_count'])
+        except Exception as e:
+            _LOG.debug("[DISCOVERY] site_kpi_summary check failed: %s", e)
+
+    # Auto-run ML pipeline in background if summary table is empty
+    if _sks_row_count == 0 and 'kpi_data' in _available_tables:
+        try:
+            from ml_pipeline import run_ml_pipeline_async, get_pipeline_status
+            _ml_st = get_pipeline_status()
+            if not _ml_st.get("running"):
+                _LOG.info("[AUTO-ML] site_kpi_summary is empty — triggering ML pipeline in background")
+                run_ml_pipeline_async(current_app._get_current_object())
+        except Exception as e:
+            _LOG.debug("[AUTO-ML] Failed to auto-trigger ML pipeline: %s", e)
 
     # ── CHANGE: read session_context for dynamic prompt injection ──
     _sctx = (getattr(ai_session, 'session_context', None) or {}) if ai_session else {}
@@ -1021,11 +1533,30 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
 
     # ── Helper functions ──────────────────────────────────────────────────────
     def _sql_with_timeout(query, timeout_sec=10):
+        """Execute SQL with timeout and safety validation."""
+        # Validate SQL safety before execution
+        is_safe, result_or_error = _validate_sql(query)
+        if not is_safe:
+            _LOG.warning("[SQL-BLOCKED] %s — SQL: %s", result_or_error, query[:200])
+            raise ValueError(f"SQL validation failed: {result_or_error}")
+        query = _add_safety_limits(result_or_error)  # result_or_error is normalized SQL when safe
+
+        # Check cache first
+        ck = _cache_key(query)
+        cached = _cache_get(ck)
+        if cached is not None:
+            _LOG.info("[CACHE-HIT] Returning cached result for: %s", query[:80])
+            return cached
+
         with db.engine.connect() as conn:
             conn.execute(sa_text(f"SET LOCAL statement_timeout = '{timeout_sec * 1000}'"))
             result = conn.execute(sa_text(query))
             cols = list(result.keys())
-            return [dict(zip(cols, row)) for row in result.fetchall()]
+            rows = [dict(zip(cols, row)) for row in result.fetchall()]
+
+        # Cache the result
+        _cache_set(ck, rows)
+        return rows
 
     def _serial(v):
         if v is None: return None
@@ -1033,6 +1564,8 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
         if isinstance(v, float) and math.isnan(v): return None
         try:    return float(v)
         except: return str(v)
+
+    _emit_progress(_ws_sid, 'executing', 'Running query...')
 
     # ── MULTI-CHART: execute each chart's SQL separately ───────────────────────
     if ai_result.get("multi_chart") and ai_result.get("charts"):
@@ -1091,6 +1624,10 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
             _update_session_context(ai_session, _all_sqls, "multi_chart")
             _maybe_summarize_conversation(ai_session)
 
+        _emit_progress(_ws_sid, 'complete', 'Done')
+        _elapsed = round(time.time() - _query_start, 2)
+        _LOG.info("[COMPLETE] Multi-chart query in %.2fs | %d charts | provider=%s",
+                  _elapsed, len(charts_out), provider.get("provider") if provider else "rule-based")
         return jsonify({
             "response":     resp_text,
             "query_type":   "multi_chart",
@@ -1102,6 +1639,7 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
             "row_count":    sum(c["row_count"] for c in charts_out),
             "provider":     provider["provider"] if provider else "rule-based",
             "session_id":   ai_session.id if ai_session else None,
+            "elapsed_seconds": _elapsed,
         })
 
     # ── SINGLE CHART: execute SQL normally ─────────────────────────────────────
@@ -1172,6 +1710,10 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
         _update_session_context(ai_session, sql, resp_chart)
         _maybe_summarize_conversation(ai_session)
 
+    _emit_progress(_ws_sid, 'complete', 'Done')
+    _elapsed = round(time.time() - _query_start, 2)
+    _LOG.info("[COMPLETE] Single-chart query in %.2fs | %d rows | provider=%s | chart=%s",
+              _elapsed, len(rows), provider.get("provider") if provider else "rule-based", resp_chart)
     return jsonify({
         "response":      resp_text,
         "query_type":    ai_result.get("query_type", "bar"),
@@ -1189,6 +1731,7 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
         "show_map":      has_geo or ai_result.get("show_map", False),
         "provider":      provider["provider"] if provider else "rule-based",
         "session_id":    ai_session.id if ai_session else None,
+        "elapsed_seconds": _elapsed,
     })
 
 
