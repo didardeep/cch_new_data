@@ -89,10 +89,16 @@ function Tip({T,active,payload,label}) {
 
 // ── Pivot helper for UNION ALL multi-series data ──────────────────────────
 function pivotMultiSeries(data, columns, xKey) {
+  if (!data || data.length === 0) return null;
   const hasKpiName = columns.includes('kpi_name');
   const hasSiteId = columns.includes('site_id');
   const hasValue = columns.includes('value');
   if (!hasValue || !xKey) return null;
+  if (!hasKpiName && !hasSiteId) return null;
+
+  // If every x value is already unique, data is flat — no pivot needed
+  const xVals = data.map(r => r[xKey]);
+  if (new Set(xVals).size === xVals.length) return null;
 
   const distinctKpis = hasKpiName ? [...new Set(data.map(r => r.kpi_name).filter(Boolean))] : [];
   const distinctSites = hasSiteId ? [...new Set(data.map(r => r.site_id).filter(Boolean))] : [];
@@ -144,6 +150,9 @@ function pivotMultiSeries(data, columns, xKey) {
     const av = a[xKey], bv = b[xKey];
     return typeof av === 'string' ? av.localeCompare(bv) : (av - bv);
   });
+
+  // Safety: ensure pivot produced real data
+  if (pivoted.length === 0 || seriesKeys.length === 0) return null;
 
   return { data: pivoted, yKeys: seriesKeys, labels: seriesLabels };
 }
@@ -284,33 +293,37 @@ function InlineChart({result,T,chartId}) {
         </ResponsiveContainer>);
     }
 
-    if(ctype==='composed'&&yKeys.length>=2){
+    if(ctype==='composed'&&yKeys.length>=1){
       const cTickInterval=data.length>15?Math.ceil(data.length/10):0;
       const chartColors=[PAL[0],PAL[1],PAL[2],PAL[3],PAL[4]];
-      const lVals=data.map(r=>parseFloat(r[yKeys[0]])).filter(v=>!isNaN(v));
-      const rVals=yKeys[1]?data.map(r=>parseFloat(r[yKeys[1]])).filter(v=>!isNaN(v)):[];
+
+      // Only use dual Y-axis when scales differ by more than 10x — prevents
+      // one series being visually invisible (e.g. drop rate 0-5% vs throughput 0-100)
+      const getRange=k=>{const vals=data.map(r=>parseFloat(r[k])).filter(v=>!isNaN(v));return vals.length?Math.max(...vals)-Math.min(...vals):1;};
+      const ranges=yKeys.map(getRange);
+      const useDualAxis=yKeys.length>=2&&ranges[0]>0&&ranges[1]>0&&
+        (Math.max(ranges[0],ranges[1])/Math.min(ranges[0],ranges[1]))>10;
+
       const domainOf=vals=>{if(!vals.length)return[0,'auto'];const mn=Math.min(...vals),mx=Math.max(...vals),rng=mx-mn||1,p=rng*.1;return[Math.max(0,Math.floor((mn-p)*100)/100),Math.ceil((mx+p)*100)/100];};
+      const lVals=data.flatMap(r=>yKeys.filter((_,i)=>!useDualAxis||i!==1).map(k=>parseFloat(r[k]))).filter(v=>!isNaN(v));
+      const rVals=useDualAxis&&yKeys[1]?data.map(r=>parseFloat(r[yKeys[1]])).filter(v=>!isNaN(v)):[];
+
       return(
         <ResponsiveContainer width="100%" height={h+30}>
-          <ComposedChart data={data} margin={{top:5,right:25,left:5,bottom:35}}>
-            <defs>
-              {yKeys.map((k,i)=>(
-                <linearGradient key={k} id={`cg${uid}${i}`} x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor={chartColors[i%chartColors.length]} stopOpacity={.4}/><stop offset="100%" stopColor={chartColors[i%chartColors.length]} stopOpacity={.03}/></linearGradient>
-              ))}
-            </defs>
+          <ComposedChart data={data} margin={{top:5,right:useDualAxis?55:20,left:5,bottom:35}}>
             <CartesianGrid strokeDasharray="3 3" stroke={T.border} vertical={false}/>
             <XAxis dataKey={xKey} tick={{fontSize:8,fill:T.muted}} axisLine={false} tickLine={false} interval={cTickInterval} angle={-35} textAnchor="end" height={45} tickFormatter={v=>{if(typeof v!=='string')return v;if(v.length>10)return v.slice(5,10);return v;}}/>
-            <YAxis yAxisId="l" tick={{fontSize:9,fill:T.muted}} axisLine={false} width={45} domain={domainOf(lVals)} tickFormatter={v=>f(v,2)} label={yKeys[0]?{value:keyLabel(yKeys[0]).slice(0,20),angle:-90,position:'insideLeft',fontSize:8,fill:T.muted}:undefined}/>
-            {yKeys.length>1&&<YAxis yAxisId="r" orientation="right" tick={{fontSize:9,fill:T.muted}} axisLine={false} width={45} domain={domainOf(rVals)} tickFormatter={v=>f(v,2)} label={yKeys[1]?{value:keyLabel(yKeys[1]).slice(0,20),angle:90,position:'insideRight',fontSize:8,fill:T.muted}:undefined}/>}
+            <YAxis yAxisId="l" tick={{fontSize:9,fill:T.muted}} axisLine={false} width={45} domain={domainOf(lVals)} tickFormatter={v=>f(v,2)} label={yKeys[0]&&useDualAxis?{value:keyLabel(yKeys[0]).slice(0,18),angle:-90,position:'insideLeft',fontSize:8,fill:T.muted}:undefined}/>
+            {useDualAxis&&<YAxis yAxisId="r" orientation="right" tick={{fontSize:9,fill:T.muted}} axisLine={false} width={45} domain={domainOf(rVals)} tickFormatter={v=>f(v,2)} label={yKeys[1]?{value:keyLabel(yKeys[1]).slice(0,18),angle:90,position:'insideRight',fontSize:8,fill:T.muted}:undefined}/>}
             <Tooltip content={<TipC/>} cursor={{stroke:T.kpmgBlue,strokeWidth:1,strokeDasharray:'4 2'}}/>
             {threshold!=null&&<ReferenceLine yAxisId="l" y={threshold} stroke={T.amber} strokeDasharray="4 2"/>}
             {yKeys.map((k,i)=>{
-              const yId=i===0?'l':(i===1?'r':'l');
+              // All series use Line — mixing Area+Line causes one to visually dominate
+              // and obscure the other. Lines are cleaner for multi-KPI overlays.
+              const yId=useDualAxis&&i===1?'r':'l';
               const color=chartColors[i%chartColors.length];
-              return i%2===0?(
-                <Area key={k} yAxisId={yId} type="natural" dataKey={k} name={keyLabel(k)} fill={`url(#cg${uid}${i})`} stroke={color} strokeWidth={2.5} activeDot={{r:5,strokeWidth:2,stroke:'#fff'}} animationDuration={1000} animationEasing="ease-in-out"/>
-              ):(
-                <Line key={k} yAxisId={yId} type="natural" dataKey={k} name={keyLabel(k)} stroke={color} strokeWidth={2.5} dot={data.length<=20?{r:3,strokeWidth:2,stroke:'#fff'}:false} activeDot={{r:6,strokeWidth:2,stroke:'#fff'}} animationDuration={1200} animationEasing="ease-in-out"/>
+              return(
+                <Line key={k} yAxisId={yId} type="monotone" dataKey={k} name={keyLabel(k)} stroke={color} strokeWidth={2} dot={data.length<=30?{r:3,strokeWidth:1.5,stroke:'#fff'}:false} activeDot={{r:5,strokeWidth:2,stroke:'#fff'}} animationDuration={900} animationEasing="ease-in-out"/>
               );
             })}
             <Legend iconType="circle" iconSize={7} wrapperStyle={{fontSize:10}}/>
