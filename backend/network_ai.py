@@ -1030,6 +1030,43 @@ ALWAYS use ILIKE for column_name matching:
         except Exception as e:
             _LOG.warning("[DISCOVERY] Failed to get kpi_data date range: %s", e)
 
+    # ── KPI value ranges — inject actual min/avg/median/max so LLM knows realistic thresholds ──
+    # Without this, the LLM has no idea if "< 8 Mbps" is a tight or loose filter,
+    # leading to threshold queries that confidently return 0 rows with no explanation.
+    if 'kpi_data' in _available_tables:
+        try:
+            _kpi_ranges = _sql(
+                """SELECT kpi_name,
+                          ROUND(MIN(value)::numeric, 2)    AS min_val,
+                          ROUND(AVG(value)::numeric, 2)    AS avg_val,
+                          ROUND(MAX(value)::numeric, 2)    AS max_val,
+                          ROUND(PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY value)::numeric, 2) AS p25,
+                          ROUND(PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY value)::numeric, 2) AS p75,
+                          COUNT(DISTINCT site_id) AS site_count
+                   FROM kpi_data
+                   WHERE data_level = 'site' AND value IS NOT NULL
+                   GROUP BY kpi_name
+                   ORDER BY kpi_name"""
+            )
+            if _kpi_ranges:
+                _schema_cache["kpi_ranges"] = {r["kpi_name"]: r for r in _kpi_ranges}
+                _rng_hint = "\n=== KPI VALUE RANGES (actual data — use for threshold calibration) ===\n"
+                _rng_hint += "Format: kpi_name → min | p25 | avg | p75 | max | sites\n"
+                for r in _kpi_ranges:
+                    _rng_hint += (
+                        f"  '{r['kpi_name']}': "
+                        f"min={r['min_val']} | p25={r['p25']} | avg={r['avg_val']} "
+                        f"| p75={r['p75']} | max={r['max_val']} | {r['site_count']} sites\n"
+                    )
+                _rng_hint += (
+                    "CRITICAL: When a threshold query returns 0 rows, it means NO site breaches "
+                    "that threshold — check ranges above and inform the user.\n"
+                )
+                SCHEMA_HINT += _rng_hint
+                _LOG.info("[DISCOVERY] KPI ranges loaded for %d KPIs", len(_kpi_ranges))
+        except Exception as e:
+            _LOG.warning("[DISCOVERY] KPI ranges query failed (non-fatal): %s", e)
+
     _schema_cache["populated"] = True
     _LOG.info("[DISCOVERY] rev_data_cols=%s rev_rev_cols=%s rev_opex=%s rev_subs=%s",
               _schema_cache["rev_data_cols"][:5], _schema_cache["rev_rev_cols"][:5],
@@ -1175,7 +1212,38 @@ Follow-up patterns and how to handle them:
 - A prompt like "i want to see for site id X" with NO new KPI mentioned = SITE SWITCH → inherit all KPIs.
 
 ═══════════════════════════════════════════════════════════
-CRITICAL RULE #0 — MULTI-PART / COMPOUND QUERIES:
+CRITICAL RULE #0b — THRESHOLD-BASED WORST SITE QUERIES:
+═══════════════════════════════════════════════════════════
+
+When the user asks for "worst N sites where KPI1 > X OR KPI2 < Y OR KPI3 < Z":
+→ NEVER generate 3 separate SQL queries (multi_chart). Generate ONE SQL query.
+→ ALWAYS use PIVOT (CASE WHEN) approach to compute all KPI averages in one query.
+→ Use HAVING clause with OR conditions to filter sites meeting ANY threshold.
+→ Add a "violations" count column to rank sites by how many thresholds they breach.
+
+CORRECT approach for "show 5 worst sites where E-RAB Drop > 1.5% OR CSSR < 98.5% OR DL Usr Tput < 8":
+```sql
+SELECT k.site_id,
+       AVG(CASE WHEN k.kpi_name = 'E-RAB Call Drop Rate_1' THEN k.value END) AS drop_rate,
+       AVG(CASE WHEN k.kpi_name = 'LTE Call Setup Success Rate' THEN k.value END) AS cssr,
+       AVG(CASE WHEN k.kpi_name = 'LTE DL - Usr Ave Throughput' THEN k.value END) AS dl_usr_tput,
+       (CASE WHEN AVG(CASE WHEN k.kpi_name = 'E-RAB Call Drop Rate_1' THEN k.value END) > 1.5 THEN 1 ELSE 0 END +
+        CASE WHEN AVG(CASE WHEN k.kpi_name = 'LTE Call Setup Success Rate' THEN k.value END) < 98.5 THEN 1 ELSE 0 END +
+        CASE WHEN AVG(CASE WHEN k.kpi_name = 'LTE DL - Usr Ave Throughput' THEN k.value END) < 8 THEN 1 ELSE 0 END
+       ) AS violations
+FROM kpi_data k
+WHERE k.data_level = 'site' AND k.value IS NOT NULL
+  AND k.kpi_name IN ('E-RAB Call Drop Rate_1', 'LTE Call Setup Success Rate', 'LTE DL - Usr Ave Throughput')
+GROUP BY k.site_id
+HAVING AVG(CASE WHEN k.kpi_name = 'E-RAB Call Drop Rate_1' THEN k.value END) > 1.5
+    OR AVG(CASE WHEN k.kpi_name = 'LTE Call Setup Success Rate' THEN k.value END) < 98.5
+    OR AVG(CASE WHEN k.kpi_name = 'LTE DL - Usr Ave Throughput' THEN k.value END) < 8
+ORDER BY violations DESC, drop_rate DESC NULLS LAST
+LIMIT 5
+```
+chart_type: "bar", x_axis: "site_id", y_axes: ["drop_rate","cssr","dl_usr_tput","violations"]
+
+
 ═══════════════════════════════════════════════════════════
 
 Users often ask for MULTIPLE things in ONE query. You MUST handle ALL parts.
@@ -1465,6 +1533,163 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
             provider  = {"provider": "rule-based-multisite"}
             _LOG.info("Multi-site trend intercepted before LLM: %s", _prompt_sites)
 
+    # 2c. Threshold-based multi-KPI worst-site queries
+    #     Pattern: "show N worst sites where KPI1 > X% or KPI2 < Y% or KPI3 < Z Mbps"
+    #     The LLM fails here because: it generates 3 separate multi_chart SQL queries,
+    #     each querying one KPI threshold, but the EAV kpi_data table requires a
+    #     PIVOT (CASE WHEN) approach to apply OR conditions across multiple KPIs
+    #     simultaneously. Sites in CSSR/throughput charts show 0 rows because the LLM
+    #     incorrectly uses HAVING or WHERE on a single-KPI subquery.
+    #     Fix: intercept before LLM and generate a single correct PIVOT SQL.
+    if not ai_result:
+        _thresh_kpi_map = {
+            # Drop rate / E-RAB — "greater than X%"
+            r'e.?rab\s+call\s+drop|call\s+drop\s+rate|drop\s+rate|cdr|erab\s+drop':
+                ('E-RAB Call Drop Rate_1', 'drop_rate', 'above'),
+            # CSSR — "less than X%"
+            r'call\s+setup\s+success|lte\s+call\s+setup|cssr':
+                ('LTE Call Setup Success Rate', 'cssr', 'below'),
+            # DL User Throughput — "less than X Mbps"
+            r'dl\s+[-–]?\s*usr\s+ave\s+throughput|dl\s+user\s+ave\s+throughput|dl.{0,10}user.{0,10}throughput|usr\s+ave\s+throughput|user\s+average\s+throughput':
+                ('LTE DL - Usr Ave Throughput', 'dl_usr_tput', 'below'),
+            # DL Cell Throughput
+            r'dl\s+[-–]?\s*cell\s+ave\s+throughput|dl.{0,10}cell.{0,10}throughput':
+                ('LTE DL - Cell Ave Throughput', 'dl_cell_tput', 'below'),
+            # RRC
+            r'lte\s+rrc\s+setup|rrc\s+setup\s+success':
+                ('LTE RRC Setup Success Rate', 'rrc_sr', 'below'),
+            # Availability
+            r'availability':
+                ('Availability', 'availability', 'below'),
+            # PRB / Congestion
+            r'prb\s+utilization|dl\s+prb':
+                ('DL PRB Utilization (1BH)', 'dl_prb', 'above'),
+        }
+
+        # Detect threshold values: "greater than 1.5%", "less than 98.5%", "< 8 Mbps"
+        def _extract_thresholds(text):
+            """Return list of (kpi_name, alias, direction, threshold_value)."""
+            import re as _re_th
+            found = []
+            # Patterns: "greater than X", "> X", "less than X", "< X", "= X"
+            val_pat = _re_th.compile(
+                r'(?:greater\s+than|more\s+than|above|>|exceeds?)\s*([\d.]+)'
+                r'|(?:less\s+than|below|under|<)\s*([\d.]+)'
+                r'|([\d.]+)\s*(?:%|mbps|ms)',
+                _re_th.IGNORECASE
+            )
+            # Split on "or"/"and" to check each condition segment
+            segments = _re_th.split(r'\bor\b|\band\b', text, flags=_re_th.IGNORECASE)
+            for seg in segments:
+                seg_lower = seg.lower()
+                for pattern, (kpi, alias, default_dir) in _thresh_kpi_map.items():
+                    if _re_th.search(pattern, seg_lower):
+                        # Find threshold value in this segment
+                        vm = val_pat.search(seg)
+                        if vm:
+                            if vm.group(1):  # "greater than X"
+                                val = float(vm.group(1))
+                                direction = 'above'
+                            elif vm.group(2):  # "less than X"
+                                val = float(vm.group(2))
+                                direction = 'below'
+                            else:  # bare "X%" — use default direction for this KPI
+                                val = float(vm.group(3))
+                                direction = default_dir
+                            found.append((kpi, alias, direction, val))
+                            break  # one KPI per segment
+            return found
+
+        _thresh_conditions = _extract_thresholds(_p_lower)
+
+        # Also detect N from "show 5 worst" / "top 5" etc.
+        _thresh_n_m = _re_pre.search(r'(?:top|worst|best|show|bottom)\s+(\d+)', _p_lower)
+        _thresh_n = int(_thresh_n_m.group(1)) if _thresh_n_m else 10
+
+        # Only intercept if we found 2+ threshold conditions (single-threshold goes to LLM normally)
+        if len(_thresh_conditions) >= 2:
+            # Build a single PIVOT query:
+            # SELECT site_id, avg(drop_rate), avg(cssr), avg(dl_tput)
+            # FROM (pivot kpi_data)
+            # WHERE drop_rate > X OR cssr < Y OR dl_tput < Z
+            # ORDER BY violations desc LIMIT N
+            _all_kpi_names = [c[0] for c in _thresh_conditions]
+            _in_clause = ", ".join(f"'{k}'" for k in _all_kpi_names)
+
+            # Build CASE WHEN pivot columns
+            _case_parts = []
+            for kpi, alias, direction, val in _thresh_conditions:
+                _case_parts.append(
+                    f"AVG(CASE WHEN k.kpi_name = '{kpi}' THEN k.value END) AS {alias}"
+                )
+
+            # Build HAVING OR conditions
+            _having_parts = []
+            for kpi, alias, direction, val in _thresh_conditions:
+                if direction == 'above':
+                    _having_parts.append(
+                        f"AVG(CASE WHEN k.kpi_name = '{kpi}' THEN k.value END) > {val}"
+                    )
+                else:
+                    _having_parts.append(
+                        f"AVG(CASE WHEN k.kpi_name = '{kpi}' THEN k.value END) < {val}"
+                    )
+
+            # Build "violation count" expression for ordering (how many thresholds breached)
+            _viol_parts = []
+            for kpi, alias, direction, val in _thresh_conditions:
+                if direction == 'above':
+                    _viol_parts.append(
+                        f"CASE WHEN AVG(CASE WHEN k.kpi_name = '{kpi}' THEN k.value END) > {val} THEN 1 ELSE 0 END"
+                    )
+                else:
+                    _viol_parts.append(
+                        f"CASE WHEN AVG(CASE WHEN k.kpi_name = '{kpi}' THEN k.value END) < {val} THEN 1 ELSE 0 END"
+                    )
+
+            _y_axes = [c[1] for c in _thresh_conditions]
+            _title_parts = []
+            for kpi, alias, direction, val in _thresh_conditions:
+                short = kpi.replace('LTE ', '').replace('E-RAB ', '').replace('DL - ', '')[:25]
+                sym = '>' if direction == 'above' else '<'
+                _title_parts.append(f"{short} {sym} {val}")
+            _title = f"Worst {_thresh_n} Sites: " + " OR ".join(_title_parts)
+
+            _thresh_sql = f"""SELECT k.site_id,
+                       {', '.join(_case_parts)},
+                       ({' + '.join(_viol_parts)}) AS violations
+                FROM kpi_data k
+                WHERE k.data_level = 'site'
+                  AND k.value IS NOT NULL
+                  AND k.kpi_name IN ({_in_clause})
+                GROUP BY k.site_id
+                HAVING {' OR '.join(_having_parts)}
+                ORDER BY violations DESC, {_y_axes[0]} {'DESC' if _thresh_conditions[0][2] == 'above' else 'ASC'} NULLS LAST
+                LIMIT {_thresh_n}"""
+
+            ai_result = {
+                "sql": _thresh_sql,
+                "query_type": "bar",
+                "chart_type": "bar",
+                "title": _title[:80],
+                "x_axis": "site_id",
+                "y_axes": _y_axes + ["violations"],
+                "response": (
+                    f"Showing {_thresh_n} worst sites breaching any of: "
+                    + ", ".join(
+                        f"{c[0].replace('LTE ','').replace('E-RAB ','')[:20]} "
+                        f"{'>' if c[2]=='above' else '<'} {c[3]}"
+                        for c in _thresh_conditions
+                    )
+                    + ". Sites are ranked by number of threshold violations."
+                ),
+            }
+            provider = {"provider": "rule-based-threshold"}
+            _LOG.info(
+                "[THRESHOLD-INTERCEPT] %d conditions detected, N=%d, SQL generated",
+                len(_thresh_conditions), _thresh_n
+            )
+
     # 2b. Non-KPI table queries (revenue, core, transport, tickets, site info)
     #     Rule-based handlers use dynamic schema discovery and are more reliable
     #     than LLM for these tables. Intercept BEFORE LLM to avoid wrong SQL.
@@ -1700,6 +1925,37 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
                     _LOG.info("Rule-based fallback returned %d rows", len(rows))
         except Exception:
             pass
+
+    # ── 0-rows explanation: if still empty, check KPI ranges and explain why ──
+    # This prevents the chart from silently showing nothing.
+    # If we know the value ranges, we can tell the user their threshold is too tight.
+    if not rows and sql:
+        try:
+            _kpi_ranges = _schema_cache.get("kpi_ranges", {})
+            _threshold_kpis = []
+            import re as _re_0r
+            # Detect HAVING/WHERE conditions in the SQL to find the KPIs + thresholds
+            _having_clauses = _re_0r.findall(
+                r"kpi_name\s*=\s*'([^']+)'[^)]*(?:>|<)\s*([\d.]+)",
+                sql, _re_0r.IGNORECASE
+            )
+            for _kn, _val in _having_clauses:
+                if _kn in _kpi_ranges:
+                    r = _kpi_ranges[_kn]
+                    _threshold_kpis.append(
+                        f"{_kn}: actual range [{r['min_val']} – {r['max_val']}], "
+                        f"avg={r['avg_val']} (your threshold: {_val})"
+                    )
+            if _threshold_kpis:
+                ai_result["response"] = (
+                    "No sites matched the specified thresholds. "
+                    "Based on actual data ranges:\n"
+                    + "\n".join(f"• {t}" for t in _threshold_kpis)
+                    + "\n\nTry relaxing the threshold values."
+                )
+                _LOG.info("[0-ROWS] Threshold explanation injected for %d KPIs", len(_threshold_kpis))
+        except Exception as _e0r:
+            _LOG.debug("[0-ROWS] Explanation injection failed: %s", _e0r)
 
     columns = list(rows[0].keys()) if rows else []
     has_geo = any(r.get("lat") or r.get("latitude") for r in rows)

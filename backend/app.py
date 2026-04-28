@@ -8515,6 +8515,54 @@ app.register_blueprint(network_bp)
 from network_ai import network_ai_bp, ensure_db_optimizations
 app.register_blueprint(network_ai_bp)
 
+# ─── Startup schema warm-up for network AI ────────────────────────────────────
+# Pre-populate _schema_cache (KPI ranges, date freshness, column discovery)
+# so the first AI query is as fast as subsequent ones.
+def _warm_network_ai_schema():
+    """Run schema discovery once at startup so first AI query has full context."""
+    import threading, time as _t
+    def _do_warm():
+        _t.sleep(5)  # let DB settle
+        try:
+            with app.app_context():
+                from network_ai import _schema_cache, _sql
+                if _schema_cache.get("populated"):
+                    print("[AI-SCHEMA] Already populated — skipping warm-up")
+                    return
+                # Populate KPI ranges
+                try:
+                    _kpi_r = _sql("""
+                        SELECT kpi_name,
+                               ROUND(MIN(value)::numeric,2) AS min_val,
+                               ROUND(AVG(value)::numeric,2) AS avg_val,
+                               ROUND(MAX(value)::numeric,2) AS max_val,
+                               ROUND(PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY value)::numeric,2) AS p25,
+                               ROUND(PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY value)::numeric,2) AS p75,
+                               COUNT(DISTINCT site_id) AS site_count
+                        FROM kpi_data WHERE data_level='site' AND value IS NOT NULL
+                        GROUP BY kpi_name ORDER BY kpi_name
+                    """)
+                    _schema_cache["kpi_ranges"] = {r["kpi_name"]: r for r in _kpi_r}
+                    print(f"[AI-SCHEMA] KPI ranges warm-up: {len(_kpi_r)} KPIs loaded")
+                except Exception as e:
+                    print(f"[AI-SCHEMA] KPI ranges warm-up failed: {e}")
+                # Populate max date
+                try:
+                    _d = _sql("SELECT MAX(date)::text AS max_date FROM kpi_data WHERE data_level='site'")
+                    if _d and _d[0].get("max_date"):
+                        _schema_cache["kpi_max_date"] = _d[0]["max_date"]
+                        _schema_cache["kpi_max_date_recent"] = _d[0]["max_date"]
+                        print(f"[AI-SCHEMA] Data freshness: latest date = {_d[0]['max_date']}")
+                except Exception as e:
+                    print(f"[AI-SCHEMA] Date warm-up failed: {e}")
+                _schema_cache["populated"] = True
+                print("[AI-SCHEMA] Warm-up complete")
+        except Exception as e:
+            print(f"[AI-SCHEMA] Warm-up error: {e}")
+    threading.Thread(target=_do_warm, daemon=True, name="ai-schema-warm").start()
+
+_warm_network_ai_schema()
+
 # ─── Database optimizations (indexes, materialized views) ────────────────────
 with app.app_context():
     try:
