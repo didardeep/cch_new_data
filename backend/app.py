@@ -3311,6 +3311,37 @@ def _cache_clear(*keys):
         _cto_cache.pop(k, None)
 
 
+def _warm_cto_cache():
+    """Best-effort startup warmup for the expensive CTO dashboard endpoints."""
+    try:
+        with app.app_context():
+            user = User.query.filter(User.role.in_(("cto", "admin"))).first()
+            if not user:
+                print(">>> CTO KPI cache warm skipped: no CTO/admin user found")
+                return
+
+            token = create_access_token(identity=str(user.id))
+            endpoints = (
+                ("/api/cto/technical-kpi", cto_technical_kpi),
+                ("/api/cto/business-kpi", cto_business_kpi),
+            )
+
+            warmed = []
+            for path, view_func in endpoints:
+                with app.test_request_context(path, headers={"Authorization": f"Bearer {token}"}):
+                    response = view_func()
+                    status_code = response[1] if isinstance(response, tuple) else getattr(response, "status_code", 200)
+                    if status_code and int(status_code) >= 400:
+                        print(f">>> CTO KPI cache warm failed for {path}: HTTP {status_code}")
+                        continue
+                    warmed.append(path)
+
+        if warmed:
+            print(f">>> CTO KPI cache warm complete: {', '.join(warmed)}")
+    except Exception as e:
+        print(f">>> CTO KPI cache warm skipped: {e}")
+
+
 def _latest_site_values_for_kpi(kpi_name):
     """Latest value per site. Uses site-level data; falls back to cell-level (averaged per site)
     for sites that have no site-level data."""
@@ -8625,15 +8656,6 @@ def agent_dashboard():
     if not user or user.role != "human_agent":
         return jsonify({"error": "Unauthorized"}), 403
 
-    # ── Mock dashboard for demo user ──
-    from mock_dashboard import MOCK_EMAIL, get_mock_dashboard
-    if user.email == MOCK_EMAIL:
-        return jsonify(get_mock_dashboard(
-            agent_name=user.name or "Agent",
-            agent_location=getattr(user, "location", "Gurgaon"),
-            agent_domain=getattr(user, "domain", "broadband"),
-        ))
-
     now = datetime.now(timezone.utc)
 
     # Helper: make any datetime UTC-aware (DB columns are stored as naive UTC)
@@ -10797,13 +10819,6 @@ with app.app_context():
 
 # Schedule daily 07:30/08:00 AM IST jobs for worst cell + overutilized detection
 schedule_daily_job(app)
-
-# ── One-time seed: AI ticket for Gunjan Kaur demo ────────────────────────
-try:
-    from seed_gunjan_ticket import seed_gunjan_ticket
-    seed_gunjan_ticket(app)
-except Exception as e:
-    print(f"[SEED] Gunjan ticket seed skipped: {e}")
 
 # ─── Register Change Workflow Blueprint ───────────────────────────────────
 try:
