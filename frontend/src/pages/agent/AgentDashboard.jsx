@@ -74,8 +74,10 @@ const IC = {
 const CSS = `
 @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@400;600;700&display=swap');
 @keyframes spin{to{transform:rotate(360deg)}}
-@keyframes fadeUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+@keyframes fadeUp{from{opacity:0;transform:translateY(18px)}to{opacity:1;transform:translateY(0)}}
 @keyframes countUp{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
+.scroll-hidden{opacity:0;transform:translateY(18px);}
+.scroll-visible{animation:fadeUp .5s ease forwards;}
 @keyframes pulseRing{0%{box-shadow:0 0 0 0 rgba(0,51,141,0.4)}70%{box-shadow:0 0 0 8px rgba(0,51,141,0)}100%{box-shadow:0 0 0 0 rgba(0,51,141,0)}}
 @keyframes shimmer{0%{background-position:-200% 0}100%{background-position:200% 0}}
 @keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:0.5;transform:scale(1.3)}}
@@ -86,6 +88,32 @@ const CSS = `
 .recharts-funnel-trapezoid{transition:opacity .2s ease;cursor:default;}
 .recharts-funnel-trapezoid:hover{opacity:.85;}
 `;
+
+/* ── Scroll Reveal Hook ─────────────────────────────────────────────── */
+function useScrollReveal(options = {}) {
+  const ref = useRef(null);
+  const [visible, setVisible] = useState(false);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const obs = new IntersectionObserver(([entry]) => {
+      if (entry.isIntersecting) { setVisible(true); obs.unobserve(el); }
+    }, { threshold: 0.15, ...options });
+    obs.observe(el);
+    return () => obs.disconnect();
+  }, []);
+  return [ref, visible];
+}
+
+function ScrollReveal({ children, className = '', style = {}, delay = 0 }) {
+  const [ref, visible] = useScrollReveal();
+  return (
+    <div ref={ref} className={`${className} ${visible ? 'scroll-visible' : 'scroll-hidden'}`}
+      style={{ ...style, animationDelay: delay ? `${delay}s` : undefined }}>
+      {children}
+    </div>
+  );
+}
 
 /* ── Performance Needle Meter ─────────────────────────────────────────── */
 function Speedometer({ score, T }) {
@@ -173,22 +201,22 @@ function Speedometer({ score, T }) {
 
 /* ── KPI Card ──────────────────────────────────────────────────────────── */
 function KpiCard({ label, value, unit, icon, sub, alert:isAlert, T, color, trend }) {
+  const [ref, visible] = useScrollReveal();
   const accent = color || (isAlert ? T.red : K.navy);
   const darkAccent = isAlert ? T.red : T.blue;
   const finalAccent = T === TD ? darkAccent : accent;
   return (
-    <div className="dk" style={{
+    <div ref={ref} className={`dk ${visible ? 'scroll-visible' : 'scroll-hidden'}`} style={{
       background: T.kpiCardBg, borderRadius:12,
       border:`1px solid ${T.border}`, padding:'14px 14px 12px',
       display:'flex', flexDirection:'column', gap:5,
       boxShadow:T.cardShadow, borderTop:`3px solid ${finalAccent}`,
-      animation:'fadeUp .4s ease',
     }}>
       <div style={{display:'flex',alignItems:'center',justifyContent:'space-between'}}>
         <span style={{fontSize:9,fontWeight:700,color:T.muted,textTransform:'uppercase',letterSpacing:'.06em',lineHeight:1.3}}>{label}</span>
         <span style={{color:finalAccent,display:'flex',opacity:.65}}>{icon}</span>
       </div>
-      <div style={{fontSize:22,fontWeight:800,color:T.text,lineHeight:1,fontFamily:"'IBM Plex Mono',monospace",animation:'countUp .5s ease'}}>
+      <div style={{fontSize:22,fontWeight:800,color:T.text,lineHeight:1,fontFamily:"'IBM Plex Mono',monospace",animation:visible?'countUp .5s ease':'none'}}>
         {value}<span style={{fontSize:10,fontWeight:500,color:T.muted,marginLeft:3}}>{unit}</span>
       </div>
       {sub && <div style={{fontSize:9,color:T.muted,lineHeight:1.4}}>{sub}</div>}
@@ -198,10 +226,11 @@ function KpiCard({ label, value, unit, icon, sub, alert:isAlert, T, color, trend
 
 /* ── Card wrapper ────────────────────────────────────────────────────────── */
 function Card({ T, title, subtitle, icon, children, style:sx }) {
+  const [ref, visible] = useScrollReveal();
   return (
-    <div className="dk" style={{
+    <div ref={ref} className={`dk ${visible ? 'scroll-visible' : 'scroll-hidden'}`} style={{
       background:T.surface, borderRadius:12, border:`1px solid ${T.border}`,
-      boxShadow:T.cardShadow, padding:'14px 18px', animation:'fadeUp .45s ease',
+      boxShadow:T.cardShadow, padding:'14px 18px',
       display:'flex', flexDirection:'column', ...sx,
     }}>
       <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:10}}>
@@ -213,7 +242,9 @@ function Card({ T, title, subtitle, icon, children, style:sx }) {
           </div>
         </div>
       </div>
-      <div style={{flex:1,display:'flex',flexDirection:'column',justifyContent:'center'}}>{children}</div>
+      <div style={{flex:1,display:'flex',flexDirection:'column',justifyContent:'center',minHeight:visible?undefined:200}}>
+        {visible ? children : null}
+      </div>
     </div>
   );
 }
@@ -558,10 +589,10 @@ export default function AgentDashboard() {
             {l:'Resolved',           v:D.summary.resolved??0,       ic:IC.check, d:'Closed successfully', g:'linear-gradient(135deg,#059669,#10b981)'},
             {l:'Open / In Progress', v:D.summary.open??0,           ic:IC.clock, d:'Awaiting resolution', g:'linear-gradient(135deg,#d97706,#f59e0b)'},
             {l:'Customer Feedbacks', v:D.summary.total_feedback??0,  ic:IC.star,  d:'Ratings received',    g:`linear-gradient(135deg,${K.indigo},${K.violet})`},
-          ].map(({l,v,ic,d,g})=>(
-            <div key={l} style={{
+          ].map(({l,v,ic,d,g},i)=>(
+            <ScrollReveal key={l} className="dk" delay={i*0.08} style={{
               background:T.kpiCardBg,borderRadius:12,border:`1px solid ${T.border}`,padding:'15px 18px',
-              boxShadow:T.cardShadow,display:'flex',alignItems:'center',gap:14,animation:'fadeUp .4s ease',
+              boxShadow:T.cardShadow,display:'flex',alignItems:'center',gap:14,
             }}>
               <div style={{width:42,height:42,borderRadius:11,background:g,display:'flex',alignItems:'center',justifyContent:'center',color:'#fff',flexShrink:0,boxShadow:'0 4px 12px rgba(0,0,0,.2)'}}>{ic}</div>
               <div>
@@ -569,7 +600,7 @@ export default function AgentDashboard() {
                 <div style={{fontSize:26,fontWeight:800,color:T.text,lineHeight:1,fontFamily:"'IBM Plex Mono',monospace"}}>{v}</div>
                 <div style={{fontSize:9.5,color:T.muted,marginTop:2}}>{d}</div>
               </div>
-            </div>
+            </ScrollReveal>
           ))}
         </div>
 
@@ -1171,10 +1202,9 @@ export default function AgentDashboard() {
 
         {/* ═══ AGING ALERT ════════════════════════════════════════════════ */}
         {(D.kpis.avg_aging_hours??0)>48 && (
-          <div style={{
+          <ScrollReveal style={{
             display:'flex',alignItems:'center',gap:14,padding:'14px 20px',borderRadius:10,
             background:dark?'#7f1d1d22':'#fef2f2',border:`1px solid ${dark?'#991b1b44':'#fecaca'}`,
-            animation:'fadeUp .4s ease',
           }}>
             <span style={{color:T.red,flexShrink:0}}>{IC.alert}</span>
             <div>
@@ -1183,7 +1213,7 @@ export default function AgentDashboard() {
                 Average open ticket age is <strong>{D.kpis.avg_aging_hours} hrs</strong>. Prioritize older tickets to maintain SLA compliance.
               </div>
             </div>
-          </div>
+          </ScrollReveal>
         )}
       </div>
     </div>

@@ -321,7 +321,7 @@ function ActionModal({ cr, onClose, onDone, isDark }) {
               <div style={{ marginBottom: 12 }}>
                 <button onClick={async () => {
                   try {
-                    const token = localStorage.getItem('token');
+                    const token = sessionStorage.getItem('token');
                     const resp = await fetch(`/api/cr/${cr.id}/pdf`, { headers: { 'Authorization': `Bearer ${token}` } });
                     if (!resp.ok) throw new Error('Download failed');
                     const blob = await resp.blob();
@@ -640,7 +640,7 @@ function DetailDrawer({ cr, onClose, isDark }) {
           <div style={{ marginBottom: 16 }}>
             <button onClick={async () => {
               try {
-                const token = localStorage.getItem('token');
+                const token = sessionStorage.getItem('token');
                 const resp = await fetch(`/api/cr/${cr.id}/pdf`, { headers: { 'Authorization': `Bearer ${token}` } });
                 if (!resp.ok) throw new Error('Download failed');
                 const blob = await resp.blob();

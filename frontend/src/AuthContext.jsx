@@ -6,7 +6,7 @@ const AuthContext = createContext(null);
 export function AuthProvider({ children }) {
   const storedUser = (() => {
     try {
-      const raw = localStorage.getItem('user');
+      const raw = sessionStorage.getItem('user');
       return raw ? JSON.parse(raw) : null;
     } catch {
       return null;
@@ -22,7 +22,7 @@ export function AuthProvider({ children }) {
         .then(data => {
           if (data?.user) {
             setUser(data.user);
-            localStorage.setItem('user', JSON.stringify(data.user));
+            sessionStorage.setItem('user', JSON.stringify(data.user));
           } else {
             clearToken();
             setUser(null);
@@ -41,7 +41,7 @@ export function AuthProvider({ children }) {
   const login = (token, userData) => {
     setToken(token);
     setUser(userData);
-    try { localStorage.setItem('user', JSON.stringify(userData)); } catch {}
+    try { sessionStorage.setItem('user', JSON.stringify(userData)); } catch {}
   };
 
   const logout = () => {
@@ -51,7 +51,7 @@ export function AuthProvider({ children }) {
 
   const updateUser = (userData) => {
     setUser(userData);
-    try { localStorage.setItem('user', JSON.stringify(userData)); } catch {}
+    try { sessionStorage.setItem('user', JSON.stringify(userData)); } catch {}
   };
 
   return (

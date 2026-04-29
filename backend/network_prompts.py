@@ -220,13 +220,18 @@ def classify_user_response(text: str) -> dict:
                     "1. is_satisfied: Is the user saying the issue is resolved / they are happy / it worked / thank you / yes it helped? (true/false)\n"
                     "2. mentions_signal: Does the user's message semantically relate to network signal, coverage, "
                     "poor reception, no signal, weak signal, call drops, slow internet speed, network not available, "
-                    "data not working, or similar signal/network connectivity issues? (true/false)\n\n"
-                    'Respond with ONLY valid JSON: {"is_satisfied": true/false, "mentions_signal": true/false}'
+                    "data not working, or similar signal/network connectivity issues? (true/false)\n"
+                    "3. needs_diagnosis: Does the user's message indicate an ongoing network problem that would benefit "
+                    "from running a device signal diagnosis? This includes: slow data/internet speed, buffering, "
+                    "call drops or disconnections, call failures or inability to make/receive calls, poor reception, "
+                    "no signal, weak network, network unavailable. Should be true for ANY of these network quality "
+                    "complaints — not just signal-specific ones. (true/false)\n\n"
+                    'Respond with ONLY valid JSON: {"is_satisfied": true/false, "mentions_signal": true/false, "needs_diagnosis": true/false}'
                 )},
                 {"role": "user", "content": text},
             ],
             temperature=0,
-            max_tokens=30,
+            max_tokens=60,
         )
         raw = response.choices[0].message.content.strip()
         if raw.startswith("```"):
@@ -234,9 +239,13 @@ def classify_user_response(text: str) -> dict:
             if raw.startswith("json"):
                 raw = raw[4:]
             raw = raw.strip()
-        return json.loads(raw)
+        result = json.loads(raw)
+        # Ensure needs_diagnosis key exists (backward compat)
+        if "needs_diagnosis" not in result:
+            result["needs_diagnosis"] = result.get("mentions_signal", False)
+        return result
     except Exception:
-        return {"is_satisfied": False, "mentions_signal": False}
+        return {"is_satisfied": False, "mentions_signal": False, "needs_diagnosis": False}
 
 
 def detect_language(text: str) -> str:

@@ -200,7 +200,7 @@ export default function CRFormModal({ open, onClose, ticket, networkIssue }) {
         try {
           await fetch(`/api/cr/${res.cr.id}/upload-pdf`, {
             method: 'POST', body: fd,
-            headers: { 'Authorization': `Bearer ${localStorage.getItem('token')}` },
+            headers: { 'Authorization': `Bearer ${sessionStorage.getItem('token')}` },
           });
         } catch (_) { /* PDF upload optional */ }
       }

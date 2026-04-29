@@ -7,8 +7,20 @@ import {
   RadarChart, Radar, PolarGrid, PolarAngleAxis,
   ScatterChart, Scatter, ZAxis,
 } from 'recharts';
+import io from 'socket.io-client';
 import { apiGet, apiPost, apiDelete } from '../../api';
 import { useTheme } from '../../ThemeContext';
+
+const SOCKET_URL = process.env.REACT_APP_API_URL || 'http://localhost:5500';
+
+// ── Progress stage labels ────────────────────────────────────────────────────
+const PROGRESS_LABELS = {
+  understanding: 'Analyzing your question...',
+  generating: 'Generating SQL query...',
+  executing: 'Running query on database...',
+  rendering: 'Preparing visualization...',
+  complete: 'Done',
+};
 
 // ── Themes ─────────────────────────────────────────────────────────────────
 const T_LIGHT = {
@@ -39,6 +51,11 @@ const SUGGESTED = [
   { label:'Congestion',    prompt:'Show top 10 sites where DL PRB Utilization (1BH) is highest along with their LTE DL - Usr Ave Throughput and Ave RRC Connected Ue' },
   { label:'Availability',  prompt:'Show sites with lowest Availability along with their E-RAB Call Drop Rate_1 and LTE Call Setup Success Rate' },
   { label:'Compare zones', prompt:'Compare all zones by average E-RAB Call Drop Rate_1, LTE DL - Usr Ave Throughput, DL PRB Utilization (1BH), and LTE Call Setup Success Rate' },
+  // ML-powered prompts
+  { label:'Critical sites',   prompt:'Show all sites with health_label critical in the last 7 days with their health_score and anomaly status from site_kpi_summary' },
+  { label:'Anomalies',        prompt:'Show all anomalies detected in the last 7 days with site_id, kpi_name, avg_value, anomaly_score, and health_label from site_kpi_summary' },
+  { label:'Site health',      prompt:'Show health score trend for top 5 underperformer sites over the last 7 days from site_kpi_summary' },
+  { label:'Zone health',      prompt:'Compare all zones by average health_score, count of critical sites, and count of anomalies from site_kpi_summary' },
 ];
 
 const CSS = `
@@ -72,10 +89,16 @@ function Tip({T,active,payload,label}) {
 
 // ── Pivot helper for UNION ALL multi-series data ──────────────────────────
 function pivotMultiSeries(data, columns, xKey) {
+  if (!data || data.length === 0) return null;
   const hasKpiName = columns.includes('kpi_name');
   const hasSiteId = columns.includes('site_id');
   const hasValue = columns.includes('value');
   if (!hasValue || !xKey) return null;
+  if (!hasKpiName && !hasSiteId) return null;
+
+  // If every x value is already unique, data is flat — no pivot needed
+  const xVals = data.map(r => r[xKey]);
+  if (new Set(xVals).size === xVals.length) return null;
 
   const distinctKpis = hasKpiName ? [...new Set(data.map(r => r.kpi_name).filter(Boolean))] : [];
   const distinctSites = hasSiteId ? [...new Set(data.map(r => r.site_id).filter(Boolean))] : [];
@@ -127,6 +150,9 @@ function pivotMultiSeries(data, columns, xKey) {
     const av = a[xKey], bv = b[xKey];
     return typeof av === 'string' ? av.localeCompare(bv) : (av - bv);
   });
+
+  // Safety: ensure pivot produced real data
+  if (pivoted.length === 0 || seriesKeys.length === 0) return null;
 
   return { data: pivoted, yKeys: seriesKeys, labels: seriesLabels };
 }
@@ -267,33 +293,37 @@ function InlineChart({result,T,chartId}) {
         </ResponsiveContainer>);
     }
 
-    if(ctype==='composed'&&yKeys.length>=2){
+    if(ctype==='composed'&&yKeys.length>=1){
       const cTickInterval=data.length>15?Math.ceil(data.length/10):0;
       const chartColors=[PAL[0],PAL[1],PAL[2],PAL[3],PAL[4]];
-      const lVals=data.map(r=>parseFloat(r[yKeys[0]])).filter(v=>!isNaN(v));
-      const rVals=yKeys[1]?data.map(r=>parseFloat(r[yKeys[1]])).filter(v=>!isNaN(v)):[];
+
+      // Only use dual Y-axis when scales differ by more than 10x — prevents
+      // one series being visually invisible (e.g. drop rate 0-5% vs throughput 0-100)
+      const getRange=k=>{const vals=data.map(r=>parseFloat(r[k])).filter(v=>!isNaN(v));return vals.length?Math.max(...vals)-Math.min(...vals):1;};
+      const ranges=yKeys.map(getRange);
+      const useDualAxis=yKeys.length>=2&&ranges[0]>0&&ranges[1]>0&&
+        (Math.max(ranges[0],ranges[1])/Math.min(ranges[0],ranges[1]))>10;
+
       const domainOf=vals=>{if(!vals.length)return[0,'auto'];const mn=Math.min(...vals),mx=Math.max(...vals),rng=mx-mn||1,p=rng*.1;return[Math.max(0,Math.floor((mn-p)*100)/100),Math.ceil((mx+p)*100)/100];};
+      const lVals=data.flatMap(r=>yKeys.filter((_,i)=>!useDualAxis||i!==1).map(k=>parseFloat(r[k]))).filter(v=>!isNaN(v));
+      const rVals=useDualAxis&&yKeys[1]?data.map(r=>parseFloat(r[yKeys[1]])).filter(v=>!isNaN(v)):[];
+
       return(
         <ResponsiveContainer width="100%" height={h+30}>
-          <ComposedChart data={data} margin={{top:5,right:25,left:5,bottom:35}}>
-            <defs>
-              {yKeys.map((k,i)=>(
-                <linearGradient key={k} id={`cg${uid}${i}`} x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor={chartColors[i%chartColors.length]} stopOpacity={.4}/><stop offset="100%" stopColor={chartColors[i%chartColors.length]} stopOpacity={.03}/></linearGradient>
-              ))}
-            </defs>
+          <ComposedChart data={data} margin={{top:5,right:useDualAxis?55:20,left:5,bottom:35}}>
             <CartesianGrid strokeDasharray="3 3" stroke={T.border} vertical={false}/>
             <XAxis dataKey={xKey} tick={{fontSize:8,fill:T.muted}} axisLine={false} tickLine={false} interval={cTickInterval} angle={-35} textAnchor="end" height={45} tickFormatter={v=>{if(typeof v!=='string')return v;if(v.length>10)return v.slice(5,10);return v;}}/>
-            <YAxis yAxisId="l" tick={{fontSize:9,fill:T.muted}} axisLine={false} width={45} domain={domainOf(lVals)} tickFormatter={v=>f(v,2)} label={yKeys[0]?{value:keyLabel(yKeys[0]).slice(0,20),angle:-90,position:'insideLeft',fontSize:8,fill:T.muted}:undefined}/>
-            {yKeys.length>1&&<YAxis yAxisId="r" orientation="right" tick={{fontSize:9,fill:T.muted}} axisLine={false} width={45} domain={domainOf(rVals)} tickFormatter={v=>f(v,2)} label={yKeys[1]?{value:keyLabel(yKeys[1]).slice(0,20),angle:90,position:'insideRight',fontSize:8,fill:T.muted}:undefined}/>}
+            <YAxis yAxisId="l" tick={{fontSize:9,fill:T.muted}} axisLine={false} width={45} domain={domainOf(lVals)} tickFormatter={v=>f(v,2)} label={yKeys[0]&&useDualAxis?{value:keyLabel(yKeys[0]).slice(0,18),angle:-90,position:'insideLeft',fontSize:8,fill:T.muted}:undefined}/>
+            {useDualAxis&&<YAxis yAxisId="r" orientation="right" tick={{fontSize:9,fill:T.muted}} axisLine={false} width={45} domain={domainOf(rVals)} tickFormatter={v=>f(v,2)} label={yKeys[1]?{value:keyLabel(yKeys[1]).slice(0,18),angle:90,position:'insideRight',fontSize:8,fill:T.muted}:undefined}/>}
             <Tooltip content={<TipC/>} cursor={{stroke:T.kpmgBlue,strokeWidth:1,strokeDasharray:'4 2'}}/>
             {threshold!=null&&<ReferenceLine yAxisId="l" y={threshold} stroke={T.amber} strokeDasharray="4 2"/>}
             {yKeys.map((k,i)=>{
-              const yId=i===0?'l':(i===1?'r':'l');
+              // All series use Line — mixing Area+Line causes one to visually dominate
+              // and obscure the other. Lines are cleaner for multi-KPI overlays.
+              const yId=useDualAxis&&i===1?'r':'l';
               const color=chartColors[i%chartColors.length];
-              return i%2===0?(
-                <Area key={k} yAxisId={yId} type="natural" dataKey={k} name={keyLabel(k)} fill={`url(#cg${uid}${i})`} stroke={color} strokeWidth={2.5} activeDot={{r:5,strokeWidth:2,stroke:'#fff'}} animationDuration={1000} animationEasing="ease-in-out"/>
-              ):(
-                <Line key={k} yAxisId={yId} type="natural" dataKey={k} name={keyLabel(k)} stroke={color} strokeWidth={2.5} dot={data.length<=20?{r:3,strokeWidth:2,stroke:'#fff'}:false} activeDot={{r:6,strokeWidth:2,stroke:'#fff'}} animationDuration={1200} animationEasing="ease-in-out"/>
+              return(
+                <Line key={k} yAxisId={yId} type="monotone" dataKey={k} name={keyLabel(k)} stroke={color} strokeWidth={2} dot={data.length<=30?{r:3,strokeWidth:1.5,stroke:'#fff'}:false} activeDot={{r:5,strokeWidth:2,stroke:'#fff'}} animationDuration={900} animationEasing="ease-in-out"/>
               );
             })}
             <Legend iconType="circle" iconSize={7} wrapperStyle={{fontSize:10}}/>
@@ -334,7 +364,7 @@ function InlineChart({result,T,chartId}) {
     }
 
     // BAR
-    const isHorizontal=data.length>8||typeof data[0]?.[xKey]==='string';
+    const isHorizontal=data.length>15;
     if(isHorizontal){
       return(
         <ResponsiveContainer width="100%" height={Math.max(h,data.length*36+60)}>
@@ -414,7 +444,35 @@ function InlineChart({result,T,chartId}) {
             <tbody>
               {data.slice(0,100).map((row,i)=>(
                 <tr key={i} style={{borderBottom:`1px solid ${T.border}`,background:i%2===0?T.surface2:'transparent'}}>
-                  {columns.map(c=><td key={c} style={{padding:'3px 7px',textAlign:'center',fontFamily:"'IBM Plex Mono',monospace",fontSize:9.5}}>{row[c]==null?'—':typeof row[c]==='number'?f(row[c],2):String(row[c])}</td>)}
+                  {columns.map(c=>{
+                    const v=row[c];
+                    // ML category badges
+                    if(c==='health_label'&&typeof v==='string'){
+                      const hlColors={healthy:{bg:'#16A34A22',color:'#16A34A'},degraded:{bg:'#D9770622',color:'#D97706'},critical:{bg:'#DC262622',color:'#DC2626'},unknown:{bg:'#94A3B822',color:'#94A3B8'}};
+                      const hl=hlColors[v]||hlColors.unknown;
+                      return<td key={c} style={{padding:'3px 7px',textAlign:'center'}}><span style={{fontSize:9,fontWeight:700,padding:'2px 8px',borderRadius:8,background:hl.bg,color:hl.color,textTransform:'uppercase'}}>{v}</span></td>;
+                    }
+                    if(c==='site_tier'&&typeof v==='string'){
+                      const stColors={top_performer:{bg:'#16A34A22',color:'#16A34A',icon:'★'},good:{bg:'#0091DA22',color:'#0091DA',icon:'●'},average:{bg:'#D9770622',color:'#D97706',icon:'◆'},underperformer:{bg:'#DC262622',color:'#DC2626',icon:'▼'},unknown:{bg:'#94A3B822',color:'#94A3B8',icon:'?'}};
+                      const st=stColors[v]||stColors.unknown;
+                      return<td key={c} style={{padding:'3px 7px',textAlign:'center'}}><span style={{fontSize:9,fontWeight:700,padding:'2px 8px',borderRadius:8,background:st.bg,color:st.color}}>{st.icon} {v.replace(/_/g,' ')}</span></td>;
+                    }
+                    if(c==='is_anomaly'){
+                      const isA=v===true||v==='true'||v===1;
+                      return<td key={c} style={{padding:'3px 7px',textAlign:'center'}}>{isA?<span style={{fontSize:9,fontWeight:700,padding:'2px 8px',borderRadius:8,background:'#DC262622',color:'#DC2626'}}>ANOMALY</span>:<span style={{fontSize:9,color:T.muted}}>normal</span>}</td>;
+                    }
+                    if(c==='health_score'&&v!=null){
+                      const score=parseFloat(v);
+                      const hsColor=score>=70?'#16A34A':score>=40?'#D97706':'#DC2626';
+                      return<td key={c} style={{padding:'3px 7px',textAlign:'center'}}><div style={{display:'flex',alignItems:'center',justifyContent:'center',gap:4}}><div style={{width:28,height:5,borderRadius:3,background:T.border,overflow:'hidden'}}><div style={{width:`${Math.min(100,score)}%`,height:'100%',borderRadius:3,background:hsColor}}/></div><span style={{fontSize:9.5,fontWeight:700,fontFamily:"'IBM Plex Mono',monospace",color:hsColor}}>{f(score,1)}</span></div></td>;
+                    }
+                    if(c==='anomaly_score'&&v!=null){
+                      const as=parseFloat(v);
+                      const asColor=as<-0.2?'#DC2626':as<0?'#D97706':'#16A34A';
+                      return<td key={c} style={{padding:'3px 7px',textAlign:'center',fontFamily:"'IBM Plex Mono',monospace",fontSize:9.5,color:asColor,fontWeight:600}}>{f(as,3)}</td>;
+                    }
+                    return<td key={c} style={{padding:'3px 7px',textAlign:'center',fontFamily:"'IBM Plex Mono',monospace",fontSize:9.5}}>{v==null?'—':typeof v==='number'?f(v,2):String(v)}</td>;
+                  })}
                 </tr>))}
             </tbody>
           </table>
@@ -448,11 +506,41 @@ export default function NetworkAiChat() {
   const [loading, setLoading]           = useState(false);
   const [sessionsLoading, setSessLoad]  = useState(true);
   const [sidebarOpen, setSidebarOpen]   = useState(true);
+  const [progress, setProgress]         = useState(null); // {stage, message}
 
-  const endRef  = useRef(null);
+  const endRef   = useRef(null);
   const inputRef = useRef(null);
+  const socketRef = useRef(null);
 
   useEffect(()=>{ endRef.current?.scrollIntoView({behavior:'smooth'}); },[messages]);
+
+  // ── WebSocket connection for AI progress streaming ────────────────────────
+  useEffect(() => {
+    const token = sessionStorage.getItem('token');
+    if (!token) return;
+    const s = io(SOCKET_URL, {
+      transports: ['websocket', 'polling'],
+      auth: { token },
+    });
+    socketRef.current = s;
+
+    s.on('ai_progress', (data) => {
+      if (data.stage === 'complete') {
+        setProgress(null);
+      } else {
+        setProgress({ stage: data.stage, message: PROGRESS_LABELS[data.stage] || data.message });
+      }
+    });
+
+    return () => { s.disconnect(); };
+  }, []);
+
+  // Join AI session room when active session changes
+  useEffect(() => {
+    if (activeSessionId && socketRef.current?.connected) {
+      socketRef.current.emit('join_ai_session', { session_id: activeSessionId });
+    }
+  }, [activeSessionId]);
 
   useEffect(()=>{
     apiGet('/api/network/ai-sessions')
@@ -499,6 +587,10 @@ export default function NetworkAiChat() {
         sid = r.session.id;
         setSessions(prev=>[r.session,...prev]);
         setActiveId(sid);
+        // Join WebSocket room for progress updates
+        if(socketRef.current?.connected){
+          socketRef.current.emit('join_ai_session',{session_id:sid});
+        }
       }catch{ return; }
     }
 
@@ -506,6 +598,7 @@ export default function NetworkAiChat() {
     setMessages(prev=>[...prev,userMsg]);
     setInput('');
     setLoading(true);
+    setProgress({ stage:'understanding', message:PROGRESS_LABELS.understanding });
 
     try{
       const result = await apiPost('/api/network/ai-query',{
@@ -519,6 +612,7 @@ export default function NetworkAiChat() {
         role:'assistant',
         content:result.response||'Here are the results.',
         payload:result,
+        elapsed: result.elapsed_seconds,
         created_at:new Date().toISOString(),
       };
       setMessages(prev=>[...prev,assistantMsg]);
@@ -536,6 +630,7 @@ export default function NetworkAiChat() {
       }]);
     }
     setLoading(false);
+    setProgress(null);
   },[activeSessionId,loading]);
 
   const formatTime = (iso)=>{
@@ -639,8 +734,16 @@ export default function NetworkAiChat() {
                       boxShadow:m.role==='user'?'0 2px 12px rgba(0,51,141,.2)':T.cardShadow,
                       border:m.role==='user'?'none':`1px solid ${T.border}`,
                     }}>
-                      <div style={{fontSize:9,fontWeight:700,marginBottom:4,opacity:.6,textTransform:'uppercase'}}>
-                        {m.role==='user'?'You':'AI Assistant'}
+                      <div style={{display:'flex',alignItems:'center',gap:6,marginBottom:4}}>
+                        <span style={{fontSize:9,fontWeight:700,opacity:.6,textTransform:'uppercase'}}>
+                          {m.role==='user'?'You':'AI Assistant'}
+                        </span>
+                        {m.role==='assistant'&&m.payload?.query_type==='informational'&&(
+                          <span style={{fontSize:8,padding:'1px 6px',borderRadius:6,background:T.teal+'22',color:T.teal,fontWeight:600}}>Knowledge</span>
+                        )}
+                        {m.role==='assistant'&&m.payload?.provider&&m.payload.query_type!=='informational'&&(
+                          <span style={{fontSize:8,padding:'1px 6px',borderRadius:6,background:T.kpmgBlue+'15',color:T.kpmgBlue,fontWeight:600}}>SQL</span>
+                        )}
                       </div>
 
                       <div style={{fontSize:12.5,lineHeight:1.65,whiteSpace:'pre-wrap'}}>{m.content}</div>
@@ -654,25 +757,51 @@ export default function NetworkAiChat() {
                         ))
                       )}
                       {/* Single chart */}
-                      {m.role==='assistant'&&m.payload&&m.payload.chart_type!=='multi_chart'&&(m.payload.data?.length>0||m.payload.error)&&(
+                      {m.role==='assistant'&&m.payload&&m.payload.chart_type!=='multi_chart'&&m.payload.chart_type!=='none'&&(m.payload.data?.length>0||m.payload.error)&&(
                         <InlineChart result={m.payload} T={T}/>
                       )}
 
-                      <div style={{fontSize:8.5,opacity:.4,marginTop:6,textAlign:m.role==='user'?'right':'left'}}>
-                        {m.created_at?new Date(m.created_at).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}):''}
+                      {/* Elapsed time + timestamp */}
+                      <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginTop:6}}>
+                        <div style={{fontSize:8.5,opacity:.4,textAlign:m.role==='user'?'right':'left'}}>
+                          {m.created_at?new Date(m.created_at).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}):''}
+                        </div>
+                        {m.role==='assistant'&&m.elapsed!=null&&(
+                          <span style={{fontSize:8,color:T.muted,fontWeight:500}}>{m.elapsed}s</span>
+                        )}
                       </div>
                     </div>
                   </div>
                 ))}
 
                 {loading&&(
-                  <div style={{display:'flex',justifyContent:'flex-start',marginBottom:16}}>
-                    <div style={{padding:'14px 20px',borderRadius:'18px 18px 18px 4px',background:T.surface,border:`1px solid ${T.border}`,boxShadow:T.cardShadow}}>
-                      <div style={{display:'flex',gap:5}}>
-                        {[0,1,2].map(i=>(
-                          <span key={i} style={{width:7,height:7,borderRadius:'50%',background:T.kpmgBlue,animation:`bounce .6s ${i*0.15}s infinite`}}/>
-                        ))}
+                  <div style={{display:'flex',justifyContent:'flex-start',marginBottom:16,animation:'fadeIn .3s ease'}}>
+                    <div style={{padding:'14px 20px',borderRadius:'18px 18px 18px 4px',background:T.surface,border:`1px solid ${T.border}`,boxShadow:T.cardShadow,minWidth:220}}>
+                      <div style={{display:'flex',alignItems:'center',gap:10}}>
+                        <div style={{display:'flex',gap:4}}>
+                          {[0,1,2].map(i=>(
+                            <span key={i} style={{width:7,height:7,borderRadius:'50%',background:T.kpmgBlue,animation:`bounce .6s ${i*0.15}s infinite`}}/>
+                          ))}
+                        </div>
+                        {progress&&(
+                          <span style={{fontSize:11,color:T.textSub,fontWeight:500,animation:'fadeIn .3s ease'}}>
+                            {progress.message}
+                          </span>
+                        )}
                       </div>
+                      {/* Progress bar */}
+                      {progress&&(
+                        <div style={{marginTop:8,height:3,borderRadius:2,background:T.border,overflow:'hidden'}}>
+                          <div style={{
+                            height:'100%',borderRadius:2,
+                            background:`linear-gradient(90deg,${T.kpmgBlue},${T.blue3})`,
+                            width: progress.stage==='understanding'?'25%':
+                                   progress.stage==='generating'?'50%':
+                                   progress.stage==='executing'?'75%':'95%',
+                            transition:'width 0.5s ease',
+                          }}/>
+                        </div>
+                      )}
                     </div>
                   </div>
                 )}
