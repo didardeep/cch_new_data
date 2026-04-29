@@ -569,8 +569,8 @@ Keep your response concise and actionable."""
         lat = session.latitude if session and session.latitude else None
         lon = session.longitude if session and session.longitude else None
 
-        # Fallback: default to Gurgaon coordinates if customer location unavailable
-        DEFAULT_LAT, DEFAULT_LON = 28.4595, 77.0266
+        # Fallback: default to Siem Reap — Svay Dankum Commune
+        DEFAULT_LAT, DEFAULT_LON = 13.3633, 103.8564
         location_source = "customer"
         if lat is None or lon is None:
             lat, lon = DEFAULT_LAT, DEFAULT_LON
@@ -601,6 +601,10 @@ Keep your response concise and actionable."""
             ticket = _db.session.get(Ticket, ticket_id)
             if ticket:
                 problem_type = _detect_network_problem_type(ticket)
+        # STRICT: when the agent picks the "site" tab they get ONLY site-level
+        # rows. When they pick the "cell" tab they get ONLY cell-level rows.
+        # No cross-level synthesis — that was producing confusing cell numbers
+        # under a site-level header.
         kpi_rows = KpiData.query.filter_by(site_id=site_id, data_level=data_level).all()
         if not kpi_rows:
             return jsonify({"error": f"No {data_level}-level KPI data found for site {site_id}"}), 404
@@ -796,7 +800,13 @@ INSTRUCTIONS:
     @app.route("/api/agent/tickets/<int:ticket_id>/recommendation", methods=["POST"])
     @jwt_required()
     def agent_recommendation(ticket_id):
-        """AI parameter recommendations based on root cause and KPI trend analysis."""
+        """AI parameter recommendations based on root cause and KPI trend analysis.
+
+        Dynamically scans every numeric RF column in telecom_sites (plus any
+        vendor-specific fields in extra_params) so the LLM can pick the most
+        appropriate parameter for the RCA rather than being limited to a
+        hard-coded subset.
+        """
         user = _db.session.get(User, int(get_jwt_identity()))
         if not user or user.role != "human_agent":
             return jsonify({"error": "Unauthorized"}), 403
@@ -814,28 +824,86 @@ INSTRUCTIONS:
         trend_summary = (request.json or {}).get("trend_summary", "")
         problem_type = _problem_type_label(_detect_network_problem_type(ticket))
 
+        # ── Chat history (customer's original complaint words) ───────────────
+        chat_history = ""
+        if session:
+            try:
+                msgs = session.messages[:20]
+                chat_history = "\n".join(f"{m.sender.upper()}: {m.content}" for m in msgs)
+            except Exception:
+                chat_history = ""
+
+        # ── Dynamically discover every numeric RF column in telecom_sites ────
+        from sqlalchemy import inspect as sa_inspect
+        TelecomSite = _models.get("TelecomSite")
+        RF_SKIP = {"id", "latitude", "longitude", "created_at", "updated_at"}
+        TEXT_SKIP = {"site_id","site_name","cell_id","cell_site_id","site_abs_id",
+                     "zone","city","state","country","province","commune",
+                     "site_status","alarms","solution","standard_solution_step",
+                     "vendor_name","technology","extra_params"}
+        rf_live = {}
+        site_vendor = site_tech = ""
+        nearest_site_id = nearest.get("site_id") if nearest else None
+        if nearest_site_id and TelecomSite is not None:
+            try:
+                _insp = sa_inspect(_db.engine)
+                cols = [c["name"] for c in _insp.get_columns("telecom_sites")]
+                num_cols = [c for c in cols if c not in RF_SKIP and c not in TEXT_SKIP]
+                if num_cols:
+                    from sqlalchemy import text as _sa_text
+                    sel_parts = ", ".join([f"AVG({c}) AS {c}" for c in num_cols])
+                    with _db.engine.connect() as conn:
+                        row = conn.execute(
+                            _sa_text(f"SELECT {sel_parts} FROM telecom_sites WHERE site_id=:sid"),
+                            {"sid": nearest_site_id},
+                        ).mappings().first()
+                    if row:
+                        rf_live = {k: v for k, v in dict(row).items() if v is not None}
+                site_obj = TelecomSite.query.filter_by(site_id=nearest_site_id).first()
+                if site_obj:
+                    if site_obj.extra_params:
+                        for k, v in site_obj.extra_params.items():
+                            if v is not None and k not in rf_live:
+                                rf_live[k] = v
+                    site_vendor = site_obj.vendor_name or ""
+                    site_tech = site_obj.technology or ""
+            except Exception:
+                pass
+
+        def _fmt_val(v):
+            try:
+                fv = float(v)
+                if fv == int(fv): return f"{int(fv)}"
+                return f"{round(fv, 3)}"
+            except (TypeError, ValueError):
+                return str(v)
+
+        rf_lines = [f"{k} = {_fmt_val(v)}" for k, v in sorted(rf_live.items())]
+        rf_full = "\n".join(rf_lines) if rf_lines else "No RF parameters found in telecom_sites for this site."
+
         site_context = "Nearest site data not available."
         if nearest:
-            site_context = "\n".join([
-                f"NEAREST SITE: {nearest.get('site_id')} (Zone: {nearest.get('zone')}, Distance: {nearest.get('distance_km')} km)",
-                f"SITE STATUS: {nearest.get('site_status') or 'on_air'}",
-                "SITE PARAMETERS:",
-                f"- Bandwidth (MHz): {nearest.get('bandwidth_mhz')}",
-                f"- Antenna Gain (dBi): {nearest.get('antenna_gain_dbi')}",
-                f"- RF Power (EIRP) [dBm]: {nearest.get('rf_power_eirp_dbm')}",
-                f"- Antenna height (AGL) (M): {nearest.get('antenna_height_agl_m')}",
-                f"- E-tilt (Degree): {nearest.get('e_tilt_degree')}",
-                f"- CRS Gain: {nearest.get('crs_gain')}",
-            ])
+            site_context = (
+                f"NEAREST SITE: {nearest.get('site_id')} (Zone: {nearest.get('zone')}, "
+                f"Distance: {nearest.get('distance_km')} km)\n"
+                f"SITE STATUS: {nearest.get('site_status') or 'on_air'}\n"
+                f"VENDOR: {site_vendor or 'Unknown'} | TECHNOLOGY: {site_tech or 'Unknown'}"
+            )
 
-        prompt = f"""You are a senior telecom network optimization engineer providing precise, actionable field recommendations.
+        prompt = f"""You are a SENIOR RAN OPTIMISATION ENGINEER on shift at the {site_vendor or 'Ericsson / Nokia'} 24x7 NOC, with 20+ years of hands-on experience triaging customer-experience tickets on live {site_tech or 'LTE'} networks. A customer complaint has been escalated to you — your job is to read what the user actually reported, study the RCA, scan the live RF parameter snapshot for the nearest site straight from the operator's telecom_sites database, and produce a field-deployable change-order an O&M / drive-test team can execute today. THINK EXACTLY AS A HUMAN RAN EXPERT WOULD on the NOC shift handover: reason from facts, quote actual DB values, never invent numbers, never speak in generalities. Your output is consumed by a CR (Change Request) workflow — be precise enough that a change-implementer can apply it without further interpretation.
 
 TICKET: {ticket.reference_number} — {ticket.category} / {ticket.subcategory}
-CUSTOMER REPORTED ISSUE: {ticket.description}
 PRIORITY: {ticket.priority.upper()}
 PROBLEM TYPE: {problem_type}
+CUSTOMER REPORTED ISSUE: {ticket.description}
+
+CUSTOMER CHAT HISTORY (read this to understand exactly what the user reported):
+{chat_history if chat_history else 'No chat history available.'}
 
 {site_context}
+
+COMPLETE RF PARAMETER DATABASE (every live numeric value currently stored for this site — treat each entry as a Managed-Object attribute on the {site_vendor or 'eNodeB'}; pick FROM THIS LIST only, never invent parameter names not present here. Common entries include bandwidth_mhz, e_tilt_degree, m_tilt_degree, rf_power_eirp_dbm, antenna_gain_dbi, antenna_height_agl_m, crs_gain, azimuth_degree, pci_cell_id, frequency_band, plus vendor-specific extra_params such as qRxLevMin, cellIndividualOffset, primaryDlPower):
+{rf_full}
 
 === TREND ANALYSIS EVIDENCE ===
 {trend_summary if trend_summary else 'No trend analysis summary available.'}
@@ -843,17 +911,27 @@ PROBLEM TYPE: {problem_type}
 === ROOT CAUSE ANALYSIS FINDINGS ===
 {root_cause if root_cause else 'No root cause analysis available.'}
 
-=== INSTRUCTIONS ===
-Generate exactly 4–5 numbered recommendations. Format: **Action Title**: 2–3 sentences.
-Rules:
-1. Each recommendation must directly address a specific finding from the Root Cause Analysis.
-2. At least 3 recommendations MUST use exact current site parameter values and propose a CONCRETE target value.
-3. One recommendation may use broader telecom best-practices (neighbor cell optimization, scheduler tuning, load balancing).
-4. State the EXPECTED OUTCOME for each (which KPI will improve, by how much approximately).
-5. Prioritize by impact — most impactful first.
-6. Be precise: say "adjust X from Y to Z to achieve W", not "consider adjusting".
-7. Do not repeat the root cause. Focus only on the fix and expected outcome.
-8. Do not add headings, summaries, or extra sections."""
+NOC PREDICTIVE-ANALYSIS METHODOLOGY YOU FOLLOW:
+  STEP 1 — Map the customer's reported symptom (call drop, slow internet, signal loss, call setup failure) to the candidate root-cause class (coverage hole, interference, congestion, handover, access).
+  STEP 2 — Cross-check that hypothesis against the KPI trend evidence and the RCA findings above.
+  STEP 3 — Map the confirmed root cause to the RF lever that fixes it. On Ericsson the typical MOs are EUtranCellFDD / SectorCarrier / AntennaSubunit (digitalTilt, mechTilt, primaryDlPower, qRxLevMin, qOffsetFreq, cellIndividualOffset). On Nokia these map to LNCEL / LNCEL_FDD / MOD (elTilt, maxTxPower, cellIndividualOffset, qRxLevMin, qHyst). Look up the equivalent attribute in the RF database above and use that exact name.
+  STEP 4 — Quote the current DB value verbatim, propose a typical-NOC-step delta (e.g., +1° E-tilt, -1 dB EIRP, +3 dB CRS gain) within 3GPP / {site_vendor or 'vendor'} {site_tech or ''} safe bounds.
+  STEP 5 — State the expected customer-experience improvement and the 48-72h verification window.
+
+=== YOUR TASK (think like a senior {site_vendor or 'Ericsson / Nokia'} NOC RAN expert) ===
+1. Read the customer's complaint and the RCA findings carefully.
+2. Scan the FULL RF parameter list above. Identify which parameter(s) will MOST DIRECTLY cure the customer's reported issue and the RCA-identified root cause.
+3. For each parameter you propose to change: quote its EXACT name as stored in the DB, the EXACT current value from the list (read verbatim), and an EXACT safe new value within 3GPP / {site_vendor or 'vendor'} {site_tech or ''} safe bounds.
+4. Tie each change back to BOTH the root cause AND the customer's reported symptom — show the cause→effect chain in plain RF terms.
+
+=== FORMATTING RULES (strict) ===
+- Plain text only. Each recommendation formatted as: **Action Title**: body text.
+- Write exactly 4–5 numbered recommendations. Most impactful first.
+- Every RF-parameter recommendation MUST include an explicit "Previous value: X → New value: Y" line, with X read directly from the RF parameter database above.
+- State the EXPECTED KPI OUTCOME for each (which KPI improves, by how much roughly, in what timeframe).
+- Be precise: "Adjust <parameter_name> from Y to Z" — never "consider adjusting".
+- Do not repeat the root cause verbatim. Focus on the fix and its expected effect.
+- Do not add headings, summaries, or extra sections."""
 
         try:
             response = _client.chat.completions.create(

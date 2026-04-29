@@ -219,7 +219,9 @@ export default function CRFormModal({ open, onClose, ticket, networkIssue }) {
     if (!crDraft?.id) return;
     setClassifying(true); setError('');
     try {
-      const res = await apiPost(`/api/cr/${crDraft.id}/classify`, { change_type: classifyType });
+      // Backend auto-classifies based on site revenue + users connected.
+      // The change_type sent here is ignored server-side.
+      const res = await apiPost(`/api/cr/${crDraft.id}/classify`, {});
       setSuccess(res?.cr || crDraft);
       setPhase('success');
     } catch (err) {
@@ -250,46 +252,30 @@ export default function CRFormModal({ open, onClose, ticket, networkIssue }) {
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 20 }}>
             <div>
               <h3 style={{ margin: '0 0 4px', fontSize: 18, fontWeight: 800, color: T.text }}>Classify Change Request</h3>
-              <span style={{ fontSize: 12, color: T.muted }}>Select the priority classification for this CR</span>
+              <span style={{ fontSize: 12, color: T.muted }}>Auto-classified from site revenue & users connected</span>
             </div>
             <span style={{ fontSize: 13, fontWeight: 800, fontFamily: "'IBM Plex Mono',monospace", color: '#fff', background: '#00338D', padding: '4px 12px', borderRadius: 6 }}>
               {crDraft.cr_number}
             </span>
           </div>
 
-          {/* Classification buttons */}
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 10, marginBottom: 20 }}>
-            {CLASSIFICATIONS.filter(c => c.key !== 'emergency').map(c => {
-              const sel = classifyType === c.key;
-              return (
-                <button key={c.key} onClick={() => setClassifyType(c.key)} style={{
-                  padding: '14px 8px', borderRadius: 10, cursor: 'pointer', textAlign: 'center',
-                  background: sel ? `${c.color}12` : T.bg,
-                  border: `2px solid ${sel ? c.color : T.border}`,
-                  color: sel ? c.color : T.muted, fontWeight: sel ? 700 : 500, fontSize: 14,
-                  transition: 'all 0.15s',
-                }}>
-                  {c.label}
-                  <div style={{ fontSize: 10, marginTop: 4, fontWeight: 400, opacity: 0.8 }}>{c.desc}</div>
-                </button>
-              );
-            })}
+          {/* Auto-classified badge — decided by backend formula (revenue + users) */}
+          <div style={{
+            padding: '16px 18px', borderRadius: 12, marginBottom: 20,
+            background: isDark ? '#152238' : '#eff6ff',
+            border: `1px solid ${isDark ? '#334155' : '#bfdbfe'}`,
+          }}>
+            <div style={{ fontSize: 11, fontWeight: 600, color: T.muted, textTransform: 'uppercase', letterSpacing: 0.4, marginBottom: 8 }}>
+              Auto-classified urgency
+            </div>
+            <div style={{ fontSize: 22, fontWeight: 800, color: isDark ? '#4da3ff' : '#00338D' }}>
+              {(crDraft.change_type || '—').toString().toUpperCase()}
+            </div>
+            <div style={{ fontSize: 11, color: T.textSub, marginTop: 6, lineHeight: 1.5 }}>
+              Classification is determined by the formula using site revenue and users connected.
+              Agents cannot override this value.
+            </div>
           </div>
-          {/* Emergency as separate full-width option */}
-          {(() => {
-            const c = CLASSIFICATIONS.find(x => x.key === 'emergency');
-            const sel = classifyType === 'emergency';
-            return (
-              <button onClick={() => setClassifyType('emergency')} style={{
-                width: '100%', padding: '12px', borderRadius: 10, cursor: 'pointer', textAlign: 'center', marginBottom: 20,
-                background: sel ? '#dc262612' : T.bg,
-                border: `2px solid ${sel ? '#dc2626' : T.border}`,
-                color: sel ? '#dc2626' : T.muted, fontWeight: sel ? 700 : 500, fontSize: 14,
-              }}>
-                Emergency <span style={{ fontSize: 10, fontWeight: 400 }}> — {c.desc} (requires CTO approval)</span>
-              </button>
-            );
-          })()}
 
           {/* Assigned manager info */}
           {crDraft.assigned_manager_name && (

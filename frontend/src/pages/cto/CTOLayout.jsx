@@ -1,9 +1,38 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, Component } from 'react';
 import { Outlet } from 'react-router-dom';
 import Sidebar from '../../components/Sidebar';
 import { useTheme } from '../../ThemeContext';
 import { apiGet } from '../../api';
 import { IndianRupee } from 'lucide-react';
+
+// Error boundary so a crash in any one CTO page (e.g. Leaflet getMinZoom
+// race during mount/unmount) doesn't take down the whole portal.
+class CTOErrorBoundary extends Component {
+  constructor(p) { super(p); this.state = { hasError: false, err: null }; }
+  static getDerivedStateFromError(err) { return { hasError: true, err }; }
+  componentDidCatch(err, info) { console.error('[CTO] render error:', err, info); }
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div style={{padding:32,maxWidth:760}}>
+          <h2 style={{color:'#dc2626',margin:'0 0 12px'}}>Page render error</h2>
+          <p style={{color:'#475569',lineHeight:1.6}}>
+            This page hit a runtime error (likely the map layer racing to mount).
+            Click <b>Retry</b> or navigate to another section from the sidebar.
+          </p>
+          <pre style={{background:'#f1f5f9',padding:12,borderRadius:8,fontSize:12,overflow:'auto',maxHeight:200,whiteSpace:'pre-wrap'}}>
+            {String(this.state.err?.message || this.state.err || 'Unknown error')}
+          </pre>
+          <button onClick={() => this.setState({ hasError: false, err: null })}
+            style={{marginTop:12,padding:'8px 20px',background:'#00338D',color:'#fff',border:'none',borderRadius:6,cursor:'pointer',fontWeight:600}}>
+            Retry
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 const ICON = (d) => (
   <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -44,7 +73,9 @@ export default function CTOLayout() {
     <div className="dashboard-layout" data-theme={theme}>
       <Sidebar links={links} />
       <main className="main-content">
-        <Outlet />
+        <CTOErrorBoundary>
+          <Outlet />
+        </CTOErrorBoundary>
       </main>
     </div>
   );

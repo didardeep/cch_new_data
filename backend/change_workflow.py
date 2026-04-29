@@ -87,6 +87,146 @@ CATEGORY_SUBCATEGORY_MAP = {
 SLA_PCT = {"standard": 0.30, "normal": 0.20, "urgent": 0.10, "emergency": 0.10}
 
 
+# ─── Auto-classification: revenue + users → priority & urgency ────────────────
+# Cache brackets daily so we don't recompute percentiles on every CR.
+_AUTO_BRACKETS = {"date": None, "rev": None, "usr": None}
+
+def _compute_brackets():
+    """Compute (p25,p50,p75) percentile brackets for revenue and users
+    across all sites using flexible_kpi_uploads monthly columns.
+
+    Revenue = average of all numeric revenue-like columns (rev_jan/feb/mar,
+              total_revenue, etc.) per site.
+    Users   = average of all numeric user/subscriber-like columns per site
+              from business KPI data.
+    """
+    from datetime import date as _d
+    today = _d.today()
+    if _AUTO_BRACKETS["date"] == today and _AUTO_BRACKETS["rev"] and _AUTO_BRACKETS["usr"]:
+        return _AUTO_BRACKETS["rev"], _AUTO_BRACKETS["usr"]
+
+    rev_defaults = {"p25": 30, "p50": 45, "p75": 60}
+    usr_defaults = {"p25": 200, "p50": 500, "p75": 1000}
+
+    def _pct(vals):
+        if not vals or len(vals) < 4:
+            return None
+        vs = sorted(vals)
+        n = len(vs)
+        return {"p25": vs[int(n * 0.25)], "p50": vs[int(n * 0.50)], "p75": vs[int(n * 0.75)]}
+
+    try:
+        # Revenue: exclude opex columns
+        rev_rows = db.session.execute(sa_text("""
+            SELECT site_id, AVG(num_value) AS v
+            FROM flexible_kpi_uploads
+            WHERE kpi_type='revenue' AND column_type='numeric'
+              AND num_value IS NOT NULL AND num_value > 0
+              AND column_name NOT ILIKE '%opex%'
+              AND column_name NOT ILIKE '%utilization%'
+              AND column_name NOT ILIKE '%util%'
+            GROUP BY site_id
+        """)).mappings().all()
+        rev_vals = [float(r["v"]) for r in rev_rows if r["v"] is not None]
+        rev = _pct(rev_vals) or rev_defaults
+    except Exception as e:
+        _LOG.warning("Revenue bracket calc failed: %s", e)
+        rev = rev_defaults
+
+    try:
+        # Users: match user/subscriber columns in business KPI
+        usr_rows = db.session.execute(sa_text("""
+            SELECT site_id, AVG(num_value) AS v
+            FROM flexible_kpi_uploads
+            WHERE kpi_type='business' AND column_type='numeric'
+              AND num_value IS NOT NULL AND num_value > 0
+              AND (column_name ILIKE '%user%' OR column_name ILIKE '%subscriber%'
+                   OR column_name ILIKE '%sub%')
+            GROUP BY site_id
+        """)).mappings().all()
+        usr_vals = [float(r["v"]) for r in usr_rows if r["v"] is not None]
+        usr = _pct(usr_vals) or usr_defaults
+    except Exception as e:
+        _LOG.warning("Users bracket calc failed: %s", e)
+        usr = usr_defaults
+
+    _AUTO_BRACKETS.update({"date": today, "rev": rev, "usr": usr})
+    return rev, usr
+
+
+def _get_site_metrics(site_id):
+    """Return (avg_revenue, avg_users) for a site from flexible_kpi_uploads.
+    Averages across all monthly columns, ignoring opex and utilization."""
+    revenue = 0.0
+    users = 0.0
+    if not site_id:
+        return revenue, users
+    try:
+        r = db.session.execute(sa_text("""
+            SELECT AVG(num_value) AS v FROM flexible_kpi_uploads
+            WHERE site_id=:sid AND kpi_type='revenue' AND column_type='numeric'
+              AND num_value IS NOT NULL AND num_value > 0
+              AND column_name NOT ILIKE '%opex%'
+              AND column_name NOT ILIKE '%util%'
+        """), {"sid": site_id}).mappings().first()
+        if r and r["v"] is not None:
+            revenue = float(r["v"])
+    except Exception:
+        pass
+    try:
+        r = db.session.execute(sa_text("""
+            SELECT AVG(num_value) AS v FROM flexible_kpi_uploads
+            WHERE site_id=:sid AND kpi_type='business' AND column_type='numeric'
+              AND num_value IS NOT NULL AND num_value > 0
+              AND (column_name ILIKE '%user%' OR column_name ILIKE '%subscriber%'
+                   OR column_name ILIKE '%sub%')
+        """), {"sid": site_id}).mappings().first()
+        if r and r["v"] is not None:
+            users = float(r["v"])
+    except Exception:
+        pass
+    return revenue, users
+
+
+def _auto_classify(site_id):
+    """Auto-classify a CR's urgency from site revenue + users connected.
+
+    Combined score (max 8):
+        revenue_bracket (1-4) + users_bracket (1-4)
+    Mapping:
+        >=7 → emergency
+        >=6 → urgent
+        >=4 → normal
+        else → standard
+    Returns: (change_type, priority_label, revenue, users, score)
+    """
+    rev_b, usr_b = _compute_brackets()
+    revenue, users = _get_site_metrics(site_id)
+
+    def _score(v, b):
+        if v >= b["p75"]: return 4
+        if v >= b["p50"]: return 3
+        if v >= b["p25"]: return 2
+        return 1
+
+    r_s = _score(revenue, rev_b)
+    u_s = _score(users, usr_b)
+    total = r_s + u_s
+
+    if total >= 7:
+        change_type, priority = "emergency", "Critical"
+    elif total >= 6:
+        change_type, priority = "urgent", "Critical"
+    elif total >= 4:
+        change_type, priority = "normal", "High"
+    elif total >= 3:
+        change_type, priority = "standard", "Medium"
+    else:
+        change_type, priority = "standard", "Low"
+
+    return change_type, priority, revenue, users, total
+
+
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _generate_pcr_number():
@@ -198,9 +338,12 @@ def create_cr():
 
         # Required fields
         title = (data.get("title") or "Parameter Change Request").strip()
-        change_type = (data.get("change_type") or "standard").lower()
-        if change_type not in SLA_PCT:
-            return jsonify({"error": "change_type must be standard/normal/urgent/emergency"}), 400
+        # Auto-classify urgency from site revenue + users connected
+        # (agent-selected change_type is ignored — decided by formula)
+        auto_site = data.get("nearest_site_id") or ""
+        change_type, auto_priority, auto_rev, auto_usr, auto_score = _auto_classify(auto_site)
+        print(f"[CR CREATE] Auto-classified site={auto_site} rev={auto_rev:.1f} users={auto_usr:.0f} "
+              f"score={auto_score} → {change_type} ({auto_priority})")
 
         # Domain mapping
         category = data.get("category", "")
@@ -357,10 +500,8 @@ def classify_cr(cr_id):
     if cr.status != "created":
         return jsonify({"error": f"Cannot classify CR in status '{cr.status}'"}), 409
 
-    data = request.json or {}
-    change_type = (data.get("change_type") or "standard").lower()
-    if change_type not in SLA_PCT:
-        return jsonify({"error": "change_type must be standard/normal/urgent/emergency"}), 400
+    # Auto-classify based on site revenue + users connected (agent input ignored)
+    change_type, _ap, _arv, _au, _asc = _auto_classify(cr.nearest_site_id or "")
 
     old_status = cr.status
     cr.change_type = change_type

@@ -250,7 +250,7 @@ export default function CTOChangeWorkflow() {
   const [filter, setFilter] = useState('');
   const [reviewCR, setReviewCR] = useState(null);
   const [remarksCR, setRemarksCR] = useState(null);
-  const [section, setSection] = useState('customer'); // 'customer' or 'ai'
+  const [section, setSection] = useState('customer'); // 'customer' | 'ai' | 'overutilized'
 
   const fetchCRs = useCallback(async () => {
     try {
@@ -263,10 +263,11 @@ export default function CTOChangeWorkflow() {
   useEffect(() => { fetchCRs(); }, [fetchCRs]);
   useEffect(() => { const iv = setInterval(fetchCRs, 30000); return () => clearInterval(iv); }, [fetchCRs]);
 
-  // Split CRs into customer complaint vs AI ticket
+  // Split CRs into customer complaint vs worst cell vs overutilized
   const customerCRs = crs.filter(c => c.ticket_id && !c.network_issue_id);
-  const aiCRs = crs.filter(c => c.network_issue_id);
-  const activeCRs = section === 'customer' ? customerCRs : aiCRs;
+  const worstCellCRs = crs.filter(c => c.network_issue_id && c.network_issue_id < 100000);
+  const overutilizedCRs = crs.filter(c => c.network_issue_id && c.network_issue_id >= 100000);
+  const activeCRs = section === 'customer' ? customerCRs : section === 'ai' ? worstCellCRs : overutilizedCRs;
 
   // Filter by status tab
   const filtered = filter ? activeCRs.filter(c => {
@@ -289,7 +290,7 @@ export default function CTOChangeWorkflow() {
   });
 
   const pendingCount = activeCRs.filter(c => c.status === 'pending_cto').length;
-  const sectionColor = section === 'customer' ? '#00338D' : '#7c3aed';
+  const sectionColor = section === 'customer' ? '#00338D' : section === 'ai' ? '#7c3aed' : '#E65100';
 
   return (
     <div>
@@ -324,7 +325,16 @@ export default function CTOChangeWorkflow() {
           display: 'flex', alignItems: 'center', gap: 8,
         }}>
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 2a4 4 0 0 1 4 4v1h2a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2h2V6a4 4 0 0 1 4-4z"/><circle cx="9" cy="14" r="1"/><circle cx="15" cy="14" r="1"/></svg>
-          AI Tickets ({aiCRs.length})
+          Worst Cell ({worstCellCRs.length})
+        </button>
+        <button onClick={() => { setSection('overutilized'); setFilter(''); }} style={{
+          padding: '10px 24px', fontSize: 13, fontWeight: 700, cursor: 'pointer', border: 'none',
+          borderLeft: `1px solid ${isDark ? '#334155' : '#e2e8f0'}`,
+          background: section === 'overutilized' ? '#E65100' : (isDark ? '#1e293b' : '#f8fafc'),
+          color: section === 'overutilized' ? '#fff' : (isDark ? '#94a3b8' : '#64748b'),
+          display: 'flex', alignItems: 'center', gap: 8,
+        }}>
+          Overutilized ({overutilizedCRs.length})
         </button>
       </div>
 
@@ -332,10 +342,10 @@ export default function CTOChangeWorkflow() {
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
         <div style={{ width: 4, height: 16, borderRadius: 2, background: sectionColor }} />
         <span style={{ fontSize: 13, fontWeight: 700, color: isDark ? '#e2e8f0' : '#0f172a', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
-          {section === 'customer' ? 'Customer Complaint CRs' : 'AI-Detected Network Issue CRs'}
+          {section === 'customer' ? 'Customer Complaint CRs' : section === 'ai' ? 'Worst Cell CRs' : 'Overutilized Site CRs'}
         </span>
         <span style={{ fontSize: 11, color: isDark ? '#64748b' : '#94a3b8' }}>
-          {section === 'customer' ? 'Raised from customer tickets (SR)' : 'Raised from AI-detected network issues'}
+          {section === 'customer' ? 'Raised from customer tickets' : section === 'ai' ? 'Raised from worst cell AI tickets' : 'Raised from overutilized site tickets'}
         </span>
       </div>
 
@@ -358,7 +368,7 @@ export default function CTOChangeWorkflow() {
         <div style={{ textAlign: 'center', padding: 40, color: '#94a3b8' }}>Loading...</div>
       ) : filtered.length === 0 ? (
         <div style={{ textAlign: 'center', padding: 40, color: '#94a3b8' }}>
-          No {section === 'customer' ? 'customer complaint' : 'AI ticket'} change requests{filter ? ` with status "${filter}"` : ''} found.
+          No {section === 'customer' ? 'customer complaint' : section === 'ai' ? 'worst cell' : 'overutilized'} change requests{filter ? ` with status "${filter}"` : ''} found.
         </div>
       ) : (
         filtered.map(cr => {

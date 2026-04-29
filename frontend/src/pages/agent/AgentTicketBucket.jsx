@@ -287,18 +287,14 @@ function parseRcaPoints(text) {
       const content = numMatch[2].trim();
       current = { index: parseInt(numMatch[1], 10), raw: content, title: '', body: content };
 
-      // Try "*Title*: Body" or "**Title**: Body"
-      const boldMatch = content.match(/^\*\*([^*]+)\*\*\s*[:\-–]\s*(.+)/s);
-      if (boldMatch) {
-        current.title = boldMatch[1].trim();
-        current.body  = boldMatch[2].trim();
-      } else {
-        // Try plain "Title: Body" where title ends within first 60 chars
-        const plainMatch = content.match(/^([^:]{5,60}):\s+(.+)/s);
-        if (plainMatch) {
-          current.title = plainMatch[1].trim();
-          current.body  = plainMatch[2].trim();
-        }
+      // Strip asterisks first, then try "Title: Body"
+      const cleanContent = content.replace(/\*{1,3}/g, '');
+      current.raw = cleanContent;
+      current.body = cleanContent;
+      const plainMatch = cleanContent.match(/^([^:]{5,60}):\s+(.+)/s);
+      if (plainMatch) {
+        current.title = plainMatch[1].trim();
+        current.body  = plainMatch[2].trim();
       }
     } else if (current) {
       // Continuation line — append to body
@@ -317,12 +313,9 @@ function parseRcaPoints(text) {
  */
 function renderInlineBold(text) {
   if (!text) return null;
-  const parts = text.split(/\*\*([^*]+)\*\*/g);
-  return parts.map((part, i) =>
-    i % 2 === 1
-      ? <strong key={i} style={{ color: '#0f172a', fontWeight: 700 }}>{part}</strong>
-      : <span key={i}>{part}</span>
-  );
+  // Strip any remaining asterisks and render as plain text
+  const cleaned = text.replace(/\*{1,3}/g, '');
+  return <span>{cleaned}</span>;
 }
 
 /**
@@ -1072,7 +1065,9 @@ function MapTab({ customer, sites }) {
   if (!mapReady || !Leaflet) return <div className="page-loader" style={{ height: 350 }}><div className="spinner" /></div>;
 
   const { MapContainer, TileLayer, Marker, Popup, Tooltip } = Leaflet;
-  const center    = customer ? [customer.latitude, customer.longitude] : [20.5937, 78.9629];
+  // Dynamic center: use customer location, or first site, or world view fallback
+  const center    = customer ? [customer.latitude, customer.longitude]
+                   : (sites && sites.length > 0 ? [sites[0].latitude, sites[0].longitude] : [0, 20]);
   const allPoints = [center, ...(sites || []).map(s => [s.latitude, s.longitude])];
   const bounds    = allPoints.length > 1 ? allPoints : undefined;
 

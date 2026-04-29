@@ -31,7 +31,7 @@ export default function DataUpload() {
   const [coreKpiStatus, setCoreKpiStatus] = useState(null);
   const [revenueKpiStatus, setRevenueKpiStatus] = useState(null);
 
-  // ── Business KPI upload (Site Users + Site Revenue)
+  // ── Business KPI upload (flexible — site users data)
   const [businessKpiFile, setBusinessKpiFile] = useState(null);
   const [businessKpiResult, setBusinessKpiResult] = useState(null);
   const [uploadingBusiness, setUploadingBusiness] = useState(false);
@@ -44,6 +44,21 @@ export default function DataUpload() {
   const [uploadingTransport, setUploadingTransport] = useState(false);
   const [deletingTransport, setDeletingTransport] = useState(false);
   const [transportStatus, setTransportStatus] = useState(null);
+
+  // ── Core Component KPI upload (per-component file + state)
+  const [coreFiles, setCoreFiles] = useState({});       // { MME: File, SGW: File, ... }
+  const [coreCompResult, setCoreCompResult] = useState(null);
+  const [uploadingCore, setUploadingCore] = useState(''); // component type currently uploading
+  const [deletingCore, setDeletingCore] = useState('');
+  const [coreCompStatus, setCoreCompStatus] = useState(null);
+  const [coreCompStatusByType, setCoreCompStatusByType] = useState(null);
+
+  const fetchCoreCompStatusByType = useCallback(async () => {
+    try {
+      const resp = await fetch(`${API_BASE}/api/admin/core-component-status-by-type`, { headers: { Authorization: `Bearer ${getToken()}` } });
+      if (resp.ok) setCoreCompStatusByType(await resp.json());
+    } catch {}
+  }, []);
 
   const fetchKpiList = useCallback(async () => {
     try {
@@ -86,9 +101,42 @@ export default function DataUpload() {
     fetchFlexStatus('revenue', setRevenueKpiStatus);
   }, [fetchFlexStatus]);
 
+  // ── Core Component KPI fetch/upload/delete ──
+  const fetchCoreCompStatus = useCallback(async () => {
+    try {
+      const resp = await fetch(`${API_BASE}/api/admin/core-component-kpi-status`, {
+        headers: { Authorization: `Bearer ${getToken()}` },
+      });
+      if (resp.ok) setCoreCompStatus(await resp.json());
+    } catch { /* ignore */ }
+  }, []);
+
+  useEffect(() => { fetchCoreCompStatus(); fetchCoreCompStatusByType(); }, [fetchCoreCompStatus, fetchCoreCompStatusByType]);
+
+  const uploadCoreComp = async (compType) => {
+    const file = coreFiles[compType];
+    if (!file) return;
+    setUploadingCore(compType); setError(''); setSuccess('');
+    try {
+      const fd = new FormData();
+      fd.append('file', file);
+      const resp = await fetch(`${API_BASE}/api/admin/upload-core-component-kpi`, {
+        method: 'POST', headers: { Authorization: `Bearer ${getToken()}` }, body: fd,
+      });
+      const d = await resp.json();
+      if (resp.ok) {
+        setCoreCompResult(d);
+        setCoreFiles(prev => ({ ...prev, [compType]: null }));
+        setSuccess(`${compType} KPIs uploaded!`);
+        fetchCoreCompStatus(); fetchCoreCompStatusByType();
+      } else { setError(d.error || 'Upload failed'); }
+    } catch (e) { setError('Upload failed: ' + e.message); }
+    setUploadingCore('');
+  };
+
   const fetchBusinessKpiStatus = useCallback(async () => {
     try {
-      const resp = await fetch(`${API_BASE}/api/admin/shared-site-workbook-summary`, {
+      const resp = await fetch(`${API_BASE}/api/admin/flexible-kpi-status?type=business`, {
         headers: { Authorization: `Bearer ${getToken()}` },
       });
       if (resp.ok) setBusinessKpiStatus(await resp.json());
@@ -104,7 +152,7 @@ export default function DataUpload() {
     try {
       const form = new FormData();
       form.append('file', businessKpiFile);
-      const resp = await fetch(`${API_BASE}/api/admin/upload-shared-site-workbook`, {
+      const resp = await fetch(`${API_BASE}/api/admin/upload-flexible-kpi?type=business`, {
         method: 'POST',
         headers: { Authorization: `Bearer ${getToken()}` },
         body: form,
@@ -120,10 +168,10 @@ export default function DataUpload() {
   };
 
   const deleteBusinessKpi = async () => {
-    if (!window.confirm('Delete all Site Users & Site Revenue data? This cannot be undone.')) return;
+    if (!window.confirm('Delete all Business KPI (site users) data? This cannot be undone.')) return;
     setDeletingBusiness(true); setError(''); setSuccess('');
     try {
-      const resp = await fetch(`${API_BASE}/api/admin/delete-shared-site-workbook`, {
+      const resp = await fetch(`${API_BASE}/api/admin/delete-flexible-kpi?type=business`, {
         method: 'DELETE',
         headers: { Authorization: `Bearer ${getToken()}` },
       });
@@ -425,7 +473,9 @@ export default function DataUpload() {
         </div>
         <div className="section-card-body">
           <p style={{ fontSize: 13, color: '#64748b', marginBottom: 16 }}>
-            Upload an Excel file (.xlsx) containing site data.
+            Upload an Excel file (.xlsx) containing site data. Only <strong>Site_ID</strong> is mandatory — all other columns are <strong>auto-detected</strong> from the first row.<br/>
+            Supported: Site ID, Site Abs ID, Site Name, Cell Name, Vendor, Latitude, Longitude, Province, Commune, City, State, Country, Technology, Status, and all RF parameters.<br/>
+            Any extra columns are stored automatically.
           </p>
           <div style={{ display: 'flex', gap: 16, alignItems: 'center', marginBottom: 16 }}>
             <div style={{ background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 8, padding: '10px 16px' }}>
@@ -453,6 +503,16 @@ export default function DataUpload() {
               <div style={{ marginTop: 6, color: '#475569' }}>
                 Total rows processed: {siteResult.total ?? 0}
               </div>
+              {siteResult.detected_columns?.length > 0 && (
+                <div style={{ marginTop: 6, color: '#1e40af', fontSize: 12 }}>
+                  Detected columns: {siteResult.detected_columns.join(', ')}
+                </div>
+              )}
+              {siteResult.extra_columns?.length > 0 && (
+                <div style={{ marginTop: 4, color: '#7c3aed', fontSize: 12 }}>
+                  Extra parameters stored: {siteResult.extra_columns.join(', ')}
+                </div>
+              )}
               {siteResult.skipped?.length > 0 && (
                 <div style={{ marginTop: 6, color: '#d97706', fontSize: 12 }}>
                   Skipped ({siteResult.skipped.length}): {siteResult.skipped.slice(0, 5).join('; ')}
@@ -475,7 +535,7 @@ export default function DataUpload() {
           <div className="section-card-body">
             <p style={{ fontSize: 13, color: '#64748b', marginBottom: 12 }}>
               Upload an Excel workbook (.xlsx/.xlsm) with <strong>27 sheets</strong>. Each sheet name = KPI name.<br/>
-              Sheet columns: <strong>Site_ID</strong>, then <strong>date columns</strong> with values.
+              Columns are <strong>auto-detected</strong>: Vendor Name, Site Name, Site ID, Site Abs ID + date columns with values.
             </p>
             <div style={{ background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 8, padding: '10px 14px', marginBottom: 12 }}>
               <div style={{ fontSize: 12, color: '#64748b' }}>Site-level KPIs uploaded: <strong style={{ color: '#00338D' }}>{siteKpiList.length}</strong></div>
@@ -519,7 +579,7 @@ export default function DataUpload() {
           <div className="section-card-body">
             <p style={{ fontSize: 13, color: '#64748b', marginBottom: 12 }}>
               Upload an Excel workbook (.xlsx/.xlsm) with <strong>27 sheets</strong>. Each sheet name = KPI name.<br/>
-              Sheet columns: <strong>Site_ID, Cell_ID, Cell_Site_ID</strong>, then <strong>date columns</strong> with values.
+              Columns are <strong>auto-detected</strong>: Vendor, Site ID, Site Abs ID, Cell Name + <strong>date columns</strong> with values.
             </p>
             <div style={{ background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 8, padding: '10px 14px', marginBottom: 12 }}>
               <div style={{ fontSize: 12, color: '#64748b' }}>Cell-level KPIs uploaded: <strong style={{ color: '#00338D' }}>{cellKpiList.length}</strong></div>
@@ -673,107 +733,94 @@ export default function DataUpload() {
         </div>
       )}
 
-      {/* ── NEW: Core KPI Upload (flexible — only Site_ID mandatory) ── */}
-      <div className="section-card" style={{ marginTop: 24, borderTop: '3px solid #7c3aed' }}>
-        <div className="section-card-header" style={{ background: 'linear-gradient(135deg, #f5f3ff 0%, #ede9fe 100%)' }}>
+      {/* ── Core Component KPI Upload — 5 Sections (MME / SGW / PGW / HSS / PCRF) ── */}
+      <div className="section-card" style={{ marginTop: 24, borderTop: '3px solid #00338D' }}>
+        <div className="section-card-header" style={{ background: 'linear-gradient(135deg, #e8eef7 0%, #d1ddf0 100%)' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-            <span style={{ fontSize: 18 }}>🖥</span>
-            <h3 style={{ color: '#7c3aed', margin: 0 }}>Core KPI Upload</h3>
-            <span style={{ marginLeft: 8, background: '#7c3aed', color: '#fff', fontSize: 10, fontWeight: 700, padding: '2px 8px', borderRadius: 20 }}>FLEXIBLE</span>
+            <span style={{ fontSize: 18 }}>&#128225;</span>
+            <h3 style={{ color: '#00338D', margin: 0 }}>Core Network KPI Upload</h3>
           </div>
         </div>
         <div className="section-card-body">
           <p style={{ fontSize: 13, color: '#64748b', marginBottom: 12 }}>
-            Upload your Core Network KPI file (Excel or CSV) for the <strong>Core Network tab</strong> in the
-            agent's Network Analysis dashboard. Only <code>Site_ID</code> is mandatory — all other columns
-            (Auth Success Rate, CPU Utilization, Attach Success Rate, PDP Bearer SR, or any custom columns)
-            are <strong>auto-detected</strong>, typed and stored. Each upload replaces the previous data.
+            Upload KPI data for each core component separately. Each Excel workbook should have <strong>one sheet per KPI</strong> (sheet name = KPI name).
+            Columns are <strong>auto-detected</strong>: Component IDs + datetime columns with 15-minute interval data.
           </p>
-          <div style={{ background: '#f5f3ff', border: '1px solid #ddd6fe', borderRadius: 8, padding: '10px 14px', marginBottom: 14, fontSize: 12, color: '#5b21b6' }}>
-            <strong>Only mandatory column:</strong> <code>Site_ID</code> (case-insensitive) — all other column names, types and units are identified automatically.
-          </div>
 
-          {/* Status row */}
-          {coreKpiStatus && (
-            <div style={{ display: 'flex', gap: 12, marginBottom: 14, flexWrap: 'wrap' }}>
-              {[
-                { label: 'Unique Sites', value: coreKpiStatus.unique_sites ?? 0, color: '#7c3aed' },
-                { label: 'Columns Detected', value: coreKpiStatus.unique_columns ?? 0, color: '#6d28d9' },
-                { label: 'Total Records', value: (coreKpiStatus.total_rows ?? 0).toLocaleString(), color: '#059669' },
-                ...(coreKpiStatus.date_range?.from ? [{ label: 'Date Range', value: `${coreKpiStatus.date_range.from} → ${coreKpiStatus.date_range.to}`, color: '#0369a1' }] : []),
-              ].map((s, i) => (
-                <div key={i} style={{ background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 8, padding: '10px 16px' }}>
-                  <div style={{ fontSize: 11, color: '#64748b' }}>{s.label}</div>
-                  <div style={{ fontSize: 20, fontWeight: 700, color: s.color }}>{s.value}</div>
-                </div>
-              ))}
-            </div>
-          )}
-
-          {/* Detected columns */}
-          {coreKpiStatus?.columns?.length > 0 && (
-            <div style={{ background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 8, padding: '10px 14px', marginBottom: 14 }}>
-              <div style={{ fontSize: 11, color: '#64748b', fontWeight: 700, marginBottom: 8, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Stored Columns</div>
-              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
-                {coreKpiStatus.columns.map((c, i) => (
-                  <span key={i} style={{ display: 'inline-flex', alignItems: 'center', gap: 4, padding: '2px 8px', borderRadius: 12, fontSize: 11, fontWeight: 600, background: '#ede9fe', border: '1px solid #ddd6fe', color: '#5b21b6', margin: '2px 0' }}>
-                    {c.column_label || c.column_name}
-                    {c.unit && <span style={{ fontSize: 9, opacity: 0.7 }}>({c.unit})</span>}
-                    <span style={{ fontSize: 9, padding: '0 4px', borderRadius: 6, background: c.column_type === 'numeric' ? '#dcfce7' : '#fef3c7', color: c.column_type === 'numeric' ? '#166534' : '#92400e', fontWeight: 700 }}>{c.column_type}</span>
-                  </span>
-                ))}
-              </div>
-            </div>
-          )}
-
-          <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
-            <input type="file" accept=".xlsx,.xls,.csv"
-              onChange={e => { setCoreKpiFile(e.target.files[0]); setCoreKpiResult(null); setError(''); setSuccess(''); }}
-              style={{ fontSize: 13 }} />
-            <button className="btn btn-primary btn-sm"
-              onClick={() => uploadFlexKpi('core', coreKpiFile, setCoreKpiFile, setCoreKpiResult, setCoreKpiStatus)}
-              disabled={!coreKpiFile || uploadingFlex.core}
-              style={{ background: '#7c3aed', borderColor: '#7c3aed' }}>
-              {uploadingFlex.core ? 'Uploading…' : 'Upload Core KPI Data'}
-            </button>
-            <button className="btn btn-sm"
-              onClick={() => deleteFlexKpi('core', setCoreKpiResult, setCoreKpiStatus)}
-              disabled={deletingFlex.core || !coreKpiStatus?.unique_sites}
-              style={{ background: '#dc2626', color: '#fff', border: 'none', borderRadius: 6, padding: '6px 14px', fontSize: 12, fontWeight: 600, cursor: !coreKpiStatus?.unique_sites ? 'not-allowed' : 'pointer', opacity: !coreKpiStatus?.unique_sites ? 0.5 : 1 }}>
-              {deletingFlex.core ? 'Deleting…' : 'Delete All'}
-            </button>
-          </div>
-
-          {coreKpiResult && (
-            <div style={{ marginTop: 14, background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: 8, padding: 12, fontSize: 13 }}>
-              <strong style={{ color: '#16a34a' }}>✅ Upload Successful</strong>
-              <div style={{ marginTop: 8, display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(160px, 1fr))', gap: 8 }}>
-                {[
-                  { label: 'Rows in File', value: coreKpiResult.rows_in_file ?? 0 },
-                  { label: 'Records Inserted', value: coreKpiResult.records_inserted ?? 0 },
-                  { label: 'Unique Sites', value: coreKpiResult.unique_sites ?? 0 },
-                  { label: 'Columns Found', value: (coreKpiResult.columns_detected ?? []).length },
-                ].map((s, i) => (
-                  <div key={i} style={{ background: '#fff', border: '1px solid #e2e8f0', borderRadius: 6, padding: '8px 12px' }}>
-                    <div style={{ fontSize: 11, color: '#64748b' }}>{s.label}</div>
-                    <div style={{ fontSize: 18, fontWeight: 700, color: '#7c3aed' }}>{typeof s.value === 'number' ? s.value.toLocaleString() : s.value}</div>
+          {/* 5 Component Upload Sections */}
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: 16 }}>
+            {[
+              { type: 'MME', label: 'MME (Mobility Management Entity)', color: '#00338D', nodes: 'MME1–MME4', kpiCount: 13,
+                kpis: 'Attach SR, Service Request SR, Paging SR, CSFB SR, SRVCC SR, HOSR, Context Setup Failure, CPU/Memory Util, Bearer Count, TCP Sessions, SCTP Status' },
+              { type: 'SGW', label: 'SGW (Serving Gateway)', color: '#005EB8', nodes: 'SGW1–SGW4', kpiCount: 12,
+                kpis: 'Create/Modify/Delete Session SR, Handover Data Path SR, SGW Relocation SR, Packet Loss, UL Latency, Throughput Util, CPU/Memory Util, Bearer Count, GTP-U Availability' },
+              { type: 'PGW', label: 'PGW (PDN Gateway)', color: '#0091DA', nodes: 'PGW1–PGW4', kpiCount: 15,
+                kpis: 'Default/Dedicated Bearer SR, Session Setup SR, PCRF Interaction SR, Packet Loss, UL Latency, Throughput/Subscriber, Jitter, Charging SR, Online Charging Latency, Policy Accuracy, CPU/Memory, NAT Table' },
+              { type: 'HSS', label: 'HSS (Home Subscriber Server)', color: '#483698', nodes: 'HSS1–HSS3', kpiCount: 19,
+                kpis: 'Auth SR, Location Update SR, Profile Retrieval SR, Auth Failure Rate, S6a/Cx Transaction SR & Latency, DB Query SR & Replication Lag, CPU/Memory, Diameter TPS, HSS Availability, Geo Sync, Failover Time' },
+              { type: 'PCRF', label: 'PCRF (Policy & Charging Rules)', color: '#470A68', nodes: 'PCRF1–PCRF2', kpiCount: 18,
+                kpis: 'Policy Decision SR, Session Establishment SR, Charging Rule Install/Update SR, Policy Accuracy, Gx SR & Latency, OCS Sy/Gy SR, Credit Control Failure, Active Sessions, CPU/Memory, Diameter TPS, PCRF Availability' },
+            ].map(comp => {
+              const cs = coreCompStatusByType?.[comp.type];
+              return (
+                <div key={comp.type} style={{ border: `1px solid ${comp.color}33`, borderLeft: `4px solid ${comp.color}`, borderRadius: 8, padding: '14px 16px', background: `${comp.color}04` }}>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
+                    <div>
+                      <div style={{ fontSize: 14, fontWeight: 700, color: comp.color }}>{comp.label}</div>
+                      <div style={{ fontSize: 11, color: '#64748b' }}>{comp.nodes} · {comp.kpiCount} KPIs</div>
+                    </div>
+                    {cs && cs.rows > 0 && (
+                      <div style={{ display: 'flex', gap: 8 }}>
+                        <span style={{ fontSize: 11, padding: '2px 8px', borderRadius: 12, background: `${comp.color}15`, color: comp.color, fontWeight: 700 }}>{cs.kpis} KPIs · {cs.nodes} nodes · {cs.rows.toLocaleString()} records</span>
+                        {cs.date_from && <span style={{ fontSize: 10, color: '#94a3b8' }}>{cs.date_from} → {cs.date_to}</span>}
+                      </div>
+                    )}
                   </div>
-                ))}
-              </div>
-              {coreKpiResult.columns_detected?.length > 0 && (
-                <div style={{ marginTop: 10, fontSize: 12, color: '#475569' }}>
-                  <strong>Auto-detected columns:</strong> {coreKpiResult.columns_detected.join(', ')}
+                  <div style={{ fontSize: 11, color: '#64748b', marginBottom: 10 }}>{comp.kpis}</div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                    <input type="file" accept=".xlsx,.xlsm"
+                      onChange={e => { setCoreFiles(prev => ({ ...prev, [comp.type]: e.target.files[0] })); setCoreCompResult(null); setError(''); setSuccess(''); }}
+                      style={{ fontSize: 12, maxWidth: 220 }} />
+                    <button className="btn btn-sm" onClick={() => uploadCoreComp(comp.type)} disabled={!coreFiles[comp.type] || uploadingCore === comp.type}
+                      style={{ background: comp.color, color: '#fff', border: 'none', borderRadius: 6, padding: '5px 14px', fontSize: 11, fontWeight: 700, cursor: !coreFiles[comp.type] ? 'not-allowed' : 'pointer', opacity: !coreFiles[comp.type] ? 0.5 : 1 }}>
+                      {uploadingCore === comp.type ? 'Uploading…' : `Upload ${comp.type} KPIs`}
+                    </button>
+                    <button className="btn btn-sm" disabled={deletingCore === comp.type || !cs?.rows}
+                      onClick={async () => { if (!window.confirm(`Delete ALL ${comp.type} KPI data?`)) return; setDeletingCore(comp.type); try { const token = localStorage.getItem('token'); await fetch(`${API_BASE}/api/admin/delete-core-component-kpi?component_type=${comp.type}`, { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } }); fetchCoreCompStatusByType(); fetchCoreCompStatus(); setSuccess(`${comp.type} data deleted.`); } catch {} setDeletingCore(''); }}
+                      style={{ background: '#dc2626', color: '#fff', border: 'none', borderRadius: 6, padding: '5px 12px', fontSize: 11, fontWeight: 600, cursor: !cs?.rows ? 'not-allowed' : 'pointer', opacity: !cs?.rows ? 0.5 : 1 }}>
+                      {deletingCore === comp.type ? 'Deleting…' : `Delete ${comp.type}`}
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* Upload result banner */}
+          {coreCompResult && (
+            <div style={{ marginTop: 14, background: coreCompResult.inserted > 0 ? '#f0fdf4' : '#fef2f2', border: `1px solid ${coreCompResult.inserted > 0 ? '#bbf7d0' : '#fecaca'}`, borderRadius: 8, padding: 12, fontSize: 13 }}>
+              <strong style={{ color: coreCompResult.inserted > 0 ? '#16a34a' : '#dc2626' }}>
+                {coreCompResult.inserted > 0 ? 'Upload Successful' : 'Upload Warning: 0 rows inserted'}
+              </strong> — {(coreCompResult.inserted ?? 0).toLocaleString()} rows, {coreCompResult.kpis_processed ?? 0} KPIs
+              {coreCompResult.kpi_summary?.length > 0 && (
+                <div style={{ marginTop: 6, fontSize: 11, color: '#475569' }}>
+                  {coreCompResult.kpi_summary.map(k => `${k.name} (${k.component_type||'?'}, layout=${k.layout||'?'}, ${k.rows} rows)`).join(' · ')}
+                </div>
+              )}
+              {coreCompResult.errors?.length > 0 && (
+                <div style={{ marginTop: 6, fontSize: 11, color: '#dc2626' }}>
+                  <strong>Issues:</strong> {coreCompResult.errors.join(' | ')}
                 </div>
               )}
             </div>
           )}
 
           {/* ── Transport KPI Upload — nested inside Core section ── */}
-          <div style={{ marginTop: 24, paddingTop: 20, borderTop: '1px dashed #c4b5fd' }}>
+          <div style={{ marginTop: 24, paddingTop: 20, borderTop: '1px dashed #b8c9e0' }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12 }}>
-              <span style={{ fontSize: 18 }}>🔌</span>
+              <span style={{ fontSize: 18 }}>&#128268;</span>
               <div>
-                <h4 style={{ margin: 0, color: '#5b21b6', fontSize: 14, fontWeight: 700 }}>Transport KPI Upload</h4>
+                <h4 style={{ margin: 0, color: '#005EB8', fontSize: 14, fontWeight: 700 }}>Transport KPI Upload</h4>
                 <p style={{ margin: 0, fontSize: 12, color: '#64748b', marginTop: 2 }}>
                   Only <code>Site_ID</code> is mandatory — Zone, Backhaul Type, Utilization, Latency, Jitter, Packet Loss etc. are <strong>auto-detected</strong>.
                 </p>
@@ -784,8 +831,8 @@ export default function DataUpload() {
             {transportStatus && (
               <div style={{ display: 'flex', gap: 12, marginBottom: 14, flexWrap: 'wrap' }}>
                 {[
-                  { label: 'Unique Sites',      value: transportStatus.unique_sites ?? 0,                    color: '#5b21b6' },
-                  { label: 'Total Records',      value: (transportStatus.total_rows ?? 0).toLocaleString(),   color: '#6d28d9' },
+                  { label: 'Unique Sites',      value: transportStatus.unique_sites ?? 0,                    color: '#005EB8' },
+                  { label: 'Total Records',      value: (transportStatus.total_rows ?? 0).toLocaleString(),   color: '#0091DA' },
                   { label: 'Columns Detected',   value: transportStatus.unique_columns ?? 0,                  color: '#059669' },
                 ].map((s, i) => (
                   <div key={i} style={{ background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 8, padding: '9px 14px' }}>
@@ -802,7 +849,7 @@ export default function DataUpload() {
                 <div style={{ fontSize: 11, color: '#64748b', fontWeight: 700, marginBottom: 7, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Stored Columns</div>
                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
                   {transportStatus.columns.map((c, i) => (
-                    <span key={i} style={{ display: 'inline-flex', alignItems: 'center', gap: 4, padding: '2px 8px', borderRadius: 12, fontSize: 11, fontWeight: 600, background: '#ede9fe', border: '1px solid #ddd6fe', color: '#5b21b6' }}>
+                    <span key={i} style={{ display: 'inline-flex', alignItems: 'center', gap: 4, padding: '2px 8px', borderRadius: 12, fontSize: 11, fontWeight: 600, background: '#e8eef7', border: '1px solid #b8c9e0', color: '#005EB8' }}>
                       {c}
                     </span>
                   ))}
@@ -811,7 +858,7 @@ export default function DataUpload() {
             )}
 
             {/* Format hint */}
-            <div style={{ background: '#f5f3ff', border: '1px solid #ddd6fe', borderRadius: 8, padding: '9px 13px', marginBottom: 14, fontSize: 12, color: '#5b21b6' }}>
+            <div style={{ background: '#e8eef7', border: '1px solid #b8c9e0', borderRadius: 8, padding: '9px 13px', marginBottom: 14, fontSize: 12, color: '#005EB8' }}>
               <strong>Accepted columns (all optional except Site_ID):</strong>{' '}
               Site_ID, Zone / Cluster, Backhaul_Type, Link_Capacity (Mbps), Avg_Utilization (%), Peak_Utilization (%),
               Packet_Loss (%), Avg_Latency (ms), Jitter (ms), Availability (%), Error_Rate (%), Throughput_Efficiency (%), Alarms
@@ -828,9 +875,9 @@ export default function DataUpload() {
                 className="btn btn-primary btn-sm"
                 onClick={uploadTransport}
                 disabled={!transportFile || uploadingTransport}
-                style={{ background: '#5b21b6', borderColor: '#5b21b6' }}
+                style={{ background: '#005EB8', borderColor: '#005EB8' }}
               >
-                {uploadingTransport ? 'Uploading…' : '⬆ Upload Transport KPI Data'}
+                {uploadingTransport ? 'Uploading…' : 'Upload Transport KPI Data'}
               </button>
               <button
                 className="btn btn-sm"
@@ -849,7 +896,7 @@ export default function DataUpload() {
 
             {transportResult && (
               <div style={{ marginTop: 14, background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: 8, padding: 12, fontSize: 13 }}>
-                <strong style={{ color: '#16a34a' }}>✅ Transport Upload Successful</strong>
+                <strong style={{ color: '#16a34a' }}>Transport Upload Successful</strong>
                 <div style={{ marginTop: 8, display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(160px, 1fr))', gap: 8 }}>
                   {[
                     { label: 'Records Inserted', value: transportResult.records_processed ?? 0 },
@@ -858,7 +905,7 @@ export default function DataUpload() {
                   ].map((s, i) => (
                     <div key={i} style={{ background: '#fff', border: '1px solid #e2e8f0', borderRadius: 6, padding: '8px 12px' }}>
                       <div style={{ fontSize: 11, color: '#64748b' }}>{s.label}</div>
-                      <div style={{ fontSize: 18, fontWeight: 700, color: '#5b21b6' }}>{typeof s.value === 'number' ? s.value.toLocaleString() : s.value}</div>
+                      <div style={{ fontSize: 18, fontWeight: 700, color: '#005EB8' }}>{typeof s.value === 'number' ? s.value.toLocaleString() : s.value}</div>
                     </div>
                   ))}
                 </div>
@@ -969,13 +1016,16 @@ export default function DataUpload() {
         </div>
       </div>
 
-      {/* ── Business KPI Upload (Site Users + Site Revenue) ── */}
+      {/* ── Business KPI Upload (Site Users — flexible) ── */}
       <div className="section-card" style={{ marginTop: 24 }}>
         <div className="section-card-header">
-          <h3>Business KPI Upload</h3>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <h3>Business KPI Upload</h3>
+            <span style={{ fontSize: 10, fontWeight: 700, background: '#dbeafe', color: '#1d4ed8', padding: '2px 8px', borderRadius: 999, textTransform: 'uppercase' }}>Flexible</span>
+          </div>
           <p style={{ margin: 0, fontSize: 13, color: 'var(--text-muted)' }}>
-            Upload an Excel workbook with sheets named <strong>Site Users</strong> and <strong>Site Revenue</strong>.
-            Each sheet: one Site ID column + date columns with values.
+            Upload site users / subscriber data. Only <strong>Site_ID</strong> is mandatory — all other columns are auto-detected.
+            Revenue data should be uploaded separately via <strong>Revenue KPI Upload</strong>.
           </p>
         </div>
         <div className="section-card-body">
@@ -983,29 +1033,41 @@ export default function DataUpload() {
           {/* Status */}
           <div style={{ display: 'flex', gap: 12, marginBottom: 16, flexWrap: 'wrap' }}>
             {[
-              { label: 'Records in DB', value: businessKpiStatus?.total_records ?? 0, color: '#00338D' },
-              { label: 'Sites with Data', value: businessKpiStatus?.total_sites ?? 0, color: '#10b981' },
+              { label: 'Unique Sites', value: businessKpiStatus?.unique_sites ?? 0, color: '#00338D' },
+              { label: 'Columns Detected', value: businessKpiStatus?.unique_columns ?? 0, color: '#7c3aed' },
+              { label: 'Total Records', value: businessKpiStatus?.total_rows ?? 0, color: '#10b981' },
             ].map((s, i) => (
               <div key={i} style={{ background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 8, padding: '10px 18px', minWidth: 140 }}>
                 <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 2 }}>{s.label}</div>
-                <div style={{ fontSize: 22, fontWeight: 700, color: s.color }}>{s.value.toLocaleString()}</div>
+                <div style={{ fontSize: 22, fontWeight: 700, color: s.color }}>{(s.value ?? 0).toLocaleString()}</div>
               </div>
             ))}
           </div>
 
+          {/* Detected columns */}
+          {businessKpiStatus?.columns?.length > 0 && (
+            <div style={{ background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 8, padding: '10px 14px', marginBottom: 16, fontSize: 12 }}>
+              <strong style={{ color: 'var(--text)' }}>Detected columns:</strong>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginTop: 8 }}>
+                {businessKpiStatus.columns.map((col, i) => (
+                  <span key={i} style={{ background: col.column_type === 'numeric' ? '#dbeafe' : '#fef3c7', color: col.column_type === 'numeric' ? '#1d4ed8' : '#92400e', fontSize: 11, fontWeight: 600, padding: '3px 10px', borderRadius: 999 }}>
+                    {col.column_label || col.column_name}
+                    <span style={{ opacity: 0.6, marginLeft: 4 }}>({col.column_type})</span>
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+
           {/* File format hint */}
           <div style={{ background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 8, padding: '10px 14px', marginBottom: 16, fontSize: 12, color: 'var(--text-muted)' }}>
-            <strong style={{ color: 'var(--text)' }}>Required Excel format:</strong>
-            <ul style={{ margin: '6px 0 0 16px', lineHeight: 1.8 }}>
-              <li>Sheet 1 name: <code style={{ background: 'var(--border)', padding: '1px 5px', borderRadius: 3 }}>Site Users</code></li>
-              <li>Sheet 2 name: <code style={{ background: 'var(--border)', padding: '1px 5px', borderRadius: 3 }}>Site Revenue</code></li>
-              <li>Columns: <code style={{ background: 'var(--border)', padding: '1px 5px', borderRadius: 3 }}>Site_ID</code> + date columns (e.g. 2024-03-01, 2024-03-02…)</li>
-            </ul>
+            <strong style={{ color: 'var(--text)' }}>Accepted format:</strong> Excel (.xlsx) or CSV with <code style={{ background: 'var(--border)', padding: '1px 5px', borderRadius: 3 }}>Site_ID</code> column.
+            Typical columns: Users, Subscribers, Zone, Technology, etc.
           </div>
 
           {/* Upload controls */}
           <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
-            <input type="file" accept=".xlsx,.xlsm"
+            <input type="file" accept=".xlsx,.xlsm,.csv"
               onChange={e => setBusinessKpiFile(e.target.files[0] || null)}
               style={{ fontSize: 13 }} />
             <button className="btn btn-primary btn-sm" onClick={uploadBusinessKpi}
@@ -1014,8 +1076,8 @@ export default function DataUpload() {
             </button>
             <button className="btn btn-sm"
               onClick={deleteBusinessKpi}
-              disabled={deletingBusiness || !businessKpiStatus?.total_records}
-              style={{ background: '#dc2626', color: '#fff', border: 'none', borderRadius: 6, padding: '6px 14px', fontSize: 12, fontWeight: 600, cursor: !businessKpiStatus?.total_records ? 'not-allowed' : 'pointer', opacity: !businessKpiStatus?.total_records ? 0.5 : 1 }}>
+              disabled={deletingBusiness || !businessKpiStatus?.total_rows}
+              style={{ background: '#dc2626', color: '#fff', border: 'none', borderRadius: 6, padding: '6px 14px', fontSize: 12, fontWeight: 600, cursor: !businessKpiStatus?.total_rows ? 'not-allowed' : 'pointer', opacity: !businessKpiStatus?.total_rows ? 0.5 : 1 }}>
               {deletingBusiness ? 'Deleting…' : 'Delete All'}
             </button>
           </div>
@@ -1023,28 +1085,19 @@ export default function DataUpload() {
           {/* Result */}
           {businessKpiResult && (
             <div style={{ marginTop: 14, background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: 8, padding: 12, fontSize: 13 }}>
-              <strong style={{ color: '#16a34a' }}>✅ Upload Successful</strong>
+              <strong style={{ color: '#16a34a' }}>Upload Successful</strong>
               <div style={{ marginTop: 8, display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(160px, 1fr))', gap: 8 }}>
                 {[
-                  { label: 'Records Inserted', value: businessKpiResult.inserted ?? 0 },
-                  { label: 'KPIs Processed', value: businessKpiResult.kpis_processed ?? 0 },
+                  { label: 'Records Inserted', value: businessKpiResult.records_inserted ?? 0 },
+                  { label: 'Unique Sites', value: businessKpiResult.unique_sites ?? 0 },
+                  { label: 'Columns Found', value: (businessKpiResult.columns_detected || []).length },
                 ].map((s, i) => (
                   <div key={i} style={{ background: '#fff', border: '1px solid #e2e8f0', borderRadius: 6, padding: '8px 12px' }}>
                     <div style={{ fontSize: 11, color: '#64748b' }}>{s.label}</div>
-                    <div style={{ fontSize: 18, fontWeight: 700, color: '#059669' }}>{s.value.toLocaleString()}</div>
+                    <div style={{ fontSize: 18, fontWeight: 700, color: '#059669' }}>{(s.value ?? 0).toLocaleString()}</div>
                   </div>
                 ))}
               </div>
-              {businessKpiResult.kpi_summary?.map((k, i) => (
-                <div key={i} style={{ marginTop: 6, fontSize: 12, color: '#475569' }}>
-                  <strong>{k.name}:</strong> {k.rows.toLocaleString()} rows
-                </div>
-              ))}
-              {businessKpiResult.errors?.length > 0 && (
-                <div style={{ marginTop: 8, color: '#dc2626', fontSize: 12 }}>
-                  {businessKpiResult.errors.map((e, i) => <div key={i}>{e}</div>)}
-                </div>
-              )}
             </div>
           )}
         </div>

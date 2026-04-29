@@ -6,8 +6,8 @@ import {
   AlertTriangle, TrendingUp, TrendingDown, Wifi, Signal, Zap,
 } from 'lucide-react';
 import {
-  Area, AreaChart, CartesianGrid, ResponsiveContainer,
-  Tooltip, XAxis, YAxis,
+  Area, AreaChart, CartesianGrid, ReferenceLine, ReferenceArea,
+  ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from 'recharts';
 import { apiGet } from '../../api';
 
@@ -250,8 +250,67 @@ export default function TechnicalKPI() {
         <stop offset="0%"  stopColor="#10b981" stopOpacity={0.35} />
         <stop offset="100%" stopColor="#10b981" stopOpacity={0.02} />
       </linearGradient>
+      <linearGradient id="cssrGrad" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%"  stopColor="#3b82f6" stopOpacity={0.35} />
+        <stop offset="100%" stopColor="#3b82f6" stopOpacity={0.02} />
+      </linearGradient>
+      <linearGradient id="erabGrad" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%"  stopColor="#ef4444" stopOpacity={0.35} />
+        <stop offset="100%" stopColor="#ef4444" stopOpacity={0.02} />
+      </linearGradient>
     </defs>
   );
+
+  /* ─── KPI Thresholds for breach detection ────────────────── */
+  /* Since backend now returns accessibility = CSSR only and
+     retainability = E-RAB Drop Rate only, the trend series
+     directly represent those individual KPIs.                  */
+  const retainSeries = ser.retainability || [];
+
+  const THRESHOLDS = {
+    accessibility:       { value: 95,  direction: 'min', label: 'Min 95%', color: '#ef4444' },
+    e_rab_drop:          { value: 1.0, direction: 'max', label: 'Max 1%',  color: '#ef4444' },
+    prb_utilization:     { value: 70,  direction: 'max', label: 'Max 70%', color: '#f59e0b' },
+    downlink_throughput: { value: 5,   direction: 'min', label: 'Min 5',   color: '#ef4444' },
+  };
+
+  /* Find breach regions in a series */
+  function findBreachRegions(series, threshold, direction) {
+    const regions = [];
+    let start = null;
+    for (let i = 0; i < series.length; i++) {
+      const v = series[i].value;
+      const breached = direction === 'min' ? v < threshold : v > threshold;
+      if (breached && start === null) {
+        start = i;
+      } else if (!breached && start !== null) {
+        regions.push({ x1: series[start].date, x2: series[i - 1].date });
+        start = null;
+      }
+    }
+    if (start !== null) {
+      regions.push({ x1: series[start].date, x2: series[series.length - 1].date });
+    }
+    return regions;
+  }
+
+  /* Generate insight text for a KPI */
+  function generateInsight(series, name, threshold, direction) {
+    if (!series.length) return null;
+    const latest = series[series.length - 1].value;
+    const breached = direction === 'min' ? latest < threshold : latest > threshold;
+    const breachCount = series.filter(p => direction === 'min' ? p.value < threshold : p.value > threshold).length;
+    const pct = Math.round((breachCount / series.length) * 100);
+    if (breachCount === 0) return { text: `${name}: All values within threshold. Network performance is healthy.`, severity: 'good' };
+    if (breached) return { text: `${name}: Currently breaching threshold (${latest}). ${pct}% of data points exceeded limits. Immediate attention needed.`, severity: 'critical' };
+    return { text: `${name}: ${breachCount} breach(es) detected (${pct}% of period). Currently recovered to ${latest}. Monitor closely.`, severity: 'warning' };
+  }
+
+  const accBreaches = findBreachRegions(trendSeries, THRESHOLDS.accessibility.value, 'min');
+  const erabBreaches = findBreachRegions(retainSeries, THRESHOLDS.e_rab_drop.value, 'max');
+
+  const accInsight = generateInsight(trendSeries, 'Call Setup Success Rate', THRESHOLDS.accessibility.value, 'min');
+  const erabInsight = generateInsight(retainSeries, 'E-RAB Drop Rate', THRESHOLDS.e_rab_drop.value, 'max');
 
   return (
     <div style={{ paddingBottom: 40 }}>
@@ -426,8 +485,8 @@ export default function TechnicalKPI() {
           <div style={{ height: 3, background: lin(accCfg.colors, 90) }} />
           <div style={{ padding: '18px 20px 12px', borderBottom: '1px solid var(--border)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
             <div>
-              <h3 style={{ margin: 0, fontSize: 14, fontWeight: 700, color: 'var(--text)' }}>Network Accessibility Trend</h3>
-              <p style={{ margin: '3px 0 0', fontSize: 11, color: 'var(--text-muted)' }}>Historical analysis — last 30 data points</p>
+              <h3 style={{ margin: 0, fontSize: 14, fontWeight: 700, color: 'var(--text)' }}>Accessibility — Call Setup Success Rate (%)</h3>
+              <p style={{ margin: '3px 0 0', fontSize: 11, color: 'var(--text-muted)' }}>LTE Call Setup Success Rate trend — last 30 data points</p>
             </div>
             <div style={{ display: 'flex', gap: 16 }}>
               {[['#10b981', 'Current'], ['var(--text-muted)', 'Baseline']].map(([c, l]) => (
@@ -448,12 +507,27 @@ export default function TechnicalKPI() {
                   domain={[(dataMin) => Math.floor(dataMin), (dataMax) => Math.ceil(dataMax)]}
                   allowDecimals={false} />
                 <Tooltip content={<ChartTooltip />} />
+                {accBreaches.map((b, i) => (
+                  <ReferenceArea key={`ab-${i}`} x1={b.x1} x2={b.x2} fill="#ef4444" fillOpacity={0.08} />
+                ))}
+                <ReferenceLine y={THRESHOLDS.accessibility.value} stroke="#ef4444" strokeDasharray="6 4" strokeWidth={1.5}
+                  label={{ value: `Threshold ${THRESHOLDS.accessibility.value}%`, position: 'right', fill: '#ef4444', fontSize: 9, fontWeight: 700 }} />
                 <Area type="monotoneX" dataKey="value" stroke="#10b981" strokeWidth={3}
                   fill="url(#trendGrad)" name={acc.label} dot={false}
                   activeDot={{ r: 5, fill: '#10b981', stroke: '#06b6d4', strokeWidth: 2 }} />
               </AreaChart>
             </ResponsiveContainer>
           </div>
+          {accInsight && (
+            <div style={{
+              margin: '0 16px 12px', padding: '8px 14px', borderRadius: 8, fontSize: 11, fontWeight: 600, lineHeight: 1.5,
+              background: accInsight.severity === 'critical' ? 'rgba(239,68,68,0.08)' : accInsight.severity === 'warning' ? 'rgba(245,158,11,0.08)' : 'rgba(16,185,129,0.08)',
+              color: accInsight.severity === 'critical' ? '#dc2626' : accInsight.severity === 'warning' ? '#b45309' : '#059669',
+              border: `1px solid ${accInsight.severity === 'critical' ? '#fecaca' : accInsight.severity === 'warning' ? '#fed7aa' : '#bbf7d0'}`,
+            }}>
+              {accInsight.severity === 'critical' ? '⚠ ' : accInsight.severity === 'warning' ? '⚡ ' : '✓ '}{accInsight.text}
+            </div>
+          )}
         </motion.div>
 
         {/* ── KPI Forecast Panel ─────────────────────────────── */}
@@ -636,6 +710,64 @@ export default function TechnicalKPI() {
           </div>
         </motion.div>
       </div>
+
+      {/* ══════════════════════════════════════════════════════
+          RETAINABILITY TREND — E-RAB Call Drop Rate
+          ══════════════════════════════════════════════════════ */}
+      <motion.div {...FADE(0.60)} style={{ ...glass, overflow: 'hidden', marginTop: 16 }}>
+        <div style={{ height: 3, background: 'linear-gradient(90deg, #ef4444, #f97316)' }} />
+        <div style={{ padding: '18px 20px 12px', borderBottom: '1px solid var(--border)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <div>
+            <h3 style={{ margin: 0, fontSize: 14, fontWeight: 700, color: 'var(--text)' }}>Retainability — E-RAB Call Drop Rate (%)</h3>
+            <p style={{ margin: '3px 0 0', fontSize: 11, color: 'var(--text-muted)' }}>E-RAB Call Drop Rate_1 trend — last 30 data points</p>
+          </div>
+          {retainSeries.length > 0 && (
+            <span style={{
+              fontSize: 10, fontWeight: 800, padding: '3px 8px', borderRadius: 999,
+              background: retainSeries[retainSeries.length - 1]?.value <= 1 ? '#dcfce7' : '#fee2e2',
+              color: retainSeries[retainSeries.length - 1]?.value <= 1 ? '#16a34a' : '#dc2626',
+            }}>{retainSeries[retainSeries.length - 1]?.value}%</span>
+          )}
+        </div>
+        <div style={{ padding: '8px 8px 4px', height: 260 }}>
+          {retainSeries.length > 0 ? (
+            <ResponsiveContainer width="100%" height="100%">
+              <AreaChart data={retainSeries} margin={{ top: 6, right: 12, left: -10, bottom: 0 }}>
+                <GradDefs />
+                <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" strokeOpacity={0.6} />
+                <XAxis dataKey="date" tick={{ fontSize: 9, fill: 'var(--text-muted)' }} axisLine={false} tickLine={false} />
+                <YAxis tick={{ fontSize: 10, fill: 'var(--text-muted)' }} axisLine={false} tickLine={false}
+                  domain={[0, (dataMax) => Math.max(2, Math.ceil(dataMax + 0.5))]}
+                  allowDecimals />
+                <Tooltip content={<ChartTooltip />} />
+                {erabBreaches.map((b, i) => (
+                  <ReferenceArea key={`eb-${i}`} x1={b.x1} x2={b.x2} fill="#ef4444" fillOpacity={0.08} />
+                ))}
+                <ReferenceLine y={THRESHOLDS.e_rab_drop.value} stroke="#ef4444" strokeDasharray="6 4" strokeWidth={1.5}
+                  label={{ value: 'Threshold 1%', position: 'right', fill: '#ef4444', fontSize: 9, fontWeight: 700 }} />
+                <Area type="monotoneX" dataKey="value" stroke="#ef4444" strokeWidth={3}
+                  fill="url(#erabGrad)" name="E-RAB Drop Rate %"
+                  dot={{ r: 2, fill: '#ef4444' }}
+                  activeDot={{ r: 5, fill: '#ef4444', stroke: '#f97316', strokeWidth: 2 }} />
+              </AreaChart>
+            </ResponsiveContainer>
+          ) : (
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: 'var(--text-muted)', fontSize: 12 }}>
+              No E-RAB Call Drop Rate data available
+            </div>
+          )}
+        </div>
+        {erabInsight && retainSeries.length > 0 && (
+          <div style={{
+            margin: '0 16px 12px', padding: '8px 14px', borderRadius: 8, fontSize: 11, fontWeight: 600, lineHeight: 1.5,
+            background: erabInsight.severity === 'critical' ? 'rgba(239,68,68,0.08)' : erabInsight.severity === 'warning' ? 'rgba(245,158,11,0.08)' : 'rgba(16,185,129,0.08)',
+            color: erabInsight.severity === 'critical' ? '#dc2626' : erabInsight.severity === 'warning' ? '#b45309' : '#059669',
+            border: `1px solid ${erabInsight.severity === 'critical' ? '#fecaca' : erabInsight.severity === 'warning' ? '#fed7aa' : '#bbf7d0'}`,
+          }}>
+            {erabInsight.severity === 'critical' ? '⚠ ' : erabInsight.severity === 'warning' ? '⚡ ' : '✓ '}{erabInsight.text}
+          </div>
+        )}
+      </motion.div>
       </>
       }
     </div>
@@ -725,10 +857,373 @@ function CoreTab({ data, loading, onRetry }) {
     );
   }
 
+  const isComponent = data.data_source === 'component';
+
+  // ── Legacy (flexible/site-based) path ──
+  if (!isComponent) {
+    return <LegacyCoreTab data={data} />;
+  }
+
+  // ── New component-based rich data ──
+  const hero = data.hero || {};
+  const typeHealth = data.type_health || {};
+  const typeCompare = data.type_comparison || [];
+  const trend = data.trend || [];
+  const components = data.components || [];
+  const anomalies = data.anomalies || [];
+
+  const TYPE_COLORS = {
+    MME: '#3b82f6', SGW: '#10b981', PGW: '#f59e0b',
+    HSS: '#8b5cf6', PCRF: '#ef4444',
+  };
+  const typeColor = (t) => TYPE_COLORS[t] || '#64748b';
+
+  const healthColor = (v) => v == null ? C.muted : v >= 99 ? '#059669' : v >= 95 ? '#0891b2' : v >= 90 ? '#ea580c' : '#dc2626';
+  const utilColor = (v) => v == null ? C.muted : v > 85 ? '#dc2626' : v > 70 ? '#ea580c' : v > 50 ? '#0891b2' : '#059669';
+
+  const gc = {
+    background: C.bg, backdropFilter: 'blur(20px)',
+    WebkitBackdropFilter: 'blur(20px)',
+    border: `1px solid ${C.border}`, borderRadius: 12,
+    boxShadow: '0 4px 20px rgba(0,52,101,0.06)',
+  };
+
+  // Big circular gauge
+  const BigGauge = ({ value, max = 100, color, size = 120, label, sublabel }) => {
+    const r = size / 2 - 12;
+    const cx = size / 2, cy = size / 2;
+    const circ = 2 * Math.PI * r;
+    const pct = Math.min(1, Math.max(0, (value ?? 0) / max));
+    return (
+      <div style={{ position: 'relative', width: size, height: size, flexShrink: 0 }}>
+        <svg viewBox={`0 0 ${size} ${size}`} style={{ transform: 'rotate(-90deg)', width: '100%', height: '100%' }}>
+          <circle cx={cx} cy={cy} r={r} fill="transparent" stroke="#e5e7eb" strokeWidth={8} />
+          <circle cx={cx} cy={cy} r={r} fill="transparent" stroke={color}
+            strokeWidth={8} strokeDasharray={circ} strokeDashoffset={circ * (1 - pct)}
+            strokeLinecap="round" style={{ transition: 'stroke-dashoffset 1s ease' }} />
+        </svg>
+        <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center' }}>
+          <div style={{ fontSize: size * 0.22, fontWeight: 900, color, lineHeight: 1 }}>
+            {value != null ? value.toFixed(1) : '—'}
+          </div>
+          {label && <div style={{ fontSize: 9, fontWeight: 700, color: C.muted, textTransform: 'uppercase', letterSpacing: '0.06em', marginTop: 4 }}>{label}</div>}
+          {sublabel && <div style={{ fontSize: 9, color: C.muted, marginTop: 2 }}>{sublabel}</div>}
+        </div>
+      </div>
+    );
+  };
+
+  // Small horizontal bar
+  const Bar = ({ value, max = 100, color, height = 6 }) => (
+    <div style={{ height, background: C.surface, borderRadius: height / 2, overflow: 'hidden' }}>
+      <div style={{ height: '100%', width: `${Math.min(100, (value / max) * 100)}%`, background: color, borderRadius: height / 2, transition: 'width 0.8s ease' }} />
+    </div>
+  );
+
+  // Hero metrics
+  const heroMetrics = [
+    {
+      label: 'Core Network Health',
+      value: hero.overall_health,
+      suffix: '%',
+      color: healthColor(hero.overall_health),
+      subtitle: `${hero.component_types || 0} component types · ${hero.total_nodes || 0} nodes`,
+      icon: ShieldCheck,
+    },
+    {
+      label: 'Avg CPU Usage',
+      value: hero.avg_cpu,
+      suffix: '%',
+      color: utilColor(hero.avg_cpu),
+      subtitle: hero.avg_cpu == null ? 'No data' : hero.avg_cpu > 80 ? 'Critical' : hero.avg_cpu > 60 ? 'Elevated' : 'Normal',
+      icon: Cpu,
+    },
+    {
+      label: 'Avg Memory',
+      value: hero.avg_memory,
+      suffix: '%',
+      color: utilColor(hero.avg_memory),
+      subtitle: hero.avg_memory == null ? 'No data' : hero.avg_memory > 80 ? 'Critical' : hero.avg_memory > 60 ? 'Elevated' : 'Normal',
+      icon: Database,
+    },
+    {
+      label: 'Service Success',
+      value: hero.avg_success_rate,
+      suffix: '%',
+      color: healthColor(hero.avg_success_rate),
+      subtitle: `${hero.total_kpis || 0} KPIs tracked`,
+      icon: Zap,
+    },
+  ];
+
+  // Max values for trend charts
+  const maxCpuTrend = Math.max(...trend.map(d => d.cpu || 0), 1);
+  const maxMemTrend = Math.max(...trend.map(d => d.memory || 0), 1);
+
+  return (
+    <>
+      {/* ── Hero KPI Cards ────────────────────────────────── */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 20, marginBottom: 24 }}>
+        {heroMetrics.map(({ label, value, suffix, color, subtitle, icon: Icon }, i) => (
+          <motion.div key={label} {...FADE(i * 0.07)} style={{ ...gc, padding: 24, borderLeft: `4px solid ${color}`, position: 'relative', overflow: 'hidden' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 12 }}>
+              <span style={{ fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: C.muted }}>{label}</span>
+              <Icon size={16} color={color} />
+            </div>
+            <div style={{ fontSize: 36, fontWeight: 900, color: C.primary, lineHeight: 1 }}>
+              {value != null ? `${value.toFixed(1)}${suffix}` : '—'}
+            </div>
+            <div style={{ fontSize: 11, color, marginTop: 6, fontWeight: 700 }}>{subtitle}</div>
+            <div style={{ marginTop: 12 }}>
+              <Bar value={value ?? 0} color={color} />
+            </div>
+          </motion.div>
+        ))}
+      </div>
+
+      {/* ── Component Type Health Cards (big gauges) ─────────── */}
+      <motion.div {...FADE(0.2)} style={{ marginBottom: 24 }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 14 }}>
+          <h3 style={{ margin: 0, fontSize: 16, fontWeight: 800, color: C.primary }}>Component Health by Type</h3>
+          <span style={{ fontSize: 11, color: C.muted, fontWeight: 600 }}>
+            {data.date_range?.from && `${data.date_range.from} → ${data.date_range.to}`}
+          </span>
+        </div>
+        <div style={{ display: 'grid', gridTemplateColumns: `repeat(${Math.min(typeCompare.length, 5)}, 1fr)`, gap: 16 }}>
+          {typeCompare.map((t, i) => {
+            const ct = t.type;
+            const th = typeHealth[ct] || {};
+            const color = typeColor(ct);
+            const hColor = healthColor(t.health);
+            return (
+              <motion.div key={ct} {...FADE(0.2 + i * 0.05)} style={{
+                ...gc, padding: 20, borderTop: `3px solid ${color}`,
+              }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 }}>
+                  <div>
+                    <div style={{ fontSize: 20, fontWeight: 900, color: C.primary, letterSpacing: '-0.02em' }}>{ct}</div>
+                    <div style={{ fontSize: 10, fontWeight: 600, color: C.muted, textTransform: 'uppercase', letterSpacing: '0.06em' }}>
+                      {t.instances} nodes · {t.total_kpis} KPIs
+                    </div>
+                  </div>
+                  <BigGauge value={t.health} color={hColor} size={72} />
+                </div>
+
+                {/* CPU & Memory bars */}
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                  <div>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, fontWeight: 700, color: C.muted, marginBottom: 3 }}>
+                      <span>CPU</span>
+                      <span style={{ color: utilColor(t.cpu) }}>{t.cpu != null ? `${t.cpu.toFixed(1)}%` : '—'}</span>
+                    </div>
+                    <Bar value={t.cpu ?? 0} color={utilColor(t.cpu)} height={5} />
+                  </div>
+                  <div>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, fontWeight: 700, color: C.muted, marginBottom: 3 }}>
+                      <span>MEMORY</span>
+                      <span style={{ color: utilColor(t.memory) }}>{t.memory != null ? `${t.memory.toFixed(1)}%` : '—'}</span>
+                    </div>
+                    <Bar value={t.memory ?? 0} color={utilColor(t.memory)} height={5} />
+                  </div>
+                </div>
+
+                {/* Top 3 success-rate KPIs */}
+                {Object.keys(th.success_rates || {}).length > 0 && (
+                  <div style={{ marginTop: 12, paddingTop: 10, borderTop: `1px solid ${C.border}` }}>
+                    <div style={{ fontSize: 9, fontWeight: 700, color: C.muted, textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 6 }}>
+                      Key Success Rates
+                    </div>
+                    {Object.entries(th.success_rates || {}).slice(0, 3).map(([k, v]) => (
+                      <div key={k} style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, marginBottom: 3 }}>
+                        <span style={{ color: C.muted, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '70%' }} title={k}>
+                          {k.length > 22 ? k.slice(0, 20) + '…' : k}
+                        </span>
+                        <span style={{ fontWeight: 700, color: healthColor(v) }}>{v.toFixed(1)}%</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </motion.div>
+            );
+          })}
+        </div>
+      </motion.div>
+
+      {/* ── Trend Charts: CPU/Memory/Health over time ──────── */}
+      <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: 20, marginBottom: 24 }}>
+
+        {/* Multi-line trend chart using recharts */}
+        <motion.div {...FADE(0.3)} style={{ ...gc, padding: 24 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+            <div>
+              <h3 style={{ margin: 0, fontSize: 16, fontWeight: 800, color: C.primary }}>Resource Utilisation & Health Trend</h3>
+              <p style={{ margin: '4px 0 0', fontSize: 11, color: C.muted }}>CPU · Memory · Service Success across core components</p>
+            </div>
+            <div style={{ display: 'flex', gap: 14 }}>
+              {[['#ea580c', 'CPU'], ['#8b5cf6', 'Memory'], ['#059669', 'Health']].map(([c, l]) => (
+                <div key={l} style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 10, color: C.muted, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                  <span style={{ width: 8, height: 8, borderRadius: '50%', background: c }} />{l}
+                </div>
+              ))}
+            </div>
+          </div>
+          <ResponsiveContainer width="100%" height={260}>
+            <AreaChart data={trend} margin={{ top: 10, right: 8, left: -8, bottom: 0 }}>
+              <defs>
+                <linearGradient id="cpuGrad" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor="#ea580c" stopOpacity={0.35} />
+                  <stop offset="100%" stopColor="#ea580c" stopOpacity={0.02} />
+                </linearGradient>
+                <linearGradient id="memGrad" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor="#8b5cf6" stopOpacity={0.35} />
+                  <stop offset="100%" stopColor="#8b5cf6" stopOpacity={0.02} />
+                </linearGradient>
+                <linearGradient id="healthGrad" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stopColor="#059669" stopOpacity={0.35} />
+                  <stop offset="100%" stopColor="#059669" stopOpacity={0.02} />
+                </linearGradient>
+              </defs>
+              <CartesianGrid strokeDasharray="3 3" stroke={C.border} vertical={false} />
+              <XAxis dataKey="date" tick={{ fontSize: 10, fill: C.muted }} tickFormatter={(d) => d ? new Date(d).toLocaleDateString('en', { month: 'short', day: 'numeric' }) : ''} />
+              <YAxis tick={{ fontSize: 10, fill: C.muted }} domain={[0, 100]} />
+              <Tooltip contentStyle={{ background: '#fff', border: `1px solid ${C.border}`, borderRadius: 8, fontSize: 12 }} />
+              <Area type="monotone" dataKey="cpu" stroke="#ea580c" strokeWidth={2} fill="url(#cpuGrad)" name="CPU %" />
+              <Area type="monotone" dataKey="memory" stroke="#8b5cf6" strokeWidth={2} fill="url(#memGrad)" name="Memory %" />
+              <Area type="monotone" dataKey="health" stroke="#059669" strokeWidth={2} fill="url(#healthGrad)" name="Health %" />
+            </AreaChart>
+          </ResponsiveContainer>
+        </motion.div>
+
+        {/* Component type comparison bars */}
+        <motion.div {...FADE(0.35)} style={{ ...gc, padding: 24 }}>
+          <h3 style={{ margin: '0 0 4px', fontSize: 16, fontWeight: 800, color: C.primary }}>Resource Load by Type</h3>
+          <p style={{ margin: '0 0 16px', fontSize: 11, color: C.muted }}>CPU vs Memory per component type</p>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+            {typeCompare.map(t => {
+              const color = typeColor(t.type);
+              return (
+                <div key={t.type}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, fontWeight: 700, marginBottom: 5 }}>
+                    <span style={{ color, background: color + '15', padding: '2px 8px', borderRadius: 999 }}>{t.type}</span>
+                    <span style={{ color: C.muted }}>{t.instances} nodes</span>
+                  </div>
+                  <div style={{ display: 'flex', gap: 4, alignItems: 'center', marginBottom: 3 }}>
+                    <span style={{ fontSize: 9, color: C.muted, width: 32, fontWeight: 700 }}>CPU</span>
+                    <div style={{ flex: 1 }}><Bar value={t.cpu ?? 0} color="#ea580c" height={6} /></div>
+                    <span style={{ fontSize: 10, color: utilColor(t.cpu), width: 36, textAlign: 'right', fontWeight: 700 }}>{t.cpu != null ? `${t.cpu.toFixed(0)}%` : '—'}</span>
+                  </div>
+                  <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+                    <span style={{ fontSize: 9, color: C.muted, width: 32, fontWeight: 700 }}>MEM</span>
+                    <div style={{ flex: 1 }}><Bar value={t.memory ?? 0} color="#8b5cf6" height={6} /></div>
+                    <span style={{ fontSize: 10, color: utilColor(t.memory), width: 36, textAlign: 'right', fontWeight: 700 }}>{t.memory != null ? `${t.memory.toFixed(0)}%` : '—'}</span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </motion.div>
+      </div>
+
+      {/* ── Bottom: Anomalies + Component Instance Table ───── */}
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 2fr', gap: 20 }}>
+        {/* Anomalies */}
+        <motion.div {...FADE(0.45)}>
+          <h3 style={{ margin: '0 0 6px', fontSize: 18, fontWeight: 800, color: C.primary }}>
+            Active Anomalies {anomalies.length > 0 && <span style={{ fontSize: 12, fontWeight: 700, color: C.error, background: C.errCont, padding: '2px 8px', borderRadius: 999, marginLeft: 6 }}>{anomalies.length}</span>}
+          </h3>
+          <p style={{ margin: '0 0 16px', fontSize: 12, color: C.muted, lineHeight: 1.5 }}>
+            Components with degraded health, elevated CPU, or high memory usage.
+          </p>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10, maxHeight: 520, overflowY: 'auto' }}>
+            {anomalies.length === 0 && (
+              <div style={{ ...gc, padding: '16px 18px', fontSize: 13, color: C.secondary, fontWeight: 700 }}>
+                ✓ All core components healthy
+              </div>
+            )}
+            {anomalies.map(a => {
+              const ctc = typeColor(a.component_type);
+              const hc = healthColor(a.health);
+              return (
+                <div key={`${a.component_type}:${a.component_id}`} style={{ ...gc, padding: 14, borderLeft: `3px solid ${hc}` }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <span style={{ fontSize: 10, fontWeight: 700, color: ctc, background: ctc + '15', padding: '2px 7px', borderRadius: 999 }}>{a.component_type}</span>
+                      <span style={{ fontSize: 13, fontWeight: 800, color: C.primary }}>{a.component_id}</span>
+                    </div>
+                    <span style={{ fontSize: 14, fontWeight: 900, color: hc }}>{a.health.toFixed(1)}%</span>
+                  </div>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+                    {a.reasons.map((r, i) => (
+                      <span key={i} style={{ fontSize: 10, fontWeight: 700, color: C.error, background: C.errCont, padding: '2px 7px', borderRadius: 4 }}>{r}</span>
+                    ))}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </motion.div>
+
+        {/* Component instance table */}
+        <motion.div {...FADE(0.5)} style={{ ...gc, padding: 24, overflow: 'hidden' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+            <h3 style={{ margin: 0, fontSize: 16, fontWeight: 800, color: C.primary }}>Component Instances</h3>
+            <span style={{ fontSize: 11, color: C.muted, fontWeight: 600 }}>{components.length} nodes · sorted by health</span>
+          </div>
+          <div style={{ overflowX: 'auto', overflowY: 'auto', maxHeight: 500 }}>
+            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
+              <thead>
+                <tr style={{ borderBottom: `2px solid ${C.border}` }}>
+                  {['Type', 'Instance', 'Health', 'CPU', 'Memory', 'KPIs'].map(h => (
+                    <th key={h} style={{ padding: '8px 12px', textAlign: h === 'Type' || h === 'Instance' ? 'left' : 'right', fontWeight: 700, fontSize: 10, textTransform: 'uppercase', letterSpacing: '0.07em', color: C.muted, position: 'sticky', top: 0, background: '#fff', zIndex: 1 }}>
+                      {h}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {[...components].sort((a, b) => a.health - b.health).map(row => {
+                  const ctc = typeColor(row.component_type);
+                  return (
+                    <tr key={`${row.component_type}:${row.component_id}`}
+                      style={{ borderBottom: `1px solid ${C.border}`, transition: 'background 0.15s' }}
+                      onMouseEnter={e => e.currentTarget.style.background = `${C.primary}06`}
+                      onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
+                      <td style={{ padding: '10px 12px' }}>
+                        <span style={{ fontSize: 10, fontWeight: 700, color: ctc, background: ctc + '15', padding: '2px 8px', borderRadius: 999 }}>
+                          {row.component_type}
+                        </span>
+                      </td>
+                      <td style={{ padding: '10px 12px', fontWeight: 700, color: C.primary }}>{row.component_id}</td>
+                      <td style={{ padding: '10px 12px', textAlign: 'right', fontWeight: 800, color: healthColor(row.health) }}>
+                        {row.health != null ? `${row.health.toFixed(1)}%` : '—'}
+                      </td>
+                      <td style={{ padding: '10px 12px', textAlign: 'right', fontWeight: 600, color: utilColor(row.cpu) }}>
+                        {row.cpu != null ? `${row.cpu.toFixed(1)}%` : '—'}
+                      </td>
+                      <td style={{ padding: '10px 12px', textAlign: 'right', fontWeight: 600, color: utilColor(row.memory) }}>
+                        {row.memory != null ? `${row.memory.toFixed(1)}%` : '—'}
+                      </td>
+                      <td style={{ padding: '10px 12px', textAlign: 'right', color: C.muted, fontWeight: 600 }}>
+                        {row.kpi_count}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </motion.div>
+      </div>
+    </>
+  );
+}
+
+// ── Legacy site-based core tab (kept for FlexibleKpiUpload fallback) ──
+function LegacyCoreTab({ data }) {
   const cols    = data.columns || [];
   const summary = data.summary || {};
-  const sites   = data.sites   || [];
-  const trend   = data.trend   || [];
+  const items   = data.sites || [];
+  const trend   = data.trend || [];
 
   /* find a column by its display label */
   const byLabel = (lbl) => {
@@ -768,20 +1263,25 @@ function CoreTab({ data, loading, onRetry }) {
   const authSparkline = trend.slice(-8).map(d => d[authKey] ?? 0);
   const maxAuthSpark  = Math.max(...authSparkline, 1);
 
-  /* attach: top 4 sites */
+  /* attach: top 4 components or sites */
   const attachKey   = attach?.key;
-  const attachSites = attachKey
-    ? [...sites].sort((a, b) => (b[attachKey] ?? 0) - (a[attachKey] ?? 0)).slice(0, 4)
+  const attachItems = attachKey
+    ? [...items].sort((a, b) => (b[attachKey] ?? 0) - (a[attachKey] ?? 0)).slice(0, 4)
     : [];
 
   /* anomalies */
   const bearerKey = bearer?.key;
   const anomalies = bearerKey
-    ? [...sites]
+    ? [...items]
         .filter(s => (s[bearerKey] ?? 100) < 91)
         .sort((a, b) => (b[cpuKey] ?? 0) - (a[cpuKey] ?? 0))
         .slice(0, 5)
     : [];
+
+  const itemLabel = (item) => item.site_id;
+  const isComponent = false;
+  const compTypes = [];
+  const typeSummary = {};
 
   /* glass card base style */
   const gc = {
@@ -790,6 +1290,9 @@ function CoreTab({ data, loading, onRetry }) {
     border: `1px solid ${C.border}`, borderRadius: 12,
     boxShadow: '0 4px 20px rgba(0,52,101,0.06)',
   };
+
+  /* Component type color map */
+  const TYPE_COLORS = { MME: '#3b82f6', SGW: '#10b981', PGW: '#f59e0b', HSS: '#8b5cf6', PCRF: '#ef4444' };
 
   return (
     <>
@@ -800,7 +1303,6 @@ function CoreTab({ data, loading, onRetry }) {
           const color = coreColor(label, val);
           const delta = col?.key ? trendDelta(col.key) : null;
           const isUp  = delta != null && delta > 0;
-          /* for CPU: up is bad; for others: up is good */
           const isGoodDir = label === 'CPU Usage' ? !isUp : isUp;
           const deltaColor = delta == null ? C.muted : (isGoodDir ? C.secondary : C.error);
           const deltaBg    = delta == null ? C.surface : (isGoodDir ? C.secCont  : C.errCont);
@@ -828,16 +1330,49 @@ function CoreTab({ data, loading, onRetry }) {
         })}
       </div>
 
-      {/* ── Chart Section (reference layout: 2/3 CPU trend + 1/3 stacked cards) ── */}
+      {/* ── Component Type Summary (only for component-based data) ── */}
+      {isComponent && compTypes.length > 0 && (
+        <motion.div {...FADE(0.15)} style={{ display: 'grid', gridTemplateColumns: `repeat(${Math.min(compTypes.length, 5)}, 1fr)`, gap: 16, marginBottom: 24 }}>
+          {compTypes.map((ct, i) => {
+            const ts = typeSummary[ct] || {};
+            const kpis = ts.kpis || {};
+            const instances = ts.instances || 0;
+            const ctColor = TYPE_COLORS[ct] || C.secondary;
+            return (
+              <motion.div key={ct} {...FADE(0.15 + i * 0.05)} style={{ ...gc, padding: 20, borderTop: `3px solid ${ctColor}` }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+                  <span style={{ fontSize: 16, fontWeight: 900, color: C.primary }}>{ct}</span>
+                  <span style={{ fontSize: 10, fontWeight: 700, color: ctColor, background: ctColor + '15', padding: '2px 8px', borderRadius: 999 }}>
+                    {instances} nodes
+                  </span>
+                </div>
+                {Object.entries(kpis).map(([key, val]) => {
+                  const col = cols.find(c => c.key === key);
+                  const label = col?.label || key;
+                  const color = coreColor(label, val);
+                  return (
+                    <div key={key} style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, marginBottom: 6 }}>
+                      <span style={{ color: C.muted, fontWeight: 600 }}>{label}</span>
+                      <span style={{ fontWeight: 700, color }}>{val != null ? `${val.toFixed(1)}%` : '—'}</span>
+                    </div>
+                  );
+                })}
+              </motion.div>
+            );
+          })}
+        </motion.div>
+      )}
+
+      {/* ── Chart Section (2/3 CPU trend + 1/3 stacked cards) ── */}
       <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: 20, marginBottom: 24 }}>
 
-        {/* CPU Usage Trend — date-based bar chart */}
+        {/* CPU Usage Trend */}
         <motion.div {...FADE(0.3)} style={{ ...gc, padding: 28, position: 'relative', overflow: 'hidden' }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 28 }}>
             <div>
               <h3 style={{ margin: 0, fontSize: 16, fontWeight: 800, color: C.primary }}>CPU Usage Trend</h3>
               <p style={{ margin: '4px 0 0', fontSize: 11, color: C.muted }}>
-                Real-time processing load across core elements
+                {isComponent ? 'Processing load across core components' : 'Real-time processing load across core elements'}
                 {data.date_range?.from && ` · ${data.date_range.from} → ${data.date_range.to}`}
               </p>
             </div>
@@ -925,12 +1460,12 @@ function CoreTab({ data, loading, onRetry }) {
               {attach?.avg != null && <span style={{ fontSize: 12, fontWeight: 700, color: C.secondary, marginBottom: 4 }}>%</span>}
             </div>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-              {attachSites.map(s => {
+              {attachItems.map(s => {
                 const v = s[attachKey] ?? 0;
                 return (
-                  <div key={s.site_id}>
+                  <div key={itemLabel(s)}>
                     <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, fontWeight: 700, color: C.muted, marginBottom: 4 }}>
-                      <span>{s.site_id}</span><span style={{ color: C.primary }}>{v.toFixed(1)}%</span>
+                      <span>{itemLabel(s)}</span><span style={{ color: C.primary }}>{v.toFixed(1)}%</span>
                     </div>
                     <div style={{ height: 4, background: C.surface, borderRadius: 4, overflow: 'hidden' }}>
                       <div style={{ height: '100%', background: C.secondary, width: `${v}%`, borderRadius: 4, transition: 'width 0.8s ease' }} />
@@ -950,7 +1485,7 @@ function CoreTab({ data, loading, onRetry }) {
         <motion.div {...FADE(0.45)}>
           <h3 style={{ margin: '0 0 8px', fontSize: 18, fontWeight: 800, color: C.primary }}>Active Anomalies</h3>
           <p style={{ margin: '0 0 20px', fontSize: 13, color: C.muted, lineHeight: 1.6 }}>
-            Sites with elevated CPU or degraded bearer success.
+            {isComponent ? 'Components with elevated CPU or degraded bearer success.' : 'Sites with elevated CPU or degraded bearer success.'}
           </p>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
             {anomalies.length === 0 && (
@@ -963,12 +1498,12 @@ function CoreTab({ data, loading, onRetry }) {
               const color = isHighCpu ? C.error : C.amber;
               const bg    = isHighCpu ? C.errCont : C.amberCont;
               return (
-                <div key={s.site_id} style={{ display: 'flex', gap: 12, padding: 14, borderRadius: 12, background: bg + '50', border: `1px solid ${color}20` }}>
+                <div key={itemLabel(s)} style={{ display: 'flex', gap: 12, padding: 14, borderRadius: 12, background: bg + '50', border: `1px solid ${color}20` }}>
                   <div style={{ width: 40, height: 40, borderRadius: '50%', background: bg, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
                     {isHighCpu ? <AlertTriangle size={18} color={color} /> : <TrendingDown size={18} color={color} />}
                   </div>
                   <div>
-                    <div style={{ fontSize: 12, fontWeight: 700, color: C.primary }}>{s.site_id}</div>
+                    <div style={{ fontSize: 12, fontWeight: 700, color: C.primary }}>{itemLabel(s)}</div>
                     <div style={{ fontSize: 11, color: C.muted, marginTop: 3 }}>
                       {cpuKey ? `CPU: ${(s[cpuKey] ?? 0).toFixed(1)}%` : ''}
                       {bearerKey && (s[bearerKey] ?? 100) < 91 ? `  |  Bearer: ${(s[bearerKey] ?? 0).toFixed(1)}%` : ''}
@@ -980,19 +1515,26 @@ function CoreTab({ data, loading, onRetry }) {
           </div>
         </motion.div>
 
-        {/* Site distribution table */}
+        {/* Component / Site distribution table */}
         <motion.div {...FADE(0.5)} style={{ ...gc, padding: 28, overflow: 'hidden' }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
             <h3 style={{ margin: 0, fontSize: 16, fontWeight: 800, color: C.primary }}>
-              Core KPI — Site Distribution
+              {isComponent ? 'Core KPI — Component Distribution' : 'Core KPI — Site Distribution'}
             </h3>
-            <span style={{ fontSize: 11, color: C.muted, fontWeight: 600 }}>{data.total_sites} sites</span>
+            <span style={{ fontSize: 11, color: C.muted, fontWeight: 600 }}>
+              {isComponent ? `${data.total_components} components` : `${data.total_sites} sites`}
+            </span>
           </div>
           <div style={{ overflowX: 'auto', overflowY: 'auto', maxHeight: 480 }}>
             <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
               <thead>
                 <tr style={{ borderBottom: `2px solid ${C.border}` }}>
-                  <th style={{ padding: '6px 12px', textAlign: 'left', fontWeight: 700, fontSize: 10, textTransform: 'uppercase', letterSpacing: '0.07em', color: C.muted, position: 'sticky', top: 0, background: 'white', zIndex: 1 }}>Site</th>
+                  {isComponent && (
+                    <th style={{ padding: '6px 12px', textAlign: 'left', fontWeight: 700, fontSize: 10, textTransform: 'uppercase', letterSpacing: '0.07em', color: C.muted, position: 'sticky', top: 0, background: 'white', zIndex: 1 }}>Type</th>
+                  )}
+                  <th style={{ padding: '6px 12px', textAlign: 'left', fontWeight: 700, fontSize: 10, textTransform: 'uppercase', letterSpacing: '0.07em', color: C.muted, position: 'sticky', top: 0, background: 'white', zIndex: 1 }}>
+                    {isComponent ? 'Component' : 'Site'}
+                  </th>
                   {cols.map(col => (
                     <th key={col.key} style={{ padding: '6px 12px', textAlign: 'right', fontWeight: 700, fontSize: 10, textTransform: 'uppercase', letterSpacing: '0.07em', color: C.primary, whiteSpace: 'nowrap', position: 'sticky', top: 0, background: 'white', zIndex: 1 }}>
                       {col.label}
@@ -1001,23 +1543,36 @@ function CoreTab({ data, loading, onRetry }) {
                 </tr>
               </thead>
               <tbody>
-                {sites.map(row => (
-                  <tr key={row.site_id}
-                    style={{ borderBottom: `1px solid ${C.border}`, transition: 'background 0.15s', cursor: 'default' }}
-                    onMouseEnter={e => e.currentTarget.style.background = `${C.primary}06`}
-                    onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
-                    <td style={{ padding: '10px 12px', fontWeight: 700, color: C.primary }}>{row.site_id}</td>
-                    {cols.map(col => {
-                      const val   = row[col.key];
-                      const color = coreColor(col.label, val);
-                      return (
-                        <td key={col.key} style={{ padding: '10px 12px', textAlign: 'right', fontWeight: 600, color: val != null ? color : C.muted }}>
-                          {val != null ? `${val.toFixed(1)}%` : '—'}
+                {items.map(row => {
+                  const rowKey = isComponent ? `${row.component_type}:${row.component_id}` : row.site_id;
+                  const ctColor = isComponent ? (TYPE_COLORS[row.component_type] || C.secondary) : C.primary;
+                  return (
+                    <tr key={rowKey}
+                      style={{ borderBottom: `1px solid ${C.border}`, transition: 'background 0.15s', cursor: 'default' }}
+                      onMouseEnter={e => e.currentTarget.style.background = `${C.primary}06`}
+                      onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
+                      {isComponent && (
+                        <td style={{ padding: '10px 12px' }}>
+                          <span style={{ fontSize: 10, fontWeight: 700, color: ctColor, background: ctColor + '15', padding: '2px 8px', borderRadius: 999 }}>
+                            {row.component_type}
+                          </span>
                         </td>
-                      );
-                    })}
-                  </tr>
-                ))}
+                      )}
+                      <td style={{ padding: '10px 12px', fontWeight: 700, color: C.primary }}>
+                        {isComponent ? row.component_id : row.site_id}
+                      </td>
+                      {cols.map(col => {
+                        const val   = row[col.key];
+                        const color = coreColor(col.label, val);
+                        return (
+                          <td key={col.key} style={{ padding: '10px 12px', textAlign: 'right', fontWeight: 600, color: val != null ? color : C.muted }}>
+                            {val != null ? `${val.toFixed(1)}%` : '—'}
+                          </td>
+                        );
+                      })}
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>

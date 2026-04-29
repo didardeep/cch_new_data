@@ -858,7 +858,7 @@ export default function ManagerChangeWorkflow() {
   const [actionCR, setActionCR] = useState(null);
   const [detailCR, setDetailCR] = useState(null);
   const [remarksCR, setRemarksCR] = useState(null);
-  const [section, setSection] = useState('customer'); // 'customer' or 'ai'
+  const [section, setSection] = useState('customer'); // 'customer' | 'ai' | 'overutilized'
 
   const fetchCRs = useCallback(async () => {
     try {
@@ -876,10 +876,11 @@ export default function ManagerChangeWorkflow() {
     return () => clearInterval(iv);
   }, [fetchCRs]);
 
-  // Split CRs into customer complaint vs AI ticket
+  // Split CRs into customer complaint vs worst cell vs overutilized
   const customerCRs = crs.filter(c => c.ticket_id && !c.network_issue_id);
-  const aiCRs = crs.filter(c => c.network_issue_id);
-  const activeCRs = section === 'customer' ? customerCRs : aiCRs;
+  const worstCellCRs = crs.filter(c => c.network_issue_id && c.network_issue_id < 100000);
+  const overutilizedCRs = crs.filter(c => c.network_issue_id && c.network_issue_id >= 100000);
+  const activeCRs = section === 'customer' ? customerCRs : section === 'ai' ? worstCellCRs : overutilizedCRs;
 
   // Client-side filtering by tab
   const filteredCRs = filter ? activeCRs.filter(c => {
@@ -888,7 +889,7 @@ export default function ManagerChangeWorkflow() {
     return c.status === filter;
   }) : activeCRs;
 
-  const sectionColor = section === 'customer' ? '#00338D' : '#7c3aed';
+  const sectionColor = section === 'customer' ? '#00338D' : section === 'ai' ? '#7c3aed' : '#E65100';
 
   // Compute stats for active section
   const activeStats = {
@@ -952,7 +953,16 @@ export default function ManagerChangeWorkflow() {
           display: 'flex', alignItems: 'center', gap: 8,
         }}>
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 2a4 4 0 0 1 4 4v1h2a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2h2V6a4 4 0 0 1 4-4z"/><circle cx="9" cy="14" r="1"/><circle cx="15" cy="14" r="1"/></svg>
-          AI Tickets ({aiCRs.length})
+          Worst Cell ({worstCellCRs.length})
+        </button>
+        <button onClick={() => { setSection('overutilized'); setFilter(''); }} style={{
+          padding: '10px 24px', fontSize: 13, fontWeight: 700, cursor: 'pointer', border: 'none',
+          borderLeft: `1px solid ${isDark ? '#334155' : '#e2e8f0'}`,
+          background: section === 'overutilized' ? '#E65100' : (isDark ? '#1e293b' : '#f8fafc'),
+          color: section === 'overutilized' ? '#fff' : (isDark ? '#94a3b8' : '#64748b'),
+          display: 'flex', alignItems: 'center', gap: 8,
+        }}>
+          Overutilized ({overutilizedCRs.length})
         </button>
       </div>
 

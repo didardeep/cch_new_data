@@ -7,7 +7,7 @@ import {
   RadarChart, Radar, PolarGrid, PolarAngleAxis,
   ScatterChart, Scatter, ZAxis,
 } from 'recharts';
-import { apiGet } from '../../api';
+import { apiGet, API_BASE } from '../../api';
 import { useTheme } from '../../ThemeContext';
 
 // ── Themes ─────────────────────────────────────────────────────────────────
@@ -44,7 +44,7 @@ const KPI_FILTERS = [
   { key:'overloaded',    label:'Overloaded Sites',             icon:'', desc:'PRB > 85%' },
   { key:'underutilized', label:'Underutilized Sites',          icon:'', desc:'PRB < 20%' },
   { key:'rev_leakage',   label:'Revenue Leakage Sites',        icon:'', desc:'High util, low revenue' },
-  { key:'low_margin',    label:'Low Margin Sites',             icon:'', desc:'EBITDA < 25%' },
+  { key:'low_margin',    label:'Low Margin Sites',             icon:'', desc:'Revenue − OPEX lowest' },
   { key:'high_rev_util', label:'High Revenue High Util Sites', icon:'', desc:'Top performers' },
   { key:'low_tput',      label:'< 5 Mbps Cells',              icon:'', desc:'DL tput < 5 Mbps' },
   { key:'worst_drop',    label:'Worst Call Drop Offenders',    icon:'', desc:'E-RAB drop > 2%' },
@@ -177,7 +177,7 @@ function Tip({T,active,payload,label}) {
   );
 }
 
-// ── Leaflet Map ─────────────────────────────────────────────────────────────
+// ── Leaflet Map (auto-centers from DB sites) ────────────────────────────────
 function LeafletMap({sites=[],highlight=[],T,height=300}) {
   const mapRef=useRef(null), leafRef=useRef(null), markersRef=useRef([]);
   useEffect(()=>{
@@ -191,20 +191,49 @@ function LeafletMap({sites=[],highlight=[],T,height=300}) {
       const s=document.createElement('script');s.src='https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';
       s.onload=res;document.head.appendChild(s);
     });
-    load().then(()=>{
+    load().then(async()=>{
+      // Guard: container must be mounted AND have non-zero size AND not already
+      // be a Leaflet map. Leaflet throws "Map container not found" if
+      // mapRef.current is null at init time (happens when this effect fires
+      // before React finishes mounting the <div>, or after a fast route
+      // change).
       if(!mapRef.current||leafRef.current)return;
-      const L=window.L;
-      const map=L.map(mapRef.current,{zoomControl:true,attributionControl:true}).setView([28.47,77.03],11);
-      leafRef.current=map;
-      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'© OSM'}).addTo(map);
+      if(mapRef.current.offsetWidth===0||mapRef.current.offsetHeight===0){
+        // Try again after the next animation frame in case layout isn't ready
+        requestAnimationFrame(()=>{
+          if(mapRef.current&&!leafRef.current&&mapRef.current.offsetWidth>0){
+            try{initLeafletMap();}catch(_){}
+          }
+        });
+        return;
+      }
+      initLeafletMap();
     });
-    return()=>{if(leafRef.current){leafRef.current.remove();leafRef.current=null;}};
+
+    async function initLeafletMap(){
+      if(!mapRef.current||leafRef.current||!window.L)return;
+      const L=window.L;
+      let center=[12.5657,104.9910], zoom=6; // Cambodia centroid fallback
+      try{
+        const token=localStorage.getItem('token');
+        const r=await fetch(`${API_BASE}/api/network/geo-center`,{headers:{'Authorization':`Bearer ${token}`}});
+        if(r.ok){const d=await r.json();if(d.center){center=d.center;zoom=d.zoom||6;}}
+      }catch(_){}
+      try{
+        const map=L.map(mapRef.current,{zoomControl:true,attributionControl:true}).setView(center,zoom);
+        leafRef.current=map;
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'© OSM'}).addTo(map);
+      }catch(e){
+        console.warn('[Leaflet] Map init failed:',e);
+      }
+    }
+    return()=>{if(leafRef.current){try{leafRef.current.remove();}catch(_){}leafRef.current=null;}};
   },[]);
 
   useEffect(()=>{
     let tries=0;
     const go=()=>{
-      if(!window.L||!leafRef.current){if(tries++<20)setTimeout(go,300);return;}
+      if(!window.L||!leafRef.current||!leafRef.current._container){if(tries++<20)setTimeout(go,300);return;}
       const L=window.L;
       markersRef.current.forEach(m=>m.remove());markersRef.current=[];
       const list=highlight.length?highlight:sites;
@@ -239,7 +268,7 @@ function LeafletMap({sites=[],highlight=[],T,height=300}) {
                 ['Drop Rate',`${drop.toFixed(2)}%`,drop>1.5?'#DC2626':'#16A34A'],
                 ['CSSR',`${cssr.toFixed(1)}%`,cssr<98.5?'#DC2626':'#16A34A'],
                 ['DL Tput',`${usrTput.toFixed(1)} Mbps`,usrTput<8?'#DC2626':'#16A34A'],
-                ['Zone',site.cluster||site.zone||'—','#475569']
+                ['Province',site.province||site.cluster||site.zone||'—','#475569']
               ].map(([l,v,vc])=>`
               <div style="background:#F8FAFC;border-radius:5px;padding:4px 7px">
                 <div style="font-size:8px;color:#94A3B8;font-weight:600">${l}</div>
@@ -588,6 +617,7 @@ function OverviewPage({T,data,mapSites,filters}) {
   const TipC=(p)=><Tip T={T} {...p}/>;
   const hs=Math.round(d.network_health_score||0);
 
+
   // Pre-scan worst cells (updated every 30 min by backend) — unfiltered, always shows all
   const [preScanCells,setPreScanCells]=useState([]);
   const [preScanTime,setPreScanTime]=useState(null);
@@ -604,7 +634,6 @@ function OverviewPage({T,data,mapSites,filters}) {
     {label:'Avg DL Tput',    value:f(d.avg_dl_tput),      unit:'Mbps',icon:'', color:T.teal},
     {label:'Call Drop Rate', value:f(d.avg_drop_rate,2),  unit:'%',  icon:'', color:d.avg_drop_rate>2?T.red:T.green, badge:d.avg_drop_rate>2?{color:T.red,text:'High'}:null},
     {label:'Avg PRB Util',   value:f(d.avg_prb),          unit:'%',  icon:'', color:d.avg_prb>80?T.red:d.avg_prb>60?T.amber:T.green},
-    {label:'Avg DL Volume',  value:f(d.avg_dl_vol,1),     unit:'GB', icon:'', color:T.blue2},
     {label:'Avg RRC Users',  value:f(d.avg_rrc_ue,0),     icon:'', color:T.purple},
     {label:'Packet Loss',    value:f(d.avg_packet_loss,2), unit:'%', icon:'', color:T.blue2, badge:d.avg_packet_loss>3?{color:T.red,text:'Alert'}:null},
   ];
@@ -634,7 +663,7 @@ function OverviewPage({T,data,mapSites,filters}) {
       {/* KPI row */}
       <div style={{marginBottom:13}}>
         <SL T={T}>Network Health Overview</SL>
-        <div style={{display:'grid',gridTemplateColumns:'auto repeat(9,1fr)',gap:8}}>
+        <div style={{display:'grid',gridTemplateColumns:'auto repeat(8,1fr)',gap:8}}>
           <div style={{...card(T),padding:'12px 14px',display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',minWidth:110}}>
             <div style={{fontSize:9,fontWeight:700,color:T.muted,textTransform:'uppercase',marginBottom:3}}>Health Score</div>
             <Gauge score={hs} label={d.health_label||'Fair'} T={T}/>
@@ -671,13 +700,12 @@ function OverviewPage({T,data,mapSites,filters}) {
               </div>
             ))}
           </CC>
-          {/* Revenue */}
-          <CC T={T} title=" Revenue Q1">
+          {/* Revenue — totals only, no EBITDA */}
+          <CC T={T} title=" Revenue">
             <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:7}}>
               {[
-                {label:'Revenue',value:`₹${f(d.total_q1_revenue)} L`,color:T.green},
-                {label:'OpEx',   value:`₹${f(d.total_q1_opex)} L`, color:T.amber},
-                {label:'EBITDA', value:`₹${f(d.ebitda)} L`,        color:d.ebitda>0?T.teal:T.red},
+                {label:'Revenue',value:`$${f(d.total_revenue ?? d.total_q1_revenue)}`,color:T.green},
+                {label:'OpEx',   value:`$${f(d.total_opex    ?? d.total_q1_opex)}`,   color:T.amber},
               ].map((s,i)=>(
                 <div key={i} style={{background:T.surface2,borderRadius:7,padding:'7px 9px',border:`1px solid ${T.border}`}}>
                   <div style={{fontSize:9,color:T.muted,fontWeight:700,textTransform:'uppercase',marginBottom:2}}>{s.label}</div>
@@ -693,17 +721,29 @@ function OverviewPage({T,data,mapSites,filters}) {
       <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:10,marginBottom:10}}>
         <CC T={T} title=" Zone PRB Performance">
           {zone.length>0?(
-            <ResponsiveContainer width="100%" height={190}>
-              <BarChart data={zone}>
-                <CartesianGrid strokeDasharray="3 3" stroke={T.border} vertical={false}/>
-                <XAxis dataKey="zone" tick={{fontSize:9,fill:T.muted}} axisLine={false} tickLine={false}/>
-                <YAxis tick={{fontSize:9,fill:T.muted}} axisLine={false} tickLine={false} width={30}/>
-                <Tooltip content={<TipC/>}/>
-                <Bar dataKey="avg_prb" name="Avg PRB %" radius={[4,4,0,0]} barSize={20}>
-                  {zone.map((d,i)=><Cell key={i} fill={d.avg_prb>75?T.red:d.avg_prb>55?T.amber:T.green}/>)}
-                </Bar>
-              </BarChart>
-            </ResponsiveContainer>
+            // FIXED size, NEVER blows out the dashboard grid.
+            // Shows the 5 zones with highest PRB % (the worst offenders);
+            // for full list scroll the Site-Wise page.
+            <div style={{width:'100%',maxWidth:'100%',height:190,overflow:'hidden'}}>
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart
+                  data={(zone.slice().sort((a,b)=>(b.avg_prb||0)-(a.avg_prb||0))).slice(0,5)}
+                  margin={{top:4,right:6,left:0,bottom:44}}
+                >
+                  <CartesianGrid strokeDasharray="3 3" stroke={T.border} vertical={false}/>
+                  <XAxis dataKey="zone" tick={{fontSize:9,fill:T.muted}} axisLine={false} tickLine={false}
+                         interval={0} angle={-30} textAnchor="end" height={48}
+                         tickFormatter={(v)=>{const s=(v||'').toString();return s.length>10?s.slice(0,9)+'…':s;}}/>
+                  <YAxis tick={{fontSize:9,fill:T.muted}} axisLine={false} tickLine={false} width={26}/>
+                  <Tooltip content={<TipC/>}/>
+                  <Bar dataKey="avg_prb" name="Avg PRB %" radius={[3,3,0,0]}>
+                    {zone.slice().sort((a,b)=>(b.avg_prb||0)-(a.avg_prb||0)).slice(0,5).map((d,i)=>
+                      <Cell key={i} fill={d.avg_prb>75?T.red:d.avg_prb>55?T.amber:T.green}/>
+                    )}
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
           ):<Empty T={T}/>}
         </CC>
         <CC T={T} title=" DL Throughput Trend">
@@ -750,7 +790,7 @@ function OverviewPage({T,data,mapSites,filters}) {
               <div style={{maxHeight:220,overflowY:'auto'}}>
                 <table style={{width:'100%',borderCollapse:'collapse',fontSize:10.5}}>
                   <thead>
-                    <tr>{['Cell','Site','Zone','Drop%','CSSR%','Tput(Mbps)','Flags'].map(h=><th key={h} style={{padding:'4px 6px',textAlign:'left',borderBottom:`2px solid ${T.border}`,color:T.muted,fontWeight:700,fontSize:9,textTransform:'uppercase'}}>{h}</th>)}</tr>
+                    <tr>{['Cell Name','Site','Zone','Drop%','CSSR%','Tput(Mbps)','Flags'].map(h=><th key={h} style={{padding:'4px 6px',textAlign:'left',borderBottom:`2px solid ${T.border}`,color:T.muted,fontWeight:700,fontSize:9,textTransform:'uppercase'}}>{h}</th>)}</tr>
                   </thead>
                   <tbody>
                     {rows.map((s,i)=>(
@@ -805,17 +845,22 @@ function OverviewPage({T,data,mapSites,filters}) {
             <div style={{maxHeight:Math.max(170, best.length*22+40),overflowY:'auto'}}>
               <table style={{width:'100%',borderCollapse:'collapse',fontSize:10.5}}>
                 <thead>
-                  <tr>{['Site','Revenue (₹L)','OPEX (₹L)','Rev − OPEX (₹L)'].map(h=><th key={h} style={{padding:'4px 6px',textAlign:'left',borderBottom:`2px solid ${T.border}`,color:T.muted,fontWeight:700,fontSize:9,textTransform:'uppercase'}}>{h}</th>)}</tr>
+                  <tr>{['Site','Revenue ($)','OPEX ($)','Rev − OPEX ($)'].map(h=><th key={h} style={{padding:'4px 6px',textAlign:'left',borderBottom:`2px solid ${T.border}`,color:T.muted,fontWeight:700,fontSize:9,textTransform:'uppercase'}}>{h}</th>)}</tr>
                 </thead>
                 <tbody>
-                  {lowMargin.map((s,i)=>{const diff=parseFloat(s.q1_rev||0)-parseFloat(s.q1_opex||0);return(
-                    <tr key={i} style={{borderBottom:`1px solid ${T.border}`,background:i%2===0?T.surface2:'transparent'}}>
-                      <td style={{padding:'4px 6px',fontWeight:700,color:T.kpmgBlue,fontSize:9.5,fontFamily:"'IBM Plex Mono',monospace"}}>{s.site_id}</td>
-                      <td style={{padding:'4px 6px',fontFamily:"'IBM Plex Mono',monospace",fontSize:9.5}}>{f(s.q1_rev)}</td>
-                      <td style={{padding:'4px 6px',fontFamily:"'IBM Plex Mono',monospace",fontSize:9.5}}>{f(s.q1_opex)}</td>
-                      <td style={{padding:'4px 6px',fontFamily:"'IBM Plex Mono',monospace",fontSize:9.5,color:diff<0?T.red:T.green,fontWeight:700}}>{diff<0?`(${f(Math.abs(diff))})`:`${f(diff)}`}</td>
-                    </tr>
-                  )})}
+                  {lowMargin.map((s,i)=>{
+                    const rev  = parseFloat(s.revenue ?? s.q1_rev ?? 0);
+                    const opex = parseFloat(s.opex    ?? s.q1_opex ?? 0);
+                    const diff = (s.revenue_minus_opex != null) ? parseFloat(s.revenue_minus_opex) : (rev - opex);
+                    return (
+                      <tr key={i} style={{borderBottom:`1px solid ${T.border}`,background:i%2===0?T.surface2:'transparent'}}>
+                        <td style={{padding:'4px 6px',fontWeight:700,color:T.kpmgBlue,fontSize:9.5,fontFamily:"'IBM Plex Mono',monospace"}}>{s.site_id}</td>
+                        <td style={{padding:'4px 6px',fontFamily:"'IBM Plex Mono',monospace",fontSize:9.5}}>{f(rev)}</td>
+                        <td style={{padding:'4px 6px',fontFamily:"'IBM Plex Mono',monospace",fontSize:9.5}}>{f(opex)}</td>
+                        <td style={{padding:'4px 6px',fontFamily:"'IBM Plex Mono',monospace",fontSize:9.5,color:diff<0?T.red:T.green,fontWeight:700}}>{diff<0?`(${f(Math.abs(diff))})`:`${f(diff)}`}</td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
@@ -861,7 +906,7 @@ function RANPage({T,data,mapSites,filters,opts}) {
     {label:'Call Failure Rate',value:f(100-fn(d.lte_call_setup_sr),2),unit:'%',icon:'',color:T.red},
     {label:'DL Throughput',    value:f(d.dl_cell_tput),    unit:'Mbps',icon:'', color:T.teal},
     {label:'RRC Attached UEs', value:f(d.avg_rrc_ue,0),    icon:'',  color:T.purple},
-    {label:'DL PRB Util',      value:f(d.dl_prb_util),     unit:'%',   icon:'', color:fn(d.dl_prb_util)>80?T.red:T.amber},
+    {label:'DL PRB Util',      value:f(d.dl_prb_util ?? d.avg_dl_prb ?? d.avg_prb),     unit:'%',   icon:'', color:fn(d.dl_prb_util ?? d.avg_dl_prb ?? d.avg_prb)>80?T.red:T.amber},
     {label:'DL Traffic Volume',value:f(d.dl_data_vol),     unit:'GB',  icon:'', color:T.blue3},
   ];
 
@@ -943,16 +988,44 @@ function RANPage({T,data,mapSites,filters,opts}) {
           <div style={{display:'grid',gridTemplateColumns:'1fr 1.4fr 1fr',gap:10}}>
             {/* Zone Radar */}
             <CC T={T} title=" Zone Performance Radar">
-              <ResponsiveContainer width="100%" height={210}>
-                <RadarChart data={zonePerf.length>0?zonePerf:[{zone:'No data',avg_prb:0,avg_tput:0}]} cx="50%" cy="50%" outerRadius={75}>
-                  <PolarGrid stroke={T.border}/>
-                  <PolarAngleAxis dataKey="zone" tick={{fontSize:9.5,fill:T.muted}}/>
-                  <Radar name="PRB %" dataKey="avg_prb" stroke="#2B4DCC" fill="#2B4DCC" fillOpacity={.25}/>
-                  <Radar name="Throughput" dataKey="avg_tput" stroke="#00BCD4" fill="#00BCD4" fillOpacity={.2}/>
-                  <Legend iconType="circle" iconSize={7} wrapperStyle={{fontSize:10}}/>
-                  <Tooltip content={<TipC/>}/>
-                </RadarChart>
-              </ResponsiveContainer>
+              {(() => {
+                // Limit to the 8 worst zones (highest PRB). More than 8 overlap
+                // no matter how big the container — switch to a horizontal bar
+                // list for wider datasets.
+                const sorted = (zonePerf || []).slice().sort((a,b) => (b.avg_prb||0)-(a.avg_prb||0));
+                const top = sorted.slice(0, 8);
+                if (top.length === 0) return <Empty T={T}/>;
+                if (sorted.length <= 8) {
+                  return (
+                    <ResponsiveContainer width="100%" height={280}>
+                      <RadarChart data={top} cx="50%" cy="52%" outerRadius="55%" margin={{top:26,right:44,left:44,bottom:26}}>
+                        <PolarGrid stroke={T.border}/>
+                        <PolarAngleAxis dataKey="zone" tick={{fontSize:8.5,fill:T.muted}}
+                          tickFormatter={(v)=>{const s=(v||'').toString();return s.length>10?s.slice(0,9)+'…':s;}}/>
+                        <Radar name="PRB %" dataKey="avg_prb" stroke="#2B4DCC" fill="#2B4DCC" fillOpacity={.25}/>
+                        <Radar name="Throughput" dataKey="avg_tput" stroke="#00BCD4" fill="#00BCD4" fillOpacity={.2}/>
+                        <Legend iconType="circle" iconSize={7} wrapperStyle={{fontSize:10}}/>
+                        <Tooltip content={<TipC/>}/>
+                      </RadarChart>
+                    </ResponsiveContainer>
+                  );
+                }
+                // Too many zones — fall back to a compact scrollable list so
+                // labels never overlap or get clipped.
+                return (
+                  <div style={{height:280,overflowY:'auto',paddingRight:4}}>
+                    {sorted.map((z,i)=>(
+                      <div key={i} style={{display:'flex',alignItems:'center',gap:8,padding:'5px 4px',borderBottom:`1px solid ${T.border}`}}>
+                        <span style={{flex:1,fontSize:11,color:T.text,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{z.zone}</span>
+                        <span style={{width:56,height:6,background:T.border,borderRadius:3,overflow:'hidden'}}>
+                          <span style={{display:'block',height:'100%',width:`${Math.min(100,z.avg_prb||0)}%`,background:z.avg_prb>75?T.red:z.avg_prb>55?T.amber:T.green}}/>
+                        </span>
+                        <span style={{fontSize:10,color:T.muted,minWidth:38,textAlign:'right',fontFamily:"'IBM Plex Mono',monospace"}}>{Number(z.avg_prb||0).toFixed(1)}%</span>
+                      </div>
+                    ))}
+                  </div>
+                );
+              })()}
             </CC>
             {/* Map */}
             <CC T={T} title=" Network Site Map — 4-Factor Health">
@@ -1081,7 +1154,7 @@ function RANPage({T,data,mapSites,filters,opts}) {
                   <CC T={T} title={` Cell-level Breakdown — ${selectedSite}`}>
                     <table style={{width:'100%',borderCollapse:'collapse',fontSize:10.5}}>
                       <thead>
-                        <tr style={{background:T.surface2}}>{['Cell ID','PRB %','DL Tput (Mbps)','Call Drop %','RRC Users'].map(h=><th key={h} style={{padding:'6px 9px',textAlign:'center',borderBottom:`2px solid ${T.border}`,color:T.muted,fontWeight:700,fontSize:9,textTransform:'uppercase'}}>{h}</th>)}</tr>
+                        <tr style={{background:T.surface2}}>{['Cell Name','PRB %','DL Tput (Mbps)','Call Drop %','RRC Users'].map(h=><th key={h} style={{padding:'6px 9px',textAlign:'center',borderBottom:`2px solid ${T.border}`,color:T.muted,fontWeight:700,fontSize:9,textTransform:'uppercase'}}>{h}</th>)}</tr>
                       </thead>
                       <tbody>
                         {siteData.cells.map((c,i)=>(
@@ -1143,167 +1216,776 @@ function RANPage({T,data,mapSites,filters,opts}) {
 }
 
 // ── Core Page ────────────────────────────────────────────────────────────────
-// Reusable ComposedChart for a single Core KPI with stats strip
-function CoreKpiChart({T,data,dataKey,color,sla,slaLabel,height=190}) {
-  const TipC=(p)=><Tip T={T} {...p}/>;
-  if(!data||data.length===0) return <Empty T={T}/>;
-  const vals=data.map(d=>parseFloat(d[dataKey]??0)).filter(v=>!isNaN(v));
-  const avg=vals.length?(vals.reduce((a,b)=>a+b,0)/vals.length).toFixed(1):'—';
-  const min=vals.length?Math.min(...vals).toFixed(1):'—';
-  const max=vals.length?Math.max(...vals).toFixed(1):'—';
+const CORE_COMP_COLORS = {MME:'#00338D',SGW:'#005EB8',PGW:'#0091DA',HSS:'#483698',PCRF:'#470A68'};
+const CORE_COMP_LABELS = {MME:'Mobility Management Entity',SGW:'Serving Gateway',PGW:'PDN Gateway',HSS:'Home Subscriber Server',PCRF:'Policy & Charging Rules Function'};
+const CORE_COMP_ICONS = {MME:'M',SGW:'S',PGW:'P',HSS:'H',PCRF:'R'};
+const CKC = ['#00338D','#005EB8','#0091DA','#483698','#470A68','#1E8C45','#ED8B00','#2B4DCC','#E91E8C','#00BCD4','#7B1FA2','#4A6FE5','#009A93','#DC2626','#D97706','#16A34A','#F06EB0','#26D9E8','#9C42C4','#1A3CA6'];
+const _isLatKpi=k=>/latency|time|delay|jitter/i.test(k);
+const _isCountKpi=k=>/count|session|bearer|tps|depth/i.test(k)&&!/rate|success|failure/i.test(k);
+const _isLowGoodKpi=k=>/failure|loss|drop|timeout|contention/i.test(k);
+const _isRateKpi=k=>/rate|success|accuracy|availability|status|sync/i.test(k);
+const _isUtilKpi=k=>/utilization|usage|depth/i.test(k)&&!/rate/i.test(k);
+
+// Auto-detect unit based on KPI name
+const _kU=k=>{
+  if(_isLatKpi(k))return 'ms';
+  if(_isCountKpi(k))return '';
+  if(_isUtilKpi(k))return '%';
+  if(_isRateKpi(k))return '%';
+  if(_isLowGoodKpi(k))return '%';
+  return '';
+};
+
+// Format value: if it's a rate/percentage stored as decimal (0-1), multiply by 100
+const _kFmt=(k,v)=>{
+  const val=parseFloat(v)||0;
+  if((_isRateKpi(k)||_isUtilKpi(k)||_isLowGoodKpi(k))&&val>=0&&val<=1.05){
+    return (val*100).toFixed(2);
+  }
+  if(_isLatKpi(k))return val.toFixed(1);
+  if(_isCountKpi(k))return val>=1000?(val/1000).toFixed(1)+'K':val.toFixed(0);
+  return val.toFixed(2);
+};
+
+// Determine if KPI is healthy (works with both decimal and percentage values)
+const _kGood=(k,v)=>{
+  const val=parseFloat(v)||0;
+  // Normalize to percentage if stored as decimal
+  const pct=(_isRateKpi(k)||_isUtilKpi(k)||_isLowGoodKpi(k))&&val<=1.05?val*100:val;
+  if(_isLatKpi(k))return val<100;
+  if(_isLowGoodKpi(k))return pct<5;
+  if(_isUtilKpi(k))return pct<85;
+  if(_isRateKpi(k))return pct>=95;
+  if(_isCountKpi(k))return true; // counts are informational
+  return pct>=90;
+};
+const MODEL_LABELS={holt_winters:'Holt-Winters',arima:'ARIMA',prophet:'Prophet',linear_regression:'Linear Regression'};
+
+// 14 distinct contrasting colors for day curves
+const DAY_COLORS=['#00338D','#DC2626','#16A34A','#D97706','#7C3AED','#0091DA','#E91E8C',
+  '#005EB8','#ED8B00','#483698','#009A93','#470A68','#2B4DCC','#1E8C45'];
+const DAY_NAMES=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+
+// Self-contained KPI overlay chart with calendar & multi-day comparison
+function CoreKpiOverlay({T,kpiName,compType,compId}){
+  const [curveScale,setCurveScale]=useState('15min');
+  const [mode,setMode]=useState('3d');
+  const [customDates,setCustomDates]=useState([]);
+  const [calOpen,setCalOpen]=useState(false);
+  const [calMonth,setCalMonth]=useState(()=>{const n=new Date();return {y:n.getFullYear(),m:n.getMonth()};});
+  const [curveData,setCurveData]=useState(null);
+  const [curveLoading,setCurveLoading]=useState(true);
+  const calRef=useRef(null);
+
+  useEffect(()=>{
+    const h=e=>{if(calRef.current&&!calRef.current.contains(e.target))setCalOpen(false);};
+    document.addEventListener('mousedown',h);return()=>document.removeEventListener('mousedown',h);
+  },[]);
+
+  // Compute requested dates from mode
+  const requestedDates=useCallback(()=>{
+    if(mode==='custom'&&customDates.length>0) return customDates;
+    const n=mode==='3d'?3:mode==='7d'?7:30;
+    const today=new Date();const out=[];
+    for(let i=0;i<n;i++){const d=new Date(today);d.setDate(today.getDate()-i);out.push(d.toISOString().slice(0,10));}
+    return out;
+  },[mode,customDates]);
+
+  const fetchCurves=useCallback(async()=>{
+    setCurveLoading(true);
+    try{
+      const p=new URLSearchParams();
+      p.set('kpi_name',kpiName);
+      if(compType)p.set('component_type',compType);
+      if(compId)p.set('component_id',compId);
+      p.set('scale',curveScale);
+      p.set('dates',requestedDates().join(','));
+      const r=await apiGet(`/api/network/core-daily-curves?${p.toString()}`);
+      setCurveData(r);
+    }catch(_){setCurveData(null);}
+    setCurveLoading(false);
+  },[kpiName,compType,compId,curveScale,requestedDates]);
+
+  useEffect(()=>{fetchCurves();},[fetchCurves]);
+
+  const cd=curveData||{};
+  const curves=cd.curves||{};
+  const availSet=new Set(cd.available_dates||[]);
+  const today=cd.today||new Date().toISOString().slice(0,10);
+
+  // All requested dates (even if no data — show blank)
+  const allDates=requestedDates().sort();
+
+  const timeSlots=curveScale==='hourly'
+    ?Array.from({length:24},(_,i)=>`${String(i).padStart(2,'0')}:00`)
+    :Array.from({length:96},(_,i)=>{const h=Math.floor(i/4),m=(i%4)*15;return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}`;});
+
+  const chartData=timeSlots.map(ts=>{
+    const row={time:ts};
+    allDates.forEach(dt=>{
+      const pts=curves[dt]||[];
+      const match=pts.find(p=>p.time===ts);
+      row[dt]=match?match.value:null;
+    });
+    return row;
+  });
+
+  // Has any data at all?
+  const hasAnyData=allDates.some(dt=>(curves[dt]||[]).length>0);
+
+  const toggleCustomDate=(dt)=>{
+    setCustomDates(prev=>{
+      const s=new Set(prev);if(s.has(dt))s.delete(dt);else s.add(dt);return [...s].sort();
+    });
+    setMode('custom');
+  };
+
+  const cc=CORE_COMP_COLORS[compType]||'#00338D';
+
+  // ── Calendar grid builder ──────────────────────────────────────────
+  const calDays=()=>{
+    const {y,m}=calMonth;
+    const first=new Date(y,m,1);
+    const last=new Date(y,m+1,0);
+    const startDay=first.getDay();// 0=Sun
+    const totalDays=last.getDate();
+    const cells=[];
+    // Empty cells for offset
+    for(let i=0;i<startDay;i++) cells.push(null);
+    for(let d=1;d<=totalDays;d++){
+      const ds=`${y}-${String(m+1).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+      cells.push(ds);
+    }
+    return cells;
+  };
+  const MONTH_NAMES=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  const prevMonth=()=>setCalMonth(p=>p.m===0?{y:p.y-1,m:11}:{y:p.y,m:p.m-1});
+  const nextMonth=()=>setCalMonth(p=>p.m===11?{y:p.y+1,m:0}:{y:p.y,m:p.m+1});
+
   return (
     <div>
-      <ResponsiveContainer width="100%" height={height}>
-        <BarChart data={data} margin={{top:4,right:8,bottom:0,left:0}}>
-          <CartesianGrid strokeDasharray="3 3" stroke={T.border} vertical={false}/>
-          <XAxis dataKey="date" tick={{fontSize:8.5,fill:T.muted}} axisLine={false} tickLine={false}
-                 tickFormatter={v=>v?.slice(5)||v}/>
-          <YAxis tick={{fontSize:8.5,fill:T.muted}} axisLine={false} tickLine={false} width={32} domain={['auto','auto']}/>
-          <Tooltip content={<TipC/>}/>
-          {sla&&<ReferenceLine y={sla} stroke={T.amber} strokeDasharray="5 3"
-                               label={{value:slaLabel||`SLA ${sla}%`,fill:T.amber,fontSize:8.5,position:'insideTopRight'}}/>}
-          <Bar dataKey={dataKey} fill={color} opacity={.85} barSize={10} radius={[3,3,0,0]}
-               name={dataKey.replace(/_/g,' ')}/>
-        </BarChart>
-      </ResponsiveContainer>
-      <div style={{display:'flex',gap:20,justifyContent:'center',padding:'5px 0 2px',borderTop:`1px solid ${T.border}`,marginTop:3}}>
-        {[['Avg',avg],['Min',min],['Max',max]].map(([lbl,val])=>(
-          <div key={lbl} style={{textAlign:'center'}}>
-            <div style={{fontSize:8,color:T.muted,fontWeight:700,letterSpacing:'0.04em'}}>{lbl}</div>
-            <div style={{fontSize:11,fontWeight:800,color,fontFamily:"'IBM Plex Mono',monospace"}}>{val}%</div>
-          </div>
+      {/* Controls */}
+      <div style={{display:'flex',alignItems:'center',gap:5,marginBottom:8,flexWrap:'wrap'}}>
+        {[['3d','3 Days'],['7d','7 Days'],['30d','30 Days']].map(([m,l])=>(
+          <button key={m} onClick={()=>{setMode(m);setCustomDates([]);}}
+            style={{padding:'3px 9px',borderRadius:6,border:`1px solid ${mode===m?cc:T.border}`,
+              background:mode===m?cc:'transparent',color:mode===m?'#fff':T.text,
+              fontSize:9,fontWeight:700,cursor:'pointer'}}>{l}</button>
         ))}
+        <select value={curveScale} onChange={e=>setCurveScale(e.target.value)}
+          style={{...sel(T),fontSize:9,padding:'3px 6px',minWidth:60}}>
+          <option value="15min">15 Min</option>
+          <option value="hourly">Hourly</option>
+        </select>
+        {/* Calendar */}
+        <div ref={calRef} style={{position:'relative',display:'inline-block'}}>
+          <button onClick={()=>setCalOpen(o=>!o)}
+            style={{padding:'3px 9px',borderRadius:6,border:`1px solid ${mode==='custom'?cc:T.border}`,
+              background:mode==='custom'?`${cc}10`:'transparent',color:T.text,
+              fontSize:9,fontWeight:700,cursor:'pointer',display:'flex',alignItems:'center',gap:3}}>
+            &#128197; Calendar
+            {customDates.length>0&&<span style={{fontSize:8,fontWeight:800,background:cc,color:'#fff',borderRadius:8,padding:'0 5px'}}>{customDates.length}</span>}
+          </button>
+          {calOpen&&(
+            <div style={{position:'absolute',top:'100%',right:0,marginTop:4,background:T.surface,border:`1px solid ${T.border}`,
+              borderRadius:10,boxShadow:'0 12px 36px rgba(0,0,0,.2)',zIndex:200,padding:12,width:260,userSelect:'none'}}>
+              {/* Month nav */}
+              <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:8}}>
+                <button onClick={prevMonth} style={{background:'none',border:'none',cursor:'pointer',fontSize:14,color:T.text,padding:'2px 6px'}}>&lsaquo;</button>
+                <span style={{fontSize:12,fontWeight:800,color:T.text}}>{MONTH_NAMES[calMonth.m]} {calMonth.y}</span>
+                <button onClick={nextMonth} style={{background:'none',border:'none',cursor:'pointer',fontSize:14,color:T.text,padding:'2px 6px'}}>&rsaquo;</button>
+              </div>
+              {/* Day headers */}
+              <div style={{display:'grid',gridTemplateColumns:'repeat(7,1fr)',gap:1,marginBottom:4}}>
+                {DAY_NAMES.map(d=><div key={d} style={{textAlign:'center',fontSize:8,fontWeight:700,color:T.muted,padding:2}}>{d}</div>)}
+              </div>
+              {/* Day cells */}
+              <div style={{display:'grid',gridTemplateColumns:'repeat(7,1fr)',gap:2}}>
+                {calDays().map((ds,i)=>{
+                  if(!ds) return <div key={`e${i}`}/>;
+                  const day=parseInt(ds.slice(8));
+                  const isSel=customDates.includes(ds);
+                  const isToday2=ds===today;
+                  const hasData=availSet.has(ds);
+                  const clr=isSel?DAY_COLORS[customDates.indexOf(ds)%DAY_COLORS.length]:null;
+                  return (
+                    <button key={ds} onClick={()=>toggleCustomDate(ds)}
+                      style={{width:30,height:28,borderRadius:6,fontSize:10,fontWeight:isSel||isToday2?800:500,
+                        cursor:'pointer',border:isSel?`2px solid ${clr}`:isToday2?`2px solid ${cc}`:`1px solid transparent`,
+                        background:isSel?`${clr}20`:isToday2?`${cc}08`:'transparent',
+                        color:isSel?clr:hasData?T.text:`${T.muted}60`,
+                        display:'flex',alignItems:'center',justifyContent:'center',position:'relative'}}>
+                      {day}
+                      {hasData&&!isSel&&<span style={{position:'absolute',bottom:2,left:'50%',transform:'translateX(-50%)',
+                        width:3,height:3,borderRadius:'50%',background:isToday2?cc:T.green}}/>}
+                    </button>
+                  );
+                })}
+              </div>
+              {/* Actions */}
+              <div style={{display:'flex',justifyContent:'space-between',marginTop:8,paddingTop:6,borderTop:`1px solid ${T.border}`}}>
+                {customDates.length>0?
+                  <button onClick={()=>{setCustomDates([]);setMode('3d');}}
+                    style={{fontSize:9,color:T.red,background:'none',border:'none',cursor:'pointer',fontWeight:700}}>Clear all</button>
+                  :<span style={{fontSize:9,color:T.muted}}>Click dates to select</span>}
+                <span style={{fontSize:8,color:T.muted}}>{customDates.length} selected</span>
+              </div>
+            </div>
+          )}
+        </div>
       </div>
+
+      {/* Chart */}
+      {curveLoading?<Spin T={T}/>:!hasAnyData?(
+        <div style={{height:120,display:'flex',alignItems:'center',justifyContent:'center',color:T.muted,fontSize:11}}>No data for selected dates</div>
+      ):(
+        <>
+        <ResponsiveContainer width="100%" height={210}>
+          <LineChart data={chartData} margin={{top:4,right:8,bottom:0,left:0}}>
+            <CartesianGrid strokeDasharray="3 3" stroke={T.border} vertical={false}/>
+            <XAxis dataKey="time" tick={{fontSize:7.5,fill:T.muted}} axisLine={false} tickLine={false}
+              interval={curveScale==='hourly'?1:7}/>
+            <YAxis tick={{fontSize:8,fill:T.muted}} axisLine={false} tickLine={false} width={42} domain={['auto','auto']}
+              tickFormatter={v=>{
+                const isRate=_isRateKpi(kpiName)||_isUtilKpi(kpiName)||_isLowGoodKpi(kpiName);
+                if(isRate&&v>=0&&v<=1.05)return (v*100).toFixed(1)+'%';
+                if(v>=1000)return (v/1000).toFixed(0)+'K';
+                return Number(v).toFixed(1);
+              }}/>
+            <Tooltip contentStyle={{background:T.surface,border:`1px solid ${T.border}`,borderRadius:8,fontSize:10}}
+              labelStyle={{fontWeight:700,color:T.text}}
+              formatter={(v,name)=>{
+                const dn=DAY_NAMES[new Date(name+'T00:00:00').getDay()];
+                if(v==null)return ['No data',`${name.slice(5)} (${dn})`];
+                const num=Number(v);
+                // Auto-detect decimal rates (0-1) and convert to percentage display
+                const isRate=_isRateKpi(kpiName)||_isUtilKpi(kpiName)||_isLowGoodKpi(kpiName);
+                const display=isRate&&num>=0&&num<=1.05
+                  ? (num*100).toFixed(2)+'%'
+                  : _isLatKpi(kpiName)?num.toFixed(1)+' ms'
+                  : num>=1000?(num/1000).toFixed(2)+'K'
+                  : num.toFixed(4);
+                return [display,`${name.slice(5)} (${dn})`];
+              }}/>
+            {allDates.map((dt,di)=>{
+              const clr=DAY_COLORS[di%DAY_COLORS.length];
+              const isToday2=dt===today;
+              const hasPts=(curves[dt]||[]).length>0;
+              if(!hasPts) return null;
+              // Older days: dashed lines so they're visible when overlapping
+              const dashPattern=isToday2?undefined:di===0?'8 4':di===1?'4 3':'2 2';
+              return <Line key={dt} type="monotone" dataKey={dt} stroke={clr}
+                strokeWidth={isToday2?2.5:2} dot={false} name={dt}
+                strokeDasharray={dashPattern}
+                opacity={isToday2?1:0.85} connectNulls={false}/>;
+            })}
+          </LineChart>
+        </ResponsiveContainer>
+        {/* Legend */}
+        <div style={{display:'flex',gap:6,flexWrap:'wrap',justifyContent:'center',padding:'5px 0 2px',borderTop:`1px solid ${T.border}`,marginTop:3}}>
+          {allDates.map((dt,di)=>{
+            const clr=DAY_COLORS[di%DAY_COLORS.length];
+            const isToday2=dt===today;
+            const hasPts=(curves[dt]||[]).length>0;
+            const dayName=DAY_NAMES[new Date(dt+'T00:00:00').getDay()];
+            return (
+              <div key={dt} style={{display:'flex',alignItems:'center',gap:3,padding:'2px 5px',borderRadius:5,
+                background:isToday2?`${clr}12`:'transparent',border:isToday2?`1px solid ${clr}30`:'1px solid transparent',
+                opacity:hasPts?1:0.4}}>
+                <span style={{width:14,height:isToday2?3:2,borderRadius:2,background:isToday2?clr:'transparent',
+                  borderBottom:isToday2?'none':`2px ${di===0?'dashed':di===1?'dashed':'dotted'} ${clr}`,display:'inline-block'}}/>
+                <span style={{fontSize:8,fontWeight:isToday2?800:600,color:clr}}>
+                  {dt.slice(5)} {dayName}{isToday2?' (Today)':''}{!hasPts?' -':''}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+        </>
+      )}
     </div>
   );
 }
 
-function CorePage({T,data,filters}) {
-  const [selectedSite,setSelectedSite]=useState(null);
-  const [siteData,setSiteData]=useState(null);
-  const [siteLoading,setSiteLoading]=useState(false);
-  const d=data||{};
+function CorePage({T,data}) {
+  const [compType,setCompType]=useState('');
+  const [compId,setCompId]=useState('');
+  const [scale,setScale]=useState('daily');
+  const [timeRange,setTimeRange]=useState('30d');
+  const [coreData,setCoreData]=useState(null);
+  const [loading,setLoading]=useState(true);
+  const [fcData,setFcData]=useState(null);
+  const [fcLoading,setFcLoading]=useState(false);
+  const [fcHorizon,setFcHorizon]=useState(48);
 
-  const fetchSite=useCallback(async(sid)=>{
-    setSelectedSite(sid);setSiteData(null);setSiteLoading(true);
+  const fetchCore=useCallback(async(ct,ci,tr,sc)=>{
+    setLoading(true);
     try{
-      const fq=filters?Object.entries(filters).filter(([,v])=>v).map(([k,v])=>`${k}=${encodeURIComponent(v)}`).join('&'):'';
-      const r=await apiGet(`/api/network/site-core-detail?site_id=${encodeURIComponent(sid)}${fq?'&'+fq:''}`);
-      setSiteData(r);
-    }catch(_){setSiteData(null);}
-    setSiteLoading(false);
-  },[filters]);
+      const p=new URLSearchParams();
+      if(ct)p.set('component_type',ct);if(ci)p.set('component_id',ci);
+      if(tr)p.set('time_range',tr);if(sc)p.set('scale',sc);p.set('fresh','1');
+      setCoreData(await apiGet(`/api/network/core-analytics?${p.toString()}`));
+    }catch(_){}
+    setLoading(false);
+  },[]);
 
-  useEffect(()=>{if(selectedSite)fetchSite(selectedSite);},[filters]);// eslint-disable-line
+  // Fetch server-side forecast (Holt-Winters / ARIMA / Prophet)
+  const fetchForecast=useCallback(async(ct,ci,h)=>{
+    setFcLoading(true);
+    try{
+      const p=new URLSearchParams();
+      if(ct)p.set('component_type',ct);if(ci)p.set('component_id',ci);
+      p.set('horizon',String(h));
+      setFcData(await apiGet(`/api/network/core-forecast?${p.toString()}`));
+    }catch(_){setFcData(null);}
+    setFcLoading(false);
+  },[]);
 
-  const kpis=[
-    {label:'Auth Success Rate', value:f(d.avg_auth_sr),  unit:'%',icon:'',color:fn(d.avg_auth_sr)<95?T.red:T.green,  badge:fn(d.avg_auth_sr)<95?{color:T.red,text:'Below SLA'}:null},
-    {label:'CPU Utilization',   value:f(d.avg_cpu),      unit:'%',icon:'', color:fn(d.avg_cpu)>80?T.red:T.amber,     badge:fn(d.avg_cpu)>80?{color:T.red,text:'High'}:null},
-    {label:'Attach Success Rate',value:f(d.avg_attach_sr),unit:'%',icon:'',color:fn(d.avg_attach_sr)<95?T.red:T.green},
-    {label:'PDP Bearer SR',     value:f(d.avg_pdp_sr),   unit:'%',icon:'',color:fn(d.avg_pdp_sr)<95?T.red:T.teal},
-  ];
+  useEffect(()=>{fetchCore(compType,compId,timeRange,scale);},[compType,compId,timeRange,scale,fetchCore]);
+  // Fetch forecast only on entire-network view or when component changes
+  useEffect(()=>{if(!compType||compType){fetchForecast(compType||'',compId,fcHorizon);}},[compType,compId,fcHorizon,fetchForecast]);
 
-  const siteSummary=d.site_summary||[];
+  const cd=coreData||{};
+  const compTypes=cd.component_types||[];
+  const components=cd.components||[];
+  const kpiList=cd.kpis||[];
+  const netSummary=cd.network_summary||{};
+  const kpiTrends=cd.kpi_trends||{};
+  const compSummary=cd.component_summary||[];
+  const forecasts=(fcData||{}).forecasts||{};
 
-  // Shared chart config for network & site level
-  const CORE_CHARTS=[
-    {title:' Authentication SR Trend', key:'auth_sr',  color:'#2B4DCC', sla:95, slaLabel:'SLA 95%'},
-    {title:' CPU Utilization Trend',   key:'cpu_util', color:'#E91E8C', sla:80, slaLabel:'Alert 80%'},
-    {title:' Attach Success Rate',     key:'attach_sr',color:'#00BCD4', sla:95},
-    {title:' PDP Bearer SR',           key:'pdp_sr',   color:'#7B1FA2', sla:95},
-  ];
+  const filteredComps=compType?components.filter(c=>c.component_type===compType).map(c=>c.component_id):[];
+  const kpisByComp={};
+  kpiList.forEach(k=>{if(!kpisByComp[k.component_type])kpisByComp[k.component_type]=[];kpisByComp[k.component_type].push(k.kpi_name);});
+  const visibleKpis=compType?kpiList.filter(k=>k.component_type===compType).map(k=>k.kpi_name):[...new Set(kpiList.map(k=>k.kpi_name))];
+  const ddStyle={...sel(T),minWidth:100,fontWeight:600};
+  const fmtX=v=>{if(!v)return '';if(v.startsWith('H+'))return v;if(scale==='daily')return v.slice(5);const p=v.split(' ');return p.length>1?p[1]:v.slice(5);};
 
-  // Map key → network trend array
-  const netTrends={auth_sr:d.auth_trend,cpu_util:d.cpu_trend,attach_sr:d.attach_trend,pdp_sr:d.pdp_trend};
-  // Map key → site trend array
-  const siteTrends=siteData?{auth_sr:siteData.auth_trend,cpu_util:siteData.cpu_trend,attach_sr:siteData.attach_trend,pdp_sr:siteData.pdp_trend}:{};
+  if(cd.upload_needed) return (
+    <div style={{animation:'fadeIn .3s ease'}}>
+      <CC T={T} title="Core Network Performance">
+        <div style={{padding:40,textAlign:'center',color:T.muted}}>
+          <div style={{fontSize:14,fontWeight:700,color:T.text,marginBottom:6}}>No Core Component KPI Data</div>
+          <div style={{fontSize:12}}>Upload from Admin &rarr; Data Upload page.</div>
+        </div>
+      </CC>
+    </div>
+  );
+
+  const healthScores=compTypes.map(ct=>{
+    const kpis=kpisByComp[ct]||[];let good=0,total=0;
+    kpis.forEach(kn=>{const info=netSummary[kn];if(info){total++;if(_kGood(kn,info.avg))good++;}});
+    return {type:ct,score:total?Math.round(good/total*100):0,good,total};
+  });
 
   return (
     <div style={{animation:'fadeIn .3s ease'}}>
-      <div style={{marginBottom:13}}>
-        <div style={{fontSize:17,fontWeight:800,color:T.text,marginBottom:3}}> Core Network Performance</div>
-        <div style={{fontSize:11,color:T.muted}}>EPC / 5GC · Authentication · Attach · PDP Bearer · CPU Utilization</div>
-      </div>
-      <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:9,marginBottom:12}}>
-        {kpis.map((k,i)=><KpiCard key={i} T={T} {...k}/>)}
+      {/* ── Header ─────────────────────────────────────────────────────── */}
+      <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:12,flexWrap:'wrap',gap:8}}>
+        <div>
+          <div style={{fontSize:18,fontWeight:800,color:T.text}}>
+            {compType?(compId||compType):'Core Network'} Performance
+          </div>
+          <div style={{fontSize:11,color:T.muted}}>
+            {compType?(CORE_COMP_LABELS[compType]||compType)+(compId?` — ${compId}`:'')
+              :'EPC / 5GC — Health Overview & AI Forecast'}
+          </div>
+        </div>
+        <div style={{display:'flex',gap:5,alignItems:'center',flexWrap:'wrap'}}>
+          <select value={compType} onChange={e=>{setCompType(e.target.value);setCompId('');}} style={ddStyle}>
+            <option value="">Entire Network</option>
+            {compTypes.map(ct=><option key={ct} value={ct}>{ct}</option>)}
+          </select>
+          {compType&&filteredComps.length>0&&(
+            <select value={compId} onChange={e=>setCompId(e.target.value)} style={ddStyle}>
+              <option value="">All {compType}</option>
+              {filteredComps.map(ci=><option key={ci} value={ci}>{ci}</option>)}
+            </select>
+          )}
+          {compType&&<select value={timeRange} onChange={e=>setTimeRange(e.target.value)} style={ddStyle}>
+            {[['24h','24h'],['7d','7 Days'],['30d','30 Days'],['all','All']].map(([v,l])=><option key={v} value={v}>{l}</option>)}
+          </select>}
+          {compType&&<select value={scale} onChange={e=>setScale(e.target.value)} style={ddStyle}>
+            {[['15min','15 Min'],['hourly','Hourly'],['daily','Daily']].map(([v,l])=><option key={v} value={v}>{l}</option>)}
+          </select>}
+        </div>
       </div>
 
-      {/* Network-level trend charts — 2×2 grid with ComposedChart + stats */}
-      <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginBottom:12}}>
-        {CORE_CHARTS.map(({title,key,color,sla,slaLabel})=>(
-          <CC key={key} T={T} title={title}>
-            <CoreKpiChart T={T} data={netTrends[key]} dataKey={key} color={color} sla={sla} slaLabel={slaLabel}/>
-          </CC>
-        ))}
+      {/* ── Tabs ───────────────────────────────────────────────────────── */}
+      <div style={{display:'flex',gap:5,marginBottom:14,flexWrap:'wrap'}}>
+        <button onClick={()=>{setCompType('');setCompId('');}}
+          style={{padding:'7px 16px',borderRadius:9,border:`2px solid ${!compType?T.kpmgBlue:T.border}`,
+            background:!compType?T.kpmgBlue:'transparent',color:!compType?'#fff':T.text,
+            fontSize:11,fontWeight:700,cursor:'pointer'}}>
+          Entire Network
+        </button>
+        {compTypes.map(ct=>{
+          const cc=CORE_COMP_COLORS[ct];const active=compType===ct;
+          return (<button key={ct} onClick={()=>{setCompType(ct);setCompId('');}}
+            style={{padding:'7px 16px',borderRadius:9,border:`2px solid ${active?cc:T.border}`,
+              background:active?cc:'transparent',color:active?'#fff':T.text,
+              fontSize:11,fontWeight:700,cursor:'pointer'}}>{ct}</button>);
+        })}
       </div>
 
-      {/* Site search + site-level */}
-      <CC T={T} title=" Site-level Core KPI Analysis">
-        <div style={{display:'flex',gap:10,marginBottom:12,alignItems:'center'}}>
-          <SiteSearch T={T} layer="core" onSelect={fetchSite} placeholder="Search core site ID…" filters={filters}/>
-          {selectedSite&&<button onClick={()=>{setSelectedSite(null);setSiteData(null);}} style={{padding:'4px 10px',borderRadius:8,fontSize:10,border:`1px solid ${T.border}`,background:T.surface2,color:T.textSub,cursor:'pointer'}}> Clear</button>}
+      {loading?<Spin T={T}/>:<>
+
+      {/* ══════════════════════════════════════════════════════════════════
+           ENTIRE NETWORK VIEW
+         ══════════════════════════════════════════════════════════════════ */}
+      {!compType&&(<>
+        {/* ── Health Cards ────────────────────────────────────────────── */}
+        <div style={{display:'grid',gridTemplateColumns:'repeat(5,1fr)',gap:10,marginBottom:18}}>
+          {healthScores.map(h=>{
+            const cc=CORE_COMP_COLORS[h.type];
+            return (
+              <div key={h.type} className="kc" onClick={()=>setCompType(h.type)}
+                style={{...card(T),padding:'16px',cursor:'pointer',borderTop:`4px solid ${cc}`,transition:'transform .15s'}}>
+                <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:10}}>
+                  <div style={{width:32,height:32,borderRadius:8,background:`${cc}15`,display:'flex',alignItems:'center',justifyContent:'center',fontSize:14,fontWeight:800,color:cc}}>
+                    {CORE_COMP_ICONS[h.type]}
+                  </div>
+                  <div>
+                    <div style={{fontSize:13,fontWeight:800,color:T.text}}>{h.type}</div>
+                    <div style={{fontSize:8.5,color:T.muted}}>{CORE_COMP_LABELS[h.type]}</div>
+                  </div>
+                </div>
+                <div style={{display:'flex',alignItems:'baseline',gap:4,marginBottom:6}}>
+                  <span style={{fontSize:26,fontWeight:800,color:h.score>=80?cc:h.score>=50?T.amber:T.red,fontFamily:"'IBM Plex Mono',monospace"}}>{h.score}</span>
+                  <span style={{fontSize:11,color:T.muted}}>/ 100</span>
+                </div>
+                <div style={{height:5,borderRadius:3,background:T.surface2,overflow:'hidden'}}>
+                  <div style={{height:'100%',width:`${h.score}%`,borderRadius:3,background:h.score>=80?cc:h.score>=50?T.amber:T.red,transition:'width .5s'}}/>
+                </div>
+                <div style={{fontSize:9,color:T.muted,marginTop:6}}>{h.good}/{h.total} KPIs healthy</div>
+              </div>
+            );
+          })}
         </div>
 
-        {selectedSite&&(
-          siteLoading?<Spin T={T}/>:siteData?.trend?.length>0?(
-            <div style={{animation:'fadeIn .3s ease',marginBottom:4}}>
-              {/* Site location map + KPI summary cards */}
-              <div style={{display:'grid',gridTemplateColumns:'1fr 280px',gap:10,marginBottom:12}}>
-                <div style={{display:'grid',gridTemplateColumns:'repeat(2,1fr)',gap:8,alignContent:'start'}}>
-                  {[
-                    {label:'Auth SR',   value:f(siteData.summary?.auth_sr),  unit:'%',icon:'',color:fn(siteData.summary?.auth_sr)<95?T.red:T.green},
-                    {label:'CPU Util',  value:f(siteData.summary?.cpu_util), unit:'%',icon:'', color:fn(siteData.summary?.cpu_util)>80?T.red:T.amber},
-                    {label:'Attach SR', value:f(siteData.summary?.attach_sr),unit:'%',icon:'',color:T.blue3},
-                    {label:'PDP SR',    value:f(siteData.summary?.pdp_sr),   unit:'%',icon:'',color:T.teal},
-                  ].map((k,i)=><KpiCard key={i} T={T} {...k}/>)}
-                </div>
-                <CC T={T} title={` ${selectedSite} Location`}>
-                  {siteData.meta?.latitude&&siteData.meta?.longitude?(
-                    <LeafletMap sites={[{site_id:selectedSite,lat:siteData.meta.latitude,lng:siteData.meta.longitude,cluster:siteData.meta.zone||''}]} highlight={[{site_id:selectedSite,lat:siteData.meta.latitude,lng:siteData.meta.longitude,cluster:siteData.meta.zone||''}]} T={T} height={160}/>
-                  ):<div style={{padding:20,textAlign:'center',color:T.muted,fontSize:11}}>No location data</div>}
-                </CC>
-              </div>
-              {/* Site-level 2×2 chart grid — same style as network level */}
-              <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>
-                {CORE_CHARTS.map(({title,key,color,sla,slaLabel})=>(
-                  <CC key={key} T={T} title={`${title} — ${selectedSite}`}>
-                    <CoreKpiChart T={T} data={siteTrends[key]||siteData.trend} dataKey={key} color={color} sla={sla} slaLabel={slaLabel}/>
-                  </CC>
-                ))}
-              </div>
+        {/* ── Radar + Legend (no pie — cleaner) ───────────────────────── */}
+        <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginBottom:18}}>
+          <CC T={T} title="Component Health Radar">
+            <ResponsiveContainer width="100%" height={240}>
+              <RadarChart data={healthScores.map(h=>({name:h.type,score:h.score}))}>
+                <PolarGrid stroke={T.border}/>
+                <PolarAngleAxis dataKey="name" tick={{fontSize:11,fontWeight:700,fill:T.text}}/>
+                <Radar name="Health" dataKey="score" stroke={T.kpmgBlue} fill={T.kpmgBlue} fillOpacity={0.15} strokeWidth={2.5}/>
+                <Tooltip contentStyle={{background:T.surface,border:`1px solid ${T.border}`,borderRadius:8,fontSize:11}}/>
+              </RadarChart>
+            </ResponsiveContainer>
+          </CC>
+          <CC T={T} title="Degraded KPIs — Attention Required">
+            <div style={{maxHeight:320,overflowY:'auto'}}>
+              {(() => {
+                // Build list of degraded KPIs across all components
+                const degraded = [];
+                const ns = cd.network_summary || {};
+                Object.entries(ns).forEach(([kpiName, info]) => {
+                  const avg = parseFloat(info.avg || 0);
+                  const ct = info.component_type || '?';
+                  const cc = CORE_COMP_COLORS[ct] || '#475569';
+                  // Use the shared health check
+                  const good = _kGood(kpiName, avg);
+                  if (!good) {
+                    const displayVal = _kFmt(kpiName, avg);
+                    const unit = _kU(kpiName);
+                    // Determine severity
+                    const pct = (_isRateKpi(kpiName)||_isUtilKpi(kpiName))&&avg<=1.05?avg*100:avg;
+                    let severity = 'warning';
+                    if (_isRateKpi(kpiName) && pct < 90) severity = 'critical';
+                    else if (_isLowGoodKpi(kpiName) && pct > 10) severity = 'critical';
+                    else if (_isUtilKpi(kpiName) && pct > 92) severity = 'critical';
+                    else if (_isLatKpi(kpiName) && avg > 200) severity = 'critical';
+                    degraded.push({ kpiName, ct, cc, displayVal, unit, severity, samples: info.samples });
+                  }
+                });
+                degraded.sort((a, b) => (a.severity === 'critical' ? 0 : 1) - (b.severity === 'critical' ? 0 : 1));
+
+                if (degraded.length === 0) return (
+                  <div style={{textAlign:'center',padding:30,color:T.muted,fontSize:12}}>
+                    All KPIs within healthy thresholds
+                  </div>
+                );
+                return degraded.map((d, i) => (
+                  <div key={i} style={{display:'flex',alignItems:'center',gap:10,padding:'8px 12px',borderRadius:8,
+                    background:d.severity==='critical'?'#FEF2F2':T.surface2,
+                    border:`1px solid ${d.severity==='critical'?'#FECACA':T.border}`,marginBottom:6,cursor:'pointer'}}
+                    onClick={()=>setCompType(d.ct)}>
+                    <span style={{width:8,height:8,borderRadius:'50%',background:d.severity==='critical'?'#DC2626':'#F59E0B',flexShrink:0}}/>
+                    <span style={{fontSize:9,padding:'1px 6px',borderRadius:6,background:d.cc,color:'#fff',fontWeight:700,flexShrink:0}}>{d.ct}</span>
+                    <span style={{fontSize:11,fontWeight:600,color:T.text,flex:1,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{d.kpiName}</span>
+                    <span style={{fontSize:12,fontWeight:800,color:d.severity==='critical'?'#DC2626':'#F59E0B',fontFamily:"'IBM Plex Mono',monospace",flexShrink:0}}>{d.displayVal}{d.unit}</span>
+                  </div>
+                ));
+              })()}
             </div>
-          ):<div style={{padding:16,textAlign:'center',color:T.muted,fontSize:12}}>No core data for "{selectedSite}"</div>
+          </CC>
+        </div>
+
+        {/* ── Forecast Section ────────────────────────────────────────── */}
+        <div style={{marginBottom:18}}>
+          <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:10}}>
+            <div>
+              <div style={{fontSize:15,fontWeight:800,color:T.text}}>KPI Forecast</div>
+              <div style={{fontSize:10,color:T.muted}}>Powered by Holt-Winters / ARIMA / Prophet — server-side statistical models</div>
+            </div>
+            <div style={{display:'flex',gap:5,alignItems:'center'}}>
+              <span style={{fontSize:10,color:T.muted,fontWeight:600}}>Horizon:</span>
+              {[24,48,72,168].map(h=>(
+                <button key={h} onClick={()=>setFcHorizon(h)}
+                  style={{padding:'4px 10px',borderRadius:7,border:`1px solid ${fcHorizon===h?T.kpmgBlue:T.border}`,
+                    background:fcHorizon===h?T.kpmgBlue:'transparent',color:fcHorizon===h?'#fff':T.text,
+                    fontSize:10,fontWeight:700,cursor:'pointer'}}>
+                  {h}h
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {fcLoading&&<Spin T={T}/>}
+
+          {!fcLoading&&compTypes.map(ct=>{
+            const cc=CORE_COMP_COLORS[ct];
+            const kpis=kpisByComp[ct]||[];
+            const ctForecasts=kpis.filter(kn=>forecasts[kn]&&forecasts[kn].forecast?.length>0);
+            if(!ctForecasts.length)return null;
+            return (
+              <CC key={ct} T={T} title={`${ct} — ${CORE_COMP_LABELS[ct]}`}>
+                <div style={{display:'grid',gridTemplateColumns:ctForecasts.length===1?'1fr':'1fr 1fr',gap:12}}>
+                  {ctForecasts.map((kn,ki)=>{
+                    const fc=forecasts[kn];
+                    const actual=fc.actual||[];
+                    const pred=fc.forecast||[];
+                    const upper=fc.upper||[];
+                    const lower=fc.lower||[];
+                    const modelName=MODEL_LABELS[fc.model]||fc.model;
+                    const cci=CKC[ki%CKC.length];
+
+                    // Build combined data: actual + forecast with confidence bands
+                    const combined=[
+                      ...actual.map(p=>({ts:p.ts.split(' ')[1]||p.ts,actual:p.value})),
+                      ...pred.map((p,i)=>({ts:p.ts,predicted:p.value,upper:upper[i],lower:lower[i]})),
+                    ];
+
+                    return (
+                      <div key={kn}>
+                        <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:4,paddingLeft:2}}>
+                          <span style={{fontSize:10.5,fontWeight:700,color:T.text}}>{kn} <span style={{fontSize:9,color:T.muted}}>({_kU(kn)})</span></span>
+                          <span style={{fontSize:8,fontWeight:700,padding:'2px 8px',borderRadius:6,background:`${cci}15`,color:cci}}>{modelName}</span>
+                        </div>
+                        <ResponsiveContainer width="100%" height={165}>
+                          <ComposedChart data={combined} margin={{top:4,right:8,bottom:0,left:0}}>
+                            <defs>
+                              <linearGradient id={`fcg_${ct}_${ki}`} x1="0" y1="0" x2="0" y2="1">
+                                <stop offset="5%" stopColor={cci} stopOpacity={0.15}/><stop offset="95%" stopColor={cci} stopOpacity={0.02}/>
+                              </linearGradient>
+                            </defs>
+                            <CartesianGrid strokeDasharray="3 3" stroke={T.border} vertical={false}/>
+                            <XAxis dataKey="ts" tick={{fontSize:7,fill:T.muted}} axisLine={false} tickLine={false} interval="preserveStartEnd"/>
+                            <YAxis tick={{fontSize:8,fill:T.muted}} axisLine={false} tickLine={false} width={34} domain={['auto','auto']}/>
+                            <Tooltip contentStyle={{background:T.surface,border:`1px solid ${T.border}`,borderRadius:8,fontSize:10}}/>
+                            {/* Confidence band */}
+                            <Area type="monotone" dataKey="upper" stroke="none" fill={T.amber} fillOpacity={0.08} name="Upper CI"/>
+                            <Area type="monotone" dataKey="lower" stroke="none" fill={T.surface} fillOpacity={0} name="Lower CI"/>
+                            {/* Actual line */}
+                            <Line type="monotone" dataKey="actual" stroke={cci} strokeWidth={2} dot={false} name="Actual" connectNulls={false}/>
+                            {/* Forecast line — dashed */}
+                            <Line type="monotone" dataKey="predicted" stroke={T.amber} strokeWidth={2} strokeDasharray="6 3" dot={false} name="Forecast" connectNulls={false}/>
+                          </ComposedChart>
+                        </ResponsiveContainer>
+                        {/* Forecast stats */}
+                        {pred.length>0&&(
+                          <div style={{display:'flex',gap:14,justifyContent:'center',padding:'4px 0',borderTop:`1px solid ${T.border}`,marginTop:2}}>
+                            <span style={{fontSize:9,color:T.muted}}>Next: <strong style={{color:T.amber}}>{pred[0].value}</strong></span>
+                            <span style={{fontSize:9,color:T.muted}}>End: <strong style={{color:T.amber}}>{pred[pred.length-1].value}</strong></span>
+                            <span style={{fontSize:9,color:T.muted}}>CI: <strong style={{color:T.green}}>{lower[0]}</strong> – <strong style={{color:T.red}}>{upper[0]}</strong></span>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </CC>
+            );
+          })}
+        </div>
+      </>)}
+
+      {/* ══════════════════════════════════════════════════════════════════
+           COMPONENT VIEW — actual data, drill-down graphs & comparison
+         ══════════════════════════════════════════════════════════════════ */}
+      {compType&&(<>
+        {/* ── KPI Cards ───────────────────────────────────────────────── */}
+        <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fill,minmax(220px,1fr))',gap:10,marginBottom:16}}>
+          {visibleKpis.map(kn=>{
+            const info=netSummary[kn];if(!info)return null;
+            const cc=CORE_COMP_COLORS[info.component_type]||'#00338D';
+            const good=_kGood(kn,info.avg);const u=_kU(kn);
+            const displayVal=_kFmt(kn,info.avg);
+            const displayMin=_kFmt(kn,info.min);
+            const displayMax=_kFmt(kn,info.max);
+            const statusColor=good?'#16A34A':'#DC2626';
+            const statusBg=good?'#F0FDF4':'#FEF2F2';
+            const statusBorder=good?'#BBF7D0':'#FECACA';
+            return (
+              <div key={kn} style={{background:T.surface,borderRadius:10,padding:'14px 16px',
+                border:`1px solid ${good?T.border:statusBorder}`,borderLeft:`4px solid ${good?cc:statusColor}`,
+                transition:'transform .15s,box-shadow .15s'}}>
+                <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:6}}>
+                  <div style={{fontSize:10,fontWeight:700,color:T.muted,textTransform:'uppercase',letterSpacing:'.02em',lineHeight:1.3,maxWidth:'75%'}}>{kn}</div>
+                  <span style={{fontSize:8,fontWeight:800,padding:'2px 8px',borderRadius:10,background:statusBg,color:statusColor,border:`1px solid ${statusBorder}`,whiteSpace:'nowrap'}}>
+                    {good?'Healthy':'Alert'}
+                  </span>
+                </div>
+                <div style={{fontSize:26,fontWeight:800,color:good?cc:statusColor,fontFamily:"'IBM Plex Mono',monospace",marginBottom:6}}>
+                  {displayVal}<span style={{fontSize:11,color:T.muted,marginLeft:2,fontWeight:500}}>{u}</span>
+                </div>
+                <div style={{display:'flex',gap:12,paddingTop:6,borderTop:`1px solid ${T.border}`}}>
+                  <span style={{fontSize:9,color:T.muted}}>Min <strong style={{color:'#16A34A'}}>{displayMin}</strong></span>
+                  <span style={{fontSize:9,color:T.muted}}>Max <strong style={{color:'#D97706'}}>{displayMax}</strong></span>
+                  <span style={{fontSize:9,color:T.muted,marginLeft:'auto'}}>{info.samples} samples</span>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+
+        {/* ── Daily Overlay Trend Charts ─────────────────────────────── */}
+        <div style={{display:'grid',gridTemplateColumns:visibleKpis.length===1?'1fr':'1fr 1fr',gap:10,marginBottom:16}}>
+          {visibleKpis.map(kn=>(
+            <CC key={kn} T={T} title={`${kn} (${_kU(kn)})`}>
+              <CoreKpiOverlay T={T} kpiName={kn} compType={compType} compId={compId}/>
+            </CC>
+          ))}
+        </div>
+
+        {/* ── Forecast for selected component ─────────────────────────── */}
+        {Object.keys(forecasts).length>0&&visibleKpis.some(kn=>forecasts[kn]?.forecast?.length)&&(
+          <CC T={T} title={`${compId||compType} — KPI Forecast`}
+              action={<div style={{display:'flex',gap:4}}>
+                {[24,48,72].map(h=>(
+                  <button key={h} onClick={()=>setFcHorizon(h)}
+                    style={{padding:'3px 8px',borderRadius:6,border:`1px solid ${fcHorizon===h?T.kpmgBlue:T.border}`,
+                      background:fcHorizon===h?T.kpmgBlue:'transparent',color:fcHorizon===h?'#fff':T.text,fontSize:9,fontWeight:700,cursor:'pointer'}}>
+                    {h}h
+                  </button>
+                ))}
+              </div>}>
+            {fcLoading?<Spin T={T}/>:
+            <div style={{display:'grid',gridTemplateColumns:visibleKpis.length===1?'1fr':'1fr 1fr',gap:12}}>
+              {visibleKpis.map((kn,ki)=>{
+                const fc=forecasts[kn];if(!fc||!fc.forecast?.length)return null;
+                const actual=fc.actual||[];const pred=fc.forecast||[];
+                const upper=fc.upper||[];const lower=fc.lower||[];
+                const modelName=MODEL_LABELS[fc.model]||fc.model;
+                const cci=CKC[ki%CKC.length];
+                const combined=[
+                  ...actual.map(p=>({ts:p.ts.split(' ')[1]||p.ts,actual:p.value})),
+                  ...pred.map((p,i)=>({ts:p.ts,predicted:p.value,upper:upper[i],lower:lower[i]})),
+                ];
+                return (
+                  <div key={kn}>
+                    <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:4}}>
+                      <span style={{fontSize:10.5,fontWeight:700,color:T.text}}>{kn}</span>
+                      <span style={{fontSize:8,fontWeight:700,padding:'2px 8px',borderRadius:6,background:`${cci}15`,color:cci}}>{modelName}</span>
+                    </div>
+                    <ResponsiveContainer width="100%" height={155}>
+                      <ComposedChart data={combined} margin={{top:4,right:8,bottom:0,left:0}}>
+                        <CartesianGrid strokeDasharray="3 3" stroke={T.border} vertical={false}/>
+                        <XAxis dataKey="ts" tick={{fontSize:7,fill:T.muted}} axisLine={false} tickLine={false} interval="preserveStartEnd"/>
+                        <YAxis tick={{fontSize:8,fill:T.muted}} axisLine={false} tickLine={false} width={34} domain={['auto','auto']}/>
+                        <Tooltip contentStyle={{background:T.surface,border:`1px solid ${T.border}`,borderRadius:8,fontSize:10}}/>
+                        <Area type="monotone" dataKey="upper" stroke="none" fill={T.amber} fillOpacity={0.08}/>
+                        <Line type="monotone" dataKey="actual" stroke={cci} strokeWidth={2} dot={false} name="Actual"/>
+                        <Line type="monotone" dataKey="predicted" stroke={T.amber} strokeWidth={2} strokeDasharray="6 3" dot={false} name="Forecast"/>
+                      </ComposedChart>
+                    </ResponsiveContainer>
+                    <div style={{display:'flex',gap:12,justifyContent:'center',padding:'4px 0',borderTop:`1px solid ${T.border}`,marginTop:2}}>
+                      <span style={{fontSize:9,color:T.muted}}>Next: <strong style={{color:T.amber}}>{pred[0]?.value}</strong></span>
+                      <span style={{fontSize:9,color:T.muted}}>End: <strong style={{color:T.amber}}>{pred[pred.length-1]?.value}</strong></span>
+                      <span style={{fontSize:9,color:T.muted}}>CI: <strong style={{color:T.green}}>{lower[0]}</strong> – <strong style={{color:T.red}}>{upper[0]}</strong></span>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>}
+          </CC>
         )}
 
-        {/* Network-level site table */}
-        {!selectedSite&&siteSummary.length>0&&(
-          <div style={{overflowX:'auto'}}>
-            <table style={{width:'100%',borderCollapse:'collapse',fontSize:10.5}}>
-              <thead>
-                <tr style={{background:T.surface2}}>{['Site ID','Auth SR %','CPU %','Attach SR %','PDP SR %','Status'].map(h=><th key={h} style={{padding:'6px 9px',textAlign:'center',borderBottom:`2px solid ${T.border}`,color:T.muted,fontWeight:700,fontSize:9,textTransform:'uppercase'}}>{h}</th>)}</tr>
-              </thead>
-              <tbody>
-                {siteSummary.map((s,i)=>{
-                  const ok=fn(s.auth_sr)>=95&&fn(s.attach_sr)>=95&&fn(s.pdp_sr)>=95&&fn(s.cpu_util)<80;
-                  return (
-                    <tr key={i} style={{borderBottom:`1px solid ${T.border}`,background:i%2===0?T.surface2:'transparent',cursor:'pointer'}} onClick={()=>fetchSite(s.site_id)}>
-                      <td style={{padding:'5px 9px',fontWeight:700,color:T.kpmgBlue}}>{s.site_id}</td>
-                      {['auth_sr','cpu_util','attach_sr','pdp_sr'].map(k=>(
-                        <td key={k} style={{padding:'5px 9px',textAlign:'center',fontFamily:"'IBM Plex Mono',monospace",fontWeight:700,
-                          color:k==='cpu_util'?(fn(s[k])>80?T.red:T.green):(fn(s[k])<95?T.red:T.green)}}>
-                          {f(s[k])}
-                        </td>
-                      ))}
-                      <td style={{padding:'5px 9px',textAlign:'center'}}><Bdg color={ok?T.green:T.red} sm>{ok?'Healthy':'Alert'}</Bdg></td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
+        {/* ── Instance Comparison — Card-based with gradient bars ──── */}
+        {!compId&&compSummary.length>1&&(
+          <CC T={T} title={`${compType} Node Comparison`}>
+            <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fill,minmax(280px,1fr))',gap:10}}>
+              {visibleKpis.filter(kn=>compSummary.some(c=>c.kpis&&c.kpis[kn]!=null)).map((kn,ki)=>{
+                const instances=compSummary.filter(c=>c.kpis&&c.kpis[kn]!=null&&c.component_id&&c.component_id!=='None');
+                if(!instances.length)return null;
+                const vals=instances.map(c=>parseFloat(c.kpis[kn])||0);
+                const maxVal=Math.max(...vals,0.001);
+                const cc=CORE_COMP_COLORS[compType]||'#00338D';
+                // All instances use the same solid component color
+                const barColorBase=cc;
+                return (
+                  <div key={kn} style={{background:T.surface,borderRadius:10,border:`1px solid ${T.border}`,padding:'12px 14px',overflow:'hidden'}}>
+                    <div style={{fontSize:10,fontWeight:700,color:T.text,marginBottom:10,display:'flex',justifyContent:'space-between'}}>
+                      <span>{kn}</span>
+                      <span style={{fontSize:9,color:T.muted,fontWeight:500}}>{_kU(kn)}</span>
+                    </div>
+                    {instances.map((inst,ii)=>{
+                      const v=parseFloat(inst.kpis[kn])||0;
+                      const displayVal=_kFmt(kn,v);
+                      const good=_kGood(kn,v);
+                      // Bar width: for rate/util KPIs (0-1), bar represents % out of 100
+                      // For latency/count, bar is relative to max in group
+                      const isPercent=_isRateKpi(kn)||_isUtilKpi(kn)||_isLowGoodKpi(kn);
+                      const pct=isPercent&&v<=1.05?Math.min(v*100,100):Math.min(v/maxVal*100,100);
+                      const barColor=good?barColorBase:'#DC2626';
+                      return (
+                        <div key={inst.component_id} style={{marginBottom:8}}>
+                          <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:3}}>
+                            <span style={{fontSize:10,fontWeight:700,color:T.text}}>{inst.component_id}</span>
+                            <span style={{fontSize:11,fontWeight:800,color:good?cc:'#DC2626',fontFamily:"'IBM Plex Mono',monospace"}}>{displayVal}{_kU(kn)}</span>
+                          </div>
+                          <div style={{height:10,background:'#E2E8F0',borderRadius:5,overflow:'hidden'}}>
+                            <div style={{height:'100%',width:`${pct}%`,background:barColor,borderRadius:5,transition:'width .5s ease',minWidth:pct>0?4:0}}/>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                );
+              })}
+            </div>
+          </CC>
         )}
-        {!selectedSite&&siteSummary.length===0&&<Empty T={T}/>}
-      </CC>
+
+        {/* ── Instance Table ──────────────────────────────────────────── */}
+        {!compId&&compSummary.length>0&&(
+          <CC T={T} title={`${compType} Instance Details`} p="0">
+            <div style={{overflowX:'auto'}}>
+              <table style={{width:'100%',borderCollapse:'collapse',fontSize:11}}>
+                <thead><tr style={{background:T.surface2}}>
+                  <th style={{padding:'8px 14px',textAlign:'left',borderBottom:`2px solid ${T.border}`,color:T.muted,fontWeight:700,fontSize:9,textTransform:'uppercase'}}>Instance</th>
+                  {visibleKpis.map(kn=><th key={kn} style={{padding:'8px 10px',textAlign:'center',borderBottom:`2px solid ${T.border}`,color:T.muted,fontWeight:700,fontSize:8.5,textTransform:'uppercase'}}>{kn} ({_kU(kn)})</th>)}
+                  <th style={{padding:'8px 10px',textAlign:'center',borderBottom:`2px solid ${T.border}`,color:T.muted,fontWeight:700,fontSize:9,textTransform:'uppercase'}}>Status</th>
+                </tr></thead>
+                <tbody>{compSummary.map((s,i)=>{
+                  const allGood=visibleKpis.every(kn=>s.kpis&&s.kpis[kn]!=null?_kGood(kn,s.kpis[kn]):true);
+                  return (<tr key={i} style={{borderBottom:`1px solid ${T.border}`,background:i%2===0?T.surface2:'transparent',cursor:'pointer'}} onClick={()=>setCompId(s.component_id)}>
+                    <td style={{padding:'8px 14px',fontWeight:700,color:CORE_COMP_COLORS[compType]}}>{s.component_id}</td>
+                    {visibleKpis.map(kn=>{const v=s.kpis&&s.kpis[kn];const good=v!=null?_kGood(kn,v):true;
+                      return <td key={kn} style={{padding:'8px 10px',textAlign:'center',fontFamily:"'IBM Plex Mono',monospace",fontWeight:700,color:v!=null?(good?T.text:T.red):T.muted}}>{v!=null?f(v,2):'—'}</td>;})}
+                    <td style={{padding:'8px 10px',textAlign:'center'}}><Bdg color={allGood?T.green:T.red} sm>{allGood?'Healthy':'Alert'}</Bdg></td>
+                  </tr>);
+                })}</tbody>
+              </table>
+            </div>
+          </CC>
+        )}
+      </>)}
+
+      {!loading&&visibleKpis.length===0&&Object.keys(netSummary).length===0&&<Empty T={T}/>}
+      </>}
     </div>
   );
 }
@@ -1395,21 +2077,24 @@ function TransportPage({T,data,filters}) {
         </CC>
       </div>
 
-      {/* Zone util chart */}
+      {/* Zone util chart — horizontally scrollable so every zone name fits */}
       {zoneUtil.length>0&&(
         <CC T={T} title=" Zone-wise Link Utilization" p="14px 16px">
-          <div style={{marginBottom:10}}>
-            <ResponsiveContainer width="100%" height={160}>
-              <BarChart data={zoneUtil}>
-                <CartesianGrid strokeDasharray="3 3" stroke={T.border} vertical={false}/>
-                <XAxis dataKey="zone" tick={{fontSize:9,fill:T.muted}} axisLine={false} tickLine={false}/>
-                <YAxis tick={{fontSize:9,fill:T.muted}} axisLine={false} tickLine={false} width={30}/>
-                <Tooltip content={<TipC/>}/>
-                <Bar dataKey="avg_util" name="Avg Util %" radius={[4,4,0,0]} barSize={20}>
-                  {zoneUtil.map((d,i)=><Cell key={i} fill={d.avg_util>80?T.red:d.avg_util>60?T.amber:T.green}/>)}
-                </Bar>
-              </BarChart>
-            </ResponsiveContainer>
+          <div style={{marginBottom:10,overflowX:'auto',overflowY:'hidden'}}>
+            <div style={{minWidth: Math.max(zoneUtil.length*70, 420), height:220}}>
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={zoneUtil} margin={{top:6,right:10,left:0,bottom:52}}>
+                  <CartesianGrid strokeDasharray="3 3" stroke={T.border} vertical={false}/>
+                  <XAxis dataKey="zone" tick={{fontSize:9,fill:T.muted}} axisLine={false} tickLine={false}
+                         interval={0} angle={-35} textAnchor="end" height={60}/>
+                  <YAxis tick={{fontSize:9,fill:T.muted}} axisLine={false} tickLine={false} width={30}/>
+                  <Tooltip content={<TipC/>}/>
+                  <Bar dataKey="avg_util" name="Avg Util %" radius={[4,4,0,0]} barSize={22}>
+                    {zoneUtil.map((d,i)=><Cell key={i} fill={d.avg_util>80?T.red:d.avg_util>60?T.amber:T.green}/>)}
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
           </div>
         </CC>
       )}
@@ -1516,7 +2201,7 @@ function KPIFilterPage({T,kpiFilter,data,mapSites:_mapSites,filters}) {
     overloaded:    {pk:'prb_utilization',  pl:'PRB Utilization', pu:'%',   pc:'#E91E8C',sla:85,  asc:false, ek:'dl_cell_tput',        el:'DL Tput (Mbps)'},
     underutilized: {pk:'prb_utilization',  pl:'PRB Utilization', pu:'%',   pc:'#00BCD4',sla:20,  asc:true},
     rev_leakage:   {pk:'prb_utilization',  pl:'PRB Utilization', pu:'%',   pc:'#0A2463',sla:70,  asc:false, ek:'q1_rev',              el:'Q1 Revenue (K)'},
-    low_margin:    {pk:'ebitda_margin',    pl:'EBITDA Margin',   pu:'%',   pc:'#E91E8C',sla:25,  asc:true,  ek:'q1_rev',              el:'Revenue (₹L)'},
+    low_margin:    {pk:'ebitda_margin',    pl:'EBITDA Margin',   pu:'%',   pc:'#E91E8C',sla:25,  asc:true,  ek:'q1_rev',              el:'Revenue ($)'},
     high_rev_util: {pk:'q1_rev',           pl:'Q1 Revenue',      pu:'K',   pc:'#00BCD4',sla:null,asc:false, ek:'prb_utilization',     el:'PRB Util %'},
     low_tput:      {pk:'dl_cell_tput',     pl:'DL Cell Tput',    pu:' Mbps',pc:'#7B1FA2',sla:5,   asc:true},
     worst_drop:    {pk:'erab_drop_rate',   pl:'E-RAB Drop Rate', pu:'%',   pc:'#DC2626',sla:2,   asc:false},
@@ -1593,8 +2278,8 @@ function KPIFilterPage({T,kpiFilter,data,mapSites:_mapSites,filters}) {
     rev_leakage:   [['PRB %',        s=>f(s.prb_utilization||s.dl_prb_util,1)+'%', s=>fn(s.prb_utilization||s.dl_prb_util)>70?T.red:T.green],
                     ['Q1 Revenue',   s=>'K '+f(s.q1_rev,0),               ()=>null],
                     ['EBITDA %',     s=>f(s.ebitda_margin,1)+'%',         s=>fn(s.ebitda_margin)<25?T.red:T.green]],
-    low_margin:    [['Revenue (₹L)', s=>f(s.q1_rev,1),                    ()=>null],
-                    ['OPEX (₹L)',    s=>f(s.q1_opex,1),                   ()=>null],
+    low_margin:    [['Revenue ($)', s=>f(s.q1_rev,1),                    ()=>null],
+                    ['OPEX ($)',    s=>f(s.q1_opex,1),                   ()=>null],
                     ['Rev−OPEX',     s=>f(s.rev_minus_opex||((fn(s.q1_rev)-fn(s.q1_opex))||0),1), s=>(fn(s.q1_rev)-fn(s.q1_opex))<0?T.red:T.green]],
     high_rev_util: [['Q1 Revenue',   s=>'K '+f(s.q1_rev,0),               ()=>null],
                     ['PRB Util %',   s=>f(s.prb_utilization||s.dl_prb_util,1)+'%', s=>fn(s.prb_utilization||s.dl_prb_util)>70?'#E91E8C':'#00BCD4'],
@@ -1798,7 +2483,7 @@ export default function NetworkAnalyticsDashboard() {
   const [core,       setCore]       = useState(null);
   const [transport,  setTransport]  = useState(null);
   const [kpiFilterData,setKpiFilterData] = useState(null);
-  const [opts,       setOpts]       = useState({clusters:[],technologies:[],regions:[],sites:[]});
+  const [opts,       setOpts]       = useState({clusters:[],technologies:[],vendors:[],regions:[],sites:[]});
   const [loading,    setLoading]    = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [lastUpd,    setLastUpd]    = useState(null);
@@ -1811,7 +2496,7 @@ export default function NetworkAnalyticsDashboard() {
 
   // Filters — applied globally to all pages
   // Filters — cluster/city support comma-separated multi-select (e.g. "CBD,Edge")
-  const [filters,    setFilters]    = useState({time_range:'7d',cluster:'',technology:'',region:'',country:'',state:'',city:''});
+  const [filters,    setFilters]    = useState({time_range:'7d',cluster:'',technology:'',vendor:'',region:'',country:'',state:'',city:''});
 
   const navigate = useNavigate();
 
@@ -1836,35 +2521,49 @@ export default function NetworkAnalyticsDashboard() {
     const base=process.env.REACT_APP_API_URL||'';
     const fr=fresh?'&fresh=1':'';
 
-    // ── Phase 1: overview + filters — fast, dismisses spinner ────────────────
-    try{
-      const [ov,fo]=await Promise.all([
-        fetchWithTimeout(`${base}/api/network/overview-stats?${q}${fr}`,12000),
-        fetchWithTimeout(`${base}/api/network/filters?${['country','state'].filter(k=>filters[k]).map(k=>`${k}=${encodeURIComponent(filters[k])}`).join('&')}`,8000),
-      ]);
-      if(ov)  setOverview(ov);
-      if(fo)  setOpts(fo);
-      setLastUpd(new Date());
-    }catch(_){}
+    // Helper: fetch a layer with retry-on-empty. On a cold cache the heavy
+    // aggregation queries can take 20-40s, so timeout is 60s. If the response
+    // is null OR an empty payload, retry once with fresh=1 to bypass any
+    // stale-empty entry the server cache may have stored.
+    const loadLayer = async (path, setter) => {
+      const url = `${base}${path}?${q}${fr}`;
+      let d = await fetchWithTimeout(url, 60000);
+      const isEmpty = !d || (typeof d === 'object' && !Array.isArray(d) && Object.keys(d).length === 0);
+      if (isEmpty) {
+        const retryUrl = `${base}${path}?${q}&fresh=1`;
+        d = await fetchWithTimeout(retryUrl, 60000);
+      }
+      if (d) { setter(d); setLastUpd(new Date()); }
+    };
+
+    // ── Phase 1: overview + filters — these feed the Overview page (the
+    // landing tab), so they must succeed reliably. Use the same retry-on-empty
+    // helper as Phase 2 instead of a single 15s try.
+    const filtersUrl = `${base}/api/network/filters?${['country','state'].filter(k=>filters[k]).map(k=>`${k}=${encodeURIComponent(filters[k])}`).join('&')}`;
+    await Promise.allSettled([
+      loadLayer('/api/network/overview-stats', setOverview),
+      fetchWithTimeout(filtersUrl, 15000).then(fo => { if (fo) setOpts(fo); }),
+    ]);
     setLoading(false);
     setRefreshing(false);
 
-    // ── Phase 2: map + layer data — background, non-blocking ─────────────────
+    // ── Phase 2: map + per-layer (RAN/Core/Transport) data — each layer is
+    // independent so a slow endpoint cannot block the rest; each renders as
+    // soon as it arrives.
     Promise.allSettled([
-      fetchWithTimeout(`${base}/api/network/map?${q}${fr}`,20000),
-      fetchWithTimeout(`${base}/api/network/ran-analytics?${q}${fr}`,20000),
-      fetchWithTimeout(`${base}/api/network/core-analytics?${q}${fr}`,20000),
-      fetchWithTimeout(`${base}/api/network/transport-analytics?${q}${fr}`,20000),
-    ]).then(([mp,rn,co,tr])=>{
-      if(mp.status==='fulfilled'&&mp.value) setMapData(mp.value);
-      if(rn.status==='fulfilled'&&rn.value) setRan(rn.value);
-      if(co.status==='fulfilled'&&co.value) setCore(co.value);
-      if(tr.status==='fulfilled'&&tr.value) setTransport(tr.value);
-      setLastUpd(new Date());
-    }).catch(()=>{});
+      loadLayer('/api/network/map',                 setMapData),
+      loadLayer('/api/network/ran-analytics',       setRan),
+      loadLayer('/api/network/core-analytics',      setCore),
+      loadLayer('/api/network/transport-analytics', setTransport),
+    ]);
   },[qs,fetchWithTimeout]);
 
-  useEffect(()=>{fetchAll(false,true);},[]);// eslint-disable-line 
+  // First mount: pass fresh=true so the backend always computes data (avoids
+  // the case where a previous failed/aborted request left an empty entry in
+  // the 5-minute server cache, which would make every subsequent fresh=false
+  // fetch return empty for 5 minutes). After this first compute, the cache
+  // is populated and filter changes / refreshes use it.
+  useEffect(()=>{fetchAll(false,true);},[]);// eslint-disable-line
   const mounted=useRef(false);
   // Keep refs so filter-change effect can see current page/selKpi without stale closure
   const pageRef=useRef('overview');
@@ -1935,6 +2634,7 @@ export default function NetworkAnalyticsDashboard() {
             </select>
             <MultiSel T={T} label="All Zone" options={opts.clusters||[]} value={filters.cluster} onChange={v=>setFilters(p=>({...p,cluster:v}))}/>
             <MultiSel T={T} label="All Tech" options={opts.technologies||[]} value={filters.technology} onChange={v=>setFilters(p=>({...p,technology:v}))}/>
+            <MultiSel T={T} label="All Vendor" options={opts.vendors||[]} value={filters.vendor} onChange={v=>setFilters(p=>({...p,vendor:v}))}/>
             <select value={filters.country} onChange={e=>setFilters(p=>({...p,country:e.target.value,state:'',city:''}))} style={sel(T)}>
               <option value="">All Country</option>
               {(opts.countries||[]).map(v=><option key={v} value={v}>{v}</option>)}
@@ -1949,7 +2649,7 @@ export default function NetworkAnalyticsDashboard() {
               {dark?'Light':'Dark'}
             </button>
             <button onClick={()=>navigate('/agent/network-ai')} style={{padding:'5px 11px',borderRadius:18,fontSize:11,fontWeight:700,background:`linear-gradient(135deg,${T.kpmgBlue},${T.blue3})`,border:'none',color:'#fff',cursor:'pointer'}}>AI Chat</button>
-            <button onClick={()=>fetchAll()} style={{padding:'5px 9px',borderRadius:6,fontSize:10.5,fontWeight:600,background:T.kpmgBlue,color:'#fff',border:'none',cursor:'pointer'}}>{refreshing?'':'↻'}</button>
+            <button onClick={()=>fetchAll(false,true)} style={{padding:'5px 9px',borderRadius:6,fontSize:10.5,fontWeight:600,background:T.kpmgBlue,color:'#fff',border:'none',cursor:'pointer'}} title="Refresh (bypass cache)">{refreshing?'':'↻'}</button>
           </div>
         </div>
 
@@ -1967,6 +2667,12 @@ export default function NetworkAnalyticsDashboard() {
               <span style={{display:'inline-flex',alignItems:'center',gap:4,padding:'2px 8px',borderRadius:12,fontSize:9.5,fontWeight:700,background:`${T.teal}18`,color:T.teal,border:`1px solid ${T.teal}33`}}>
                  {filters.technology}
                 <button onClick={()=>setFilters(p=>({...p,technology:''}))} style={{background:'none',border:'none',color:T.teal,cursor:'pointer',padding:0,fontSize:10,lineHeight:1}}>×</button>
+              </span>
+            )}
+            {filters.vendor&&(
+              <span style={{display:'inline-flex',alignItems:'center',gap:4,padding:'2px 8px',borderRadius:12,fontSize:9.5,fontWeight:700,background:'#0369A118',color:'#0369A1',border:'1px solid #0369A133'}}>
+                 {filters.vendor}
+                <button onClick={()=>setFilters(p=>({...p,vendor:''}))} style={{background:'none',border:'none',color:'#0369A1',cursor:'pointer',padding:0,fontSize:10,lineHeight:1}}>×</button>
               </span>
             )}
             {filters.region&&(
@@ -1993,7 +2699,7 @@ export default function NetworkAnalyticsDashboard() {
                 <button onClick={()=>setFilters(p=>({...p,city:''}))} style={{background:'none',border:'none',color:'#6B21A8',cursor:'pointer',padding:0,fontSize:10,lineHeight:1}}>×</button>
               </span>
             )}
-            <button onClick={()=>setFilters({time_range:filters.time_range,cluster:'',technology:'',region:'',country:'',state:'',city:''})}
+            <button onClick={()=>setFilters({time_range:filters.time_range,cluster:'',technology:'',vendor:'',region:'',country:'',state:'',city:''})}
               style={{fontSize:9,color:T.red,background:'none',border:`1px solid ${T.red}44`,borderRadius:10,cursor:'pointer',padding:'1px 7px',fontWeight:600}}>
               Clear all
             </button>
@@ -2087,7 +2793,7 @@ export default function NetworkAnalyticsDashboard() {
         {page==='ran' ? (
           <RANPage T={T} data={ran} mapSites={mapData?.sites||[]} filters={filters} opts={opts}/>
         ) : page==='core' ? (
-          <CorePage T={T} data={core} filters={filters}/>
+          <CorePage T={T} data={core}/>
         ) : page==='transport' ? (
           <TransportPage T={T} data={transport} filters={filters}/>
         ) : page==='kpi' ? (

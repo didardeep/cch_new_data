@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import {
   AreaChart, Area, BarChart, Bar, PieChart, Pie, Cell, Legend,
   XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
@@ -6,7 +6,9 @@ import {
   RadialBarChart, RadialBar, ComposedChart, Line,
   FunnelChart, Funnel, LabelList, Treemap,
 } from 'recharts';
-import { ComposableMap, Geographies, Geography, ZoomableGroup, Marker } from 'react-simple-maps';
+import { CircleMarker, MapContainer, Popup, TileLayer, Tooltip as LeafletTooltip, useMap } from 'react-leaflet';
+import L from 'leaflet';
+import 'leaflet/dist/leaflet.css';
 import { apiGet } from '../../api';
 import { useAuth } from '../../AuthContext';
 import { useTheme } from '../../ThemeContext';
@@ -270,112 +272,133 @@ function Heatmap({ data, T }) {
   );
 }
 
-/* ── Dynamic Zone Map (any country) ───────────────────────────────────── */
-// GeoJSON sources per country — add more as needed
-// Local GeoJSON files (no external network dependency)
-const GEO_SOURCES = {
-  'India': '/india_states.geojson',
-};
-const GEO_NAME_KEYS = { 'India': 'ST_NM' };
-const GEO_PROJECTIONS = {
-  'India': { center: [82, 24], scale: 700 },
-};
-const WORLD_GEO = '/countries-110m.json';
-
+/* ── Zone Performance Map (Leaflet CircleMarkers — auto-detects country) ── */
 function WorldZoneMap({ zones, states, T, country }) {
-  const [hovered, setHovered] = useState(null);
   const stateList = states || [];
-  const maxTotal = Math.max(...stateList.map(s => s.total), 1);
-  const stateMap = {};
-  stateList.forEach(s => { stateMap[s.state] = s; });
-  const palette = [K.navy, K.royal, K.sky, K.indigo, K.violet, '#0891B2', '#16A34A', '#F59E0B'];
+  const isDark = T === TD;
 
-  // Dynamic GeoJSON + projection based on detected country
-  const detectedCountry = country || 'India';
-  const geoUrl = GEO_SOURCES[detectedCountry] || WORLD_GEO;
-  const projConfig = GEO_PROJECTIONS[detectedCountry] || { center: [0, 20], scale: 120 };
-  const nameKey = GEO_NAME_KEYS[detectedCountry] || 'name';
+  const maxTickets = useMemo(
+    () => Math.max(1, ...stateList.map(s => s.total || 0)),
+    [stateList]
+  );
 
-  // Fuzzy match: geo property name → state_data name
-  const matchState = (geoName) => {
-    if (stateMap[geoName]) return geoName;
-    // Case-insensitive match
-    const lower = geoName.toLowerCase();
-    for (const s of stateList) {
-      if (s.state.toLowerCase() === lower) return s.state;
-      if (lower.includes(s.state.toLowerCase()) || s.state.toLowerCase().includes(lower)) return s.state;
-    }
+  // Only states with valid lat/lng
+  const validStates = useMemo(
+    () => stateList.filter(s => s.lat && s.lng && s.total > 0),
+    [stateList]
+  );
+
+  // Colour helper: green → amber → red by ticket density
+  const bubbleColor = useCallback((count) => {
+    const ratio = Math.min(1, count / maxTickets);
+    if (ratio < 0.33) return '#10b981';
+    if (ratio < 0.66) return '#f59e0b';
+    return '#ef4444';
+  }, [maxTickets]);
+
+  // Compute map center from state centroids
+  const center = useMemo(() => {
+    if (!validStates.length) return [12.5, 105]; // Cambodia default
+    const avgLat = validStates.reduce((s, st) => s + st.lat, 0) / validStates.length;
+    const avgLng = validStates.reduce((s, st) => s + st.lng, 0) / validStates.length;
+    return [avgLat, avgLng];
+  }, [validStates]);
+
+  // FitBounds component
+  function FitCircles({ pts }) {
+    const map = useMap();
+    useEffect(() => {
+      if (!pts.length || !map) return;
+      try {
+        const bounds = L.latLngBounds(pts.map(p => [p.lat, p.lng]));
+        if (bounds.isValid()) map.fitBounds(bounds, { padding: [20, 20], maxZoom: 8 });
+      } catch (_) {}
+    }, [pts, map]);
     return null;
-  };
+  }
+
+  const mapBg = isDark ? '#0B1929' : '#F0F4F8';
 
   return (
     <div>
-      <ComposableMap
-        projection="geoMercator"
-        projectionConfig={projConfig}
-        style={{ width: '100%', height: 260 }}
-      >
-        <Geographies geography={geoUrl}>
-          {({ geographies }) =>
-            geographies.map(geo => {
-              const geoName = geo.properties[nameKey] || geo.properties.NAME_1 || geo.properties.name || '';
-              const matched = matchState(geoName);
-              const sd = matched ? stateMap[matched] : null;
-              const stateIdx = sd ? stateList.findIndex(s=>s.state===matched) : -1;
-              const stateColor = stateIdx >= 0 ? palette[stateIdx % palette.length] : null;
-              const intensity = sd ? sd.total / maxTotal : 0;
-              const isHov = hovered === matched;
-              return (
-                <Geography
-                  key={geo.rsmKey}
-                  geography={geo}
-                  fill={sd ? stateColor + (isHov ? 'EE' : 'BB') : (T === TD ? '#1C2E48' : '#E8ECF0')}
-                  stroke={T === TD ? '#253550' : '#CBD5E1'}
-                  strokeWidth={0.5}
-                  onMouseEnter={() => sd && setHovered(matched)}
-                  onMouseLeave={() => setHovered(null)}
-                  style={{
-                    default: { outline: 'none' },
-                    hover: { outline: 'none', cursor: sd ? 'pointer' : 'default' },
-                    pressed: { outline: 'none' },
-                  }}
-                />
-              );
-            })
-          }
-        </Geographies>
-      </ComposableMap>
+      <div style={{ height: 240, borderRadius: 8, overflow: 'hidden', background: mapBg }}>
+        <MapContainer
+          center={center} zoom={6}
+          style={{ height: '100%', width: '100%', background: mapBg }}
+          scrollWheelZoom={false} zoomControl attributionControl={false}
+        >
+          <TileLayer
+            url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png"
+            opacity={isDark ? 0.3 : 0.6}
+          />
+          <FitCircles pts={validStates} />
 
-      {/* Tooltip — always rendered, fixed height to prevent layout shift */}
-      <div style={{textAlign:'center',padding:'4px 0',height:20,marginTop:-4}}>
-        {hovered && stateMap[hovered] && (()=>{
-          const sd = stateMap[hovered];
-          const idx = stateList.findIndex(s=>s.state===hovered);
-          const c = palette[Math.max(idx,0) % palette.length];
-          return <>
-            <span style={{fontSize:10,fontWeight:700,color:c,marginRight:6}}>{hovered}</span>
-            <span style={{fontSize:9,color:T.textSub}}>
-              {sd.total} tickets · {sd.resolved} resolved · <strong>{sd.rate}%</strong>
-            </span>
-          </>;
-        })()}
+          {validStates.map(s => {
+            const color = bubbleColor(s.total);
+            const radius = Math.max(12, Math.min(35, 12 + (s.total / maxTickets) * 25));
+            return (
+              <CircleMarker
+                key={s.state}
+                center={[s.lat, s.lng]}
+                radius={radius}
+                pathOptions={{
+                  fillColor: color, fillOpacity: 0.6,
+                  color: color, weight: 2, opacity: 0.9,
+                }}
+              >
+                <LeafletTooltip direction="top" offset={[0, -radius]} sticky>
+                  <div style={{ minWidth: 130, fontFamily: 'sans-serif' }}>
+                    <div style={{ fontWeight: 800, fontSize: 12, color: '#1e293b', marginBottom: 4, borderBottom: '1px solid #e2e8f0', paddingBottom: 3 }}>{s.state}</div>
+                    <div style={{ fontSize: 11, marginBottom: 2 }}>Tickets: <strong style={{ color: '#dc2626' }}>{s.total}</strong></div>
+                    <div style={{ fontSize: 11, marginBottom: 2 }}>Resolved: <strong style={{ color: '#10b981' }}>{s.resolved}</strong></div>
+                    <div style={{ fontSize: 11 }}>Rate: <strong>{s.rate}%</strong></div>
+                  </div>
+                </LeafletTooltip>
+                <Popup>
+                  <div style={{ minWidth: 150 }}>
+                    <div style={{ fontWeight: 800, fontSize: 13, color: '#002266', marginBottom: 6 }}>{s.state}</div>
+                    <div style={{ fontSize: 12, marginBottom: 3 }}>Total Tickets: <strong>{s.total}</strong></div>
+                    <div style={{ fontSize: 12, marginBottom: 3, color: '#10b981' }}>Resolved: <strong>{s.resolved}</strong></div>
+                    <div style={{ fontSize: 12 }}>Resolution Rate: <strong>{s.rate}%</strong></div>
+                  </div>
+                </Popup>
+              </CircleMarker>
+            );
+          })}
+        </MapContainer>
       </div>
 
-      {/* State legend grid */}
-      <div style={{display:'grid',gridTemplateColumns:'repeat(3,1fr)',gap:4,marginTop:6}}>
-        {stateList.map((s,i) => {
-          const c = palette[i % palette.length];
+      {/* Legend */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 6, paddingLeft: 4 }}>
+        {[{ color: '#10b981', label: 'Low' }, { color: '#f59e0b', label: 'Med' }, { color: '#ef4444', label: 'High' }].map(({ color, label }) => (
+          <div key={label} style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+            <div style={{ width: 8, height: 8, borderRadius: '50%', background: color, opacity: 0.8 }} />
+            <span style={{ fontSize: 8, color: T.muted, fontWeight: 600 }}>{label}</span>
+          </div>
+        ))}
+        <span style={{ fontSize: 8, color: T.muted, marginLeft: 'auto' }}>Max: {maxTickets} tickets</span>
+      </div>
+
+      {/* State chips */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 4, marginTop: 6 }}>
+        {stateList.slice().sort((a, b) => (b.total || 0) - (a.total || 0)).map((s) => {
+          const fill = s.total > 0 ? bubbleColor(s.total) : (isDark ? '#1C2E48' : '#E2E8F0');
           return (
-            <div key={s.state} style={{display:'flex',alignItems:'center',gap:4,padding:'3px 6px',borderRadius:5,
-              background:hovered===s.state ? c+'18' : T.surface2,border:`1px solid ${hovered===s.state ? c+'40' : T.border}`,
-              cursor:'pointer',transition:'all .2s ease'}}
-              onMouseEnter={()=>setHovered(s.state)} onMouseLeave={()=>setHovered(null)}>
-              <div style={{width:8,height:8,borderRadius:2,background:c,flexShrink:0}}/>
-              <div style={{flex:1,minWidth:0}}>
-                <div style={{fontSize:7.5,fontWeight:700,color:T.textSub,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{s.state}</div>
+            <div key={s.state}
+              style={{
+                display: 'flex', alignItems: 'center', gap: 4, padding: '3px 6px', borderRadius: 5,
+                background: T.surface2, border: `1px solid ${T.border}`,
+                cursor: 'default', transition: 'all .15s ease',
+              }}>
+              <div style={{ width: 8, height: 8, borderRadius: 2, background: fill, flexShrink: 0,
+                boxShadow: s.total > 0 ? `0 0 4px ${fill}80` : 'none' }} />
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 7.5, fontWeight: 700, color: T.textSub,
+                  whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{s.state}</div>
               </div>
-              <span style={{fontSize:8,fontWeight:800,color:c,fontFamily:"'IBM Plex Mono',monospace"}}>{s.total}</span>
-              <span style={{fontSize:7,color:T.muted,fontWeight:600}}>{s.rate}%</span>
+              <span style={{ fontSize: 8, fontWeight: 800, color: fill,
+                fontFamily: "'IBM Plex Mono',monospace" }}>{s.total || 0}</span>
+              {s.rate != null && <span style={{ fontSize: 7, color: T.muted, fontWeight: 600 }}>{s.rate}%</span>}
             </div>
           );
         })}
@@ -383,6 +406,8 @@ function WorldZoneMap({ zones, states, T, country }) {
     </div>
   );
 }
+
+
 
 /* ── Treemap Custom Content ──────────────────────────────────────────────── */
 function TreemapContent({ x, y, width, height, name, size, rate, depth, index }) {

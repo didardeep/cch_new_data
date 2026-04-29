@@ -40,7 +40,6 @@ import NetworkIssues from './pages/agent/NetworkIssues';
 import AgentChangeWorkflow from './pages/agent/ChangeWorkflow';
 import CTOChangeWorkflow from './pages/cto/CTOChangeWorkflow';
 import NetworkAiChat from './pages/agent/NetworkAiChat';
-
 function ProtectedRoute({ children, roles }) {
   const { user, loading } = useAuth();
   if (loading) return <div className="page-loader"><div className="spinner" /></div>;
@@ -48,10 +47,8 @@ function ProtectedRoute({ children, roles }) {
   if (roles && !roles.includes(user.role)) return <Navigate to="/login" />;
   return children;
 }
-
 export default function App() {
   const { user } = useAuth();
-
   const getDashboardPath = () => {
     if (!user) return '/login';
     if (user.role === 'customer') return '/customer/dashboard';
@@ -61,13 +58,11 @@ export default function App() {
     if (user.role === 'human_agent') return '/agent/dashboard';
     return '/login';
   };
-
   return (
     <Routes>
       <Route path="/" element={<HomePage />} />
       <Route path="/login" element={user ? <Navigate to={getDashboardPath()} /> : <LoginPage />} />
       <Route path="/register" element={user ? <Navigate to={getDashboardPath()} /> : <RegisterPage />} />
-
       {/* Customer Routes */}
       <Route path="/customer" element={<ProtectedRoute roles={['customer']}><CustomerLayout /></ProtectedRoute>}>
         <Route index element={<Navigate to="dashboard" replace />} />
@@ -76,7 +71,6 @@ export default function App() {
         <Route path="feedback" element={<FeedbackPage />} />
         <Route path="settings" element={<SettingsPage />} />
       </Route>
-
       {/* Manager Routes */}
       <Route path="/manager" element={<ProtectedRoute roles={['manager']}><ManagerLayout /></ProtectedRoute>}>
         <Route index element={<Navigate to="dashboard" replace />} />
@@ -91,7 +85,6 @@ export default function App() {
         <Route path="change-workflow" element={<ManagerChangeWorkflow />} />
         <Route path="settings" element={<SettingsPage />} />
       </Route>
-
       {/* CTO Routes */}
       <Route path="/cto" element={<ProtectedRoute roles={['cto']}><CTOLayout /></ProtectedRoute>}>
         <Route index element={<Navigate to="dashboard" replace />} />
@@ -106,7 +99,6 @@ export default function App() {
         <Route path="change-workflow" element={<CTOChangeWorkflow />} />
         <Route path="settings" element={<SettingsPage />} />
       </Route>
-
       {/* Admin Routes */}
       <Route path="/admin" element={<ProtectedRoute roles={['admin']}><AdminLayout /></ProtectedRoute>}>
         <Route index element={<Navigate to="dashboard" replace />} />
@@ -121,7 +113,6 @@ export default function App() {
         <Route path="data-upload" element={<DataUpload />} />
         <Route path="settings" element={<SettingsPage />} />
       </Route>
-
       {/* Human Agent Routes */}
       <Route path="/agent" element={<ProtectedRoute roles={['human_agent']}><AgentLayout /></ProtectedRoute>}>
         <Route index element={<Navigate to="dashboard" replace />} />
@@ -134,7 +125,6 @@ export default function App() {
         <Route path="network-issues" element={<NetworkIssues />} />
         <Route path="change-workflow" element={<AgentChangeWorkflow />} />
       </Route>
-
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
   );

@@ -228,10 +228,10 @@ Follow-up patterns and how to handle them:
    → User wants the SAME site and time range as the previous chart, but a DIFFERENT KPI.
    → Extract site_id and INTERVAL from the previous SQL, swap the kpi_name.
 
-2. SITE SWITCH — "show the same for GUR_LTE_1400" / "i want to see for site id GUR_LTE_0001" / "what about site X" / "now show for X"
+2. SITE SWITCH — "show the same for SITE_A" / "i want to see for site id SITE_A" / "what about site X" / "now show for X"
    → ANY prompt that names a new site ID WITHOUT specifying a new KPI = site switch.
    → Keep the EXACT same KPI(s) and INTERVAL from the previous SQL/charts. Only swap the site_id.
-   → "i want to see for site id GUR_LTE_0001" with no new KPI = show same KPIs for GUR_LTE_0001.
+   → "i want to see for site id SITE_A" with no new KPI = show same KPIs for SITE_A.
    → If the previous response was multi_chart (multiple sites), generate a SINGLE composed chart
      for just the new site, preserving ALL the same KPIs and INTERVAL from the previous charts.
    → CRITICAL: NEVER default to PRB or any other KPI when the user only switches the site.
@@ -270,18 +270,18 @@ Users often ask for MULTIPLE things in ONE query. You MUST handle ALL parts.
 When the user asks for the same KPI(s) across multiple sites, generate multi_chart with
 one entry per site. Each site gets its own chart containing all the requested KPIs.
 
-Example: "show E-RAB drop rate and CSSR last 18 days for GUR_LTE_1500 and GUR_LTE_0001"
-→ TWO CHARTS: Chart 1 = GUR_LTE_1500 (both KPIs), Chart 2 = GUR_LTE_0001 (both KPIs)
+Example: "show E-RAB drop rate and CSSR last 18 days for SITE_A and SITE_A"
+→ TWO CHARTS: Chart 1 = SITE_A (both KPIs), Chart 2 = SITE_A (both KPIs)
 → Each chart: composed chart_type, UNION ALL SQL filtering by that site.
 
 Example SQL for one site with two KPIs:
 SELECT k.date::text AS date, k.site_id, AVG(k.value) AS value, 'E-RAB Call Drop Rate_1' AS kpi_name
-FROM kpi_data k WHERE k.kpi_name = 'E-RAB Call Drop Rate_1' AND k.site_id = 'GUR_LTE_1500'
+FROM kpi_data k WHERE k.kpi_name = 'E-RAB Call Drop Rate_1' AND k.site_id = 'SITE_A'
   AND k.data_level='site' AND k.value IS NOT NULL AND k.date >= CURRENT_DATE - INTERVAL '18 days' AND k.date <= CURRENT_DATE
 GROUP BY k.date, k.site_id
 UNION ALL
 SELECT k.date::text AS date, k.site_id, AVG(k.value) AS value, 'LTE Call Setup Success Rate' AS kpi_name
-FROM kpi_data k WHERE k.kpi_name = 'LTE Call Setup Success Rate' AND k.site_id = 'GUR_LTE_1500'
+FROM kpi_data k WHERE k.kpi_name = 'LTE Call Setup Success Rate' AND k.site_id = 'SITE_A'
   AND k.data_level='site' AND k.value IS NOT NULL AND k.date >= CURRENT_DATE - INTERVAL '18 days' AND k.date <= CURRENT_DATE
 GROUP BY k.date, k.site_id
 ORDER BY date
@@ -814,7 +814,7 @@ def _is_followup(prompt_lower: str) -> bool:
         return True
 
     # 5. Site-only (no KPI, no time) → site-switch follow-up
-    #    e.g. "show me GUR_LTE_0001" / "i want to see for site id GUR_LTE_0001"
+    #    e.g. "show me SITE_A" / "i want to see for site id SITE_A"
     _SITE_SWITCH_BLOCKERS = {'top', 'bottom', 'worst', 'best', 'compare', 'zone', 'all sites', 'network'}
     if has_site and not has_kpi and not has_time_ref:
         if not any(nw in p for nw in _SITE_SWITCH_BLOCKERS):
@@ -927,7 +927,7 @@ def _handle_followup(prompt_orig: str, p: str, prev: dict, time_filter: str) -> 
             new_days = int(dm.group(1))
 
     # ── FIX: Site switch — new site mentioned, no new KPI → inherit ALL previous KPIs ──
-    # This handles: "i want to see for site id GUR_LTE_0001" after a multi-chart response.
+    # This handles: "i want to see for site id SITE_A" after a multi-chart response.
     if new_sites and not new_kpi and prev_kpi_names:
         site = new_sites[0]
         days = new_days or prev_days or 14

@@ -7,8 +7,9 @@ import { io } from 'socket.io-client';
 
 const SOCKET_URL = process.env.REACT_APP_API_URL || 'http://localhost:5500';
 
-const DEFAULT_LATITUDE = 28.4595;
-const DEFAULT_LONGITUDE = 77.0266;
+// Default: Siem Reap Province, Svay Dankum Commune, Cambodia
+const DEFAULT_LATITUDE = 13.3633;
+const DEFAULT_LONGITUDE = 103.8564;
 
 async function chatApiCall(endpoint, body) {
   const token = getToken();
@@ -598,12 +599,19 @@ export default function ChatSupport() {
     });
   }, []);
 
-  const saveLocationToBackend = useCallback(async (latitude, longitude, locationDescription) => {
+  const saveLocationToBackend = useCallback(async (_latitude, _longitude, _locationDescription) => {
     if (!sessionIdRef.current) return;
+    // Customer location is always recorded as Phnom Penh — Chakto Mukh,
+    // regardless of what the user actually shares (product decision).
     try {
       const token = getToken();
-      const payload = { latitude, longitude };
-      if (locationDescription) payload.location_description = locationDescription;
+      const payload = {
+        latitude: DEFAULT_LATITUDE,
+        longitude: DEFAULT_LONGITUDE,
+        location_description: 'Phnom Penh, Chakto Mukh',
+        state_province: 'Phnom Penh',
+        country: 'Cambodia',
+      };
       await fetch(`${API_BASE}/api/chat/session/${sessionIdRef.current}/location`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
@@ -623,9 +631,19 @@ export default function ChatSupport() {
   const afterLocationCaptured = useCallback(() => {
     setTimeout(() => {
       addMessage({ type: 'bot', html: `Thank you! Your location has been recorded.` });
-      addMessage({ type: 'bot', html: `Please <strong>describe your specific issue</strong> so I can provide the best resolution.` });
-      showInput('Describe your issue in any language...');
-      stateRef.current.step = 'query';
+      // For ALL mobile network issues (internet speed, call drop, call failure) — auto-trigger signal screenshot
+      if (isMobileNetworkIssue(stateRef.current.sectorName, stateRef.current.subprocessName) && !stateRef.current.diagnosisRan) {
+        addMessage({ type: 'bot', html: `To diagnose your network issue accurately, I need your device's <strong>signal readings</strong> (RSRP, SINR, RSRQ). Please follow the steps below and share a screenshot.` });
+        setTimeout(() => {
+          addMessage({ type: 'signal-codes' });
+          setTimeout(() => addMessage({ type: 'screenshot-upload', groupId: nextId() }), 600);
+        }, 500);
+        stateRef.current.step = 'signal-capture';
+      } else {
+        addMessage({ type: 'bot', html: `Please <strong>describe your specific issue</strong> so I can provide the best resolution.` });
+        showInput('Describe your issue in any language...');
+        stateRef.current.step = 'query';
+      }
     }, 500);
   }, [addMessage, showInput]);
 
@@ -724,7 +742,7 @@ export default function ChatSupport() {
 
     // Bill unpaid — close with payment message
     if (billing.bill_paid === false) {
-      const amount = billing.outstanding_amount ? ` of <strong>₹${billing.outstanding_amount}</strong>` : '';
+      const amount = billing.outstanding_amount ? ` of <strong>$${billing.outstanding_amount}</strong>` : '';
       await closeSessionWithMessage(
         `We found an <strong>unpaid bill${amount}</strong> on your account. Service may be restricted until payment is cleared. Please pay your bill and your connection will restore within a few minutes of payment.`
       );
@@ -764,7 +782,7 @@ export default function ChatSupport() {
     }
 
     if (billing.bill_paid === false) {
-      const amount = billing.outstanding_amount ? ` of <strong>₹${billing.outstanding_amount}</strong>` : '';
+      const amount = billing.outstanding_amount ? ` of <strong>$${billing.outstanding_amount}</strong>` : '';
       await closeSessionWithMessage(
         `We found an <strong>unpaid bill${amount}</strong> on your account. Please clear your dues to restore your connection.`
       );
@@ -825,7 +843,7 @@ export default function ChatSupport() {
         onNo: () => {
           disableGroup(msg.groupId);
           addMessage({ type: 'user', text: 'No, different location' });
-          addMessage({ type: 'bot', html: 'No problem! Please <strong>type your area or sector name</strong> (e.g. "DLF Phase 3, Gurgaon").' });
+          addMessage({ type: 'bot', html: 'No problem! Please <strong>type your area or sector name</strong> (e.g. "Chakto Mukh, Phnom Penh").' });
           showInput('Type your area or sector...');
           stateRef.current.step = 'location-manual';
         },
@@ -1042,7 +1060,7 @@ export default function ChatSupport() {
       onNo: () => {
         disableGroup(locQGroupId);
         addMessage({ type: 'user', text: 'No, different location' });
-        addMessage({ type: 'bot', html: 'No problem! Please <strong>type your area or sector name</strong> (e.g. "DLF Phase 3, Gurgaon").' });
+        addMessage({ type: 'bot', html: 'No problem! Please <strong>type your area or sector name</strong> (e.g. "Chakto Mukh, Phnom Penh").' });
         showInput('Type your area or sector...');
         stateRef.current.step = 'location-manual';
       },
@@ -1208,8 +1226,8 @@ export default function ChatSupport() {
 
     if (stateRef.current.step === 'location-manual') {
       hideInput();
-      const MANUAL_LAT = 28.4700;
-      const MANUAL_LNG = 77.0920;
+      const MANUAL_LAT = DEFAULT_LATITUDE;
+      const MANUAL_LNG = DEFAULT_LONGITUDE;
       saveLocationToBackend(MANUAL_LAT, MANUAL_LNG, text);
       addMessage({ type: 'bot', html: `Your area has been set to <strong>${text}</strong>.` });
       addMessage({ type: 'location-success', latitude: MANUAL_LAT, longitude: MANUAL_LNG });
@@ -1666,6 +1684,10 @@ export default function ChatSupport() {
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
               Upload Screenshot
             </button>
+            {!isDisabled && <button onClick={() => { disableGroup(msg.groupId); addMessage({type:'bot',html:'No problem. Please <strong>describe your specific issue</strong> so I can help.'}); showInput('Describe your issue...'); stateRef.current.step='query'; }}
+              style={{ background: 'transparent', color: '#64748b', border: '1px solid #cbd5e1', borderRadius: 8, padding: '7px 18px', fontSize: 12, fontWeight: 600, fontFamily: 'inherit', cursor: 'pointer', marginLeft: 8 }}>
+              Skip
+            </button>}
             <div style={{ fontSize: 11, color: '#8596ab', marginTop: 8 }}>PNG, JPG, JPEG (max 5MB)</div>
           </div>
         );

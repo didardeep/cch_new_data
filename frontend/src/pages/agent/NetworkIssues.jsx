@@ -78,21 +78,49 @@ function Modal({ title, onClose, children }) {
 /* ── RCA Points Renderer ─────────────────────────────────────────────────────── */
 function RcaPoints({ text }) {
   if (!text) return <div style={{color:'#94a3b8',fontSize:12,padding:16}}>Click "Run Analysis" to generate</div>;
-  const lines = text.split('\n').filter(l => l.trim());
+
+  // Clean all markdown symbols
+  const clean = text.replace(/\*{1,3}/g, '').replace(/#{1,4}\s*/g, '').replace(/^[•●◦▪]\s*/gm, '').replace(/^[\-─━═]{3,}$/gm, '').trim();
+
+  // Split into numbered points: "1. ...", "2. ...", etc. Works even if they're in one big paragraph
+  const parts = clean.split(/(?=(?:^|\n)\s*\d+[\.\)]\s)/);
+  const points = [];
+  for (const part of parts) {
+    const trimmed = part.trim();
+    if (!trimmed || trimmed.length < 10) continue;
+    // Remove the leading number
+    const content = trimmed.replace(/^\d+[\.\)]\s*/, '').trim();
+    if (content.length < 10) continue;
+
+    // Try to extract a short title before first period or colon
+    let title = null, body = content;
+    const colonMatch = content.match(/^([^:.]{5,60})[.:]\s*(.+)/s);
+    if (colonMatch) {
+      title = colonMatch[1].trim();
+      body = colonMatch[2].trim();
+    }
+    points.push({ title, body });
+  }
+
+  // Fallback: if no numbered points found, split by newlines
+  if (points.length === 0) {
+    clean.split('\n').filter(l => l.trim().length > 15).forEach(line => {
+      const l = line.replace(/^\d+[\.\)]\s*/, '').trim();
+      const cm = l.match(/^([^:.]{5,60})[.:]\s*(.+)/s);
+      points.push({ title: cm ? cm[1].trim() : null, body: cm ? cm[2].trim() : l });
+    });
+  }
+
   return (
-    <div style={{display:'flex',flexDirection:'column',gap:8}}>
-      {lines.map((line, i) => {
-        const cleaned = line.replace(/^\d+[\.\)]\s*/, '');
-        const bm = cleaned.match(/^\*\*(.+?)\*\*[:\s]*(.*)/);
-        return (
-          <div key={i} style={{display:'flex',gap:10,padding:'10px 14px',background:'#f8fafc',borderLeft:'3px solid #00338D',borderRadius:6,border:'1px solid #e2e8f0'}}>
-            <span style={{width:24,height:24,borderRadius:'50%',background:'#00338D',color:'#fff',display:'flex',alignItems:'center',justifyContent:'center',fontSize:11,fontWeight:800,flexShrink:0}}>{i+1}</span>
-            <div style={{fontSize:12,lineHeight:1.6,color:'#334155'}}>
-              {bm ? <><b style={{color:'#0f172a'}}>{bm[1]}:</b> {bm[2]}</> : cleaned}
-            </div>
+    <div style={{display:'flex',flexDirection:'column',gap:10}}>
+      {points.map((pt, i) => (
+        <div key={i} style={{display:'flex',gap:12,padding:'14px 16px',background:'#f8fafc',borderLeft:'3px solid #00338D',borderRadius:6,border:'1px solid #e2e8f0'}}>
+          <span style={{width:26,height:26,borderRadius:'50%',background:'#00338D',color:'#fff',display:'flex',alignItems:'center',justifyContent:'center',fontSize:11,fontWeight:800,flexShrink:0,marginTop:2}}>{i+1}</span>
+          <div style={{fontSize:12.5,lineHeight:1.75,color:'#334155'}}>
+            {pt.title ? <><b style={{color:'#0f172a'}}>{pt.title}:</b> {pt.body}</> : pt.body}
           </div>
-        );
-      })}
+        </div>
+      ))}
     </div>
   );
 }
@@ -159,36 +187,150 @@ function TrendChart({ kpiName, data, color = '#00338D' }) {
   );
 }
 
+/* ── Multi-Site Overlay Trend Chart (target + neighbors) ─────────────────────── */
+function MultiTrendChart({ kpiName, series }) {
+  // series: [{ site_id, label, color, data: [{label, avg}, ...], isTarget }]
+  const [RC, setRC] = useState(null);
+  useEffect(() => { import('recharts').then(m => setRC(m)); }, []);
+  if (!RC) return <div style={{background:'#f8fafc',border:'1px solid #e2e8f0',borderRadius:8,padding:12,height:210}}><div style={{fontSize:11,fontWeight:700,color:'#475569',marginBottom:6}}>{kpiName}</div><div style={{fontSize:11,color:'#94a3b8'}}>Loading...</div></div>;
+  const { ResponsiveContainer, LineChart, Line, XAxis, YAxis, Tooltip, CartesianGrid, Legend } = RC;
+
+  // Merge all data points by label
+  const labelSet = new Set();
+  series.forEach(s => (s.data||[]).forEach(d => labelSet.add(d.label)));
+  const labels = [...labelSet].sort();
+  const merged = labels.map(l => {
+    const row = { label: l };
+    series.forEach(s => {
+      const hit = (s.data||[]).find(d => d.label === l);
+      row[s.site_id] = hit ? hit.avg : null;
+    });
+    return row;
+  });
+  const hasData = series.some(s => (s.data||[]).length > 0);
+  if (!hasData) return <div style={{background:'#f8fafc',border:'1px solid #e2e8f0',borderRadius:8,padding:12,height:210}}><div style={{fontSize:11,fontWeight:700,color:'#475569',marginBottom:6}}>{kpiName}</div><div style={{fontSize:11,color:'#94a3b8'}}>No data</div></div>;
+
+  return (
+    <div style={{background:'#fff',border:'1px solid #e2e8f0',borderRadius:10,padding:'10px 12px',height:230,boxShadow:'0 1px 3px rgba(0,0,0,.04)'}}>
+      <div style={{fontSize:11,fontWeight:700,color:'#1e293b',marginBottom:4}}>{kpiName}</div>
+      <ResponsiveContainer width="100%" height={195}>
+        <LineChart data={merged} margin={{top:5,right:5,bottom:20,left:-5}}>
+          <CartesianGrid strokeDasharray="3 3" stroke="#f1f5f9" vertical={false}/>
+          <XAxis dataKey="label" tick={{fontSize:7,fill:'#94a3b8'}} axisLine={false} tickLine={false} interval="preserveStartEnd" tickFormatter={v=>v?.length>10?v.slice(5,10):v}/>
+          <YAxis tick={{fontSize:8,fill:'#94a3b8'}} axisLine={false} tickLine={false} width={36}/>
+          <Tooltip contentStyle={{fontSize:10,borderRadius:8}}/>
+          <Legend wrapperStyle={{fontSize:9,bottom:-5}} iconSize={8}/>
+          {series.map(s => (
+            <Line key={s.site_id} type="monotone" dataKey={s.site_id} name={s.label}
+              stroke={s.color} strokeWidth={s.isTarget ? 2.5 : 1.3}
+              strokeDasharray={s.isTarget ? '' : '4 3'}
+              dot={false} activeDot={{r:3,fill:s.color}} connectNulls/>
+          ))}
+        </LineChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
+
+/* ── Nearest Sites Map (Leaflet dynamic import) ──────────────────────────────── */
+function NearestSitesMap({ target, neighbors }) {
+  const [L, setL] = useState(null);
+  useEffect(() => { Promise.all([import('leaflet'), import('leaflet/dist/leaflet.css')]).then(([mod])=>setL(mod.default||mod)); }, []);
+  const ref = useRef(null);
+  const mapRef = useRef(null);
+  useEffect(() => {
+    if (!L || !ref.current || !target?.latitude || !target?.longitude) return;
+    if (mapRef.current) { mapRef.current.remove(); mapRef.current = null; }
+    const pts = [[target.latitude, target.longitude], ...neighbors.map(n=>[n.latitude,n.longitude]).filter(p=>p[0]&&p[1])];
+    const map = L.map(ref.current).setView([target.latitude, target.longitude], 12);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{attribution:'&copy; OSM',maxZoom:18}).addTo(map);
+    // Target (red, larger)
+    L.circleMarker([target.latitude, target.longitude], {radius:11,color:'#dc2626',fillColor:'#dc2626',fillOpacity:.9,weight:2}).addTo(map).bindPopup(`<b>${target.site_id}</b><br/>Overutilized<br/>PRB ${target.avg_prb}%`);
+    // Neighbors (green)
+    neighbors.forEach(n => {
+      if (!n.latitude || !n.longitude) return;
+      const color = n.avg_prb >= 80 ? '#f97316' : '#16a34a';
+      L.circleMarker([n.latitude, n.longitude], {radius:8,color,fillColor:color,fillOpacity:.85,weight:2}).addTo(map)
+        .bindPopup(`<b>${n.site_id}</b><br/>${n.distance_km} km away<br/>PRB ${n.avg_prb}% (spare ${n.spare_capacity_pct}%)<br/>RRC ${n.avg_rrc} users`);
+      // Line from target to neighbor with distance label
+      L.polyline([[target.latitude,target.longitude],[n.latitude,n.longitude]], {color:'#64748b',weight:1.5,opacity:.5,dashArray:'4 4'}).addTo(map);
+    });
+    if (pts.length > 1) map.fitBounds(pts, {padding:[30,30]});
+    mapRef.current = map;
+    return () => { if (mapRef.current) { mapRef.current.remove(); mapRef.current = null; } };
+  }, [L, target, neighbors]);
+
+  if (!target?.latitude || !target?.longitude) return <div style={{padding:16,background:'#fef2f2',color:'#991b1b',borderRadius:8,fontSize:12}}>Target site lat/lng missing — cannot render map.</div>;
+  return <div ref={ref} style={{height:320,width:'100%',borderRadius:8,border:'1px solid #e2e8f0'}}/>;
+}
+
 /* ── AI Diagnosis Modal ──────────────────────────────────────────────────────── */
 function AIDiagnosisModal({ ticket, onClose }) {
   const [tab, setTab] = useState('trends');
   const [target, setTarget] = useState('site');
   const [period, setPeriod] = useState('day');
   const [trends, setTrends] = useState(null);
+  const [neighborTrends, setNeighborTrends] = useState({});
+  const [neighbors, setNeighbors] = useState([]);
   const [trendsLoading, setTrendsLoading] = useState(false);
   const [rca, setRca] = useState({});
   const [rcaLoading, setRcaLoading] = useState(false);
   const [rec, setRec] = useState({});
   const [recLoading, setRecLoading] = useState(false);
+  // Nearest-sites state (overutilized only)
+  const [nearest, setNearest] = useState(null);
+  const [nearestLoading, setNearestLoading] = useState(false);
+
+  // Route to correct API based on ticket type
+  const isOU = ticket.isOverutilized;
+  const apiBase = isOU ? `/api/network-issues/overutilized/${ticket.id}` : `/api/network-issues/${ticket.id}`;
 
   const cells = ticket.cells ? ticket.cells : (ticket.cells_affected||'').split(',').filter(Boolean);
   const cellSiteIds = ticket.cell_site_id_list ? ticket.cell_site_id_list : (ticket.cell_site_ids||'').split(',').filter(Boolean);
 
+  // Deterministic neighbor colors
+  const NEIGHBOR_COLORS = ['#16a34a', '#0ea5e9', '#f97316', '#7c3aed'];
+
   const fetchTrends = useCallback(async (t, p) => {
     setTrendsLoading(true);
     try {
-      const d = await apiGet(`/api/network-issues/${ticket.id}/trends?target=${t}&period=${p}`);
+      // For overutilized tickets, also pass site_id and include_neighbors=1 so
+      // the backend returns {trends, neighbors, neighbor_trends}.
+      const extra = isOU ? `&site_id=${encodeURIComponent(ticket.site_id)}&include_neighbors=1` : '';
+      const d = await apiGet(`${apiBase}/trends?target=${t}&period=${p}${extra}`);
       setTrends(d.trends || {});
-    } catch (_) { setTrends({}); }
+      if (isOU) {
+        setNeighborTrends(d.neighbor_trends || {});
+        setNeighbors(Array.isArray(d.neighbors) ? d.neighbors : []);
+      }
+    } catch (_) { setTrends({}); setNeighborTrends({}); setNeighbors([]); }
     setTrendsLoading(false);
-  }, [ticket.id]);
+  }, [ticket.id, ticket.site_id, isOU, apiBase]);
 
   useEffect(() => { fetchTrends(target, period); }, [target, period, fetchTrends]);
+
+  // Fetch nearest sites for overutilized tickets (map tab)
+  useEffect(() => {
+    if (!isOU) return;
+    setNearestLoading(true);
+    apiGet(`${apiBase}/nearest-sites?site_id=${encodeURIComponent(ticket.site_id)}`)
+      .then(d => { setNearest(d); setNearestLoading(false); })
+      .catch(() => { setNearest({ target: null, neighbors: [] }); setNearestLoading(false); });
+  }, [isOU, apiBase, ticket.site_id]);
+
+  // For overutilized tickets, the 'site' button means "this specific site
+  // in the clubbed ticket". Pass site_id explicitly so the backend doesn't
+  // mistake the literal "site" string for an actual site identifier.
+  const buildBody = (t, extra = {}) => {
+    const body = { target: t, ...extra };
+    if (isOU) body.site_id = (t === 'site' || !t) ? ticket.site_id : t;
+    return body;
+  };
 
   const runRCA = async (t) => {
     setRcaLoading(true);
     try {
-      const r = await apiCall(`/api/network-issues/${ticket.id}/rca`, { method: 'POST', body: JSON.stringify({ target: t }) });
+      const r = await apiCall(`${apiBase}/rca`, { method: 'POST', body: JSON.stringify(buildBody(t)) });
       setRca(prev => ({ ...prev, [t]: r.root_cause }));
     } catch (_) {}
     setRcaLoading(false);
@@ -200,59 +342,152 @@ function AIDiagnosisModal({ ticket, onClose }) {
       // Auto-run RCA first if not done, so recommendations have context
       let rcaText = rca[t] || '';
       if (!rcaText) {
-        const rcaRes = await apiCall(`/api/network-issues/${ticket.id}/rca`, { method: 'POST', body: JSON.stringify({ target: t }) });
+        const rcaRes = await apiCall(`${apiBase}/rca`, { method: 'POST', body: JSON.stringify(buildBody(t)) });
         rcaText = rcaRes.root_cause || '';
         setRca(prev => ({ ...prev, [t]: rcaText }));
       }
-      const r = await apiCall(`/api/network-issues/${ticket.id}/recommendations`, { method: 'POST', body: JSON.stringify({ target: t, root_cause: rcaText }) });
+      const r = await apiCall(`${apiBase}/recommendations`, { method: 'POST', body: JSON.stringify(buildBody(t, { root_cause: rcaText })) });
       setRec(prev => ({ ...prev, [t]: r.recommendation }));
     } catch (_) {}
     setRecLoading(false);
   };
 
+  // First button ALWAYS shows the site identifier (site_abs_id → site_id).
+  // All subsequent buttons show the Cell Name column (kpi_data.cell_id / cells_affected),
+  // falling back to cell_site_id only if cell_name is missing. This applies to
+  // Trend Analysis, Root Cause Analysis and Final Recommendations.
+  const siteLabel = ticket.site_abs_id || ticket.site_id;
   const TargetButtons = ({ onClick, current }) => (
     <div style={{display:'flex',gap:5,marginBottom:12,flexWrap:'wrap'}}>
       <button onClick={()=>onClick('site')} style={{padding:'5px 14px',borderRadius:16,fontSize:10,fontWeight:700,cursor:'pointer',
         background:current==='site'?'#00338D':'#f1f5f9',color:current==='site'?'#fff':'#475569',border:current==='site'?'none':'1px solid #e2e8f0'}}>
-         {ticket.site_id}
+         {siteLabel}
       </button>
-      {cells.map((c, i) => (
-        <button key={c} onClick={()=>onClick(c)} style={{padding:'5px 14px',borderRadius:16,fontSize:10,fontWeight:700,cursor:'pointer',
-          background:current===c?'#7C3AED':'#f1f5f9',color:current===c?'#fff':'#475569',border:current===c?'none':'1px solid #e2e8f0'}}>
-           {cellSiteIds[i] || c}
-        </button>
-      ))}
+      {cells.map((c, i) => {
+        const cellLabel = c || cellSiteIds[i] || `Cell ${i+1}`;
+        return (
+          <button key={c||i} onClick={()=>onClick(c)} style={{padding:'5px 14px',borderRadius:16,fontSize:10,fontWeight:700,cursor:'pointer',
+            background:current===c?'#7C3AED':'#f1f5f9',color:current===c?'#fff':'#475569',border:current===c?'none':'1px solid #e2e8f0'}}>
+             {cellLabel}
+          </button>
+        );
+      })}
     </div>
   );
+
+  // Tab list — overutilized tickets get an extra "Nearest Sites" tab
+  const tabList = isOU
+    ? [['nearest','Nearest Sites'],['trends','Trend Analysis'],['rca','Root Cause Analysis'],['rec','Final Recommendations']]
+    : [['trends','Trend Analysis'],['rca','Root Cause Analysis'],['rec','Final Recommendations']];
 
   return (
     <Modal title={`AI Network Diagnosis — ${ticket.site_id}`} onClose={onClose}>
       {/* Tabs */}
-      <div style={{display:'flex',gap:4,marginBottom:16,borderBottom:'2px solid #e2e8f0',paddingBottom:8}}>
-        {[['trends',' Trend Analysis'],['rca',' Root Cause Analysis'],['rec',' Final Recommendations']].map(([k,l])=>(
+      <div style={{display:'flex',gap:4,marginBottom:16,borderBottom:'2px solid #e2e8f0',paddingBottom:8,flexWrap:'wrap'}}>
+        {tabList.map(([k,l])=>(
           <button key={k} onClick={()=>setTab(k)} style={{padding:'7px 18px',borderRadius:8,fontSize:12,fontWeight:700,cursor:'pointer',
             background:tab===k?'#00338D':'transparent',color:tab===k?'#fff':'#475569',border:'none'}}>{l}</button>
         ))}
       </div>
 
+      {/* Nearest Sites (overutilized only) */}
+      {isOU && tab==='nearest' && (
+        <div>
+          <div style={{fontSize:12,color:'#64748b',marginBottom:10}}>
+            Map shows the overutilized site (red) and its 3 nearest neighbours (green/orange by PRB load).
+            Use this to decide if traffic can be routed off the overutilized site.
+          </div>
+          {nearestLoading ? <div style={{textAlign:'center',padding:40,color:'#94a3b8'}}>Locating nearest sites...</div> : (
+            <>
+              <NearestSitesMap target={nearest?.target} neighbors={nearest?.neighbors || []}/>
+              <div style={{marginTop:12}}>
+                <table style={{width:'100%',borderCollapse:'collapse',fontSize:11}}>
+                  <thead><tr style={{borderBottom:'1px solid #e2e8f0',background:'#f8fafc'}}>
+                    <th style={{textAlign:'left',padding:'6px 8px',fontSize:10,color:'#475569',fontWeight:700}}>Site</th>
+                    <th style={{textAlign:'center',padding:'6px 8px',fontSize:10,color:'#475569',fontWeight:700}}>Distance</th>
+                    <th style={{textAlign:'center',padding:'6px 8px',fontSize:10,color:'#475569',fontWeight:700}}>PRB %</th>
+                    <th style={{textAlign:'center',padding:'6px 8px',fontSize:10,color:'#475569',fontWeight:700}}>Spare</th>
+                    <th style={{textAlign:'center',padding:'6px 8px',fontSize:10,color:'#475569',fontWeight:700}}>RRC Users</th>
+                    <th style={{textAlign:'center',padding:'6px 8px',fontSize:10,color:'#475569',fontWeight:700}}>Tput</th>
+                    <th style={{textAlign:'center',padding:'6px 8px',fontSize:10,color:'#475569',fontWeight:700}}>BW</th>
+                    <th style={{textAlign:'center',padding:'6px 8px',fontSize:10,color:'#475569',fontWeight:700}}>E-tilt</th>
+                    <th style={{textAlign:'center',padding:'6px 8px',fontSize:10,color:'#475569',fontWeight:700}}>EIRP</th>
+                  </tr></thead>
+                  <tbody>
+                    {(nearest?.neighbors || []).map(n => (
+                      <tr key={n.site_id} style={{borderBottom:'1px solid #f1f5f9'}}>
+                        <td style={{padding:'6px 8px',fontWeight:700,color:'#0f172a'}}>{n.site_id}<div style={{fontSize:9,color:'#94a3b8',fontWeight:500}}>{n.city||n.zone}</div></td>
+                        <td style={{textAlign:'center',padding:'6px 8px'}}>{n.distance_km} km</td>
+                        <td style={{textAlign:'center',padding:'6px 8px',color:n.avg_prb>=80?'#dc2626':'#16a34a',fontWeight:700}}>{n.avg_prb}%</td>
+                        <td style={{textAlign:'center',padding:'6px 8px',color:'#475569'}}>{n.spare_capacity_pct}%</td>
+                        <td style={{textAlign:'center',padding:'6px 8px'}}>{n.avg_rrc}</td>
+                        <td style={{textAlign:'center',padding:'6px 8px'}}>{n.avg_tput} Mbps</td>
+                        <td style={{textAlign:'center',padding:'6px 8px'}}>{n.bandwidth_mhz ?? '—'}</td>
+                        <td style={{textAlign:'center',padding:'6px 8px'}}>{n.e_tilt_degree ?? '—'}°</td>
+                        <td style={{textAlign:'center',padding:'6px 8px'}}>{n.rf_power_eirp_dbm ?? '—'} dBm</td>
+                      </tr>
+                    ))}
+                    {(!nearest?.neighbors || nearest.neighbors.length===0) && (
+                      <tr><td colSpan={9} style={{padding:20,textAlign:'center',color:'#94a3b8'}}>No neighbours found with lat/lng in DB.</td></tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
       {/* Trend Analysis */}
       {tab==='trends'&&(
         <div>
           <TargetButtons onClick={t=>{setTarget(t);}} current={target}/>
-          <div style={{display:'flex',gap:5,marginBottom:12}}>
+          <div style={{display:'flex',gap:5,marginBottom:12,alignItems:'center'}}>
             {['month','week','day','hour'].map(p=>(
               <button key={p} onClick={()=>setPeriod(p)} style={{padding:'4px 12px',borderRadius:14,fontSize:10,fontWeight:700,cursor:'pointer',
                 background:period===p?'#0f172a':'#f1f5f9',color:period===p?'#fff':'#64748b',border:period===p?'none':'1px solid #e2e8f0'}}>
                 {p==='day'?'Daily':p==='hour'?'Hourly':p==='week'?'Weekly':'Monthly'}
               </button>
             ))}
+            {isOU && neighbors.length > 0 && (
+              <div style={{marginLeft:12,display:'flex',gap:10,alignItems:'center',flexWrap:'wrap'}}>
+                <span style={{fontSize:10,color:'#64748b',fontWeight:600}}>Overlay:</span>
+                <span style={{display:'inline-flex',alignItems:'center',gap:4,fontSize:10,color:'#475569'}}>
+                  <span style={{width:16,height:3,background:'#dc2626',display:'inline-block'}}/>{ticket.site_id} (target)
+                </span>
+                {neighbors.map((n, i) => (
+                  <span key={n.site_id} style={{display:'inline-flex',alignItems:'center',gap:4,fontSize:10,color:'#475569'}}>
+                    <span style={{width:16,height:2,background:NEIGHBOR_COLORS[i%NEIGHBOR_COLORS.length],borderTop:`1px dashed ${NEIGHBOR_COLORS[i%NEIGHBOR_COLORS.length]}`,display:'inline-block'}}/>
+                    {n.site_id} ({n.distance_km}km)
+                  </span>
+                ))}
+              </div>
+            )}
           </div>
           {trendsLoading ? <div style={{textAlign:'center',padding:40,color:'#94a3b8'}}>Loading trends...</div> : (
-            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:10}}>
-              {Object.entries(trends||{}).map(([kpi,data])=>(
-                <TrendChart key={kpi} kpiName={kpi} data={data} color={target==='site'?'#00338D':'#7C3AED'}/>
-              ))}
-            </div>
+            isOU && target === 'site' && neighbors.length > 0 ? (
+              <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>
+                {Object.entries(trends||{}).map(([kpi,data])=>{
+                  const series = [
+                    { site_id: ticket.site_id, label: `${ticket.site_id} (target)`, color: '#dc2626', data, isTarget: true },
+                    ...neighbors.map((n, i) => ({
+                      site_id: n.site_id,
+                      label: `${n.site_id} (${n.distance_km}km)`,
+                      color: NEIGHBOR_COLORS[i%NEIGHBOR_COLORS.length],
+                      data: (neighborTrends[n.site_id] || {})[kpi] || [],
+                      isTarget: false,
+                    })),
+                  ];
+                  return <MultiTrendChart key={kpi} kpiName={kpi} series={series}/>;
+                })}
+              </div>
+            ) : (
+              <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:10}}>
+                {Object.entries(trends||{}).map(([kpi,data])=>(
+                  <TrendChart key={kpi} kpiName={kpi} data={data} color={target==='site'?'#00338D':'#7C3AED'}/>
+                ))}
+              </div>
+            )
           )}
         </div>
       )}
@@ -444,10 +679,15 @@ export default function NetworkIssues() {
   const [paramTicket, setParamTicket] = useState(null);
   const [triggering, setTriggering] = useState(false);
   const [resolving, setResolving] = useState(null);
-  const [pdfLoading, setPdfLoading] = useState(null); // ticket id being downloaded
+  const [pdfLoading, setPdfLoading] = useState(null);
   const [showRouting, setShowRouting] = useState(false);
   const [routingData, setRoutingData] = useState([]);
   const [routingLoading, setRoutingLoading] = useState(false);
+  // Overutilized sites
+  const [issueTab, setIssueTab] = useState('worst'); // 'worst' | 'overutilized'
+  const [ouTickets, setOuTickets] = useState([]);
+  const [ouLoading, setOuLoading] = useState(false);
+  const [ouExpanded, setOuExpanded] = useState({});  // {ticketId: true/false}
 
   /* ── PDF Trend Chart Helper ────────────────────────────────────────────────── */
   const drawTrendChart = (doc, { x, y, w, h, title, points, color = [0, 51, 141] }) => {
@@ -544,22 +784,24 @@ export default function NetworkIssues() {
       const pageW = doc.internal.pageSize.getWidth();
 
       // Fetch PDF data, trends, RCA, recommendations in parallel
+      const isOU = ticket.isOverutilized;
+      const pdfBase = isOU ? `/api/network-issues/overutilized/${ticket.id}` : `/api/network-issues/${ticket.id}`;
       const cells = (ticket.cells_affected || '').split(',').filter(Boolean);
       const firstCell = cells[0] || null;
       const [pdfData, siteTrends, cellTrends, siteRca, cellRca] = await Promise.all([
-        apiGet(`/api/network-issues/${ticket.id}/pdf-data`),
-        apiGet(`/api/network-issues/${ticket.id}/trends?target=site&period=day`),
-        firstCell ? apiGet(`/api/network-issues/${ticket.id}/trends?target=${firstCell}&period=day`) : Promise.resolve(null),
-        apiCall(`/api/network-issues/${ticket.id}/rca`, { method: 'POST', body: JSON.stringify({ target: 'site' }) }).catch(() => null),
-        firstCell ? apiCall(`/api/network-issues/${ticket.id}/rca`, { method: 'POST', body: JSON.stringify({ target: firstCell }) }).catch(() => null) : Promise.resolve(null),
+        apiGet(`${pdfBase}/pdf-data`),
+        apiGet(`${pdfBase}/trends?target=site&period=day`),
+        firstCell ? apiGet(`${pdfBase}/trends?target=${firstCell}&period=day`) : Promise.resolve(null),
+        apiCall(`${pdfBase}/rca`, { method: 'POST', body: JSON.stringify(isOU ? { target: 'site', site_id: ticket.site_id } : { target: 'site' }) }).catch(() => null),
+        firstCell ? apiCall(`${pdfBase}/rca`, { method: 'POST', body: JSON.stringify({ target: firstCell }) }).catch(() => null) : Promise.resolve(null),
       ]);
 
       // Get recommendations (needs RCA)
       const siteRcaText = siteRca?.root_cause || pdfData?.ticket?.root_cause || '';
       const cellRcaText = cellRca?.root_cause || '';
       const [siteRec, cellRec] = await Promise.all([
-        siteRcaText ? apiCall(`/api/network-issues/${ticket.id}/recommendations`, { method: 'POST', body: JSON.stringify({ target: 'site', root_cause: siteRcaText }) }).catch(() => null) : Promise.resolve(null),
-        firstCell && cellRcaText ? apiCall(`/api/network-issues/${ticket.id}/recommendations`, { method: 'POST', body: JSON.stringify({ target: firstCell, root_cause: cellRcaText }) }).catch(() => null) : Promise.resolve(null),
+        siteRcaText ? apiCall(`${pdfBase}/recommendations`, { method: 'POST', body: JSON.stringify(isOU ? { target: 'site', site_id: ticket.site_id, root_cause: siteRcaText } : { target: 'site', root_cause: siteRcaText }) }).catch(() => null) : Promise.resolve(null),
+        firstCell && cellRcaText ? apiCall(`${pdfBase}/recommendations`, { method: 'POST', body: JSON.stringify({ target: firstCell, root_cause: cellRcaText }) }).catch(() => null) : Promise.resolve(null),
       ]);
 
       const tkt = pdfData?.ticket || ticket;
@@ -596,7 +838,7 @@ export default function NetworkIssues() {
           body: [
             ['Site ID', siteInfo.site_id],
             ['Location', `${siteInfo.latitude?.toFixed(5)}, ${siteInfo.longitude?.toFixed(5)}`],
-            ['Zone / Cluster', siteInfo.zone || 'N/A'],
+            ['Province', siteInfo.province || siteInfo.zone || 'N/A'],
             ['City', siteInfo.city || 'N/A'],
             ['State', siteInfo.state || 'N/A'],
             ['Status', siteInfo.site_status || 'on_air'],
@@ -657,7 +899,7 @@ export default function NetworkIssues() {
         if (cellKpis.length > 0) {
           autoTable(doc, {
             startY: y,
-            head: [['#', 'Cell ID', 'Cell Site ID', 'Drop Rate %', 'CSSR %', 'DL Tput Mbps', 'RRC Users']],
+            head: [['#', 'Cell Name', 'Cell Site ID', 'Drop Rate %', 'CSSR %', 'DL Tput Mbps', 'RRC Users']],
             body: cellKpis.map((ck, i) => [
               i + 1,
               ck.cell_id,
@@ -677,7 +919,7 @@ export default function NetworkIssues() {
           // Fallback: just list cell IDs
           autoTable(doc, {
             startY: y,
-            head: [['#', 'Cell ID', 'Cell Site ID']],
+            head: [['#', 'Cell Name', 'Cell Site ID']],
             body: cells.map((c, i) => [i + 1, c, cellSiteIds[i] || 'N/A']),
             styles: { fontSize: 9 },
             headStyles: { fillColor: [0, 51, 141] },
@@ -697,7 +939,7 @@ export default function NetworkIssues() {
           doc.setFont(undefined, 'normal');
           autoTable(doc, {
             startY: y,
-            head: [['Cell ID', 'BW MHz', 'Gain dBi', 'EIRP dBm', 'Height m', 'E-Tilt', 'CRS']],
+            head: [['Cell Name', 'BW MHz', 'Gain dBi', 'EIRP dBm', 'Height m', 'E-Tilt', 'CRS']],
             body: affectedCellsInfo.map(ci => [
               ci.cell_id,
               ci.bandwidth_mhz ?? 'N/A',
@@ -809,9 +1051,17 @@ export default function NetworkIssues() {
     setLoading(false);
   }, []);
 
-  useEffect(() => { fetchAll(); }, [fetchAll]);
-  // Refresh every 30s for SLA timer
-  useEffect(() => { const iv = setInterval(fetchAll, 30000); return () => clearInterval(iv); }, [fetchAll]);
+  const fetchOverutilized = useCallback(async () => {
+    setOuLoading(true);
+    try {
+      const d = await apiGet('/api/network-issues/overutilized/list');
+      setOuTickets(d.tickets || []);
+    } catch (_) {}
+    setOuLoading(false);
+  }, []);
+
+  useEffect(() => { fetchAll(); fetchOverutilized(); }, [fetchAll, fetchOverutilized]);
+  useEffect(() => { const iv = setInterval(() => { fetchAll(); fetchOverutilized(); }, 30000); return () => clearInterval(iv); }, [fetchAll, fetchOverutilized]);
 
   const triggerJob = async () => {
     setTriggering(true);
@@ -827,6 +1077,7 @@ export default function NetworkIssues() {
 
   // Only show tickets assigned to this agent
   const myTickets = tickets.filter(t => t.is_mine);
+  const myOuTickets = ouTickets.filter(t => t.is_mine);
 
   const filtered = filter === 'All' ? myTickets
     : filter === 'Pending' ? myTickets.filter(t => t.status === 'open')
@@ -850,14 +1101,28 @@ export default function NetworkIssues() {
 
   return (
     <div>
+      {/* Issue Type Tabs */}
+      <div style={{display:'flex',gap:0,marginBottom:16,borderBottom:'2px solid #e2e8f0'}}>
+        <button onClick={()=>setIssueTab('worst')} style={{padding:'10px 24px',fontSize:13,fontWeight:700,cursor:'pointer',border:'none',background:'transparent',
+          color:issueTab==='worst'?'#00338D':'#94a3b8',borderBottom:issueTab==='worst'?'3px solid #00338D':'3px solid transparent',marginBottom:-2}}>
+          Worst Cell Offenders ({myTickets.length})
+        </button>
+        <button onClick={()=>setIssueTab('overutilized')} style={{padding:'10px 24px',fontSize:13,fontWeight:700,cursor:'pointer',border:'none',background:'transparent',
+          color:issueTab==='overutilized'?'#E65100':'#94a3b8',borderBottom:issueTab==='overutilized'?'3px solid #E65100':'3px solid transparent',marginBottom:-2}}>
+          Overutilized Sites ({myOuTickets.length})
+        </button>
+      </div>
+
       {/* Header */}
       <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:16}}>
         <div>
           <h2 style={{margin:0,fontSize:20,fontWeight:800,color:'#0f172a',display:'flex',alignItems:'center',gap:8}}>
-            <span style={{width:4,height:28,background:'#00338D',borderRadius:2,display:'inline-block'}}/>
-            Network Issues — Worst Cell Offenders
+            <span style={{width:4,height:28,background:issueTab==='worst'?'#00338D':'#E65100',borderRadius:2,display:'inline-block'}}/>
+            {issueTab==='worst' ? 'Worst Cell Offenders' : 'Overutilized Sites (PRB > 92%)'}
           </h2>
-          <p style={{margin:'4px 0 0',fontSize:12,color:'#64748b'}}>{openCount} open · {resolvedCount} resolved · {myTickets.length} total</p>
+          <p style={{margin:'4px 0 0',fontSize:12,color:'#64748b'}}>
+            {issueTab==='worst' ? `${openCount} open · ${resolvedCount} resolved · ${myTickets.length} total` : `${myOuTickets.filter(t=>t.status==='open').length} open · ${myOuTickets.filter(t=>t.status==='resolved').length} resolved · ${myOuTickets.length} assigned to you`}
+          </p>
         </div>
         <div style={{display:'flex',gap:8}}>
           <button onClick={fetchRouting} style={{display:'flex',alignItems:'center',gap:5,padding:'7px 14px',borderRadius:8,fontSize:12,fontWeight:600,background:'#f8fafc',color:'#475569',border:'1px solid #e2e8f0',cursor:'pointer'}}>
@@ -873,6 +1138,86 @@ export default function NetworkIssues() {
         </div>
       </div>
 
+      {/* ── OVERUTILIZED SITES TAB ── */}
+      {issueTab === 'overutilized' && (
+        <div>
+          {ouLoading ? <div style={{textAlign:'center',padding:40}}><div className="spinner"/></div> :
+           myOuTickets.length === 0 ? (
+            <div style={{textAlign:'center',padding:40,color:'#94a3b8',fontSize:14}}>
+              No overutilized tickets assigned to you. Check Today's Routing for all active tickets.
+            </div>
+           ) : (
+            <div style={{display:'flex',flexDirection:'column',gap:14}}>
+              {myOuTickets.map(t => {
+                const pc = t.priority==='Critical'?{bg:'#FEE2E2',bar:'#DC2626',text:'#991B1B'}:t.priority==='High'?{bg:'#FEF3C7',bar:'#F59E0B',text:'#92400E'}:t.priority==='Medium'?{bg:'#DBEAFE',bar:'#3B82F6',text:'#1E40AF'}:{bg:'#F1F5F9',bar:'#94A3B8',text:'#475569'};
+                const sites = t.sites || [];
+                const siteStatuses = t.site_statuses || {};
+                const resolvedCount = Object.values(siteStatuses).filter(v=>v==='resolved').length;
+                const expanded = ouExpanded[t.id] || false;
+                const toggleExpand = () => setOuExpanded(prev => ({...prev, [t.id]: !prev[t.id]}));
+                return (
+                  <div key={t.id} style={{border:'1px solid #e2e8f0',borderLeft:`3px solid ${pc.bar}`,borderRadius:8,background:'#fff',overflow:'hidden'}}>
+                    {/* Compact header — single row */}
+                    <div style={{padding:'8px 12px',display:'flex',alignItems:'center',gap:8,flexWrap:'wrap',cursor:'pointer'}} onClick={toggleExpand}>
+                      <span style={{fontSize:10,fontWeight:700,color:'#E65100',fontFamily:'monospace'}}>OU-{String(t.id).padStart(4,'0')}</span>
+                      <span style={{fontSize:13,fontWeight:800,color:'#0f172a'}}>{t.zone||t.site_id}</span>
+                      <span style={{padding:'1px 6px',borderRadius:10,fontSize:9,fontWeight:700,background:pc.bg,color:pc.text}}>{t.priority}</span>
+                      <span style={{padding:'1px 6px',borderRadius:10,fontSize:9,fontWeight:700,background:'#FFF7ED',color:'#E65100'}}>{sites.length} sites · PRB {t.avg_prb_util}%</span>
+                      <span style={{padding:'1px 6px',borderRadius:10,fontSize:9,fontWeight:700,
+                        background:t.status==='resolved'?'#DCFCE7':t.status==='in_progress'?'#DBEAFE':'#FEF3C7',
+                        color:t.status==='resolved'?'#166534':t.status==='in_progress'?'#1E40AF':'#92400E'}}>{t.status.replace('_',' ')}</span>
+                      <span style={{fontSize:9,color:'#64748b'}}>RRC:{t.avg_rrc} · Tput:{t.avg_dl_tput}Mbps · Rev:${t.revenue_total}</span>
+                      <span style={{marginLeft:'auto',fontSize:9,color:'#64748b'}}>{t.agent_name||'Unassigned'} · {resolvedCount}/{sites.length} done</span>
+                      <span style={{fontSize:10,color:'#94a3b8',transform:expanded?'rotate(180deg)':'rotate(0)',transition:'transform .2s'}}>&#9660;</span>
+                    </div>
+
+                    {/* Expandable site list */}
+                    {expanded && sites.length > 0 && (
+                      <div style={{padding:'6px 12px 10px',borderTop:'1px solid #f1f5f9'}}>
+                        <table style={{width:'100%',borderCollapse:'collapse',fontSize:11}}>
+                          <thead><tr style={{borderBottom:'1px solid #e2e8f0'}}>
+                            <th style={{textAlign:'left',padding:'4px 6px',fontSize:9,color:'#94a3b8',fontWeight:600}}>Site</th>
+                            <th style={{textAlign:'center',padding:'4px 6px',fontSize:9,color:'#94a3b8',fontWeight:600}}>PRB %</th>
+                            <th style={{textAlign:'center',padding:'4px 6px',fontSize:9,color:'#94a3b8',fontWeight:600}}>Tput</th>
+                            <th style={{textAlign:'center',padding:'4px 6px',fontSize:9,color:'#94a3b8',fontWeight:600}}>RRC</th>
+                            <th style={{textAlign:'right',padding:'4px 6px',fontSize:9,color:'#94a3b8',fontWeight:600}}>Actions</th>
+                          </tr></thead>
+                          <tbody>{sites.map(s=>{
+                            const resolved=siteStatuses[s.site_id]==='resolved';
+                            const st={...t,site_id:s.site_id,site_abs_id:s.site_abs_id||'',site_name:s.site_name||'',avg_prb_util:s.avg_prb,avg_dl_tput:s.avg_tput,avg_rrc:s.avg_rrc,avg_drop_rate:s.avg_drop,isOverutilized:true};
+                            return(
+                              <tr key={s.site_id} style={{borderBottom:'1px solid #f8fafc',background:resolved?'#F0FDF408':'transparent'}}>
+                                <td style={{padding:'5px 6px'}}><span style={{width:6,height:6,borderRadius:'50%',background:resolved?'#16A34A':'#E65100',display:'inline-block',marginRight:6}}/><b>{s.site_id}</b></td>
+                                <td style={{textAlign:'center',padding:'5px 6px',color:'#E65100',fontWeight:700}}>{s.avg_prb}%</td>
+                                <td style={{textAlign:'center',padding:'5px 6px',color:'#475569'}}>{s.avg_tput} Mbps</td>
+                                <td style={{textAlign:'center',padding:'5px 6px',color:'#475569'}}>{s.avg_rrc}</td>
+                                <td style={{textAlign:'right',padding:'3px 6px'}}>
+                                  <div style={{display:'flex',gap:3,justifyContent:'flex-end'}}>
+                                    <button onClick={()=>setDiagTicket(st)} style={{fontSize:8,padding:'2px 6px',borderRadius:3,background:'#00338D',color:'#fff',border:'none',cursor:'pointer',fontWeight:600}}>RCA</button>
+                                    <button onClick={()=>setParamTicket(st)} style={{fontSize:8,padding:'2px 6px',borderRadius:3,background:'#f1f5f9',color:'#475569',border:'1px solid #cbd5e1',cursor:'pointer',fontWeight:600}}>Param</button>
+                                    <button onClick={()=>downloadPdf(st)} style={{fontSize:8,padding:'2px 6px',borderRadius:3,background:'#f1f5f9',color:'#475569',border:'1px solid #cbd5e1',cursor:'pointer',fontWeight:600}}>PDF</button>
+                                    {!resolved?<button onClick={async()=>{try{await apiCall(`/api/network-issues/overutilized/${t.id}/resolve-site`,{method:'POST',body:JSON.stringify({site_id:s.site_id})});fetchOverutilized();}catch(_){}}}
+                                      style={{fontSize:8,padding:'2px 6px',borderRadius:3,background:'#16A34A',color:'#fff',border:'none',cursor:'pointer',fontWeight:600}}>Resolve</button>
+                                    :<span style={{fontSize:8,color:'#16A34A',fontWeight:700}}>Done</span>}
+                                  </div>
+                                </td>
+                              </tr>
+                            );})}</tbody>
+                        </table>
+                        {t.status!=='resolved'&&<button onClick={async()=>{if(!window.confirm('Resolve all?'))return;try{await apiCall(`/api/network-issues/overutilized/${t.id}/status`,{method:'PUT',body:JSON.stringify({status:'resolved'})});fetchOverutilized();}catch(_){}}}
+                          style={{marginTop:6,padding:'4px 12px',borderRadius:6,fontSize:10,fontWeight:600,background:'#16A34A',color:'#fff',border:'none',cursor:'pointer'}}>Resolve All</button>}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+           )}
+        </div>
+      )}
+
+      {/* ── WORST CELL TAB ── */}
+      {issueTab === 'worst' && <>
       {/* Filter tabs */}
       <div style={{display:'flex',gap:8,marginBottom:16}}>
         {['All','Pending','In Progress','Resolved'].map(f=>(
@@ -922,7 +1267,7 @@ export default function NetworkIssues() {
                   <span>Tput: <b style={{color:t.avg_tput<8?'#dc2626':'#16a34a'}}>{f(t.avg_tput,1)}Mbps</b></span>
                   <span>Avg RRC: <b>{f(t.avg_rrc,0)}</b></span>
                   <span>Max RRC: <b>{f(t.max_rrc,0)}</b></span>
-                  <span>Rev: <b>₹{f(t.revenue_total,0)}L</b></span>
+                  <span>Rev: <b>${f(t.revenue_total,0)}</b></span>
                 </div>
               </div>
 
@@ -987,7 +1332,9 @@ export default function NetworkIssues() {
         );
       })}
 
-      {/* AI Diagnosis Modal */}
+      </>}
+
+      {/* AI Diagnosis Modal — works for both worst cell and overutilized tickets */}
       {diagTicket && <AIDiagnosisModal ticket={diagTicket} onClose={()=>setDiagTicket(null)}/>}
       {paramTicket && <CRFormModal open={!!paramTicket} networkIssue={paramTicket} onClose={()=>{setParamTicket(null);fetchAll();}}/>}
 
@@ -1012,9 +1359,10 @@ export default function NetworkIssues() {
                   <thead>
                     <tr style={{borderBottom:'2px solid #e2e8f0'}}>
                       <th style={{textAlign:'left',padding:'8px 10px',fontWeight:700,color:'#475569',fontSize:11,textTransform:'uppercase'}}>Ticket</th>
+                      <th style={{textAlign:'left',padding:'8px 10px',fontWeight:700,color:'#475569',fontSize:11,textTransform:'uppercase'}}>Category</th>
                       <th style={{textAlign:'left',padding:'8px 10px',fontWeight:700,color:'#475569',fontSize:11,textTransform:'uppercase'}}>Type</th>
-                      <th style={{textAlign:'left',padding:'8px 10px',fontWeight:700,color:'#475569',fontSize:11,textTransform:'uppercase'}}>Site</th>
-                      <th style={{textAlign:'left',padding:'8px 10px',fontWeight:700,color:'#475569',fontSize:11,textTransform:'uppercase'}}>Cells</th>
+                      <th style={{textAlign:'left',padding:'8px 10px',fontWeight:700,color:'#475569',fontSize:11,textTransform:'uppercase'}}>Site / Zone</th>
+                      <th style={{textAlign:'left',padding:'8px 10px',fontWeight:700,color:'#475569',fontSize:11,textTransform:'uppercase'}}>Sites/Cells</th>
                       <th style={{textAlign:'left',padding:'8px 10px',fontWeight:700,color:'#475569',fontSize:11,textTransform:'uppercase'}}>Priority</th>
                       <th style={{textAlign:'left',padding:'8px 10px',fontWeight:700,color:'#475569',fontSize:11,textTransform:'uppercase'}}>Status</th>
                       <th style={{textAlign:'left',padding:'8px 10px',fontWeight:700,color:'#475569',fontSize:11,textTransform:'uppercase'}}>Assigned Agent</th>
@@ -1023,15 +1371,21 @@ export default function NetworkIssues() {
                   <tbody>
                     {routingData.map((r,i) => {
                       const prc = P_CFG[r.priority] || P_CFG.Low;
+                      const isOU = r.category === 'Overutilized';
+                      const catColor = isOU ? '#E65100' : '#00338D';
+                      const catBg = isOU ? '#FFF7ED' : '#EFF6FF';
+                      const ticketLabel = isOU ? `OU-${r.ticket_id}` : `#${r.ticket_id}`;
                       return (
-                        <tr key={r.ticket_id||i} style={{borderBottom:'1px solid #f1f5f9',background:i%2===0?'#fff':'#f8fafc'}}>
-                          <td style={{padding:'8px 10px',fontWeight:700,color:'#00338D',fontFamily:'monospace'}}>#{r.ticket_id}</td>
+                        <tr key={`${r.category}-${r.ticket_id}`||i} style={{borderBottom:'1px solid #f1f5f9',background:i%2===0?'#fff':'#f8fafc'}}>
+                          <td style={{padding:'8px 10px',fontWeight:700,color:catColor,fontFamily:'monospace'}}>{ticketLabel}</td>
+                          <td style={{padding:'8px 10px'}}><span style={{padding:'2px 8px',borderRadius:10,fontSize:9,fontWeight:700,background:catBg,color:catColor,border:`1px solid ${catColor}33`}}>
+                            {isOU ? 'Overutilized' : 'Worst Cell'}</span></td>
                           <td style={{padding:'8px 10px'}}><span style={{padding:'2px 8px',borderRadius:10,fontSize:10,fontWeight:700,
                             background:r.type==='created'?'#16A34A18':r.type==='updated'?'#0091DA18':'#94a3b818',
                             color:r.type==='created'?'#16A34A':r.type==='updated'?'#0091DA':'#94a3b8'}}>
                             {r.type==='created'?'New':r.type==='updated'?'Updated':'Existing'}</span></td>
                           <td style={{padding:'8px 10px',fontWeight:600,color:'#0f172a'}}>{r.site_id}<br/><span style={{fontSize:10,color:'#64748b'}}>{r.zone}{r.location?' · '+r.location:''}</span></td>
-                          <td style={{padding:'8px 10px',color:'#475569'}}>{r.cell_count} cell{r.cell_count!==1?'s':''}</td>
+                          <td style={{padding:'8px 10px',color:'#475569'}}>{r.cell_count} {isOU?'site':'cell'}{r.cell_count!==1?'s':''}</td>
                           <td style={{padding:'8px 10px'}}><span style={{padding:'2px 8px',borderRadius:10,fontSize:10,fontWeight:700,background:prc.bar+'18',color:prc.bar}}>{r.priority}</span></td>
                           <td style={{padding:'8px 10px'}}><span style={{padding:'2px 8px',borderRadius:10,fontSize:10,fontWeight:700,
                             background:r.status==='resolved'?'#16A34A18':r.status==='in_progress'?'#F59E0B18':'#00338D18',

@@ -11,6 +11,7 @@ import time
 import math
 import random
 import string
+import hashlib
 from datetime import date, datetime, timezone, timedelta
 
 from flask import Flask, request, jsonify, send_from_directory
@@ -29,7 +30,7 @@ import urllib.error
 
 from sqlalchemy import case as sql_case, text
 from sqlalchemy.orm import joinedload
-from models import db, bcrypt, User, ChatSession, ChatMessage, Ticket, Feedback, SystemSetting, SlaAlert, TelecomSite, KpiData, ParameterChange, ChangeRequest, FlexibleKpiUpload
+from models import db, bcrypt, User, ChatSession, ChatMessage, Ticket, Feedback, SystemSetting, SlaAlert, TelecomSite, KpiData, ParameterChange, ChangeRequest, FlexibleKpiUpload, CoreComponentKpi
 # Add this import after other imports
 from whatsapp_integration import send_whatsapp_message, format_chat_summary_for_whatsapp, format_ticket_alert_for_whatsapp
 import network_prompts
@@ -39,14 +40,27 @@ load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 # ─── App Setup ────────────────────────────────────────────────────────────────
 def _get_jwt_secret():
+    """Return a deterministic 32+ byte JWT signing key.
+
+    Order of precedence:
+      1. JWT_SECRET env var, used directly when >= 32 chars.
+      2. JWT_SECRET env var, upgraded via SHA-256 to a 64-char hex key when
+         shorter (avoids PyJWT's InsecureKeyLengthWarning on Python 3.14
+         and the 422 token-rejection that follows).
+      3. Deterministic fallback derived from the legacy default string so
+         tokens stay valid across restarts when no JWT_SECRET is configured
+         (a random os.urandom would invalidate every token on each restart).
+    """
     raw = os.environ.get("JWT_SECRET")
     if raw:
         if len(raw) >= 32:
             return raw
-        # Upgrade short secrets to a SHA-256 derived key to avoid insecure length warnings.
-        print("⚠️ JWT_SECRET is shorter than 32 bytes; deriving a stronger key.")
+        print("⚠️ JWT_SECRET is shorter than 32 bytes; deriving a stronger key via SHA-256.")
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-    return os.urandom(32).hex()
+    # No JWT_SECRET set — derive a deterministic 64-char key so tokens
+    # survive server restarts. Operators should still set JWT_SECRET in .env.
+    print("⚠️ JWT_SECRET not set in environment; using a deterministic dev fallback. Set JWT_SECRET in .env for production.")
+    return hashlib.sha256(b"telecom-cch-default-jwt-secret-change-me").hexdigest()
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", os.urandom(24).hex())
@@ -55,8 +69,25 @@ app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get(
     "postgresql://postgres:ROOT@localhost:5432/telecom_cch"
 )
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-app.config["JWT_SECRET_KEY"] = os.environ.get("JWT_SECRET", "super-secret-jwt-key-change-in-prod")
+# Raise DB connection pool limits — default SQLAlchemy 5+10 is far too small
+# once the background schedulers, daily jobs, and dashboard reads all run
+# concurrently. Also recycle stale connections and pre-ping so the pool
+# never hands out a dead socket.
+app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
+    "pool_size": 30,
+    "max_overflow": 60,
+    "pool_timeout": 30,
+    "pool_recycle": 1800,
+    "pool_pre_ping": True,
+}
+# Use _get_jwt_secret() so short JWT_SECRET values from .env are upgraded to a
+# SHA-256 derived 64-char key. PyJWT on Python 3.14 emits InsecureKeyLength
+# warnings for HMAC keys < 32 bytes, and verification can become flaky; the
+# derivation gives a deterministic strong key from whatever the user set.
+app.config["JWT_SECRET_KEY"] = _get_jwt_secret()
 app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(hours=24)
+# JWT error handler messages are JSON — see JWTManager handlers below.
+app.config["JWT_ERROR_MESSAGE_KEY"] = "msg"
 app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024  # 500MB max for large Excel uploads
 
 # Flask-Mail Configuration
@@ -70,6 +101,34 @@ app.config["MAIL_DEFAULT_SENDER"] = os.environ.get("MAIL_DEFAULT_SENDER", os.env
 db.init_app(app)
 bcrypt.init_app(app)
 jwt = JWTManager(app)
+
+# ─── JWT error handlers ───────────────────────────────────────────────────────
+# By default flask-jwt-extended returns 422 with no useful body when token
+# decoding fails. Replace each handler so the frontend gets a clear reason
+# (helps the user know whether they need to re-login vs. it's a bug).
+@jwt.expired_token_loader
+def _jwt_expired(jwt_header, jwt_payload):
+    return jsonify({"error": "token_expired", "msg": "Session expired — please log in again."}), 401
+
+@jwt.invalid_token_loader
+def _jwt_invalid(reason):
+    # Triggered for bad signature, malformed token, etc. Most common after a
+    # JWT_SECRET change on the server: every old token becomes invalid and
+    # the user must re-login once.
+    return jsonify({"error": "token_invalid", "msg": f"Invalid auth token: {reason}. Please log out and log in again."}), 401
+
+@jwt.unauthorized_loader
+def _jwt_missing(reason):
+    return jsonify({"error": "auth_required", "msg": f"Authentication required: {reason}"}), 401
+
+@jwt.needs_fresh_token_loader
+def _jwt_needs_fresh(jwt_header, jwt_payload):
+    return jsonify({"error": "fresh_token_required", "msg": "Fresh login required for this action."}), 401
+
+@jwt.revoked_token_loader
+def _jwt_revoked(jwt_header, jwt_payload):
+    return jsonify({"error": "token_revoked", "msg": "Token has been revoked."}), 401
+
 mail = Mail(app)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 # CORS_ORIGINS: comma-separated allowed frontend origins.
@@ -552,6 +611,21 @@ def _infer_issue_flags(text: str):
     return flags
 
 
+def _clean_ai_response(text):
+    """Strip all markdown formatting from AI response: **, ##, ###, ---, •, ━, ─"""
+    import re
+    if not text:
+        return text
+    t = text
+    t = t.replace('**', '')
+    t = t.replace('***', '')
+    t = re.sub(r'^#{1,4}\s*', '', t, flags=re.MULTILINE)
+    t = re.sub(r'^[\-─━═]{3,}$', '', t, flags=re.MULTILINE)
+    t = re.sub(r'^[•●◦▪]\s*', '', t, flags=re.MULTILINE)
+    t = re.sub(r'\n{3,}', '\n\n', t)
+    return t.strip()
+
+
 def _build_parameter_recommendations(problem_type, root_cause, trend_summary, nearest):
     """Build concrete RF parameter change recommendations using actual site values."""
     bw = nearest.get("bandwidth_mhz") if nearest else None
@@ -694,25 +768,8 @@ def _filter_rca_lines(lines):
 
 def generate_root_cause_analysis(ticket, session, client, deployment):
     """
-    Generate AI-powered root cause analysis for a ticket.
-
-    Flow:
-      1. Find nearest tower site to customer's location
-      2. Fetch site-level and cell-level KPI trend data for that site
-      3. Filter KPIs relevant to the problem type (Internet Speed / Call Drop / Call Failure)
-      4. Build prompt with site status, alarms, RF parameters, and KPI trends
-      5. Call AI model for analysis (4-5 numbered points)
-      6. Fallback to _kpi_degradation_points() if AI fails
-
-    Args:
-        ticket:     Ticket object with category, subcategory, description, priority
-        session:    ChatSession object with customer latitude/longitude
-        client:     OpenAI/Azure client for AI completions
-        deployment: Model deployment name
-
-    Returns:
-        dict with keys: analysis, analysis_pdf, site_id, site_zone, site_status,
-                        distance_km, problem_type, selected_kpis
+    Generate AI-powered root cause analysis for a ticket using Senior Telecom
+    RAN Optimization Expert prompt with full KPI trend data and RF parameters.
     """
     if not session or not session.latitude or not session.longitude:
         return {"error": "Customer location not available"}
@@ -723,20 +780,11 @@ def generate_root_cause_analysis(ticket, session, client, deployment):
 
     nearest = nearest_list[0]
     nearest_site_id = nearest["site_id"]
-    nearest_zone = nearest.get("zone")
+    nearest_zone = nearest.get("zone") or nearest.get("province", "")
     dist_km = nearest["distance_km"]
     site_status = (nearest.get("site_status") or "on_air").lower()
-    alarms_text = nearest.get("alarms") or "None"
-    solution_text = nearest.get("solution") or "No action required"
-    std_solution_text = nearest.get("standard_solution_step") or ""
-    site_params_text = "\n".join([
-        f"- Bandwidth (MHz): {nearest.get('bandwidth_mhz')}",
-        f"- Antenna Gain (dBi): {nearest.get('antenna_gain_dbi')}",
-        f"- RF Power (EIRP) [dBm]: {nearest.get('rf_power_eirp_dbm')}",
-        f"- Antenna height (AGL) (M): {nearest.get('antenna_height_agl_m')}",
-        f"- E-tilt (Degree): {nearest.get('e_tilt_degree')}",
-        f"- CRS Gain: {nearest.get('crs_gain')}",
-    ])
+    site_name = nearest.get("site_name") or nearest_site_id
+    cell_id = nearest.get("cell_id") or nearest.get("cell_name") or "N/A"
 
     problem_type = _detect_network_problem_type(ticket)
     problem_type_label = _problem_type_label(problem_type)
@@ -748,92 +796,93 @@ def generate_root_cause_analysis(ticket, session, client, deployment):
     selected_kpis = _filter_kpi_names_for_problem(all_kpis, problem_type)
     site_kpi_text = _build_kpi_summary_text(site_rows, selected_kpis, "site-level")
     cell_kpi_text = _build_kpi_summary_text(cell_rows, selected_kpis, "cell-level")
-    kpis_str = ", ".join(selected_kpis) if selected_kpis else "none matched"
 
-    # Build prompt based on site status
-    if site_status == "off_air":
-        prompt = f"""You are a senior telecom network engineer performing root cause analysis.
+    # Build RF parameters block from all site params including extra_params
+    rf_params_lines = [
+        f"Bandwidth (MHz): {nearest.get('bandwidth_mhz')}",
+        f"Antenna Gain (dBi): {nearest.get('antenna_gain_dbi')}",
+        f"RF Power (EIRP) [dBm]: {nearest.get('rf_power_eirp_dbm')}",
+        f"Antenna Height (AGL) (M): {nearest.get('antenna_height_agl_m')}",
+        f"E-tilt (Degree): {nearest.get('e_tilt_degree')}",
+        f"CRS Gain: {nearest.get('crs_gain')}",
+    ]
+    extra = nearest.get("extra_params") or {}
+    for k, v in extra.items():
+        rf_params_lines.append(f"{k}: {v}")
+    rf_parameters_block = "\n".join(rf_params_lines)
 
-TICKET: {ticket.reference_number} — {ticket.category} / {ticket.subcategory}
-CUSTOMER REPORTED ISSUE: {ticket.description}
-PROBLEM TYPE: {problem_type_label}
-NEAREST SITE: {nearest_site_id} (Zone: {nearest_zone}, Distance: {dist_km} km from customer)
+    # Extract signal diagnosis data (RSRP, SINR, RSRQ) from chat messages if available
+    signal_diagnosis_block = ""
+    if session:
+        try:
+            signal_msgs = ChatMessage.query.filter_by(session_id=session.id, sender='bot').order_by(ChatMessage.created_at.desc()).limit(20).all()
+            for msg in signal_msgs:
+                content = msg.content or ""
+                if any(kw in content.lower() for kw in ['rsrp', 'sinr', 'rsrq', 'signal diagnosis', 'signal:']):
+                    signal_diagnosis_block = f"\nCUSTOMER SIGNAL READINGS (from device screenshot):\n{content}\n"
+                    break
+        except Exception:
+            pass
 
-=== SITE STATUS: OFF AIR ===
-ACTIVE ALARMS:\n{alarms_text}
-KNOWN SOLUTION:\n{solution_text}
-STANDARD SOLUTION STEP:\n{std_solution_text if std_solution_text else 'N/A'}
-SITE RF PARAMETERS:\n{site_params_text}
-SITE-LEVEL KPI TREND DATA (KPIs: {kpis_str}):\n{site_kpi_text}
-CELL-LEVEL KPI TREND DATA:\n{cell_kpi_text}
+    # Build KPI trend block
+    kpi_trend_block = f"SITE-LEVEL KPI TRENDS:\n{site_kpi_text}\n\nCELL-LEVEL KPI TRENDS:\n{cell_kpi_text}"
+    if signal_diagnosis_block:
+        kpi_trend_block += signal_diagnosis_block
 
-INSTRUCTIONS:
-- Write exactly 4–5 numbered points. Format: **Concise Title**: 1-2 sentences with specific technical evidence.
-- Point 1: Primary root cause linking alarm to {problem_type_label} degradation with a specific KPI value.
-- Point 2: What KPI trend shows before/during the outage and magnitude of drop.
-- Point 3: RF/parameter context using actual values and how they contribute.
-- Point 4: Link alarm's standard solution step to expected KPI recovery.
-- Point 5: Secondary impact on adjacent cells visible in cell-level KPI trends.
-- Use actual numbers. Do not add headings or extra sections."""
+    # Determine observation window
+    dates = sorted({r.date for r in site_rows + cell_rows if r.date})
+    if dates:
+        obs_window = f"{dates[0]} to {dates[-1]} ({(dates[-1]-dates[0]).days} days)"
     else:
-        prompt = f"""You are a senior telecom network engineer performing root cause analysis.
+        obs_window = "Last 7 Days"
 
-TICKET: {ticket.reference_number} — {ticket.category} / {ticket.subcategory}
-CUSTOMER REPORTED ISSUE: {ticket.description}
+    site_status_display = "ON AIR" if site_status == "on_air" else "OFF AIR"
+
+    prompt = f"""You are a Senior RAN Optimization Expert with 20+ years of hands-on field experience investigating network performance issues across Ericsson, Huawei, and Nokia LTE networks. You think like a real RF engineer — you look at KPI data the way a doctor reads lab results: each number tells a story, and the combination of multiple KPI movements reveals the underlying disease.
+
+A customer has escalated a complaint that the AI chatbot could not resolve. You must analyze the KPI trends from the nearest cell site, correlate them with the site's RF parameters, and determine what is physically happening in the radio environment that is causing the customer's problem.
+
+CUSTOMER COMPLAINT: {ticket.description}
 PROBLEM TYPE: {problem_type_label}
-NEAREST SITE: {nearest_site_id} (Zone: {nearest_zone}, Distance: {dist_km} km from customer)
 
-=== SITE STATUS: ON AIR ===
-SITE RF PARAMETERS:\n{site_params_text}
-SITE-LEVEL KPI TREND DATA (KPIs: {kpis_str}):\n{site_kpi_text}
-CELL-LEVEL KPI TREND DATA:\n{cell_kpi_text}
+NEAREST SITE:
+  Site: {site_name} | Cell: {cell_id} | Status: {site_status_display} | Distance: {dist_km} km from customer
+  Observation Window: {obs_window}
 
-INSTRUCTIONS:
-- Write exactly 4–5 numbered points. Format: **Concise Title**: 1-2 sentences with specific technical evidence.
-- Point 1: PRIMARY degraded KPI — state recent value vs baseline (actual numbers) and what it reflects.
-- Point 2: SECONDARY degraded KPI — state values and chain of impact to customer's {problem_type_label}.
-- Point 3: RF parameter context (bandwidth, E-tilt, EIRP, height, CRS gain) and how values amplify degradation.
-- Point 4: Temporal pattern — when degradation started, continuous or intermittent, peak vs off-peak.
-- Point 5: Cell-level vs site-level discrepancy narrowing fault to specific cell/sector.
-- Be precise: use actual KPI values. Do not add headings or extra sections."""
+RF PARAMETERS (live values from database):
+{rf_parameters_block}
+
+KPI TREND DATA:
+{kpi_trend_block}
+
+FORMATTING RULES:
+- Plain text only. No asterisks, no hash symbols, no dashes as separators, no bullet points, no bold markers.
+- Write exactly 4 numbered points (1. 2. 3. 4.)
+- Each point: 3-4 clear sentences. Start with a short title followed by colon, then explanation.
+- Cite actual KPI values and RF parameter values from the data above. No assumptions.
+
+Write these 4 points:
+
+1. Primary KPI Degradation: Identify the main degraded KPI that directly reflects the customer's {problem_type_label} complaint. Cite its exact values (daily avg, min, max vs baseline). Explain what this means in RF terms and how it connects to the customer's experience.
+
+2. Supporting Evidence: Cite a second correlated KPI that confirms the diagnosis. Explain the cause-effect chain between the KPIs (e.g., high PRB util with low users = SINR problem not congestion). {'Use the customer signal readings (RSRP, SINR) from the screenshot as evidence.' if signal_diagnosis_block else ''}
+
+3. RF Parameter Analysis: Explain how the current site configuration — Bandwidth, E-tilt, EIRP, Antenna Height, CRS Gain (use actual values from DB) — contributes to the problem. Connect each relevant parameter to the degraded KPIs.
+
+4. Root Cause Conclusion: State the single physical root cause that explains all degraded KPIs together (e.g., "overshooting due to low E-tilt at high antenna height" or "capacity exhaustion on narrow bandwidth"). State whether the issue is sudden, gradual, or chronic based on KPI trend comparison."""
 
     try:
         response = client.chat.completions.create(
             model=deployment,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.2,
-            max_tokens=1500,
+            max_tokens=4000,
         )
-        analysis_raw = response.choices[0].message.content.strip()
-        cleaned_lines = _filter_rca_lines(_normalize_ai_lines(analysis_raw))
-        fallback_rca = []
-        if site_status == "off_air":
-            fallback_rca.append(f"**Site Outage**: Nearest site {nearest_site_id} is OFF AIR; alarms indicate outage as primary cause.")
-        fallback_rca += _kpi_degradation_points(site_rows + cell_rows, selected_kpis, max_points=3)
-        if len(fallback_rca) < 4:
-            fallback_rca += [
-                f"**KPI Evidence**: Trend shifts across {problem_type_label}-related KPIs indicate measurable degradation.",
-                "**Correlation**: Site-level and cell-level KPI movement aligns with the customer's symptom timeline.",
-                "**Impact Scope**: Degradation appears localized to the nearest site/cells based on trend evidence.",
-                "**Next Check**: Validate alarms and RF parameters for contributing factors.",
-            ]
-            fallback_rca = fallback_rca[:4]
-        analysis = _force_numbered_points(
-            "\n".join(cleaned_lines) if cleaned_lines else "",
-            min_points=4, max_points=5, fallback_points=fallback_rca,
-        )
+        analysis = _clean_ai_response(response.choices[0].message.content)
+        if not analysis or len(analysis) < 50:
+            analysis = "AI analysis returned insufficient data. Please retry."
     except Exception as e:
-        fallback_rca = _kpi_degradation_points(site_rows + cell_rows, selected_kpis, max_points=4)
-        if not fallback_rca:
-            fallback_rca = [
-                f"**Model Error**: RCA could not be generated: {str(e)}.",
-                f"**KPI Evidence**: Review KPI shifts for {problem_type_label} and isolate the largest deviations.",
-                "**Correlation**: Correlate degraded cell indicators with site KPIs to confirm fault domain.",
-                "**Next Check**: Validate alarms and site status if KPI evidence is weak.",
-            ]
-        analysis = _force_numbered_points(
-            "\n".join(fallback_rca), min_points=4, max_points=5, fallback_points=fallback_rca,
-        )
+        analysis = f"RCA generation failed: {str(e)}. Please check OpenAI configuration and retry."
 
     return {
         "analysis": analysis,
@@ -849,25 +898,8 @@ INSTRUCTIONS:
 
 def generate_final_recommendations(ticket, session, root_cause, trend_summary, client, deployment):
     """
-    Generate AI-powered final recommendations based on root cause analysis.
-
-    Flow:
-      1. Find nearest tower site to customer's location
-      2. Build site context with RF parameters (bandwidth, tilt, EIRP, gain, height, CRS)
-      3. Call AI model with root cause + trend evidence for 4-5 actionable recommendations
-      4. Each recommendation proposes concrete parameter changes with expected KPI improvement
-      5. Fallback to _build_parameter_recommendations() if AI fails
-
-    Args:
-        ticket:        Ticket object
-        session:       ChatSession object with customer lat/lng
-        root_cause:    Text output from generate_root_cause_analysis()
-        trend_summary: Text summary of KPI trend analysis
-        client:        OpenAI/Azure client
-        deployment:    Model deployment name
-
-    Returns:
-        dict with keys: recommendation, recommendation_pdf
+    Generate AI-powered final recommendations using Senior Telecom RAN Optimization
+    Expert prompt with full RF parameter database and root cause analysis.
     """
     nearest = None
     if session and session.latitude and session.longitude:
@@ -877,64 +909,69 @@ def generate_final_recommendations(ticket, session, root_cause, trend_summary, c
 
     problem_type = _problem_type_label(_detect_network_problem_type(ticket))
 
-    site_context = "Nearest site data not available."
+    # Build RF parameters block
+    rf_params_lines = []
     if nearest:
-        site_context = "\n".join([
-            f"NEAREST SITE: {nearest.get('site_id')} (Zone: {nearest.get('zone')}, Distance: {nearest.get('distance_km')} km)",
-            f"SITE STATUS: {nearest.get('site_status') or 'on_air'}",
-            "SITE PARAMETERS:",
-            f"- Bandwidth (MHz): {nearest.get('bandwidth_mhz')}",
-            f"- Antenna Gain (dBi): {nearest.get('antenna_gain_dbi')}",
-            f"- RF Power (EIRP) [dBm]: {nearest.get('rf_power_eirp_dbm')}",
-            f"- Antenna height (AGL) (M): {nearest.get('antenna_height_agl_m')}",
-            f"- E-tilt (Degree): {nearest.get('e_tilt_degree')}",
-            f"- CRS Gain: {nearest.get('crs_gain')}",
-        ])
+        rf_params_lines = [
+            f"Bandwidth (MHz): {nearest.get('bandwidth_mhz')}",
+            f"Antenna Gain (dBi): {nearest.get('antenna_gain_dbi')}",
+            f"RF Power (EIRP) [dBm]: {nearest.get('rf_power_eirp_dbm')}",
+            f"Antenna Height (AGL) (M): {nearest.get('antenna_height_agl_m')}",
+            f"E-tilt (Degree): {nearest.get('e_tilt_degree')}",
+            f"CRS Gain: {nearest.get('crs_gain')}",
+        ]
+        extra = nearest.get("extra_params") or {}
+        for k, v in extra.items():
+            rf_params_lines.append(f"{k}: {v}")
+    rf_parameters_block = "\n".join(rf_params_lines) if rf_params_lines else "Not available"
 
-    prompt = f"""You are a senior telecom network optimization engineer providing precise, actionable field recommendations.
+    site_name = nearest.get("site_name", nearest.get("site_id", "Unknown")) if nearest else "Unknown"
+    cell_id = nearest.get("cell_id", "N/A") if nearest else "N/A"
+    site_status = (nearest.get("site_status") or "on_air").upper().replace("_", " ") if nearest else "ON AIR"
 
-TICKET: {ticket.reference_number} — {ticket.category} / {ticket.subcategory}
-CUSTOMER REPORTED ISSUE: {ticket.description}
-PRIORITY: {ticket.priority.upper()}
+    prompt = f"""You are a Senior RAN Optimization Expert writing field recommendations after completing a root cause analysis. You have the root cause findings and the complete RF parameter database for this site. Your job is to identify ONLY the 2-3 RF parameters whose adjustment will directly resolve the identified root cause, and propose specific changes with engineering justification.
+
+SITE: {site_name} | Cell: {cell_id} | Status: {site_status}
+CUSTOMER COMPLAINT: {ticket.description}
 PROBLEM TYPE: {problem_type}
 
-{site_context}
+ROOT CAUSE ANALYSIS FINDINGS:
+{root_cause if root_cause else 'Root cause analysis not available.'}
 
-=== TREND ANALYSIS EVIDENCE ===
-{trend_summary if trend_summary else 'No trend analysis summary available.'}
+TREND EVIDENCE:
+{trend_summary if trend_summary else 'No trend data available.'}
 
-=== ROOT CAUSE ANALYSIS FINDINGS ===
-{root_cause if root_cause else 'No root cause analysis available.'}
+COMPLETE RF PARAMETER DATABASE (all current live values):
+{rf_parameters_block}
 
-=== INSTRUCTIONS ===
-Generate exactly 4–5 numbered recommendations. Format: **Action Title**: 2–3 sentences.
-Rules:
-1. Each recommendation must directly address a specific finding from the Root Cause Analysis.
-2. At least 3 recommendations MUST use exact current site parameter values and propose a CONCRETE target value.
-3. One recommendation may use broader telecom best-practices (neighbor cell optimization, scheduler tuning, load balancing).
-4. State the EXPECTED OUTCOME for each (which KPI will improve, by how much approximately).
-5. Prioritize by impact — most impactful first.
-6. Be precise: say "adjust X from Y to Z to achieve W", not "consider adjusting".
-7. Do not repeat the root cause. Focus only on the fix and expected outcome.
-8. Do not add headings, summaries, or extra sections."""
+FORMATTING RULES:
+- Plain text only. No asterisks, no hash symbols, no dashes as separators, no bullet points, no bold markers.
+- Write exactly 3 numbered points (1. 2. 3.)
+- Each point: 4-5 clear sentences. Start with a title followed by colon.
+- Use EXACT current values from the database. Do NOT invent values.
+
+Pick ONLY the 2-3 RF parameters most relevant to the root cause. Do NOT recommend unrelated parameters.
+
+Write these 3 recommendations:
+
+1. [Most critical parameter] Change: State parameter name and current value from DB. Recommend new value within 3GPP standards. Explain why this fixes the root cause — what happens to the radio signal. State which KPIs improve and by how much. Note any risk to adjacent cells.
+
+2. [Second parameter] Change: Same structure — current value, recommended value, RF rationale linking to root cause, expected KPI recovery, rollback plan.
+
+3. [Third parameter or Validation]: Either a third parameter change, or a post-optimization validation step (drive test, 48hr monitoring, neighbor impact check)."""
 
     try:
         response = client.chat.completions.create(
             model=deployment,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.2,
-            max_tokens=1500,
+            max_tokens=4000,
         )
-        recommendation_raw = response.choices[0].message.content.strip()
-        fallback_points = _build_parameter_recommendations(problem_type, root_cause, trend_summary, nearest or {})
-        if recommendation_raw and len(recommendation_raw) > 80:
-            recommendation = _force_numbered_points(recommendation_raw, min_points=4, max_points=5, fallback_points=fallback_points)
-        else:
-            recommendation = _force_numbered_points("\n".join(fallback_points), min_points=4, max_points=5, fallback_points=fallback_points)
+        recommendation = _clean_ai_response(response.choices[0].message.content)
+        if not recommendation or len(recommendation) < 50:
+            recommendation = "AI recommendations returned insufficient data. Please retry."
     except Exception as e:
-        fallback_points = _build_parameter_recommendations(problem_type, root_cause, trend_summary, nearest or {})
-        fallback_points.insert(0, f"**Model Error**: Recommendation generation failed: {str(e)}.")
-        recommendation = _force_numbered_points("\n".join(fallback_points), min_points=4, max_points=5, fallback_points=fallback_points)
+        recommendation = f"Recommendation generation failed: {str(e)}. Please check OpenAI configuration and retry."
 
     return {
         "recommendation": recommendation,
@@ -953,7 +990,9 @@ def find_nearest_sites(lat, lon, n=3):
     try:
         from sqlalchemy import text as sa_text
         rows = db.session.execute(sa_text("""
-            SELECT site_id, zone, city, state, site_status, alarms, solution, standard_solution_step,
+            SELECT site_id, MIN(site_name) AS site_name, MIN(cell_id) AS cell_id,
+                   MIN(province) AS province, MIN(commune) AS commune,
+                   zone, city, state, site_status, alarms, solution, standard_solution_step,
                    AVG(latitude) AS latitude, AVG(longitude) AS longitude,
                    ROUND(AVG(bandwidth_mhz)::numeric, 1) AS bandwidth_mhz,
                    ROUND(AVG(antenna_gain_dbi)::numeric, 1) AS antenna_gain_dbi,
@@ -980,9 +1019,23 @@ def find_nearest_sites(lat, lon, n=3):
     results = []
     for dist, r in scored[:n]:
         status = (r.site_status or "on_air").lower()
+        # Fetch extra_params for this site
+        site_extra = {}
+        try:
+            site_obj = TelecomSite.query.filter_by(site_id=r.site_id).first()
+            if site_obj and site_obj.extra_params:
+                site_extra = site_obj.extra_params
+        except:
+            pass
+
         results.append({
             "site_id": r.site_id,
-            "zone": r.zone or "",
+            "site_name": getattr(r, 'site_name', None) or r.site_id,
+            "cell_id": getattr(r, 'cell_id', None),
+            "cell_name": getattr(r, 'cell_id', None),
+            "province": getattr(r, 'province', None) or r.zone or "",
+            "commune": getattr(r, 'commune', None) or "",
+            "zone": r.zone or getattr(r, 'province', None) or "",
             "city": r.city or "",
             "state": r.state or "",
             "latitude": float(r.latitude or 0),
@@ -1001,6 +1054,7 @@ def find_nearest_sites(lat, lon, n=3):
             "antenna_height_agl_m": float(r.antenna_height_agl_m) if r.antenna_height_agl_m else None,
             "e_tilt_degree": float(r.e_tilt_degree) if r.e_tilt_degree else None,
             "crs_gain": float(r.crs_gain) if r.crs_gain else None,
+            "extra_params": site_extra,
         })
     return results
 
@@ -2034,19 +2088,17 @@ def save_session_location(session_id):
     if session.user_id != user_id:
         return jsonify({"error": "Unauthorized"}), 403
 
-    data = request.json or {}
-    if data.get("location_description"):
-        session.location_description = data.get("location_description")
-    if data.get("state_province"):
-        session.state_province = data.get("state_province")
-    if data.get("country"):
-        session.country = data.get("country")
-
-    # ── Default coordinates (Gurgaon, Haryana) ────────────────────────────────
-    DEFAULT_LATITUDE  = 28.4595
-    DEFAULT_LONGITUDE = 77.0266
-    session.latitude  = data.get("latitude")  or DEFAULT_LATITUDE
-    session.longitude = data.get("longitude") or DEFAULT_LONGITUDE
+    # Product decision: regardless of what the client sends, the customer's
+    # location is always recorded as Phnom Penh — Chakto Mukh, Cambodia.
+    # (The 3 nearest sites are still computed by formula from telecom_sites.)
+    # Siem Reap — Svay Dankum commune (near Angkor Wat)
+    DEFAULT_LATITUDE  = 13.3633
+    DEFAULT_LONGITUDE = 103.8564
+    session.latitude             = DEFAULT_LATITUDE
+    session.longitude            = DEFAULT_LONGITUDE
+    session.location_description = "Siem Reap, Svay Dankum"
+    session.state_province       = "Siem Reap"
+    session.country              = "Cambodia"
 
     db.session.commit()
 
@@ -2260,6 +2312,18 @@ def escalate_session(session_id):
     ticket_expertise = _resolve_expertise(session.subprocess_name)
     assigned_agent = _find_best_expert(ticket_domain, ticket_city, priority, expertise=ticket_expertise)
 
+    # Enrich ticket description with signal diagnosis if available
+    ticket_description = session.query_text or ""
+    if session.diagnosis_ran:
+        try:
+            sig_msg = ChatMessage.query.filter_by(session_id=session_id, sender='bot').filter(
+                ChatMessage.content.ilike('%rsrp%')
+            ).order_by(ChatMessage.created_at.desc()).first()
+            if sig_msg and sig_msg.content:
+                ticket_description += f"\n\n[Signal Diagnosis: {sig_msg.content}]"
+        except Exception:
+            pass
+
     # Create ticket
     ref = generate_ref_number()
     ticket = Ticket(
@@ -2269,7 +2333,7 @@ def escalate_session(session_id):
         category=session.sector_name,
         subcategory=session.subprocess_name,
         domain=ticket_domain,
-        description=session.query_text,
+        description=ticket_description,
         status="pending",
         severity=severity,
         priority=priority,
@@ -3191,6 +3255,15 @@ def cto_overview():
         db.func.count(ChatSession.id),
     ).filter(ChatSession.created_at >= six_months_ago).group_by("month").order_by("month").all()
 
+    # Network issue stats
+    worst_cell_count = overutilized_count = 0
+    try:
+        from network_issues import NetworkIssueTicket, OverutilizedTicket
+        worst_cell_count = NetworkIssueTicket.query.filter(NetworkIssueTicket.status.in_(["open", "in_progress"])).count()
+        overutilized_count = OverutilizedTicket.query.filter(OverutilizedTicket.status.in_(["open", "in_progress"])).count()
+    except Exception:
+        pass
+
     return jsonify({
         "resolution_rate": resolution_rate,
         "avg_rating": round(float(avg_rating), 1),
@@ -3198,6 +3271,8 @@ def cto_overview():
         "total_sessions": total,
         "priority_breakdown": [{"priority": p[0], "count": p[1]} for p in priorities],
         "monthly_trends": [{"month": m[0].isoformat() if m[0] else "", "count": m[1]} for m in monthly],
+        "worst_cell_tickets": worst_cell_count,
+        "overutilized_tickets": overutilized_count,
     })
 
 
@@ -3223,9 +3298,21 @@ def _cache_set(key, data):
     _cto_cache[key] = {"data": data, "ts": _time.time()}
 
 
+def _cache_clear(*keys):
+    """Drop cached entries for specified keys, or clear everything if no keys given."""
+    if not keys:
+        _cto_cache.clear()
+        return
+    for k in keys:
+        _cto_cache.pop(k, None)
+
+
 def _latest_site_values_for_kpi(kpi_name):
-    # Use DISTINCT ON for fast latest-per-site lookup on PostgreSQL
+    """Latest value per site. Uses site-level data; falls back to cell-level (averaged per site)
+    for sites that have no site-level data."""
     date_floor = date.today() - timedelta(days=30)
+
+    # Site-level first
     rows = db.session.execute(db.text("""
         SELECT DISTINCT ON (site_id) site_id, date, value
         FROM kpi_data
@@ -3233,12 +3320,29 @@ def _latest_site_values_for_kpi(kpi_name):
         ORDER BY site_id, date DESC
     """), {"kpi": kpi_name, "floor": date_floor}).fetchall()
 
-    return {r.site_id: {"date": r.date, "value": float(r.value)} for r in rows}
+    result = {r.site_id: {"date": r.date, "value": float(r.value)} for r in rows}
+
+    # Cell-level fallback for sites not in result
+    cell_rows = db.session.execute(db.text("""
+        SELECT site_id, MAX(date) AS date, AVG(value) AS value
+        FROM kpi_data
+        WHERE data_level = 'cell' AND kpi_name = :kpi AND value IS NOT NULL AND date >= :floor
+        GROUP BY site_id
+    """), {"kpi": kpi_name, "floor": date_floor}).fetchall()
+
+    for r in cell_rows:
+        if r.site_id not in result:
+            result[r.site_id] = {"date": r.date, "value": float(r.value)}
+
+    return result
 
 
 def _site_values_near_date(kpi_name, target_date):
-    """Return {site_id: value} for the closest date <= target_date per site."""
+    """Return {site_id: value} for the closest date <= target_date per site.
+    Falls back to cell-level (averaged per site) for sites without site-level data."""
     date_floor = target_date - timedelta(days=14)
+
+    # Site-level
     rows = db.session.execute(db.text("""
         SELECT DISTINCT ON (site_id) site_id, value
         FROM kpi_data
@@ -3247,13 +3351,40 @@ def _site_values_near_date(kpi_name, target_date):
         ORDER BY site_id, date DESC
     """), {"kpi": kpi_name, "floor": date_floor, "target": target_date}).fetchall()
 
-    return {r.site_id: float(r.value) for r in rows}
+    result = {r.site_id: float(r.value) for r in rows}
+
+    # Cell-level fallback
+    cell_rows = db.session.execute(db.text("""
+        SELECT site_id, AVG(value) AS value
+        FROM kpi_data
+        WHERE data_level = 'cell' AND kpi_name = :kpi AND value IS NOT NULL
+          AND date >= :floor AND date <= :target
+        GROUP BY site_id
+    """), {"kpi": kpi_name, "floor": date_floor, "target": target_date}).fetchall()
+
+    for r in cell_rows:
+        if r.site_id not in result:
+            result[r.site_id] = float(r.value)
+
+    return result
 
 
 def _series_for_kpi_patterns(patterns, days=30):
+    """Daily average series. Uses site-level; merges cell-level for sites without site data."""
     from sqlalchemy import func as sa_func
     date_floor = date.today() - timedelta(days=days)
-    rows = db.session.query(
+
+    # Sites with site-level data
+    site_level_sites = set(r[0] for r in db.session.query(
+        db.distinct(KpiData.site_id)
+    ).filter(
+        KpiData.data_level == "site",
+        KpiData.kpi_name.in_(patterns),
+        KpiData.date >= date_floor,
+    ).all())
+
+    # Site-level series
+    site_rows = db.session.query(
         KpiData.date,
         sa_func.avg(KpiData.value).label("avg_val"),
     ).filter(
@@ -3263,7 +3394,40 @@ def _series_for_kpi_patterns(patterns, days=30):
         KpiData.date >= date_floor,
     ).group_by(KpiData.date).order_by(KpiData.date).all()
 
-    return [{"date": r.date.isoformat(), "value": round(float(r.avg_val), 2)} for r in rows]
+    # Cell-level fallback for sites without site data
+    cell_rows = []
+    if site_level_sites:
+        cell_rows = db.session.query(
+            KpiData.date,
+            sa_func.avg(KpiData.value).label("avg_val"),
+        ).filter(
+            KpiData.data_level == "cell",
+            KpiData.value.isnot(None),
+            KpiData.kpi_name.in_(patterns),
+            KpiData.date >= date_floor,
+            ~KpiData.site_id.in_(site_level_sites),
+        ).group_by(KpiData.date).order_by(KpiData.date).all()
+    else:
+        # No site-level data at all — use all cell data
+        cell_rows = db.session.query(
+            KpiData.date,
+            sa_func.avg(KpiData.value).label("avg_val"),
+        ).filter(
+            KpiData.data_level == "cell",
+            KpiData.value.isnot(None),
+            KpiData.kpi_name.in_(patterns),
+            KpiData.date >= date_floor,
+        ).group_by(KpiData.date).order_by(KpiData.date).all()
+
+    # Merge by date
+    merged = {}
+    for r in site_rows:
+        merged.setdefault(r.date, []).append(float(r.avg_val))
+    for r in cell_rows:
+        merged.setdefault(r.date, []).append(float(r.avg_val))
+
+    return [{"date": d.isoformat(), "value": round(sum(v) / len(v), 2)}
+            for d, v in sorted(merged.items())]
 
 
 def _latest_average_for_patterns(patterns):
@@ -3310,6 +3474,65 @@ def cto_map_data():
     })
 
 
+@app.route("/api/cto/ticket-heatmap", methods=["GET"])
+@jwt_required()
+def cto_ticket_heatmap():
+    """Return ticket counts grouped by state/province with centroid lat/lng
+    for rendering as Leaflet circle markers (no GeoJSON needed).
+    """
+    user = _require_cto_user()
+    if not user:
+        return jsonify({"error": "Unauthorized"}), 403
+
+    from sqlalchemy import func as sa_func
+
+    # Query tickets joined with chat sessions to get state/province + avg location
+    rows = db.session.query(
+        ChatSession.state_province,
+        ChatSession.country,
+        sa_func.count(Ticket.id).label("total"),
+        sa_func.sum(
+            db.case((Ticket.status == "resolved", 1), else_=0)
+        ).label("resolved"),
+        sa_func.avg(ChatSession.latitude).label("avg_lat"),
+        sa_func.avg(ChatSession.longitude).label("avg_lng"),
+    ).join(
+        ChatSession, Ticket.chat_session_id == ChatSession.id
+    ).filter(
+        ChatSession.state_province.isnot(None),
+        ChatSession.state_province != "",
+    ).group_by(
+        ChatSession.state_province,
+        ChatSession.country,
+    ).all()
+
+    # Detect dominant country
+    country_counts = {}
+    for _, country, total, _, _, _ in rows:
+        c = (country or "").strip()
+        if c:
+            country_counts[c] = country_counts.get(c, 0) + (total or 0)
+    detected_country = max(country_counts, key=country_counts.get) if country_counts else ""
+
+    state_data = []
+    for state, country, total, resolved, avg_lat, avg_lng in rows:
+        lat = float(avg_lat) if avg_lat else None
+        lng = float(avg_lng) if avg_lng else None
+        state_data.append({
+            "state": (state or "").strip(),
+            "total": total or 0,
+            "resolved": resolved or 0,
+            "pending": (total or 0) - (resolved or 0),
+            "lat": lat,
+            "lng": lng,
+        })
+
+    return jsonify({
+        "state_data": state_data,
+        "detected_country": detected_country,
+    })
+
+
 @app.route("/api/cto/technical-kpi", methods=["GET"])
 @jwt_required()
 def cto_technical_kpi():
@@ -3320,25 +3543,19 @@ def cto_technical_kpi():
     kpi_defs = [
         {
             "key": "accessibility",
-            "label": "Accessibility",
+            "label": "Accessibility (CSSR)",
             "names": [
-                "Availability",
-                "LTE RRC Setup Success Rate",
                 "LTE Call Setup Success Rate",
-                "LTE E-RAB Setup Success Rate",
-                "CSFB Access Success Rate",
             ],
+            "unit": "%",
         },
         {
             "key": "retainability",
-            "label": "Retainability",
+            "label": "Retainability (E-RAB Drop)",
             "names": [
                 "E-RAB Call Drop Rate_1",
-                "Inter-eNBS1HO Success Rate",
-                "Inter-eNBX2HO Success Rate",
-                "Intra-eNB HO Success Rate",
-                "LTE Intra-Freq HO Success Rate",
             ],
+            "unit": "%",
         },
         {
             "key": "downlink_throughput",
@@ -3347,6 +3564,7 @@ def cto_technical_kpi():
                 "LTE DL - Cell Ave Throughput",
                 "LTE DL - Usr Ave Throughput",
             ],
+            "unit": "Mbps",
         },
         {
             "key": "prb_utilization",
@@ -3355,6 +3573,7 @@ def cto_technical_kpi():
                 "DL PRB Utilization (1BH)",
                 "UL PRB Utilization (1BH",
             ],
+            "unit": "%",
         },
         {
             "key": "downlink_volume",
@@ -3362,6 +3581,7 @@ def cto_technical_kpi():
             "names": [
                 "DL Data Total Volume",
             ],
+            "unit": "GB",
         },
         {
             "key": "uplink_volume",
@@ -3369,6 +3589,7 @@ def cto_technical_kpi():
             "names": [
                 "UL Data Total Volume",
             ],
+            "unit": "GB",
         },
     ]
 
@@ -3379,13 +3600,36 @@ def cto_technical_kpi():
 
     # Bulk query: all KPI names in one shot, grouped by kpi_name + date
     # Only last 45 days — enough for 30-day trend + buffer
+    # Uses site-level data first; for sites missing site-level, falls back to
+    # cell-level data averaged per site.
     from sqlalchemy import func as sa_func
     all_names = []
     for item in kpi_defs:
         all_names.extend(item["names"])
 
     date_floor = date.today() - timedelta(days=45)
-    bulk = db.session.query(
+
+    # Step 1: Find sites that have site-level data
+    sites_with_site_level = set(r[0] for r in db.session.query(
+        db.distinct(KpiData.site_id)
+    ).filter(
+        KpiData.data_level == "site",
+        KpiData.kpi_name.in_(all_names),
+        KpiData.date >= date_floor,
+    ).all())
+
+    # Step 2: Find sites that only have cell-level data (no site-level)
+    sites_cell_only = set(r[0] for r in db.session.query(
+        db.distinct(KpiData.site_id)
+    ).filter(
+        KpiData.data_level == "cell",
+        KpiData.kpi_name.in_(all_names),
+        KpiData.date >= date_floor,
+        ~KpiData.site_id.in_(sites_with_site_level) if sites_with_site_level else db.true(),
+    ).all()) if True else set()
+
+    # Step 3: Query site-level data
+    bulk_site = db.session.query(
         KpiData.kpi_name,
         KpiData.date,
         sa_func.avg(KpiData.value).label("avg_val"),
@@ -3395,6 +3639,31 @@ def cto_technical_kpi():
         KpiData.kpi_name.in_(all_names),
         KpiData.date >= date_floor,
     ).group_by(KpiData.kpi_name, KpiData.date).order_by(KpiData.date).all()
+
+    # Step 4: Query cell-level data for sites missing site-level, averaged per site then overall
+    bulk_cell = []
+    if sites_cell_only:
+        bulk_cell = db.session.query(
+            KpiData.kpi_name,
+            KpiData.date,
+            sa_func.avg(KpiData.value).label("avg_val"),
+        ).filter(
+            KpiData.data_level == "cell",
+            KpiData.value.isnot(None),
+            KpiData.kpi_name.in_(all_names),
+            KpiData.date >= date_floor,
+            KpiData.site_id.in_(sites_cell_only),
+        ).group_by(KpiData.kpi_name, KpiData.date).order_by(KpiData.date).all()
+
+    # Merge: combine site-level and cell-level (fallback) into one result
+    # Cell-level values are merged into the same kpi_name+date buckets
+    merged = {}
+    for kpi_name, kpi_date, avg_val in bulk_site:
+        merged.setdefault((kpi_name, kpi_date), []).append(float(avg_val))
+    for kpi_name, kpi_date, avg_val in bulk_cell:
+        merged.setdefault((kpi_name, kpi_date), []).append(float(avg_val))
+
+    bulk = [(kn, dt, sum(vals) / len(vals)) for (kn, dt), vals in sorted(merged.items(), key=lambda x: x[0][1])]
 
     # Map kpi_name → key
     name_to_key = {}
@@ -3424,6 +3693,7 @@ def cto_technical_kpi():
             "key": k,
             "label": item["label"],
             "value": round(series[-1]["value"], 2) if series else 0,
+            "unit": item.get("unit", ""),
         })
         chart_series[k] = series[-30:]
 
@@ -3467,7 +3737,10 @@ def cto_technical_kpi():
         }
 
     # ── Per-site latest values for the site breakdown table ──────────
+    # Uses site-level data; for sites with only cell-level data, averages cells per site
     date_floor_site = date.today() - timedelta(days=7)
+
+    # Site-level latest
     site_sub = db.session.query(
         KpiData.site_id,
         KpiData.kpi_name,
@@ -3495,6 +3768,38 @@ def cto_technical_kpi():
         k = name_to_key.get(kpi_name)
         if k:
             site_pivot.setdefault(site_id, {})[k] = round(float(value), 2)
+
+    # Cell-level fallback: for sites missing from site_pivot, average their cells
+    if sites_cell_only:
+        cell_sub = db.session.query(
+            KpiData.site_id,
+            KpiData.kpi_name,
+            sa_func.max(KpiData.date).label("max_date"),
+        ).filter(
+            KpiData.data_level == "cell",
+            KpiData.kpi_name.in_(all_names),
+            KpiData.value.isnot(None),
+            KpiData.date >= date_floor_site,
+            KpiData.site_id.in_(sites_cell_only),
+        ).group_by(KpiData.site_id, KpiData.kpi_name).subquery()
+
+        cell_latest = db.session.query(
+            KpiData.site_id,
+            KpiData.kpi_name,
+            sa_func.avg(KpiData.value).label("avg_val"),
+        ).join(cell_sub, db.and_(
+            KpiData.site_id == cell_sub.c.site_id,
+            KpiData.kpi_name == cell_sub.c.kpi_name,
+            KpiData.date == cell_sub.c.max_date,
+        )).filter(
+            KpiData.data_level == "cell",
+            KpiData.kpi_name.in_(all_names),
+        ).group_by(KpiData.site_id, KpiData.kpi_name).all()
+
+        for site_id, kpi_name, avg_val in cell_latest:
+            k = name_to_key.get(kpi_name)
+            if k and site_id not in site_pivot:
+                site_pivot.setdefault(site_id, {})[k] = round(float(avg_val), 2)
 
     site_list = []
     for sid in sorted(site_pivot.keys()):
@@ -3576,7 +3881,32 @@ def cto_technical_kpi():
         "source": "network_kpi_timeseries" if nkt_count > 0 else "kpi_data (E-RAB Call Drop Rate)",
     }
 
-    result = {"cards": cards, "series": chart_series, "sites": site_list, "packet_loss": packet_loss, "forecast": forecast}
+    # ── Individual KPI series for specific trend charts ────────────────
+    # Frontend shows dedicated trend graphs for these specific metrics.
+    individual_kpi_names = [
+        "LTE Call Setup Success Rate",
+        "E-RAB Call Drop Rate_1",
+    ]
+    individual_series = {}
+    for kpi_name, kpi_date, avg_val in bulk:
+        if kpi_name in individual_kpi_names:
+            key = kpi_name.lower().replace(" ", "_").replace("-", "_").replace("(", "").replace(")", "")
+            individual_series.setdefault(key, []).append({
+                "date": kpi_date.isoformat() if hasattr(kpi_date, 'isoformat') else str(kpi_date),
+                "value": round(float(avg_val), 2),
+            })
+    # Sort each series by date and take last 30
+    for k in individual_series:
+        individual_series[k] = sorted(individual_series[k], key=lambda x: x["date"])[-30:]
+
+    result = {
+        "cards": cards,
+        "series": chart_series,
+        "individual_series": individual_series,
+        "sites": site_list,
+        "packet_loss": packet_loss,
+        "forecast": forecast,
+    }
     _cache_set("technical_kpi", result)
     return jsonify(result)
 
@@ -3584,27 +3914,308 @@ def cto_technical_kpi():
 @app.route("/api/cto/core-kpi", methods=["GET"])
 @jwt_required()
 def cto_core_kpi():
-    """Return Core Network KPI data from the flexible upload table.
-    Optimised: uses bulk queries instead of per-KPI loops.
+    """Return Core Network KPI data — component-based from CoreComponentKpi table.
+    Falls back to FlexibleKpiUpload(core) if no component data exists.
+    Shows data by component_type/component_id instead of site_id.
     """
     import datetime as _dt
     from sqlalchemy import func as sa_func
+    from models import CoreComponentKpi
 
     user = _require_cto_user()
     if not user:
         return jsonify({"error": "Unauthorized"}), 403
 
-    has_kpi_name = db.session.query(FlexibleKpiUpload.id).filter(
+    def _iso(d):
+        return d.isoformat() if d and hasattr(d, 'isoformat') else (str(d) if d else None)
+
+    # ── Check CoreComponentKpi table first (component-based data) ──
+    has_core_comp = db.session.query(CoreComponentKpi.id).limit(1).scalar() is not None
+
+    if has_core_comp:
+        return _core_kpi_from_components()
+
+    # ── Fallback: FlexibleKpiUpload (core) — site-based ──
+    has_flex = db.session.query(FlexibleKpiUpload.id).filter(
         FlexibleKpiUpload.kpi_type == "core",
         FlexibleKpiUpload.kpi_name.isnot(None),
     ).limit(1).scalar() is not None
 
-    if not has_kpi_name:
-        # Check if any core data exists at all
-        total = FlexibleKpiUpload.query.filter_by(kpi_type="core").count()
-        if total == 0:
-            return jsonify({"available": False, "message": "No Core KPI data uploaded yet."})
-        return jsonify({"available": False, "message": "Core data missing KPI names."})
+    if has_flex:
+        return _core_kpi_from_flexible()
+
+    return jsonify({"available": False, "message": "No Core KPI data uploaded yet."})
+
+
+def _core_kpi_from_components():
+    """Build rich Core KPI response from CoreComponentKpi — CTO-level analytics.
+    Auto-categorises each KPI as success_rate / utilization / latency / capacity.
+    Computes health scores, identifies anomalies, builds comparison data.
+    """
+    from sqlalchemy import func as sa_func
+
+    def _iso(d):
+        return d.isoformat() if d and hasattr(d, 'isoformat') else (str(d) if d else None)
+
+    def _categorise(name):
+        nl = name.lower()
+        if any(k in nl for k in ("success", "availability", "accuracy")):
+            return "success_rate"
+        if any(k in nl for k in ("cpu", "memory", "utilization", "prb", "tps usage", "queue depth")):
+            return "utilization"
+        if any(k in nl for k in ("latency", "(ms)", "(s)", "lag", "jitter", "response time")):
+            return "latency"
+        if any(k in nl for k in ("failure", "drop", "loss", "timeout", "contention", "error")):
+            return "failure_rate"
+        return "capacity"  # sessions, counts, throughput, etc.
+
+    # ── Per-KPI scale detection: if max value <= 1.5 for a percentage-type
+    # KPI, treat stored values as fractions (0-1) and multiply by 100 for display.
+    max_rows = db.session.query(
+        CoreComponentKpi.kpi_name,
+        sa_func.max(CoreComponentKpi.value),
+    ).filter(CoreComponentKpi.value.isnot(None)).group_by(CoreComponentKpi.kpi_name).all()
+    kpi_scale = {}  # kpi_name → multiplier
+    for kn, mx in max_rows:
+        if mx is None:
+            kpi_scale[kn] = 1.0
+            continue
+        cat = _categorise(kn)
+        if cat in ("success_rate", "failure_rate", "utilization") and float(mx) <= 1.5:
+            kpi_scale[kn] = 100.0
+        else:
+            kpi_scale[kn] = 1.0
+
+    def _scale(kn, v):
+        if v is None:
+            return None
+        return float(v) * kpi_scale.get(kn, 1.0)
+
+    # ── Date range ──
+    date_range = db.session.query(
+        sa_func.min(CoreComponentKpi.date),
+        sa_func.max(CoreComponentKpi.date),
+    ).one()
+    min_date, latest_date = date_range
+    if not min_date:
+        return jsonify({"available": False, "message": "No valid dates found."})
+
+    # ── Component types + instance counts ──
+    comp_types_raw = db.session.query(
+        CoreComponentKpi.component_type,
+        sa_func.count(sa_func.distinct(CoreComponentKpi.component_id)),
+    ).group_by(CoreComponentKpi.component_type).all()
+    comp_types = sorted([r[0] for r in comp_types_raw])
+    type_instance_count = {r[0]: r[1] for r in comp_types_raw}
+    total_nodes = sum(type_instance_count.values())
+
+    # ── All KPI names and their categories ──
+    all_kpis = [r[0] for r in db.session.query(CoreComponentKpi.kpi_name).distinct().all()]
+    kpi_category = {k: _categorise(k) for k in all_kpis}
+
+    # ── Latest values: component_type × kpi_name → avg across instances ──
+    latest_rows = db.session.query(
+        CoreComponentKpi.component_type,
+        CoreComponentKpi.kpi_name,
+        sa_func.avg(CoreComponentKpi.value).label("avg_val"),
+    ).filter(
+        CoreComponentKpi.date == latest_date,
+        CoreComponentKpi.value.isnot(None),
+    ).group_by(
+        CoreComponentKpi.component_type,
+        CoreComponentKpi.kpi_name,
+    ).all()
+
+    # Build per-type KPI dict (apply scale)
+    type_kpis = {}  # {MME: {kpi_name: avg_val}}
+    for ct, kn, av in latest_rows:
+        type_kpis.setdefault(ct, {})[kn] = round(_scale(kn, av), 2)
+
+    # ── Compute health score per component type ──
+    # Health = avg of success_rate KPIs (higher=better).
+    # If no success rates, fall back to 100 - avg(failure_rates) - avg(utilization > 80 penalty).
+    type_health = {}
+    for ct in comp_types:
+        kpis = type_kpis.get(ct, {})
+        success_vals = [v for k, v in kpis.items() if kpi_category.get(k) == "success_rate" and v is not None]
+        failure_vals = [v for k, v in kpis.items() if kpi_category.get(k) == "failure_rate" and v is not None]
+        util_vals    = [v for k, v in kpis.items() if kpi_category.get(k) == "utilization" and v is not None]
+
+        if success_vals:
+            health = round(sum(success_vals) / len(success_vals), 1)
+        elif failure_vals:
+            health = round(100 - (sum(failure_vals) / len(failure_vals)), 1)
+        else:
+            health = 100.0
+
+        # Penalise high utilisation (>80% is a concern)
+        if util_vals:
+            over80 = [v for v in util_vals if v > 80]
+            if over80:
+                health = max(0, health - len(over80) * 2)
+
+        cpu_val = next((v for k, v in kpis.items() if "cpu" in k.lower()), None)
+        mem_val = next((v for k, v in kpis.items() if "memory" in k.lower()), None)
+
+        type_health[ct] = {
+            "health": round(health, 1),
+            "cpu": cpu_val,
+            "memory": mem_val,
+            "instances": type_instance_count.get(ct, 0),
+            "success_rates": {k: v for k, v in kpis.items() if kpi_category.get(k) == "success_rate"},
+            "failure_rates": {k: v for k, v in kpis.items() if kpi_category.get(k) == "failure_rate"},
+            "utilization":   {k: v for k, v in kpis.items() if kpi_category.get(k) == "utilization"},
+            "latency":       {k: v for k, v in kpis.items() if kpi_category.get(k) == "latency"},
+            "capacity":      {k: v for k, v in kpis.items() if kpi_category.get(k) == "capacity"},
+        }
+
+    # ── Overall hero metrics ──
+    all_health = [v["health"] for v in type_health.values()]
+    overall_health = round(sum(all_health) / len(all_health), 1) if all_health else 0
+
+    all_cpu = [v["cpu"] for v in type_health.values() if v["cpu"] is not None]
+    avg_cpu = round(sum(all_cpu) / len(all_cpu), 1) if all_cpu else None
+
+    all_mem = [v["memory"] for v in type_health.values() if v["memory"] is not None]
+    avg_mem = round(sum(all_mem) / len(all_mem), 1) if all_mem else None
+
+    # Average of all success-rate KPIs across all components
+    all_sr = []
+    for th in type_health.values():
+        all_sr.extend(th["success_rates"].values())
+    avg_success = round(sum(all_sr) / len(all_sr), 2) if all_sr else None
+
+    # ── Trends: daily avg for CPU, Memory, Health across all components ──
+    trend_rows = db.session.query(
+        CoreComponentKpi.kpi_name,
+        CoreComponentKpi.date,
+        sa_func.avg(CoreComponentKpi.value).label("avg_val"),
+    ).filter(
+        CoreComponentKpi.value.isnot(None),
+    ).group_by(CoreComponentKpi.kpi_name, CoreComponentKpi.date).all()
+
+    # Build daily trend for CPU, Memory, and overall success (apply scale)
+    daily = {}  # date → {cpu: [], mem: [], success: []}
+    for kn, dt, av in trend_rows:
+        d_str = _iso(dt)
+        bucket = daily.setdefault(d_str, {"cpu": [], "mem": [], "success": [], "failure": []})
+        cat = kpi_category.get(kn, "")
+        val = _scale(kn, av)
+        if val is None:
+            continue
+        if "cpu" in kn.lower():
+            bucket["cpu"].append(val)
+        elif "memory" in kn.lower():
+            bucket["mem"].append(val)
+        if cat == "success_rate":
+            bucket["success"].append(val)
+        elif cat == "failure_rate":
+            bucket["failure"].append(val)
+
+    trend = []
+    for d_str in sorted(daily.keys()):
+        b = daily[d_str]
+        cpu_avg = round(sum(b["cpu"]) / len(b["cpu"]), 2) if b["cpu"] else None
+        mem_avg = round(sum(b["mem"]) / len(b["mem"]), 2) if b["mem"] else None
+        sr_avg  = round(sum(b["success"]) / len(b["success"]), 2) if b["success"] else None
+        fr_avg  = round(sum(b["failure"]) / len(b["failure"]), 2) if b["failure"] else None
+        health_d = sr_avg if sr_avg is not None else (round(100 - fr_avg, 2) if fr_avg is not None else None)
+        trend.append({"date": d_str, "cpu": cpu_avg, "memory": mem_avg, "success_rate": sr_avg, "health": health_d})
+
+    # ── Per-component instance latest (for drilldown table) ──
+    inst_rows = db.session.query(
+        CoreComponentKpi.component_type,
+        CoreComponentKpi.component_id,
+        CoreComponentKpi.kpi_name,
+        sa_func.avg(CoreComponentKpi.value).label("avg_val"),
+    ).filter(
+        CoreComponentKpi.date == latest_date,
+    ).group_by(
+        CoreComponentKpi.component_type,
+        CoreComponentKpi.component_id,
+        CoreComponentKpi.kpi_name,
+    ).all()
+
+    # Build per-instance health (apply scale)
+    inst_pivot = {}
+    for ct, cid, kn, av in inst_rows:
+        key = f"{ct}:{cid}"
+        inst_pivot.setdefault(key, {"component_type": ct, "component_id": cid, "kpis": {}})
+        sv = _scale(kn, av)
+        if sv is not None:
+            inst_pivot[key]["kpis"][kn] = round(sv, 2)
+
+    component_table = []
+    for key in sorted(inst_pivot.keys()):
+        inst = inst_pivot[key]
+        kpis = inst["kpis"]
+        sr = [v for k, v in kpis.items() if kpi_category.get(k) == "success_rate"]
+        fr = [v for k, v in kpis.items() if kpi_category.get(k) == "failure_rate"]
+        health = round(sum(sr) / len(sr), 1) if sr else (round(100 - sum(fr) / len(fr), 1) if fr else 100)
+        cpu = next((v for k, v in kpis.items() if "cpu" in k.lower()), None)
+        mem = next((v for k, v in kpis.items() if "memory" in k.lower()), None)
+        component_table.append({
+            "component_type": inst["component_type"],
+            "component_id": inst["component_id"],
+            "health": health,
+            "cpu": cpu,
+            "memory": mem,
+            "kpi_count": len(kpis),
+        })
+
+    # ── Anomalies: instances with health < 95 or CPU > 80 or Memory > 80 ──
+    anomalies = []
+    for row in component_table:
+        reasons = []
+        if row["health"] < 95:
+            reasons.append(f"Health {row['health']}%")
+        if row["cpu"] is not None and row["cpu"] > 80:
+            reasons.append(f"CPU {row['cpu']}%")
+        if row["memory"] is not None and row["memory"] > 80:
+            reasons.append(f"Memory {row['memory']}%")
+        if reasons:
+            anomalies.append({**row, "reasons": reasons})
+    anomalies.sort(key=lambda r: r["health"])
+
+    # ── Component type comparison (for bar chart) ──
+    type_comparison = []
+    for ct in comp_types:
+        th = type_health[ct]
+        type_comparison.append({
+            "type": ct,
+            "health": th["health"],
+            "cpu": th["cpu"],
+            "memory": th["memory"],
+            "instances": th["instances"],
+            "success_count": len(th["success_rates"]),
+            "total_kpis": sum(len(v) for v in [th["success_rates"], th["failure_rates"], th["utilization"], th["latency"], th["capacity"]]),
+        })
+
+    return jsonify({
+        "available": True,
+        "data_source": "component",
+        "date_range": {"from": _iso(min_date), "to": _iso(latest_date)},
+        "hero": {
+            "overall_health": overall_health,
+            "avg_cpu": avg_cpu,
+            "avg_memory": avg_mem,
+            "avg_success_rate": avg_success,
+            "total_nodes": total_nodes,
+            "total_kpis": len(all_kpis),
+            "component_types": len(comp_types),
+        },
+        "type_health": type_health,
+        "type_comparison": type_comparison,
+        "trend": trend,
+        "components": component_table,
+        "anomalies": anomalies,
+    })
+
+
+def _core_kpi_from_flexible():
+    """Fallback: Build Core KPI from FlexibleKpiUpload(core) — site-based."""
+    import datetime as _dt
+    from sqlalchemy import func as sa_func
 
     def _iso(d):
         return d.isoformat() if d and hasattr(d, 'isoformat') else (str(d) if d else None)
@@ -3616,7 +4227,6 @@ def cto_core_kpi():
         except ValueError:
             return None
 
-    # ── KPI metadata ─────────────────────────────────────────────
     LABEL_MAP = {
         "CPU Utilization": "CPU Usage",
         "Authentication Success Rate": "Auth Success Rate",
@@ -3630,21 +4240,19 @@ def cto_core_kpi():
         FlexibleKpiUpload.kpi_name.isnot(None),
     ).distinct().all()]
 
-    db_to_key = {}   # "CPU Utilization" → "cpu_utilization"
-    cols_meta = {}   # "cpu_utilization" → {"db_name": ..., "label": ...}
+    db_to_key = {}
+    cols_meta = {}
     for kn in kpi_names:
         key = kn.lower().replace(" ", "_")
         db_to_key[kn] = key
         cols_meta[key] = {"db_name": kn, "label": LABEL_MAP.get(kn, kn)}
 
-    # ── Detect data format: row_date based (new) or column_name dates (old) ──
     has_row_date = db.session.query(FlexibleKpiUpload.id).filter(
         FlexibleKpiUpload.kpi_type == "core",
         FlexibleKpiUpload.row_date.isnot(None),
     ).limit(1).scalar() is not None
 
     if has_row_date:
-        # ── NEW FORMAT: kpi_name in column_name, dates in row_date ──
         date_range = db.session.query(
             sa_func.min(FlexibleKpiUpload.row_date),
             sa_func.max(FlexibleKpiUpload.row_date),
@@ -3653,11 +4261,9 @@ def cto_core_kpi():
             FlexibleKpiUpload.row_date.isnot(None),
         ).one()
         min_date, latest_date = date_range
-
         if not min_date:
             return jsonify({"available": False, "message": "No valid dates found."})
 
-        # Bulk query: kpi_name + row_date → avg
         bulk_rows = db.session.query(
             FlexibleKpiUpload.kpi_name,
             FlexibleKpiUpload.row_date,
@@ -3666,14 +4272,9 @@ def cto_core_kpi():
             FlexibleKpiUpload.kpi_type == "core",
             FlexibleKpiUpload.kpi_name.isnot(None),
             FlexibleKpiUpload.row_date.isnot(None),
-        ).group_by(
-            FlexibleKpiUpload.kpi_name,
-            FlexibleKpiUpload.row_date,
-        ).all()
+        ).group_by(FlexibleKpiUpload.kpi_name, FlexibleKpiUpload.row_date).all()
 
-        # Build unique dates
         all_dates = sorted(set(r[1] for r in bulk_rows if r[1]))
-
         per_kpi_all = {k: [] for k in cols_meta}
         per_kpi_latest = {k: None for k in cols_meta}
         trend_pivot = {_iso(d): {"date": _iso(d)} for d in all_dates}
@@ -3690,43 +4291,25 @@ def cto_core_kpi():
             if d_str in trend_pivot:
                 trend_pivot[d_str][key] = val
 
-        # Per-site table: latest date
         site_rows = db.session.query(
-            FlexibleKpiUpload.site_id,
-            FlexibleKpiUpload.kpi_name,
-            FlexibleKpiUpload.num_value,
-        ).filter(
-            FlexibleKpiUpload.kpi_type == "core",
-            FlexibleKpiUpload.row_date == latest_date,
-        ).all()
-
+            FlexibleKpiUpload.site_id, FlexibleKpiUpload.kpi_name, FlexibleKpiUpload.num_value,
+        ).filter(FlexibleKpiUpload.kpi_type == "core", FlexibleKpiUpload.row_date == latest_date).all()
     else:
-        # ── OLD FORMAT: dates as column_name, kpi_name separate ──
-        date_cols = [r[0] for r in db.session.query(
-            FlexibleKpiUpload.column_name
-        ).filter_by(kpi_type="core").distinct().all()]
+        date_cols = [r[0] for r in db.session.query(FlexibleKpiUpload.column_name).filter_by(kpi_type="core").distinct().all()]
         date_cols_parsed = {dc: _parse_col_date(dc) for dc in date_cols}
         date_cols_parsed = {k: v for k, v in date_cols_parsed.items() if v}
         sorted_date_cols = sorted(date_cols_parsed.items(), key=lambda x: x[1])
-
         if not sorted_date_cols:
             return jsonify({"available": False, "message": "No valid date columns found."})
-
         min_date = sorted_date_cols[0][1]
         latest_date = sorted_date_cols[-1][1]
         latest_col = sorted_date_cols[-1][0]
 
         bulk_rows = db.session.query(
-            FlexibleKpiUpload.kpi_name,
-            FlexibleKpiUpload.column_name,
+            FlexibleKpiUpload.kpi_name, FlexibleKpiUpload.column_name,
             sa_func.avg(FlexibleKpiUpload.num_value).label("avg_val"),
-        ).filter(
-            FlexibleKpiUpload.kpi_type == "core",
-            FlexibleKpiUpload.kpi_name.isnot(None),
-        ).group_by(
-            FlexibleKpiUpload.kpi_name,
-            FlexibleKpiUpload.column_name,
-        ).all()
+        ).filter(FlexibleKpiUpload.kpi_type == "core", FlexibleKpiUpload.kpi_name.isnot(None),
+        ).group_by(FlexibleKpiUpload.kpi_name, FlexibleKpiUpload.column_name).all()
 
         per_kpi_all = {k: [] for k in cols_meta}
         per_kpi_latest = {k: None for k in cols_meta}
@@ -3746,26 +4329,15 @@ def cto_core_kpi():
                 if d_str in trend_pivot:
                     trend_pivot[d_str][key] = val
 
-        # Per-site table: latest date
         site_rows = db.session.query(
-            FlexibleKpiUpload.site_id,
-            FlexibleKpiUpload.kpi_name,
-            FlexibleKpiUpload.num_value,
-        ).filter(
-            FlexibleKpiUpload.kpi_type == "core",
-            FlexibleKpiUpload.column_name == latest_col,
-        ).all()
+            FlexibleKpiUpload.site_id, FlexibleKpiUpload.kpi_name, FlexibleKpiUpload.num_value,
+        ).filter(FlexibleKpiUpload.kpi_type == "core", FlexibleKpiUpload.column_name == latest_col).all()
 
-    # ── Common: build summary, trend, site_table ──────────────────
     summary = {}
     for key, meta in cols_meta.items():
         vals = per_kpi_all[key]
         avg_all = round(sum(vals) / len(vals), 2) if vals else None
-        summary[key] = {
-            "label": meta["label"],
-            "avg": avg_all,
-            "latest_avg": per_kpi_latest[key],
-        }
+        summary[key] = {"label": meta["label"], "avg": avg_all, "latest_avg": per_kpi_latest[key]}
 
     trend = sorted(trend_pivot.values(), key=lambda x: x["date"])
 
@@ -3785,6 +4357,7 @@ def cto_core_kpi():
 
     return jsonify({
         "available": True,
+        "data_source": "site",
         "total_sites": len(site_table),
         "date_range": {"from": _iso(min_date), "to": _iso(latest_date)},
         "columns": [{"key": k, "label": m["label"]} for k, m in cols_meta.items()],
@@ -3798,356 +4371,701 @@ def cto_core_kpi():
 @jwt_required()
 def cto_business_kpi():
     """Business KPI dashboard.
-    Pulls revenue/subscriber data from FlexibleKpiUpload (kpi_type='revenue')
-    and falls back to KpiData if no revenue upload exists.
+    Users from FlexibleKpiUpload(kpi_type='business') or KpiData('Site Users').
+    Revenue from FlexibleKpiUpload(kpi_type='revenue') or KpiData('Site Revenue').
+    Merges both sources by site_id.
     """
     user = _require_cto_user()
     if not user:
         return jsonify({"error": "Unauthorized"}), 403
 
-    # Check cache first
     cached = _cache_get("business_kpi")
     if cached:
         return jsonify(cached)
 
-    # ── Try KpiData (Site Users + Site Revenue) first, fall back to FlexibleKpiUpload ──
-    has_kpi = _latest_site_values_for_kpi("Site Users")
-    if has_kpi:
-        return _business_kpi_from_kpidata()
-    from models import FlexibleKpiUpload
-    has_flex = db.session.query(FlexibleKpiUpload.id).filter_by(kpi_type='revenue').first()
-    if has_flex:
-        return _business_kpi_from_flexible()
-    return _business_kpi_from_kpidata()
+    return _business_kpi_merged()
 
 
-def _business_kpi_from_flexible():
-    """Build business KPI response from FlexibleKpiUpload revenue data.
-    Columns: subscribers, revenue_jan_l/feb_l/mar_l, opex_jan_l/feb_l/mar_l,
-             zone, technology, site_category
+def _business_kpi_merged():
     """
-    from sqlalchemy import func as sa_func
+    Build business KPI response by merging:
+      - revenue data  → flexible_kpi_uploads WHERE kpi_type='revenue'
+      - users data    → flexible_kpi_uploads WHERE kpi_type='business'
 
-    # ── Load revenue rows using raw SQL for speed (pivots in Python) ──────
-    pivot_sql = db.text("""
-        SELECT site_id, column_name, column_type,
-               num_value, str_value
-        FROM flexible_kpi_uploads
-        WHERE kpi_type = 'revenue'
-        ORDER BY site_id
-    """)
-    raw = db.session.execute(pivot_sql).fetchall()
-    sites = {}
-    for site_id, col_name, col_type, num_val, str_val in raw:
-        site = sites.setdefault(site_id, {})
-        if col_type == "numeric" and num_val is not None:
-            site[col_name] = float(num_val)
-        elif col_type == "text" and str_val is not None:
-            site[col_name] = str_val
+    Response shape (consumed by BusinessKPI.jsx frontend):
+    {
+      "revenue_rows": [
+        {
+          "site_id": str,
+          "utilization": float,          # Site Utilization %
+          "opex": float,                 # total OPEX for this site
+          "monthly_revenue": {           # dict of month_label → SUM(revenue)
+            "Feb": 1071.34,
+            "Mar": 563.71,
+            ...                          # expands automatically as new months arrive
+          }
+        },
+        ...
+      ],
+      "users_rows": [
+        {
+          "site_id": str,
+          "monthly_total_users": {       # dict of month_label → SUM(total users)
+            "Feb": 811,
+            "Mar": 831,
+            ...
+          }
+        },
+        ...
+      ]
+    }
 
-    if not sites:
-        return jsonify({"summary": {}, "top_sites": [], "declining_sites": [],
-                        "overloaded_sites": [], "trend": [], "arpu_trend": [],
-                        "site_health": []})
+    The frontend (BusinessKPI.jsx deriveKpis()) computes ALL KPI card values,
+    trend charts, site-health scores, declining/overloaded tables from these
+    two arrays — no pre-computed summary is needed from the backend.
 
-    # ── Detect revenue/opex month columns ────────────────────────────────────
+    Column detection is fully dynamic:
+      Revenue file: "Feb Avg", "Mar Avg", "Feb Total", "Mar Total", "OPEX",
+                    "Total Revenue", "Site Utilization", ...
+      Users file:   "Feb avg users", "Mar avg users", "Feb Total Users",
+                    "March Total Users", ...
+    Adding new month columns to either file automatically extends all trends.
+    """
+    import re as _re
+
+    # ────────────────────────────────────────────────────────────────────────
+    # 1.  CONSTANTS & HELPERS
+    # ────────────────────────────────────────────────────────────────────────
     MONTH_ORDER = ["jan", "feb", "mar", "apr", "may", "jun",
                    "jul", "aug", "sep", "oct", "nov", "dec"]
-    sample = next(iter(sites.values()))
-    rev_cols = sorted(
-        [k for k in sample if k.startswith("revenue_") and isinstance(sample.get(k), (int, float))],
-        key=lambda c: next((i for i, m in enumerate(MONTH_ORDER) if m in c), 99)
-    )
-    opex_cols = sorted(
-        [k for k in sample if k.startswith("opex_") and isinstance(sample.get(k), (int, float))],
-        key=lambda c: next((i for i, m in enumerate(MONTH_ORDER) if m in c), 99)
-    )
+    MONTH_LABELS = {
+        "jan": "Jan", "feb": "Feb", "mar": "Mar", "apr": "Apr",
+        "may": "May", "jun": "Jun", "jul": "Jul", "aug": "Aug",
+        "sep": "Sep", "oct": "Oct", "nov": "Nov", "dec": "Dec",
+    }
+    _MONTH_PAT = {
+        "jan": r"jan(?:uary)?",   "feb": r"feb(?:ruary)?",
+        "mar": r"mar(?:ch)?",     "apr": r"apr(?:il)?",
+        "may": r"may",            "jun": r"jun(?:e)?",
+        "jul": r"jul(?:y)?",      "aug": r"aug(?:ust)?",
+        "sep": r"sep(?:t(?:ember)?)?", "oct": r"oct(?:ober)?",
+        "nov": r"nov(?:ember)?",  "dec": r"dec(?:ember)?",
+    }
 
-    latest_rev_col = rev_cols[-1] if rev_cols else None
-    prev_rev_col   = rev_cols[-2] if len(rev_cols) >= 2 else None
-    latest_opex_col = opex_cols[-1] if opex_cols else None
+    def _norm(s):
+        return (s or "").lower().strip()
 
-    # ── Pull PRB utilization from KpiData (latest value per site) ────────────
-    prb_latest = _latest_site_values_for_kpi("DL PRB Utilization (1BH)")
-    # fallback: try pattern match if exact name not found (with date range)
+    def _month_token(col):
+        cl = _norm(col)
+        for m in MONTH_ORDER:
+            if _re.search(rf"(^|[^a-z]){_MONTH_PAT[m]}([^a-z]|$)", cl):
+                return m
+        return None
+
+    def _is_opex(col):
+        return "opex" in _norm(col)
+
+    def _is_util(col):
+        cl = _norm(col)
+        return "util" in cl or "utilization" in cl
+
+    def _is_total_rev_col(col):
+        cl = _norm(col)
+        return ("total" in cl and "revenue" in cl) or cl in (
+            "total_revenue", "total revenue", "totalrevenue"
+        )
+
+    def _is_id_like(col):
+        cl = _norm(col)
+        return any(k in cl for k in (
+            "site_id", "site id", "siteid", "abs_id", "abs id", "absid",
+            "pcid", "bandwidth", "latitude", "longitude", "lat", "lon", "lng",
+            "antenna", "rf_power", "eirp", "tilt", "azimuth", "crs", "gain",
+            "subscribers", "subscriber count", "zone", "state", "country",
+        )) or cl in ("id",)
+
+    def _is_rev_total_month(col):          # "Feb Total", "Mar Total" (revenue)
+        cl = _norm(col)
+        return "total" in cl and "opex" not in cl and "user" not in cl and "subs" not in cl
+
+    def _is_rev_avg_month(col):            # "Feb Avg", "Mar Avg"
+        cl = _norm(col)
+        return "avg" in cl and "opex" not in cl and "user" not in cl and "subs" not in cl
+
+    def _is_total_users(col):              # "Feb Total Users", "March Total Users"
+        cl = _norm(col)
+        return "total" in cl and ("user" in cl or "subs" in cl)
+
+    def _is_avg_users(col):                # "Feb avg users", "March avg users"
+        cl = _norm(col)
+        return "avg" in cl and ("user" in cl or "subs" in cl)
+
+    # ────────────────────────────────────────────────────────────────────────
+    # 2.  LOAD RAW ROWS FROM DB
+    #     One row per (site_id, column_name) in flexible_kpi_uploads.
+    #     We need EVERY row (not just distinct site_id) because some sites
+    #     have multiple sectors/cells — the frontend sums them.
+    # ────────────────────────────────────────────────────────────────────────
+    def _load_kpi_rows(kpi_type):
+        """Return list of dicts {site_id, column_name, column_type, num_value, str_value}."""
+        sql = db.text("""
+            SELECT site_id, column_name, column_type, num_value, str_value
+            FROM flexible_kpi_uploads
+            WHERE kpi_type = :t
+            ORDER BY site_id, id
+        """)
+        rows = db.session.execute(sql, {"t": kpi_type}).fetchall()
+        return rows  # list of Row objects
+
+    rev_raw = _load_kpi_rows("revenue")
+    biz_raw = _load_kpi_rows("business")
+
+    # ────────────────────────────────────────────────────────────────────────
+    # 3.  DISCOVER COLUMN NAMES (from distinct column_name values)
+    # ────────────────────────────────────────────────────────────────────────
+    rev_numeric_cols = set()
+    biz_numeric_cols = set()
+
+    for _, col_name, col_type, num_val, _ in rev_raw:
+        if col_type == "numeric" and num_val is not None:
+            rev_numeric_cols.add(col_name)
+    for _, col_name, col_type, num_val, _ in biz_raw:
+        if col_type == "numeric" and num_val is not None:
+            biz_numeric_cols.add(col_name)
+
+    # ── Revenue: monthly revenue columns ──
+    rev_total_month_map = {}   # month_token → col_name  ("Feb Total", "Mar Total")
+    rev_avg_month_map   = {}   # month_token → col_name  ("Feb Avg",   "Mar Avg")
+    for c in rev_numeric_cols:
+        if _is_opex(c) or _is_util(c) or _is_id_like(c) or _is_total_rev_col(c):
+            continue
+        m = _month_token(c)
+        if not m:
+            continue
+        if _is_rev_total_month(c) and m not in rev_total_month_map:
+            rev_total_month_map[m] = c
+        elif _is_rev_avg_month(c) and m not in rev_avg_month_map:
+            rev_avg_month_map[m] = c
+        else:
+            rev_avg_month_map.setdefault(m, c)
+
+    # Prefer "Total" columns (monthly sums match Excel); fall back to "Avg"
+    rev_month_map  = rev_total_month_map if rev_total_month_map else rev_avg_month_map
+    rev_month_cols = [rev_month_map[m] for m in MONTH_ORDER if m in rev_month_map]
+
+    # ── Revenue: OPEX column(s) ──
+    opex_single_col = None
+    opex_month_map  = {}
+    for c in rev_numeric_cols:
+        if not _is_opex(c):
+            continue
+        m = _month_token(c)
+        if m:
+            opex_month_map.setdefault(m, c)
+        elif opex_single_col is None:
+            opex_single_col = c
+    opex_month_cols = [opex_month_map[m] for m in MONTH_ORDER if m in opex_month_map]
+
+    # ── Revenue: utilization column ──
+    util_col = next((c for c in rev_numeric_cols if _is_util(c)), None)
+
+    # ── Revenue: single "Total Revenue" column (if present) ──
+    total_rev_col = next((c for c in rev_numeric_cols if _is_total_rev_col(c)), None)
+
+    # ── Users: monthly user columns ──
+    user_total_month_map = {}   # "Feb Total Users", "March Total Users"
+    user_avg_month_map   = {}   # "Feb avg users",   "March avg users"
+    for c in biz_numeric_cols:
+        if _is_util(c) or _is_id_like(c):
+            continue
+        m = _month_token(c)
+        if not m:
+            continue
+        if _is_total_users(c) and m not in user_total_month_map:
+            user_total_month_map[m] = c
+        elif _is_avg_users(c) and m not in user_avg_month_map:
+            user_avg_month_map[m] = c
+
+    user_month_map  = user_total_month_map if user_total_month_map else user_avg_month_map
+    if not user_month_map:
+        # Last resort: any month-tagged column in business upload
+        for c in biz_numeric_cols:
+            if _is_util(c) or _is_id_like(c):
+                continue
+            m = _month_token(c)
+            if m and m not in user_month_map:
+                user_month_map[m] = c
+    user_month_cols = [user_month_map[m] for m in MONTH_ORDER if m in user_month_map]
+
+    print(f"[BUSINESS KPI] rev_month_map={rev_month_map}, "
+          f"user_month_map={user_month_map}, "
+          f"opex_single={opex_single_col!r}, opex_months={opex_month_cols}, "
+          f"util_col={util_col!r}, total_rev_col={total_rev_col!r}")
+
+    # ────────────────────────────────────────────────────────────────────────
+    # 4.  PIVOT RAW ROWS → per-site dicts
+    #     We store ALL numeric values keyed by (site_id → {col_name: value}).
+    #     Multiple sector rows for the same site_id are SUMMED so the
+    #     frontend receives one entry per unique site and can re-sum correctly.
+    # ────────────────────────────────────────────────────────────────────────
+    # Identify columns that are SITE-LEVEL totals (repeated on every sector
+    # row) — these must use MAX (i.e. pick one copy), never SUM.
+    _site_level_cols = set()
+    for c in rev_numeric_cols | biz_numeric_cols:
+        if _is_opex(c) or _is_total_rev_col(c) or _is_util(c):
+            _site_level_cols.add(c)
+        # Monthly "Total" columns (e.g. "Feb Total", "Mar Total") are site-level
+        m = _month_token(c)
+        if m and _is_rev_total_month(c):
+            _site_level_cols.add(c)
+        # Monthly "Total Users" columns are also site-level
+        if m and _is_total_users(c):
+            _site_level_cols.add(c)
+
+    def _pivot_rows(raw_rows, numeric_cols_set):
+        """
+        Returns a dict:  site_id → { col_name: float, ... }
+        Site-level columns (OPEX, Total Revenue, utilization, monthly Totals)
+        use MAX across sectors (pick one copy — they are repeated identically).
+        Per-sector columns (e.g. Feb Avg, Mar Avg) are AVERAGED across sectors.
+        """
+        out = {}
+        counts = {}  # site_id → { col_name: count } for averaging
+        for site_id, col_name, col_type, num_val, str_val in raw_rows:
+            if site_id not in out:
+                out[site_id] = {}
+                counts[site_id] = {}
+            if col_type == "numeric" and num_val is not None:
+                v = float(num_val)
+                prev = out[site_id].get(col_name, 0.0)
+                cnt  = counts[site_id].get(col_name, 0)
+                if col_name in _site_level_cols:
+                    # Site-level total — take MAX (all rows have the same value)
+                    out[site_id][col_name] = max(prev, v)
+                else:
+                    # Per-sector value — accumulate for averaging
+                    out[site_id][col_name] = prev + v
+                    counts[site_id][col_name] = cnt + 1
+            elif col_type == "text" and str_val is not None:
+                out[site_id][col_name] = str_val
+
+        # Average per-sector columns (not site-level)
+        for sid in out:
+            for col in list(out[sid].keys()):
+                if col not in _site_level_cols and col in counts.get(sid, {}):
+                    n = counts[sid][col]
+                    if n > 1:
+                        out[sid][col] = out[sid][col] / n
+        return out
+
+    rev_by_site = _pivot_rows(rev_raw, rev_numeric_cols)
+    biz_by_site = _pivot_rows(biz_raw, biz_numeric_cols)
+
+    all_site_ids_rev  = set(rev_by_site.keys())
+    all_site_ids_biz  = set(biz_by_site.keys())
+    all_site_ids      = sorted(all_site_ids_rev | all_site_ids_biz)
+
+    # ── Fallback to legacy KpiData if flexible tables are empty ──
+    if not all_site_ids:
+        kpi_users = _latest_site_values_for_kpi("Site Users")
+        kpi_rev   = _latest_site_values_for_kpi("Site Revenue")
+        # Return minimal shape; frontend will show zeros gracefully
+        revenue_rows = [
+            {
+                "site_id": sid,
+                "utilization": 0.0,
+                "opex": 0.0,
+                "monthly_revenue": {"Latest": round(float(info.get("value", 0) or 0), 2)},
+            }
+            for sid, info in kpi_rev.items()
+        ]
+        users_rows = [
+            {
+                "site_id": sid,
+                "monthly_total_users": {"Latest": int(round(float(info.get("value", 0) or 0)))},
+            }
+            for sid, info in kpi_users.items()
+        ]
+        result = {"revenue_rows": revenue_rows, "users_rows": users_rows}
+        _cache_set("business_kpi", result)
+        return jsonify(result)
+
+    # ────────────────────────────────────────────────────────────────────────
+    # 5.  PULL PRB UTILIZATION FROM KpiData
+    #     Prefer this over the "Site Utilization" column in the revenue file
+    #     because it comes from live network data.
+    # ────────────────────────────────────────────────────────────────────────
+    prb_latest = {}
+    try:
+        from sqlalchemy import text as _t
+        r = db.session.execute(_t("""
+            SELECT kpi_name FROM kpi_data
+            WHERE kpi_name IS NOT NULL AND LOWER(kpi_name) LIKE '%dl%prb%util%'
+            GROUP BY kpi_name ORDER BY COUNT(*) DESC LIMIT 1
+        """)).fetchone()
+        dl_prb_name = r[0] if r else "DL PRB Utilization (1BH)"
+    except Exception:
+        dl_prb_name = "DL PRB Utilization (1BH)"
+
+    prb_latest = _latest_site_values_for_kpi(dl_prb_name)
     if not prb_latest:
-        date_floor = date.today() - timedelta(days=30)
+        date_floor = date.today() - timedelta(days=60)
         prb_rows = KpiData.query.filter(
-            KpiData.data_level == "site",
             KpiData.kpi_name.ilike("%prb%util%"),
             KpiData.date >= date_floor,
         ).order_by(KpiData.site_id, KpiData.date.desc()).all()
         for row in prb_rows:
             if row.site_id not in prb_latest and row.value is not None:
-                prb_latest[row.site_id] = {"date": row.date, "value": float(row.value)}
+                prb_latest[row.site_id] = {"value": float(row.value)}
 
-    # ── Build per-site rows ──────────────────────────────────────────────────
-    site_rows = []
-    for site_id, data in sites.items():
-        subs    = data.get("subscribers", 0)
-        rev_now = data.get(latest_rev_col, 0) if latest_rev_col else 0
-        rev_prev = data.get(prev_rev_col, 0) if prev_rev_col else 0
-        opex    = data.get(latest_opex_col, 0) if latest_opex_col else 0
-        arpu    = round(rev_now / subs, 4) if subs else 0
-        growth  = round(((rev_now - rev_prev) / rev_prev) * 100, 2) if rev_prev and rev_prev != 0 else 0
-        util_val = prb_latest.get(site_id, {}).get("value", 0) if isinstance(prb_latest.get(site_id), dict) else 0
-        site_rows.append({
-            "site_id": site_id,
-            "users": round(subs, 2),
-            "revenue": round(rev_now, 2),
-            "opex": round(opex, 2),
-            "arpu": round(arpu, 2),
-            "growth": growth,
-            "utilization": round(util_val, 2),
-            "zone": data.get("zone", ""),
-            "technology": data.get("technology", ""),
-            "category": data.get("site_category", ""),
+    def _site_util(sid):
+        if isinstance(prb_latest.get(sid), dict):
+            v = prb_latest[sid].get("value", 0) or 0
+            if v:
+                return float(v)
+        # Fallback: "Site Utilization" column from revenue upload
+        if util_col:
+            return float(rev_by_site.get(sid, {}).get(util_col, 0) or 0)
+        return 0.0
+
+    def _site_opex(sid):
+        d = rev_by_site.get(sid, {})
+        if opex_single_col:
+            return float(d.get(opex_single_col, 0) or 0)
+        return sum(float(d.get(c, 0) or 0) for c in opex_month_cols)
+
+    # ────────────────────────────────────────────────────────────────────────
+    # 6.  BUILD revenue_rows — one entry per unique site_id
+    #
+    #     monthly_revenue dict uses canonical labels ("Feb", "Mar", …)
+    #     and contains the SUMMED value across all sectors (already done by
+    #     _pivot_rows).
+    #
+    #     We also record whether this site has users data so the frontend
+    #     can enforce the "all three data points present" rule for site
+    #     health and KPI-card totals.
+    # ────────────────────────────────────────────────────────────────────────
+    revenue_rows = []
+    for sid in sorted(all_site_ids_rev):
+        d = rev_by_site[sid]
+
+        monthly_revenue = {}
+        for m in MONTH_ORDER:
+            col = rev_month_map.get(m)
+            if col and col in d:
+                monthly_revenue[MONTH_LABELS[m]] = round(float(d[col] or 0), 4)
+
+        # If no monthly columns but "Total Revenue" column exists, put it under
+        # a pseudo-month key so the frontend still has something to render.
+        if not monthly_revenue and total_rev_col and total_rev_col in d:
+            monthly_revenue["Total"] = round(float(d[total_rev_col] or 0), 4)
+
+        util_val  = round(_site_util(sid), 2)
+        opex_val  = round(_site_opex(sid), 4)
+
+        # has_users: True when this site also appears in the business upload.
+        # Used by frontend to restrict site-health, low-margin, and overloaded
+        # tables to only sites where ALL three data dimensions are present.
+        has_users = sid in all_site_ids_biz
+
+        # "Total Revenue" column — the overall total (not monthly sum).
+        # Used for ROI = (Total Revenue - OPEX) / OPEX × 100
+        site_total_rev = round(float(d.get(total_rev_col, 0) or 0), 4) if total_rev_col else 0.0
+
+        revenue_rows.append({
+            "site_id":         sid,
+            "utilization":     util_val,
+            "opex":            opex_val,
+            "monthly_revenue": monthly_revenue,
+            "total_revenue":   site_total_rev,
+            "has_users":       has_users,
         })
 
-    num_sites     = len(site_rows) or 1
-    total_users   = int(sum(r["users"] for r in site_rows))
-    avg_users     = int(round(total_users / num_sites))
-    total_revenue = round(sum(r["revenue"] for r in site_rows), 2)
-    total_opex    = round(sum(r["opex"] for r in site_rows), 2)
+    # ────────────────────────────────────────────────────────────────────────
+    # 7.  BUILD users_rows — one entry per unique site_id
+    #
+    #     monthly_total_users uses the same canonical month labels as
+    #     monthly_revenue so the frontend can join them by label.
+    #
+    #     We also record whether this site has revenue data so the frontend
+    #     can enforce completeness checks from the users side too.
+    # ────────────────────────────────────────────────────────────────────────
+    users_rows = []
+    for sid in sorted(all_site_ids_biz):
+        d = biz_by_site[sid]
 
-    # ARPU (total) — revenue / users in same unit as revenue
-    arpu = round(total_revenue / total_users, 4) if total_users else 0
+        monthly_total_users = {}
+        for m in MONTH_ORDER:
+            col = user_month_map.get(m)
+            if col and col in d:
+                monthly_total_users[MONTH_LABELS[m]] = int(round(float(d[col] or 0)))
 
-    # Growth: avg revenue change across sites
-    growths = [r["growth"] for r in site_rows if r["growth"] != 0]
-    avg_growth = round(sum(growths) / len(growths), 2) if growths else 0
+        has_revenue = sid in all_site_ids_rev
 
-    # Declining & overloaded sites, churn, revenue at risk
-    declining_sites = []
-    overloaded_sites_list = []
-    revenue_at_risk = 0.0
-    declining_count = 0
-
-    for row in site_rows:
-        g = row["growth"]
-        item = row
-        if g < 0:
-            declining_sites.append(item)
-            declining_count += 1
-        if row["utilization"] > 80:
-            overloaded_sites_list.append(item)
-        if g < 0 or row["utilization"] > 80:
-            revenue_at_risk += row["revenue"]
-
-    revenue_at_risk = round(revenue_at_risk, 2)
-
-    # Churn rate: percentage of sites with declining revenue (subscriber snapshot is static)
-    churn_rate = round((declining_count / num_sites) * 100, 2) if num_sites else 0.0
-
-    # Network ROI: use actual OPEX data
-    network_roi = round(((total_revenue - total_opex) / total_opex) * 100, 2) if total_opex else 0.0
-
-    # Top sites by revenue
-    top_sites = sorted(site_rows, key=lambda r: (r["revenue"], r["users"]), reverse=True)[:10]
-
-    declining_sites = sorted(declining_sites, key=lambda r: r["growth"])[:10]
-    overloaded_sites = sorted(overloaded_sites_list, key=lambda r: r["utilization"], reverse=True)[:10]
-
-    # ── Monthly trend ────────────────────────────────────────────────────────
-    trend = []
-    for col in rev_cols:
-        # Extract month label from column name like 'revenue_jan_l'
-        parts = col.replace("revenue_", "").split("_")
-        month_label = parts[0].capitalize() if parts else col
-        month_rev   = sum(sites[s].get(col, 0) for s in sites)
-        month_users = total_users  # subscribers is a snapshot, same across months
-        trend.append({
-            "date": month_label,
-            "users": month_users,
-            "revenue": round(month_rev, 2),
+        users_rows.append({
+            "site_id":              sid,
+            "monthly_total_users":  monthly_total_users,
+            "has_revenue":          has_revenue,
         })
 
-    # ARPU trend
-    arpu_trend = []
-    for item in trend:
-        arpu_trend.append({
-            "date": item["date"],
-            "arpu": round(item["revenue"] / item["users"], 4) if item["users"] else 0,
-        })
+    # ────────────────────────────────────────────────────────────────────────
+    # 8.  SERVER-SIDE PRE-COMPUTATION — low_margin_sites & overloaded_sites
+    #
+    #     These two tables have strict data-presence rules so we compute them
+    #     here (backend knows which columns exist) and ship the final sorted
+    #     lists to the frontend rather than replicating the column-detection
+    #     logic in JS.
+    #
+    #  LOW MARGIN SITES
+    #  ─────────────────
+    #  Eligibility:  site must have utilization + users + revenue ALL present.
+    #  Definition:   Margin % = (Revenue − OPEX) / Revenue × 100
+    #                Sites where Margin % < LOW_MARGIN_THRESHOLD are "low margin".
+    #  Sort:         ascending margin % (worst first).
+    #  Columns shown: site_id, revenue (current month), opex, margin_pct, users (current month)
+    #
+    #  OVERLOADED SITES
+    #  ─────────────────
+    #  Eligibility:  site must have BOTH utilization AND revenue data present.
+    #                (users data is NOT required for overloaded sites.)
+    #  Definition:   utilization ≥ OVERLOAD_THRESHOLD (80%).
+    #  Sort:         utilization DESC, revenue DESC.
+    #  Columns shown: site_id, utilization, revenue (current month)
+    # ────────────────────────────────────────────────────────────────────────
+    LOW_MARGIN_THRESHOLD = 30.0   # margin % below this is "low margin"
+    OVERLOAD_THRESHOLD   = 80.0   # utilization % at or above this is "overloaded"
 
-    # ── Site Health Score ────────────────────────────────────────────────────
-    max_users_v   = max((r["users"]   for r in site_rows), default=1) or 1
-    max_revenue_v = max((r["revenue"] for r in site_rows), default=1) or 1
+    # Determine latest month label present in revenue data
+    _latest_rev_month_label = None
+    for m in reversed(MONTH_ORDER):
+        if m in rev_month_map:
+            _latest_rev_month_label = MONTH_LABELS[m]
+            break
 
-    site_health = []
-    for row in site_rows:
-        util_score = max(0.0, 1.0 - row["utilization"] / 100.0)
-        user_score = row["users"]   / max_users_v
-        rev_score  = row["revenue"] / max_revenue_v
-        health     = round((util_score * 0.4 + user_score * 0.3 + rev_score * 0.3) * 100, 2)
-        site_health.append({**row, "health_score": health})
+    # Helper: get current-month revenue for a site from its revenue_row entry
+    # (we re-index revenue_rows by site_id for O(1) lookup)
+    rev_row_by_sid = {r["site_id"]: r for r in revenue_rows}
+    usr_row_by_sid = {u["site_id"]: u for u in users_rows}
 
-    avg_health_score = round(
-        sum(s["health_score"] for s in site_health) / len(site_health), 2
-    ) if site_health else 0
-    worst_sites = sorted(site_health, key=lambda r: r["health_score"])[:10]
+    def _current_rev(sid):
+        r = rev_row_by_sid.get(sid, {})
+        mr = r.get("monthly_revenue", {})
+        if _latest_rev_month_label and _latest_rev_month_label in mr:
+            return float(mr[_latest_rev_month_label])
+        # Fallback: last value in dict
+        vals = [v for v in mr.values() if isinstance(v, (int, float))]
+        return float(vals[-1]) if vals else 0.0
 
-    result = {
-        "summary": {
-            "total_users":      total_users,
-            "avg_users":        avg_users,
-            "growth":           avg_growth,
-            "arpu":             arpu,
-            "revenue_at_risk":  revenue_at_risk,
-            "churn_rate":       churn_rate,
-            "network_roi":      network_roi,
-            "avg_health_score": avg_health_score,
-        },
-        "top_sites":        top_sites,
-        "declining_sites":  declining_sites,
-        "overloaded_sites": overloaded_sites,
-        "trend":            trend,
-        "arpu_trend":       arpu_trend,
-        "site_health":      worst_sites,
-    }
-    _cache_set("business_kpi", result)
-    return jsonify(result)
+    def _current_users(sid):
+        u = usr_row_by_sid.get(sid, {})
+        mu = u.get("monthly_total_users", {})
+        if _latest_rev_month_label and _latest_rev_month_label in mu:
+            return int(mu[_latest_rev_month_label])
+        vals = [v for v in mu.values() if isinstance(v, (int, float))]
+        return int(vals[-1]) if vals else 0
 
+    # ── LOW MARGIN SITES ──────────────────────────────────────────────────
+    # Only include sites that have ALL THREE: utilization > 0, users > 0, revenue > 0
+    # Uses "Total Revenue" column (overall total) vs OPEX for margin calculation
+    low_margin_sites = []
+    for r in revenue_rows:
+        sid   = r["site_id"]
+        util  = r["utilization"]
+        opex  = r["opex"]
+        # Use "Total Revenue" column for margin comparison with OPEX
+        rev   = r.get("total_revenue", 0) or _current_rev(sid)
+        users = _current_users(sid) if r["has_users"] else 0
 
-def _business_kpi_from_kpidata():
-    """Legacy fallback: build business KPI from KpiData table."""
-    users_latest = _latest_site_values_for_kpi("Site Users")
-    revenue_latest = _latest_site_values_for_kpi("Site Revenue")
-    prb_latest = _latest_site_values_for_kpi("DL PRB Utilization (1BH)")
+        # STRICT completeness: all three dimensions must be non-zero
+        if util <= 0 or users <= 0 or rev <= 0:
+            continue
 
-    if users_latest:
-        _latest_date_val = max(v["date"] for v in users_latest.values())
-        _date_7d_ago = _latest_date_val - timedelta(days=7)
-        users_7d_ago = _site_values_near_date("Site Users", _date_7d_ago)
-    else:
-        users_7d_ago = {}
+        # Margin % = (Total Revenue − OPEX) / Total Revenue × 100
+        margin_pct = round(((rev - opex) / rev) * 100, 2) if rev else 0.0
 
-    users_series = _series_for_kpi_patterns(["Site Users"])
-    revenue_series = _series_for_kpi_patterns(["Site Revenue"])
+        if margin_pct < LOW_MARGIN_THRESHOLD:
+            low_margin_sites.append({
+                "site_id":    sid,
+                "revenue":    round(rev, 2),
+                "opex":       round(opex, 2),
+                "margin_pct": margin_pct,
+                "users":      users,
+                "utilization": util,
+            })
 
-    all_site_ids = sorted(set(users_latest.keys()) | set(revenue_latest.keys()))
-    site_rows = []
-    for site_id in all_site_ids:
-        user_val = users_latest.get(site_id, {}).get("value", 0.0)
-        revenue_val = revenue_latest.get(site_id, {}).get("value", 0.0)
-        util_val = prb_latest.get(site_id, {}).get("value", 0.0)
-        arpu = (revenue_val / user_val) if user_val else 0.0
-        site_rows.append({
-            "site_id": site_id,
-            "users": round(user_val, 2),
-            "revenue": round(revenue_val, 2),
-            "utilization": round(util_val, 2),
-            "arpu": round(arpu, 2),
-        })
+    # Sort: worst margin first
+    low_margin_sites.sort(key=lambda x: x["margin_pct"])
+    low_margin_sites = low_margin_sites[:20]   # cap at 20 rows
 
-    revenue_by_day = {row["date"]: row["value"] for row in revenue_series}
-
-    def _week_avg(series, offset=0):
-        if offset == 0:
-            window = series[-7:]
-        else:
-            end   = -(offset * 7)
-            start = end - 7
-            window = series[start:end]
-        return sum(p["value"] for p in window) / len(window) if window else None
-
-    num_sites = len(site_rows) or 1
-    this_week_users_vals = [p["value"] * num_sites for p in users_series[-7:]]
-    total_users = int(round(sum(this_week_users_vals) / len(this_week_users_vals), 0)) if this_week_users_vals else 0
-    avg_users = int(round(total_users / num_sites, 0)) if num_sites else 0
-    total_revenue = round(sum(row["revenue"] for row in site_rows), 2)
-
-    this_week_rev_vals = [revenue_by_day.get(p["date"], 0) * num_sites for p in users_series[-7:]]
-    avg_weekly_revenue = sum(this_week_rev_vals) / len(this_week_rev_vals) if this_week_rev_vals else 0
-    arpu = round(avg_weekly_revenue / total_users, 4) if total_users else 0
-
-    this_w = _week_avg(users_series, 0)
-    last_w = _week_avg(users_series, 1)
-    growth = round(((this_w - last_w) / last_w) * 100, 2) if this_w and last_w else 0
-
-    declining_sites = []
+    # ── OVERLOADED SITES ──────────────────────────────────────────────────
+    # Only include sites that have BOTH utilization AND revenue present.
+    # Users data is NOT required.
     overloaded_sites = []
-    revenue_at_risk = 0.0
-    users_lost      = 0.0
-    users_at_start  = 0.0
+    for r in revenue_rows:
+        sid  = r["site_id"]
+        util = r["utilization"]
+        rev  = _current_rev(sid)
 
-    for row in site_rows:
-        u_now  = row["users"]
-        u_prev = users_7d_ago.get(row["site_id"])
-        if u_now and u_prev:
-            growth_pct = round(((u_now - u_prev) / u_prev) * 100, 2)
-            users_at_start += u_prev
-            if growth_pct < 0:
-                users_lost += (u_prev - u_now)
-        else:
-            growth_pct = 0.0
-        item = {**row, "growth": growth_pct}
-        if growth_pct < 0:
-            declining_sites.append(item)
-        if row["utilization"] > 80:
-            overloaded_sites.append(item)
-        if growth_pct < 0 or row["utilization"] > 80:
-            revenue_at_risk += row["users"] * arpu
+        # Both utilization and revenue must be present and non-zero
+        if util <= 0 or rev <= 0:
+            continue
 
-    total_sites = max(len(site_rows), 1)
-    top_sites        = sorted(site_rows,       key=lambda row: (row["revenue"], row["users"]), reverse=True)[:10]
-    declining_sites  = sorted(declining_sites,  key=lambda row: row["growth"])[:10]
-    overloaded_sites = sorted(overloaded_sites, key=lambda row: row["utilization"], reverse=True)[:10]
+        if util >= OVERLOAD_THRESHOLD:
+            overloaded_sites.append({
+                "site_id":    sid,
+                "utilization": util,
+                "revenue":    round(rev, 2),
+            })
 
-    churn_rate = round((users_lost / users_at_start) * 100, 2) if users_at_start else 0.0
-    baseline_cost = total_sites * 5000.0
-    network_roi   = round(((total_revenue - baseline_cost) / baseline_cost) * 100, 2) if baseline_cost else 0.0
+    # Sort: highest utilization first; break ties by revenue desc
+    overloaded_sites.sort(key=lambda x: (-x["utilization"], -x["revenue"]))
+    overloaded_sites = overloaded_sites[:20]   # cap at 20 rows
 
-    trend = []
-    for row in users_series[-30:]:
-        trend.append({
-            "date":    row["date"],
-            "users":   row["value"],
-            "revenue": revenue_by_day.get(row["date"], 0),
-        })
+    # ────────────────────────────────────────────────────────────────────────
+    # 9.  SERVER-SIDE SUMMARY — current_month, previous_month, ARPU
+    #
+    #     Pre-compute authoritative month labels and KPI card values so the
+    #     frontend card sub-labels are driven by the same column-detection
+    #     logic that built revenue_rows / users_rows.
+    #
+    #     current_month  = latest month label present in revenue data
+    #     previous_month = second-to-last month label (or None)
+    #     total_revenue  = Sum monthly_revenue[current_month] across all sites
+    #     total_users    = Sum monthly_total_users[current_month] across all sites
+    #     arpu           = total_revenue / total_users  (0 if no users)
+    #
+    #     Frontend BusinessKPI.jsx reads summary_kpis to set:
+    #       * KPI card values and sub-label month names
+    #       * Period label  e.g. "Feb -> Mar"
+    #       * ARPU  = "Mar total revenue / Mar total users"
+    #     so "Feb Total" column revenue is never confused with the cross-month
+    #     "Total Revenue" column.
+    # ────────────────────────────────────────────────────────────────────────
 
-    arpu_trend = []
-    for row in users_series[-30:]:
-        d_users = row["value"]
-        d_rev   = revenue_by_day.get(row["date"], 0)
-        arpu_trend.append({
-            "date": row["date"],
-            "arpu": round(d_rev / d_users, 4) if d_users else 0,
-        })
+    # Discover all canonical month labels present in revenue rows
+    _all_rev_labels = set()
+    for r in revenue_rows:
+        _all_rev_labels.update(r.get("monthly_revenue", {}).keys())
+    _LABEL_TO_IDX = {MONTH_LABELS[m]: i for i, m in enumerate(MONTH_ORDER)}
+    _sorted_rev_labels = sorted(
+        _all_rev_labels,
+        key=lambda lb: _LABEL_TO_IDX.get(lb, 99)
+    )
+    _current_month_label  = _sorted_rev_labels[-1] if _sorted_rev_labels else None
+    _previous_month_label = _sorted_rev_labels[-2] if len(_sorted_rev_labels) >= 2 else None
 
-    max_users_v   = max((r["users"]   for r in site_rows), default=1) or 1
-    max_revenue_v = max((r["revenue"] for r in site_rows), default=1) or 1
+    # Total Revenue — sum across all sites for each of the two months
+    _total_rev_current  = 0.0
+    _total_rev_previous = 0.0
+    for r in revenue_rows:
+        mr = r.get("monthly_revenue", {})
+        if _current_month_label:
+            _total_rev_current  += float(mr.get(_current_month_label,  0) or 0)
+        if _previous_month_label:
+            _total_rev_previous += float(mr.get(_previous_month_label, 0) or 0)
 
-    site_health = []
-    for row in site_rows:
-        util_score = max(0.0, 1.0 - row["utilization"] / 100.0)
-        user_score = row["users"]   / max_users_v
-        rev_score  = row["revenue"] / max_revenue_v
-        health     = round((util_score * 0.4 + user_score * 0.3 + rev_score * 0.3) * 100, 2)
-        site_health.append({**row, "health_score": health})
+    # Total Users — sum across all sites, aligned to the same month labels
+    _total_usr_current  = 0
+    _total_usr_previous = 0
+    for u in users_rows:
+        mu = u.get("monthly_total_users", {})
+        if _current_month_label:
+            _total_usr_current  += int(mu.get(_current_month_label,  0) or 0)
+        if _previous_month_label:
+            _total_usr_previous += int(mu.get(_previous_month_label, 0) or 0)
 
-    avg_health_score = round(
-        sum(s["health_score"] for s in site_health) / len(site_health), 2
-    ) if site_health else 0.0
-    worst_sites = sorted(site_health, key=lambda r: r["health_score"])[:10]
+    # ARPU = Total Revenue (current month) / Total Users (current month)
+    _arpu = round(_total_rev_current / _total_usr_current, 6)         if _total_usr_current > 0 else 0.0
 
+    # Revenue Growth % MoM
+    _rev_growth = 0.0
+    if _previous_month_label and _total_rev_previous > 0:
+        _rev_growth = round(
+            ((_total_rev_current - _total_rev_previous) / _total_rev_previous) * 100, 2
+        )
+
+    _num_sites = len(revenue_rows) or 1
+
+    # Overall "Total Revenue" column sum (the 10-month total, NOT monthly sum)
+    _overall_total_rev = sum(r.get("total_revenue", 0) or 0 for r in revenue_rows)
+    _overall_total_opex = sum(r.get("opex", 0) or 0 for r in revenue_rows)
+
+    # Revenue at Risk = Σ(prev - current) for sites where current < previous
+    _revenue_at_risk = 0.0
+    if _previous_month_label and _current_month_label:
+        for r in revenue_rows:
+            mr = r.get("monthly_revenue", {})
+            curr = float(mr.get(_current_month_label, 0) or 0)
+            prev = float(mr.get(_previous_month_label, 0) or 0)
+            if curr < prev:
+                _revenue_at_risk += (prev - curr)
+
+    # Churn Rate = (Users(prev) - Users(current)) / Users(prev) × 100
+    _churn_rate = 0.0
+    if _previous_month_label and _total_usr_previous > 0:
+        _churn_rate = max(0, ((_total_usr_previous - _total_usr_current) / _total_usr_previous) * 100)
+
+    # Network ROI = (Total Revenue - OPEX) / OPEX × 100
+    # Uses the "Total Revenue" column value, NOT monthly sums
+    _network_roi = round(((_overall_total_rev - _overall_total_opex) / _overall_total_opex) * 100, 2) if _overall_total_opex > 0 else 0.0
+
+    summary_kpis = {
+        "current_month":        _current_month_label,
+        "previous_month":       _previous_month_label,
+        "total_revenue":        round(_total_rev_current,  2),
+        "total_revenue_prev":   round(_total_rev_previous, 2),
+        "total_users":          _total_usr_current,
+        "total_users_prev":     _total_usr_previous,
+        "arpu":                 _arpu,
+        "revenue_growth":       _rev_growth,
+        "num_sites":            _num_sites,
+        "avg_users_per_site":   round(_total_usr_current / _num_sites, 2),
+        "revenue_at_risk":      round(_revenue_at_risk, 2),
+        "churn_rate":           round(_churn_rate, 2),
+        "network_roi":          _network_roi,
+        "overall_total_revenue": round(_overall_total_rev, 2),
+        "overall_total_opex":   round(_overall_total_opex, 2),
+        "period_label": (
+            f"{_previous_month_label} → {_current_month_label}"
+            if _previous_month_label and _current_month_label
+            else (_current_month_label or "")
+        ),
+    }
+
+    # ────────────────────────────────────────────────────────────────────────
+    # 10.  DIAGNOSTICS
+    # ────────────────────────────────────────────────────────────────────────
+    _sample_months_rev = list(revenue_rows[0]["monthly_revenue"].keys()) if revenue_rows else []
+    _sample_months_usr = list(users_rows[0]["monthly_total_users"].keys()) if users_rows else []
+    _complete_sites = sum(
+        1 for r in revenue_rows
+        if r["utilization"] > 0 and r["has_users"] and _current_rev(r["site_id"]) > 0
+    )
+    print(f"[BUSINESS KPI] revenue_rows={len(revenue_rows)}, "
+          f"users_rows={len(users_rows)}, "
+          f"complete_sites(util+users+rev)={_complete_sites}, "
+          f"low_margin={len(low_margin_sites)}, "
+          f"overloaded={len(overloaded_sites)}, "
+          f"rev_months={_sample_months_rev}, "
+          f"user_months={_sample_months_usr}, "
+          f"current_month={_current_month_label!r}, "
+          f"total_revenue={_total_rev_current:.2f}, "
+          f"total_users={_total_usr_current}, "
+          f"arpu={_arpu:.6f}")
+
+    # ────────────────────────────────────────────────────────────────────────
+    # 11.  ASSEMBLE RESULT & CACHE
+    # ────────────────────────────────────────────────────────────────────────
     result = {
-        "summary": {
-            "total_users":      total_users,
-            "avg_users":        avg_users,
-            "growth":           growth,
-            "arpu":             arpu,
-            "revenue_at_risk":  round(revenue_at_risk, 2),
-            "churn_rate":       churn_rate,
-            "network_roi":      network_roi,
-            "avg_health_score": avg_health_score,
-        },
-        "top_sites":       top_sites,
-        "declining_sites": declining_sites,
-        "overloaded_sites": overloaded_sites,
-        "trend":           trend,
-        "arpu_trend":      arpu_trend,
-        "site_health":     worst_sites,
+        "revenue_rows":      revenue_rows,
+        "users_rows":        users_rows,
+        "low_margin_sites":  low_margin_sites,
+        "overloaded_sites":  overloaded_sites,
+        # Authoritative summary consumed directly by BusinessKPI.jsx KPI cards.
+        # Ensures "Feb Total" column revenue is not confused with cross-month
+        # "Total Revenue" column — ARPU = total_revenue / total_users for the
+        # same month, not a mixed-column calculation.
+        "summary_kpis":      summary_kpis,
     }
     _cache_set("business_kpi", result)
     return jsonify(result)
@@ -4486,7 +5404,8 @@ def cto_cdo_engagement_kpi():
 @jwt_required()
 def manager_sla_alerts():
     user = User.query.get(int(get_jwt_identity()))
-    if user.role not in ("manager", "admin"):
+    role = (getattr(user, "role", "") or "").strip().lower()
+    if role not in ("manager", "admin"):
         return jsonify({"error": "Unauthorized"}), 403
     unread_only = request.args.get("unread_only", "false").lower() == "true"
     q = SlaAlert.query.filter_by(recipient_role="manager")
@@ -4500,7 +5419,8 @@ def manager_sla_alerts():
 @jwt_required()
 def cto_sla_alerts():
     user = User.query.get(int(get_jwt_identity()))
-    if user.role != "cto":
+    role = (getattr(user, "role", "") or "").strip().lower()
+    if role not in ("cto", "admin"):
         return jsonify({"error": "Unauthorized"}), 403
     unread_only = request.args.get("unread_only", "false").lower() == "true"
     q = SlaAlert.query.filter_by(recipient_role="cto")
@@ -4514,10 +5434,11 @@ def cto_sla_alerts():
 @jwt_required()
 def manager_mark_alert_read(alert_id):
     user = User.query.get(int(get_jwt_identity()))
-    if user.role not in ("manager", "admin"):
+    role = (getattr(user, "role", "") or "").strip().lower()
+    if role not in ("manager", "admin"):
         return jsonify({"error": "Unauthorized"}), 403
     alert = SlaAlert.query.get(alert_id)
-    if not alert or alert.recipient_role != "manager":
+    if not alert or (alert.recipient_role or "").strip().lower() != "manager":
         return jsonify({"error": "Alert not found"}), 404
     alert.is_read = True
     db.session.commit()
@@ -4528,10 +5449,11 @@ def manager_mark_alert_read(alert_id):
 @jwt_required()
 def cto_mark_alert_read(alert_id):
     user = User.query.get(int(get_jwt_identity()))
-    if user.role != "cto":
+    role = (getattr(user, "role", "") or "").strip().lower()
+    if role not in ("cto", "admin"):
         return jsonify({"error": "Unauthorized"}), 403
     alert = SlaAlert.query.get(alert_id)
-    if not alert or alert.recipient_role != "cto":
+    if not alert or (alert.recipient_role or "").strip().lower() != "cto":
         return jsonify({"error": "Alert not found"}), 404
     alert.is_read = True
     db.session.commit()
@@ -4542,7 +5464,8 @@ def cto_mark_alert_read(alert_id):
 @jwt_required()
 def manager_mark_all_alerts_read():
     user = User.query.get(int(get_jwt_identity()))
-    if user.role not in ("manager", "admin"):
+    role = (getattr(user, "role", "") or "").strip().lower()
+    if role not in ("manager", "admin"):
         return jsonify({"error": "Unauthorized"}), 403
     SlaAlert.query.filter_by(recipient_role="manager", is_read=False).update({"is_read": True})
     db.session.commit()
@@ -4553,7 +5476,8 @@ def manager_mark_all_alerts_read():
 @jwt_required()
 def cto_mark_all_alerts_read():
     user = User.query.get(int(get_jwt_identity()))
-    if user.role != "cto":
+    role = (getattr(user, "role", "") or "").strip().lower()
+    if role not in ("cto", "admin"):
         return jsonify({"error": "Unauthorized"}), 403
     SlaAlert.query.filter_by(recipient_role="cto", is_read=False).update({"is_read": True})
     db.session.commit()
@@ -4570,7 +5494,8 @@ def cto_cr_alerts():
     """CR SLA alerts for CTO — breach + 90% warnings."""
     from models import CrSlaAlert
     user = User.query.get(int(get_jwt_identity()))
-    if user.role != "cto":
+    role = (getattr(user, "role", "") or "").strip().lower()
+    if role not in ("cto", "admin"):
         return jsonify({"error": "Unauthorized"}), 403
     unread_only = request.args.get("unread_only", "false").lower() == "true"
     q = CrSlaAlert.query.filter(CrSlaAlert.recipient_role == "cto")
@@ -5306,47 +6231,54 @@ def admin_upload_sites():
     wb = openpyxl.load_workbook(file, data_only=True)
     ws = wb.active
 
-    headers = [str(c.value).strip().lower() if c.value else "" for c in ws[1]]
+    # ── Auto-detect columns from first row headers ──────────────────────────
+    raw_headers = [str(c.value).strip() if c.value else "" for c in ws[1]]
+    headers = [h.lower() for h in raw_headers]
     col_map = {}
-    for i, h in enumerate(headers):
-        if ("site" in h and "id" in h) or h in ("site name", "sitename", "site"):
-            col_map["site_id"] = i
-        elif h in ("cell_id", "cell id", "cellid", "cell"):
-            col_map["cell_id"] = i
-        elif "lat" in h:
-            col_map["latitude"] = i
-        elif "lon" in h:
-            col_map["longitude"] = i
-        elif "zone" in h or "cluster" in h:
-            col_map["zone"] = i
-        elif h in ("city",):
-            col_map["city"] = i
-        elif h in ("state",):
-            col_map["state"] = i
-        elif h == "status" or "site status" in h or "site_status" in h:
-            col_map["site_status"] = i
-        elif "alarm" in h:
-            col_map["alarms"] = i
-        elif h in ("solution", "standard solution step", "standard solution", "standard_solution_step"):
-            col_map["solution"] = i
-        elif "bandwidth" in h or h == "bandwidth_mhz":
-            col_map["bandwidth_mhz"] = i
-        elif "antenna" in h and "gain" in h or h == "antenna_gain_dbi":
-            col_map["antenna_gain_dbi"] = i
-        elif ("rf" in h and "power" in h) or "eirp" in h or h == "rf_power_eirp_dbm":
-            col_map["rf_power_eirp_dbm"] = i
-        elif ("antenna" in h and "height" in h) or h == "antenna_height_agl_m":
-            col_map["antenna_height_agl_m"] = i
-        elif "tilt" in h or h == "e_tilt_degree":
-            col_map["e_tilt_degree"] = i
-        elif "crs" in h or h == "crs_gain":
-            col_map["crs_gain"] = i
-        elif h in ("country",):
-            col_map["country"] = i
-        elif h in ("technology", "tech", "tech_type", "technology_type"):
-            col_map["technology"] = i
+    extra_col_indices = []  # indices of columns that don't map to known fields
 
-    required = ["site_id", "latitude", "longitude"]
+    # Known field matchers: (field_name, matcher_fn)
+    _KNOWN_MATCHERS = [
+        ("site_id",            lambda h: ("site" in h and "id" in h and "abs" not in h) or h in ("site_id", "siteid")),
+        ("site_abs_id",        lambda h: ("site" in h and "abs" in h) or h in ("site_abs_id", "siteabsid", "abs_id", "absid")),
+        ("site_name",          lambda h: h in ("site_name", "sitename", "site name") or (h == "site")),
+        ("cell_id",            lambda h: h in ("cell_name", "cell name", "cellname", "cell_id", "cell id", "cellid", "cell")),
+        ("vendor_name",        lambda h: h in ("vendor", "vendor_name", "vendor name", "vendorname")),
+        ("latitude",           lambda h: "lat" in h),
+        ("longitude",          lambda h: "lon" in h),
+        ("province",           lambda h: h in ("province", "prov", "region") or "province" in h),
+        ("commune",            lambda h: h in ("commune", "comm") or "commune" in h),
+        ("zone",               lambda h: "zone" in h or "cluster" in h),
+        ("city",               lambda h: h in ("city", "ville")),
+        ("state",              lambda h: h in ("state",)),
+        ("site_status",        lambda h: h == "status" or "site status" in h or "site_status" in h),
+        ("alarms",             lambda h: "alarm" in h),
+        ("solution",           lambda h: h in ("solution", "standard solution step", "standard solution", "standard_solution_step")),
+        ("bandwidth_mhz",      lambda h: "bandwidth" in h or h == "bandwidth_mhz"),
+        ("antenna_gain_dbi",   lambda h: ("antenna" in h and "gain" in h) or h == "antenna_gain_dbi"),
+        ("rf_power_eirp_dbm",  lambda h: ("rf" in h and "power" in h) or "eirp" in h or h == "rf_power_eirp_dbm"),
+        ("antenna_height_agl_m", lambda h: ("antenna" in h and "height" in h) or h == "antenna_height_agl_m"),
+        ("e_tilt_degree",      lambda h: "tilt" in h or h == "e_tilt_degree"),
+        ("crs_gain",           lambda h: "crs" in h or h == "crs_gain"),
+        ("country",            lambda h: h in ("country",)),
+        ("technology",         lambda h: h in ("technology", "tech", "tech_type", "technology_type",
+                                                "network type", "network_type", "networktype",
+                                                "radio", "radio_type", "radio access technology", "rat")),
+    ]
+
+    for i, h in enumerate(headers):
+        if not h:
+            continue
+        matched = False
+        for field_name, matcher in _KNOWN_MATCHERS:
+            if field_name not in col_map and matcher(h):
+                col_map[field_name] = i
+                matched = True
+                break
+        if not matched:
+            extra_col_indices.append(i)
+
+    required = ["site_id"]
     missing = [k for k in required if k not in col_map]
     if missing:
         return jsonify({"error": f"Missing columns: {', '.join(missing)}. Found headers: {headers}"}), 400
@@ -5380,161 +6312,170 @@ def admin_upload_sites():
 
     created = 0
     skipped = []
+    detected_extra_cols = [raw_headers[i] for i in extra_col_indices if i < len(raw_headers) and raw_headers[i]]
+
+    def _clean_key(raw):
+        """Normalise a header into a safe JSON key (no newlines, no control chars)."""
+        s = str(raw or "").replace("\n", " ").replace("\r", " ").replace("\t", " ")
+        s = re.sub(r"\s+", " ", s).strip()
+        return s or "unknown"
+
+    def _clean_val(v):
+        """Coerce a cell value into something JSON-serialisable."""
+        if v is None:
+            return None
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, (int, float)):
+            # Guard against NaN/Inf which are not valid JSON.
+            try:
+                if math.isnan(v) or math.isinf(v):
+                    return None
+            except Exception:
+                pass
+            return v
+        # Everything else → trimmed, newline-free string
+        s = str(v).replace("\n", " ").replace("\r", " ").strip()
+        return s[:500] if len(s) > 500 else s
+
+    # ── Build a list of plain dicts first (no ORM objects) ────────
+    # This lets us use bulk_insert_mappings and deduplicate (site_id, cell_id)
+    # before ever touching the DB.
+    mappings = []
+    seen_keys = set()  # (site_id, cell_id_or_None) — enforces unique constraint client-side
+
     for row_idx, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
         try:
-            sid = str(row[col_map["site_id"]]).strip()
-            lat = float(row[col_map["latitude"]])
-            lon = float(row[col_map["longitude"]])
+            sid_raw = row[col_map["site_id"]] if col_map.get("site_id") is not None and col_map["site_id"] < len(row) else None
+            if sid_raw is None:
+                skipped.append(f"Row {row_idx}: empty site_id")
+                continue
+            sid = str(sid_raw).strip()
+            if not sid or sid.lower() == "none":
+                skipped.append(f"Row {row_idx}: empty site_id")
+                continue
+            lat = _float_cell(row, "latitude") or 0.0
+            lon = _float_cell(row, "longitude") or 0.0
         except Exception as e:
-            skipped.append(f"Row {row_idx}: {e}")
+            skipped.append(f"Row {row_idx}: parse error: {e}")
             continue
+
+        cell_id_val = _str_cell(row, "cell_id") or None
+        dedup_key = (sid, cell_id_val)
+        if dedup_key in seen_keys:
+            skipped.append(f"Row {row_idx}: duplicate site_id={sid} cell_id={cell_id_val}")
+            continue
+        seen_keys.add(dedup_key)
 
         raw_status = _str_cell(row, "site_status", "on_air").lower()
         site_status = status_map.get(raw_status, raw_status or "on_air")
 
-        db.session.add(TelecomSite(
-            site_id=sid,
-            cell_id=_str_cell(row, "cell_id") or None,
-            latitude=lat,
-            longitude=lon,
-            zone=_str_cell(row, "zone"),
-            city=_str_cell(row, "city") or None,
-            state=_str_cell(row, "state") or None,
-            country=_str_cell(row, "country") or "India",
-            technology=_str_cell(row, "technology") or None,
-            site_status=site_status,
-            alarms=_str_cell(row, "alarms"),
-            solution=_str_cell(row, "solution"),
-            bandwidth_mhz=_float_cell(row, "bandwidth_mhz"),
-            antenna_gain_dbi=_float_cell(row, "antenna_gain_dbi"),
-            rf_power_eirp_dbm=_float_cell(row, "rf_power_eirp_dbm"),
-            antenna_height_agl_m=_float_cell(row, "antenna_height_agl_m"),
-            e_tilt_degree=_float_cell(row, "e_tilt_degree"),
-            crs_gain=_float_cell(row, "crs_gain"),
-        ))
-        created += 1
+        # Build extra_params dict — sanitised keys/values.
+        extra_params = {}
+        for idx in extra_col_indices:
+            if idx < len(row) and row[idx] is not None:
+                raw_label = raw_headers[idx] if idx < len(raw_headers) else f"col_{idx}"
+                key = _clean_key(raw_label)
+                val = _clean_val(row[idx])
+                if val is not None and val != "":
+                    extra_params[key] = val
 
-    db.session.commit()
+        province_val = _str_cell(row, "province")
+        commune_val = _str_cell(row, "commune")
+        zone_val = _str_cell(row, "zone")
+        if not province_val and zone_val:
+            province_val = zone_val
+
+        mappings.append({
+            "site_id": sid,
+            "site_abs_id": _str_cell(row, "site_abs_id") or None,
+            "site_name": _str_cell(row, "site_name") or None,
+            "cell_id": cell_id_val,
+            "vendor_name": _str_cell(row, "vendor_name") or None,
+            "latitude": lat,
+            "longitude": lon,
+            "province": province_val or "",
+            "commune": commune_val or "",
+            "zone": zone_val or province_val or "",
+            "city": _str_cell(row, "city") or None,
+            "state": _str_cell(row, "state") or None,
+            "country": _str_cell(row, "country") or "",
+            "technology": _str_cell(row, "technology") or None,
+            "site_status": site_status,
+            "alarms": _str_cell(row, "alarms") or "",
+            "solution": _str_cell(row, "solution") or "",
+            "standard_solution_step": "",
+            "bandwidth_mhz": _float_cell(row, "bandwidth_mhz"),
+            "antenna_gain_dbi": _float_cell(row, "antenna_gain_dbi"),
+            "rf_power_eirp_dbm": _float_cell(row, "rf_power_eirp_dbm"),
+            "antenna_height_agl_m": _float_cell(row, "antenna_height_agl_m"),
+            "e_tilt_degree": _float_cell(row, "e_tilt_degree"),
+            "crs_gain": _float_cell(row, "crs_gain"),
+            "extra_params": extra_params if extra_params else None,
+        })
+
+    # ── Bulk insert in chunks with per-chunk fallback to row-by-row ──
+    CHUNK = 500
+    try:
+        for i in range(0, len(mappings), CHUNK):
+            chunk = mappings[i:i + CHUNK]
+            try:
+                db.session.bulk_insert_mappings(TelecomSite, chunk)
+                db.session.flush()
+                created += len(chunk)
+            except Exception as chunk_err:
+                # Fallback: insert row-by-row so one bad row doesn't kill the chunk
+                db.session.rollback()
+                app.logger.warning(f"Chunk {i}-{i+len(chunk)} failed ({type(chunk_err).__name__}); retrying row-by-row")
+                for r_idx, r in enumerate(chunk):
+                    try:
+                        db.session.bulk_insert_mappings(TelecomSite, [r])
+                        db.session.flush()
+                        created += 1
+                    except Exception as row_err:
+                        db.session.rollback()
+                        underlying = getattr(row_err, "orig", None)
+                        err_msg = str(underlying) if underlying else str(row_err)
+                        skipped.append(f"site_id={r.get('site_id')} cell_id={r.get('cell_id')}: {type(row_err).__name__}: {err_msg[:200]}")
+                        # Log the first 5 bad rows in full so we can see the real cause
+                        if len([s for s in skipped if 'site_id=' in s]) <= 5:
+                            app.logger.error(f"Bad row: {r}")
+                            app.logger.error(f"Underlying error: {err_msg}")
+
+        db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        import traceback
+        traceback.print_exc()
+        underlying = getattr(e, "orig", None)
+        err_msg = str(underlying) if underlying else str(e)
+        return jsonify({
+            "error": f"{type(e).__name__}: {err_msg[:500]}",
+            "created_before_error": created,
+            "skipped_sample": skipped[-10:],
+            "total_skipped": len(skipped),
+        }), 500
 
     # Auto-populate city/state/country from lat/lng for sites missing geo data
-    _auto_populate_geo()
+    try:
+        _auto_populate_geo()
+    except Exception as e:
+        print(f">>> Geo auto-populate failed (non-fatal): {e}")
 
     clear_analytics_cache()
-    return jsonify({"created": created, "skipped": skipped, "total": created})
+    return jsonify({
+        "created": created, "skipped": skipped, "total": created,
+        "detected_columns": list(col_map.keys()),
+        "extra_columns": detected_extra_cols,
+    })
 
 
 def _auto_populate_geo():
-    """Populate city, state, country for telecom_sites using lat/lng coordinate mapping.
-    Uses a built-in mapping of Indian city bounding boxes — no external API needed."""
-    import math
-
-    # Indian city coordinate regions: (name, state, lat_min, lat_max, lng_min, lng_max)
-    CITY_REGIONS = [
-        # NCR / Haryana
-        ("Gurgaon",     "Haryana",        "India", 28.38, 28.55, 76.90, 77.12),
-        ("Faridabad",   "Haryana",        "India", 28.30, 28.45, 77.25, 77.40),
-        ("Noida",       "Uttar Pradesh",  "India", 28.50, 28.65, 77.30, 77.45),
-        ("Greater Noida","Uttar Pradesh", "India", 28.40, 28.52, 77.45, 77.60),
-        ("Ghaziabad",   "Uttar Pradesh",  "India", 28.60, 28.72, 77.38, 77.50),
-        ("New Delhi",   "Delhi",          "India", 28.50, 28.80, 77.10, 77.35),
-        ("Delhi",       "Delhi",          "India", 28.40, 28.90, 76.85, 77.35),
-        # Rajasthan
-        ("Jaipur",      "Rajasthan",      "India", 26.78, 27.05, 75.65, 75.92),
-        ("Jodhpur",     "Rajasthan",      "India", 26.22, 26.40, 72.93, 73.10),
-        ("Udaipur",     "Rajasthan",      "India", 24.50, 24.65, 73.60, 73.80),
-        # Maharashtra
-        ("Mumbai",      "Maharashtra",    "India", 18.87, 19.30, 72.77, 73.00),
-        ("Navi Mumbai", "Maharashtra",    "India", 19.00, 19.15, 73.00, 73.15),
-        ("Thane",       "Maharashtra",    "India", 19.15, 19.30, 72.95, 73.10),
-        ("Pune",        "Maharashtra",    "India", 18.45, 18.65, 73.75, 73.95),
-        ("Nagpur",      "Maharashtra",    "India", 21.05, 21.22, 79.00, 79.15),
-        # Karnataka
-        ("Bangalore",   "Karnataka",      "India", 12.85, 13.10, 77.45, 77.75),
-        ("Mysore",      "Karnataka",      "India", 12.25, 12.40, 76.55, 76.72),
-        # Tamil Nadu
-        ("Chennai",     "Tamil Nadu",     "India", 12.90, 13.20, 80.15, 80.30),
-        ("Coimbatore",  "Tamil Nadu",     "India", 10.95, 11.10, 76.90, 77.05),
-        # Telangana
-        ("Hyderabad",   "Telangana",      "India", 17.30, 17.55, 78.35, 78.60),
-        # West Bengal
-        ("Kolkata",     "West Bengal",    "India", 22.45, 22.70, 88.25, 88.45),
-        # Gujarat
-        ("Ahmedabad",   "Gujarat",        "India", 22.95, 23.15, 72.50, 72.70),
-        ("Surat",       "Gujarat",        "India", 21.10, 21.25, 72.75, 72.90),
-        # Madhya Pradesh
-        ("Indore",      "Madhya Pradesh", "India", 22.65, 22.80, 75.80, 75.95),
-        ("Bhopal",      "Madhya Pradesh", "India", 23.20, 23.35, 77.35, 77.50),
-        # Punjab
-        ("Chandigarh",  "Chandigarh",     "India", 30.68, 30.78, 76.72, 76.82),
-        ("Ludhiana",    "Punjab",         "India", 30.85, 30.98, 75.82, 75.95),
-        ("Amritsar",    "Punjab",         "India", 31.58, 31.70, 74.82, 74.92),
-        # Kerala
-        ("Kochi",       "Kerala",         "India", 9.90, 10.05, 76.22, 76.38),
-        ("Thiruvananthapuram","Kerala",   "India", 8.45, 8.58, 76.90, 77.02),
-        # Bihar
-        ("Patna",       "Bihar",          "India", 25.55, 25.68, 85.08, 85.22),
-        # Uttar Pradesh
-        ("Lucknow",     "Uttar Pradesh",  "India", 26.78, 26.95, 80.88, 81.05),
-        ("Kanpur",      "Uttar Pradesh",  "India", 26.40, 26.55, 80.28, 80.42),
-        ("Varanasi",    "Uttar Pradesh",  "India", 25.28, 25.40, 82.95, 83.08),
-        # Assam
-        ("Guwahati",    "Assam",          "India", 26.12, 26.22, 91.68, 91.82),
-    ]
-
-    # Broader state-level fallback from lat/lng ranges
-    STATE_REGIONS = [
-        ("Haryana",         "India", 27.5, 31.0, 74.5, 77.5),
-        ("Delhi",           "India", 28.4, 28.9, 76.8, 77.4),
-        ("Uttar Pradesh",   "India", 23.5, 30.5, 77.0, 84.5),
-        ("Rajasthan",       "India", 23.0, 30.0, 69.5, 78.0),
-        ("Maharashtra",     "India", 15.5, 22.0, 72.5, 80.5),
-        ("Karnataka",       "India", 11.5, 18.5, 74.0, 78.5),
-        ("Tamil Nadu",      "India", 8.0, 13.5, 76.0, 80.5),
-        ("Telangana",       "India", 15.8, 19.9, 77.2, 81.3),
-        ("West Bengal",     "India", 21.5, 27.2, 85.8, 89.9),
-        ("Gujarat",         "India", 20.0, 24.5, 68.2, 74.5),
-        ("Madhya Pradesh",  "India", 21.0, 26.9, 74.0, 82.8),
-        ("Punjab",          "India", 29.5, 32.5, 73.8, 76.9),
-        ("Chandigarh",      "India", 30.6, 30.8, 76.7, 76.9),
-        ("Kerala",          "India", 8.2, 12.8, 74.8, 77.4),
-        ("Bihar",           "India", 24.3, 27.5, 83.3, 88.2),
-        ("Assam",           "India", 24.0, 28.0, 89.5, 96.0),
-    ]
-
-    # ── Known city → state corrections ──────────────────────────────────────
-    # Nominatim sometimes returns wrong or inconsistent state values.
-    # This map ensures cities are always assigned to the correct state.
-    CITY_STATE_FIX = {
-        "delhi":          "Delhi",
-        "new delhi":      "Delhi",
-        "gurugram":       "Haryana",
-        "gurgaon":        "Haryana",
-        "garhi harsaru":  "Haryana",
-        "faridabad":      "Haryana",
-        "noida":          "Uttar Pradesh",
-        "greater noida":  "Uttar Pradesh",
-        "ghaziabad":      "Uttar Pradesh",
-    }
-
+    """Populate province, commune, city, state, country for telecom_sites.
+    Dynamic: uses province/commune from upload if available, infers technology from site_id.
+    Copies province→state and commune→city for backward compatibility when those fields are empty.
+    No hardcoded country/city mappings — all geo comes from the uploaded data."""
     try:
-        # Step 1: Fix state for sites with known city names (runs always)
-        fixed = 0
-        sites_with_city = TelecomSite.query.filter(
-            TelecomSite.city.isnot(None),
-            TelecomSite.city != "",
-        ).all()
-        for s in sites_with_city:
-            correct_state = CITY_STATE_FIX.get((s.city or "").strip().lower())
-            if correct_state and (s.state or "").strip().lower() != correct_state.lower():
-                s.state = correct_state
-                if not s.country:
-                    s.country = "India"
-                fixed += 1
-        if fixed:
-            db.session.commit()
-            print(f">>> Fixed state for {fixed} sites using city→state mapping")
-
-        # Step 2: Populate geo for sites missing city/state, and infer technology
         sites = TelecomSite.query.filter(
             TelecomSite.latitude.isnot(None),
             TelecomSite.longitude.isnot(None),
@@ -5543,7 +6484,6 @@ def _auto_populate_geo():
         updated = 0
         for s in sites:
             changed = False
-            lat, lng = float(s.latitude), float(s.longitude)
 
             # Infer technology from site_id (e.g. "GUR_LTE_001" → "LTE")
             if not s.technology and s.site_id:
@@ -5554,38 +6494,19 @@ def _auto_populate_geo():
                         changed = True
                         break
 
-            # Skip geo if already populated
-            if s.city and s.state:
-                if changed:
-                    updated += 1
-                continue
+            # Sync province → state and commune → city for backward compat
+            if s.province and not s.state:
+                s.state = s.province
+                changed = True
+            if s.commune and not s.city:
+                s.city = s.commune
+                changed = True
+            # Also sync zone from province if zone is empty
+            if s.province and not s.zone:
+                s.zone = s.province
+                changed = True
 
-            city_found = ""
-            state_found = ""
-            country_found = "India"
-
-            # Try city-level match first
-            for cname, sname, cntry, lat_min, lat_max, lng_min, lng_max in CITY_REGIONS:
-                if lat_min <= lat <= lat_max and lng_min <= lng <= lng_max:
-                    city_found = cname
-                    state_found = sname
-                    country_found = cntry
-                    break
-
-            # Fallback to state-level if no city match
-            if not state_found:
-                for sname, cntry, lat_min, lat_max, lng_min, lng_max in STATE_REGIONS:
-                    if lat_min <= lat <= lat_max and lng_min <= lng <= lng_max:
-                        state_found = sname
-                        country_found = cntry
-                        break
-
-            if city_found or state_found:
-                if city_found:
-                    s.city = city_found
-                if state_found:
-                    s.state = state_found
-                s.country = country_found
+            if changed:
                 updated += 1
 
         if updated:
@@ -5657,11 +6578,30 @@ def admin_upload_kpi_site_level():
                 errors.append(f"Sheet '{kpi_name}': insufficient columns")
                 continue
 
+            # Auto-detect identifier columns and date columns
+            id_col_map = {}
             date_columns = []
-            for col_idx in range(1, len(headers)):
-                h = headers[col_idx]
+            for col_idx, h in enumerate(headers):
                 if h is None:
                     continue
+                h_str = str(h).strip().lower() if isinstance(h, str) else ""
+
+                # Check if it's an identifier column
+                if isinstance(h, str):
+                    if ("site" in h_str and "id" in h_str and "abs" not in h_str) or h_str in ("site_id", "siteid"):
+                        id_col_map["site_id"] = col_idx
+                        continue
+                    elif ("site" in h_str and "abs" in h_str) or h_str in ("site_abs_id", "siteabsid", "abs_id"):
+                        id_col_map["site_abs_id"] = col_idx
+                        continue
+                    elif h_str in ("vendor", "vendor_name", "vendor name", "vendorname"):
+                        id_col_map["vendor_name"] = col_idx
+                        continue
+                    elif h_str in ("site_name", "site name", "sitename"):
+                        id_col_map["site_name"] = col_idx
+                        continue
+
+                # Try to parse as date
                 try:
                     if isinstance(h, datetime):
                         date_columns.append((col_idx, h.date()))
@@ -5677,11 +6617,15 @@ def admin_upload_kpi_site_level():
                 except Exception:
                     continue
 
+            # Default site_id to column 0 if not explicitly found
+            if "site_id" not in id_col_map:
+                id_col_map["site_id"] = 0
+
             if not date_columns:
                 errors.append(f"Sheet '{kpi_name}': no valid date columns found")
                 continue
 
-            sheet_inserted = bulk_insert_from_sheet_site(db, rows_iter, kpi_name, date_columns)
+            sheet_inserted = bulk_insert_from_sheet_site(db, rows_iter, kpi_name, date_columns, id_col_map=id_col_map)
             total_inserted += sheet_inserted
             kpi_summary.append({"name": kpi_name, "rows": sheet_inserted})
             app.logger.info(f"Site-level upload: sheet '{kpi_name}' done — {sheet_inserted} rows")
@@ -5827,15 +6771,21 @@ def admin_delete_shared_site_workbook():
 
 @app.route("/api/admin/debug-upload", methods=["POST", "OPTIONS"])
 def debug_upload():
-    """Debug endpoint — no auth, logs everything received."""
-    print(f"\n[DEBUG] Method: {request.method}")
-    print(f"[DEBUG] Headers: {dict(request.headers)}")
-    print(f"[DEBUG] Files: {list(request.files.keys())}")
-    print(f"[DEBUG] Form: {list(request.form.keys())}")
-    if 'file' in request.files:
-        f = request.files['file']
-        print(f"[DEBUG] File name: {f.filename}, size: {len(f.read())} bytes")
-    return jsonify({"status": "ok", "files": list(request.files.keys()), "method": request.method})
+    """Debug endpoint — no auth, reads Excel structure for troubleshooting."""
+    if 'file' not in request.files:
+        return jsonify({"error": "No file"}), 400
+    f = request.files['file']
+    import io as _io, openpyxl
+    raw = f.read()
+    wb = openpyxl.load_workbook(_io.BytesIO(raw), data_only=True, read_only=True)
+    result = {}
+    for ws in wb.worksheets:
+        rows = list(ws.iter_rows(values_only=True, max_row=4))
+        result[ws.title] = []
+        for ri, row in enumerate(rows):
+            result[ws.title].append([f"{type(c).__name__}:{str(c)[:40]}" if c is not None else None for c in row[:10]])
+    wb.close()
+    return jsonify({"sheets": len(result), "preview": result})
 
 
 @app.route("/api/admin/upload-kpi-cell-level", methods=["POST"])
@@ -5880,15 +6830,40 @@ def admin_upload_kpi_cell_level():
                 errors.append(f"Sheet '{kpi_name}': empty sheet")
                 continue
 
-            if not headers or len(headers) < 4:
-                errors.append(f"Sheet '{kpi_name}': insufficient columns (need Site_ID, Cell_ID, Cell_Site_ID + dates)")
+            if not headers or len(headers) < 3:
+                errors.append(f"Sheet '{kpi_name}': insufficient columns")
                 continue
 
+            # Auto-detect identifier columns and date columns
+            id_col_map = {}
             date_columns = []
-            for col_idx in range(3, len(headers)):
-                h = headers[col_idx]
+            for col_idx, h in enumerate(headers):
                 if h is None:
                     continue
+                h_str = str(h).strip().lower() if isinstance(h, str) else ""
+
+                # Check if it's an identifier column
+                if isinstance(h, str):
+                    if ("site" in h_str and "id" in h_str and "abs" not in h_str) or h_str in ("site_id", "siteid"):
+                        id_col_map["site_id"] = col_idx
+                        continue
+                    elif ("site" in h_str and "abs" in h_str) or h_str in ("site_abs_id", "siteabsid", "abs_id"):
+                        id_col_map["site_abs_id"] = col_idx
+                        continue
+                    elif h_str in ("cell_name", "cell name", "cellname", "cell_id", "cell id", "cellid", "cell"):
+                        id_col_map["cell_id"] = col_idx
+                        continue
+                    elif h_str in ("cell_site_id", "cell site id", "cellsiteid"):
+                        id_col_map["cell_site_id"] = col_idx
+                        continue
+                    elif h_str in ("vendor", "vendor_name", "vendor name", "vendorname"):
+                        id_col_map["vendor_name"] = col_idx
+                        continue
+                    elif h_str in ("site_name", "site name", "sitename"):
+                        id_col_map["site_name"] = col_idx
+                        continue
+
+                # Try to parse as date
                 try:
                     if isinstance(h, datetime):
                         date_columns.append((col_idx, h.date()))
@@ -5904,11 +6879,19 @@ def admin_upload_kpi_cell_level():
                 except Exception:
                     continue
 
+            # Defaults if not auto-detected (legacy format: col0=Site_ID, col1=Cell_ID, col2=Cell_Site_ID)
+            if "site_id" not in id_col_map:
+                id_col_map["site_id"] = 0
+            if "cell_id" not in id_col_map:
+                id_col_map["cell_id"] = 1
+            if "cell_site_id" not in id_col_map and "cell_site_id" not in id_col_map:
+                id_col_map["cell_site_id"] = 2
+
             if not date_columns:
                 errors.append(f"Sheet '{kpi_name}': no valid date columns found")
                 continue
 
-            sheet_inserted = bulk_insert_from_sheet_cell(db, rows_iter, kpi_name, date_columns)
+            sheet_inserted = bulk_insert_from_sheet_cell(db, rows_iter, kpi_name, date_columns, id_col_map=id_col_map)
             total_inserted += sheet_inserted
             kpi_summary.append({"name": kpi_name, "rows": sheet_inserted})
             app.logger.info(f"Cell-level upload: sheet '{kpi_name}' done — {sheet_inserted} rows")
@@ -5925,6 +6908,579 @@ def admin_upload_kpi_cell_level():
         "kpi_summary": kpi_summary,
         "errors": errors,
     })
+
+
+# ── Core Component KPI Upload (MME / SGW / PGW / HSS / PCRF) ─────────────
+# Mapping: which KPI belongs to which component type
+# All 77 Core KPIs mapped to their component type
+CORE_KPI_COMPONENT_MAP = {
+    # ── MME (13 KPIs) ──────────────────────────────────────────────────────
+    "attach success rate":            "MME",
+    "service request success rate":   "MME",
+    "service request sr":             "MME",
+    "paging success rate":            "MME",
+    "csfb success rate":              "MME",
+    "srvcc success rate":             "MME",
+    "hosr":                           "MME",
+    "context setup failure rate":     "MME",
+    "tau success rate":               "MME",
+    "bearer count":                   "MME",
+    "tcp session count":              "MME",
+    "sctp association status":        "MME",
+    "thread process queue depth":     "MME",
+    # ── SGW (12 KPIs) ──────────────────────────────────────────────────────
+    "create session success rate":    "SGW",
+    "modify bearer success rate":     "SGW",
+    "delete session success rate":    "SGW",
+    "handover data path success rate":"SGW",
+    "sgw relocation success rate":    "SGW",
+    "packet loss":                    "SGW",
+    "packet loss (ul/dl)":            "SGW",
+    "user plane latency":             "SGW",
+    "user plane latency (ms)":        "SGW",
+    "throughput utilization":         "SGW",
+    "bearer count vs capacity":       "SGW",
+    "gtp-u tunnel availability":      "SGW",
+    # ── PGW (15 KPIs) ──────────────────────────────────────────────────────
+    "default bearer setup success rate": "PGW",
+    "dedicated bearer success rate":  "PGW",
+    "session setup success rate":     "PGW",
+    "pdn session setup sr":           "PGW",
+    "pcrf pcf interaction success rate": "PGW",
+    "packet loss dl ul":              "PGW",
+    "throughput per subscriber":      "PGW",
+    "throughput per subscriber (%)":  "PGW",
+    "jitter":                         "PGW",
+    "jitter (ms)":                    "PGW",
+    "charging record success rate":   "PGW",
+    "online charging latency":        "PGW",
+    "online charging latency (ms)":   "PGW",
+    "policy enforcement accuracy":    "PGW",
+    "policy enforcement accuracy (%)":"PGW",
+    "ip allocation success rate":     "PGW",
+    "end-to-end core latency":        "PGW",
+    "active sessions vs capacity":    "PGW",
+    "nat table utilization":          "PGW",
+    # ── HSS (19 KPIs) ──────────────────────────────────────────────────────
+    "authentication success rate":    "HSS",
+    "location update success rate":   "HSS",
+    "profile retrieval success rate": "HSS",
+    "authentication failure rate":    "HSS",
+    "s6a transaction success rate":   "HSS",
+    "s6a response latency":           "HSS",
+    "s6a response latency (ms)":      "HSS",
+    "s6a timeout rate":               "HSS",
+    "cx success rate":                "HSS",
+    "cx response latency":            "HSS",
+    "cx response latency (ms)":       "HSS",
+    "db query success rate":          "HSS",
+    "db replication lag":             "HSS",
+    "db replication lag (ms)":        "HSS",
+    "db lock contention rate":        "HSS",
+    "db lock contention rate (%)":    "HSS",
+    "diameter transaction sr":        "HSS",
+    "authentication response time":   "HSS",
+    "db utilization":                 "HSS",
+    "diameter tps vs capacity":       "HSS",
+    "thread worker queue depth":      "HSS",
+    "thread worker queue depth (%)":  "HSS",
+    "hss availability":               "HSS",
+    "geo redundancy sync status":     "HSS",
+    "geo redundancy sync status (%)": "HSS",
+    "failover time":                  "HSS",
+    "failover time (s)":              "HSS",
+    # ── PCRF (18 KPIs) ─────────────────────────────────────────────────────
+    "policy decision success rate":   "PCRF",
+    "session establishment success rate": "PCRF",
+    "charging rule install success rate": "PCRF",
+    "charging rule update success rate":  "PCRF",
+    "gx success rate":                "PCRF",
+    "gx response latency":            "PCRF",
+    "gx response latency (ms)":       "PCRF",
+    "gx timeout rate":                "PCRF",
+    "ocs sy gy success rate":         "PCRF",
+    "credit control failure rate":    "PCRF",
+    "active policy sessions":         "PCRF",
+    "policy session retention rate":  "PCRF",
+    "dedicated bearer trigger accuracy": "PCRF",
+    "diameter tps usage":             "PCRF",
+    "diameter message latency":       "PCRF",
+    "policy rule provisioning delay": "PCRF",
+    "thread queue depth":             "PCRF",
+    "thread queue depth (%)":         "PCRF",
+    "pcrf availability":              "PCRF",
+}
+
+# KPIs shared across multiple components (detected by keyword)
+CORE_SHARED_KPIS = {
+    "cpu utilization": True,     # All 5 components have this
+    "memory utilization": True,  # All 5 components have this
+}
+
+
+def _detect_component_type_from_kpi(kpi_name):
+    """Detect component type from KPI name using fuzzy matching.
+    Shared KPIs (CPU/Memory Utilization) return None — component type
+    must be determined from the component_id column instead."""
+    kn = (kpi_name or "").strip().lower()
+    # Shared KPIs exist on all components — can't determine type from name alone
+    if kn in CORE_SHARED_KPIS:
+        return None  # Caller must use component_id to determine type
+    if kn in CORE_KPI_COMPONENT_MAP:
+        return CORE_KPI_COMPONENT_MAP[kn]
+    # Fuzzy fallback
+    for key, comp in CORE_KPI_COMPONENT_MAP.items():
+        if key in kn or kn in key:
+            return comp
+    return "UNKNOWN"
+
+
+@app.route("/api/admin/upload-core-component-kpi", methods=["POST"])
+@jwt_required()
+def admin_upload_core_component_kpi():
+    """Upload Core Component KPI workbook — fully flexible auto-detection.
+
+    Only requirement: sheet name = KPI name.
+
+    Auto-detects the layout. Supports at minimum:
+      Layout A (standard):
+        Row 0 = title row (skipped if no DATE/TIME header)
+        Row 1 = headers: DATE | TIME (HH:MM) | comp1 | comp2 | … | (blank) | SUMMARY …
+        Row 2+ = data:   datetime | "HH:MM"  | float | float | …
+      Layout B (transposed):
+        Col 0 = Component_Type, Col 1 = Component_ID, remaining cols = datetimes
+    """
+    from bulk_insert import bulk_insert_core_component_rows
+    import uuid
+
+    user = User.query.get(int(get_jwt_identity()))
+    if not user or user.role not in ("admin", "cto"):
+        return jsonify({"error": "Unauthorized"}), 403
+
+    if "file" not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+
+    file = request.files["file"]
+    if not file.filename.lower().endswith((".xlsx", ".xlsm")):
+        return jsonify({"error": "Only .xlsx or .xlsm files are supported."}), 400
+    ok, err = _validate_ooxml_excel_upload(file)
+    if not ok:
+        return jsonify({"error": err}), 400
+
+    import io as _io, openpyxl
+    import re as _re
+
+    raw_bytes = file.read()
+    wb = openpyxl.load_workbook(_io.BytesIO(raw_bytes), data_only=True, read_only=True)
+
+    batch_id = str(uuid.uuid4())[:12]
+    total_inserted = 0
+    kpi_summary = []
+    errors = []
+
+    def _detect_comp_type_from_id_static(comp_id):
+        cid = (comp_id or "").strip().upper()
+        for prefix in ("MME", "SGW", "PGW", "HSS", "PCRF"):
+            if cid.startswith(prefix): return prefix
+        return "UNKNOWN"
+
+    # Detect which component type this file is for (from first sheet header col 0)
+    _upload_comp_type = None
+    try:
+        first_ws = wb.worksheets[0]
+        first_rows = list(first_ws.iter_rows(values_only=True, max_row=2))
+        if first_rows:
+            for row in first_rows:
+                if row and row[0]:
+                    _ct = _detect_comp_type_from_id_static(str(row[0]).strip())
+                    if _ct != "UNKNOWN":
+                        _upload_comp_type = _ct
+                        break
+    except Exception:
+        pass
+
+    # Delete only this component's data (not all components)
+    try:
+        with db.engine.connect() as conn:
+            if _upload_comp_type:
+                conn.execute(text("DELETE FROM core_component_kpi WHERE component_type = :ct"), {"ct": _upload_comp_type})
+                app.logger.info(f"Deleted existing {_upload_comp_type} data before upload")
+            else:
+                conn.execute(text("DELETE FROM core_component_kpi"))
+                app.logger.info("Deleted ALL core component data (could not detect specific component type)")
+            conn.commit()
+    except Exception:
+        pass
+
+    def _detect_comp_type_from_id(comp_id):
+        """Extract component type from component ID like MME1 → MME, SGW2 → SGW."""
+        cid = (comp_id or "").strip().upper()
+        for prefix in ("MME", "SGW", "PGW", "HSS", "PCRF"):
+            if cid.startswith(prefix):
+                return prefix
+        return "UNKNOWN"
+
+    def _parse_time_str(ts):
+        """Parse time string 'HH:MM' or 'H:MM' → (hour, minute)."""
+        m = _re.match(r'^(\d{1,2}):(\d{2})$', (ts or "").strip())
+        if m:
+            return int(m.group(1)), int(m.group(2))
+        return None, None
+
+    def _is_header_row(row):
+        """Check if a row looks like a header.
+        Returns True if row has DATE/TIME columns OR has component-like ID strings."""
+        non_none = [c for c in row[:8] if c is not None]
+        if len(non_none) < 2:
+            return False
+        for c in row[:4]:
+            if isinstance(c, str):
+                ct = c.strip().upper()
+                if len(ct) < 25 and (ct == "DATE" or ct.startswith("TIME") or ct == "TIMESTAMP"):
+                    return True
+        # Also check if row has component IDs like MME1, SGW2, etc. in later columns
+        for c in row[1:8]:
+            if isinstance(c, str):
+                cs = c.strip().upper()
+                for prefix in ("MME", "SGW", "PGW", "HSS", "PCRF"):
+                    if cs.startswith(prefix) and len(cs) <= 8:
+                        return True
+        # Check if row has datetime objects in later columns (transposed format)
+        dt_count = sum(1 for c in row[1:8] if isinstance(c, datetime) or (isinstance(c, str) and _re.match(r'\d{4}-\d{2}-\d{2}', (c or '').strip())))
+        if dt_count >= 2:
+            return True
+        return False
+
+    def _find_data_columns(header_row):
+        """Find component-ID columns from header row.
+        Returns list of (col_idx, component_id) for columns that look like
+        component IDs (e.g. MME1, SGW2, HSS1, PCRF1, PGW3).
+        Stops at first blank/None column or 'SUMMARY' column."""
+        comp_cols = []
+        for idx in range(2, len(header_row)):
+            h = header_row[idx]
+            if h is None:
+                break  # blank column = end of data section
+            hs = str(h).strip().upper()
+            if "SUMMARY" in hs or "STAT" in hs or "AVG" in hs or "MIN" in hs or "MAX" in hs:
+                break
+            if hs:  # any non-empty string after DATE/TIME is a component ID
+                comp_cols.append((idx, str(h).strip()))
+        return comp_cols
+
+    try:
+        for ws in wb.worksheets:
+            kpi_name = ws.title.strip()
+            if not kpi_name:
+                continue
+            # Skip index/info/readme sheets
+            if kpi_name.upper() in ("INDEX", "README", "INFO", "DICTIONARY", "METADATA", "SHEET1"):
+                continue
+
+            # Read all rows into list for flexibility
+            all_rows = list(ws.iter_rows(values_only=True))
+            if len(all_rows) < 2:
+                errors.append(f"Sheet '{kpi_name}': too few rows")
+                continue
+
+            # ── Auto-detect header row ───────────────────────────────────
+            # Skip title/info rows until we find the header row with DATE/TIME
+            header_idx = None
+            for ri, row in enumerate(all_rows):
+                if _is_header_row(row):
+                    header_idx = ri
+                    break
+
+            if header_idx is None:
+                # Fallback: treat row 0 or 1 as header
+                # Check if row 1 looks like a header (common: row 0 is title)
+                if len(all_rows) > 1 and _is_header_row(all_rows[1]):
+                    header_idx = 1
+                elif _is_header_row(all_rows[0]):
+                    header_idx = 0
+                else:
+                    # Last resort: assume row 0 is header
+                    header_idx = 0
+
+            header_row = all_rows[header_idx]
+            data_rows = all_rows[header_idx + 1:]
+            app.logger.info(f"Sheet '{kpi_name}': header_idx={header_idx}, rows={len(data_rows)}, header[:6]={[str(c)[:30] if c else None for c in header_row[:6]]}")
+
+            if not data_rows:
+                errors.append(f"Sheet '{kpi_name}': no data rows after header")
+                continue
+
+            # Detect component type from KPI name (fallback for shared KPIs like CPU/Memory)
+            auto_comp_type = _detect_component_type_from_kpi(kpi_name) or "UNKNOWN"
+
+            # ── Smart layout detection ───────────────────────────────────
+            # Scan header row to classify each column as: identifier, date, component_id, or unknown
+            layout = None
+            date_col = None
+            time_col = None
+            comp_cols = []  # [(col_idx, comp_id)]
+            date_header_cols = []  # [(col_idx, datetime)]
+            comp_id_col = 0  # default: first column
+
+            id_col_indices = []
+            for ci, h in enumerate(header_row):
+                if h is None: continue
+                hs = str(h).strip() if isinstance(h, str) else ""
+                hu = hs.upper()
+
+                # Check for DATE/TIME/INTERVAL labels
+                if isinstance(h, str) and len(hu) < 25:
+                    if hu == "DATE" or hu == "DATES": date_col = ci; continue
+                    if hu.startswith("TIME") or hu == "TIMESTAMP": time_col = ci; continue
+                    if "INTERVAL" in hu: continue  # skip interval column
+
+                # Check for identifier column names
+                if isinstance(h, str) and ci < 6:
+                    if any(kw in hu for kw in ["COMPONENT", "NODE", "VENDOR", "SITE", "ID", "NAME", "TYPE"]):
+                        id_col_indices.append(ci)
+                        continue
+
+                # Check if header is a component ID (MME1, SGW2, PCRF, HSS etc.)
+                is_comp = False
+                if isinstance(h, str) and len(hs) <= 10:
+                    for pfx in ("MME", "SGW", "PGW", "HSS", "PCRF"):
+                        if hu.startswith(pfx):
+                            comp_cols.append((ci, hs))
+                            is_comp = True
+                            break
+
+                # Try to parse as date (supports: 10-Apr-26, 2026-04-10, 10/04/2026, etc.)
+                if not is_comp and isinstance(h, str):
+                    _DATE_FMTS = ("%d-%b-%y", "%d-%b-%Y", "%Y-%m-%d", "%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S",
+                                  "%d-%m-%Y", "%m/%d/%Y", "%d/%m/%Y", "%b-%d-%y", "%b %d, %Y")
+                    for fmt in _DATE_FMTS:
+                        try:
+                            dt = datetime.strptime(hs.strip()[:19], fmt)
+                            date_header_cols.append((ci, dt))
+                            break
+                        except (ValueError, IndexError):
+                            continue
+
+                # Check for datetime objects
+                if isinstance(h, datetime):
+                    date_header_cols.append((ci, h))
+                elif hasattr(h, 'date') and not isinstance(h, str):
+                    date_header_cols.append((ci, datetime.combine(h, datetime.min.time())))
+
+            # Determine layout
+            if comp_cols and date_col is not None:
+                layout = "A"  # DATE | TIME | MME1 | MME2 ...
+            elif comp_cols and date_col is None and len(comp_cols) >= 2:
+                layout = "A"  # No explicit DATE col but component IDs found — date might be in col 0
+                if date_col is None:
+                    # Check if first non-id column has date-like data
+                    for row in data_rows[:3]:
+                        if row and row[0] is not None:
+                            if isinstance(row[0], datetime) or (isinstance(row[0], str) and _re.match(r'\d{4}-\d{2}-\d{2}', str(row[0]))):
+                                date_col = 0
+                                break
+            elif date_header_cols and len(date_header_cols) >= 2:
+                layout = "B"  # Transposed: comp_id in rows, dates as column headers
+                comp_id_col = id_col_indices[0] if id_col_indices else 0
+                # If col 0 header is a component type (e.g., "PCRF", "MME"), use it as forced type
+                if comp_cols:
+                    header_comp_type = _detect_comp_type_from_id(comp_cols[0][1])
+                    if header_comp_type != "UNKNOWN":
+                        auto_comp_type = header_comp_type  # Force all rows to this type
+            else:
+                # Last resort: check if column 0 has dates and remaining have numbers
+                has_dates_in_col0 = False
+                for row in data_rows[:5]:
+                    if row and row[0] is not None:
+                        if isinstance(row[0], datetime) or (isinstance(row[0], str) and _re.match(r'\d{4}', str(row[0]).strip())):
+                            has_dates_in_col0 = True; break
+                if has_dates_in_col0:
+                    layout = "A"; date_col = 0
+                    # Remaining non-None header columns are component IDs
+                    for ci, h in enumerate(header_row):
+                        if ci == 0 or h is None: continue
+                        hs = str(h).strip()
+                        if hs and hs.upper() not in ("SUMMARY", "AVG", "MIN", "MAX", "STAT"):
+                            comp_cols.append((ci, hs))
+
+            app.logger.info(f"Sheet '{kpi_name}': layout={layout}, comp_cols={len(comp_cols)}, date_headers={len(date_header_cols)}, date_col={date_col}, time_col={time_col}, id_cols={id_col_indices}, auto_type={auto_comp_type}")
+            if layout is None or (layout == "A" and not comp_cols) or (layout == "B" and len(date_header_cols) < 2):
+                errors.append(f"Sheet '{kpi_name}': could not detect layout (comp_cols={len(comp_cols)}, date_headers={len(date_header_cols)}, header[:5]={[str(c)[:25] for c in header_row[:5] if c]})")
+                continue
+
+            # ── Generate rows ────────────────────────────────────────────
+            def _row_gen():
+                if layout == "A":
+                    # Layout A: DATE | TIME | comp1 | comp2 ...
+                    for row in data_rows:
+                        if not row or len(row) < 2: continue
+                        d_val = None
+                        if date_col is not None and date_col < len(row) and row[date_col] is not None:
+                            cell = row[date_col]
+                            if isinstance(cell, datetime): d_val = cell.date()
+                            elif hasattr(cell, 'date'): d_val = cell.date()
+                            elif isinstance(cell, str):
+                                for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%m/%d/%Y", "%d/%m/%Y", "%Y/%m/%d"):
+                                    try: d_val = datetime.strptime(cell.strip()[:10], fmt).date(); break
+                                    except (ValueError, IndexError): continue
+                        if d_val is None: continue
+                        hr, mn = 0, 0
+                        if time_col is not None and time_col < len(row) and row[time_col] is not None:
+                            tc = row[time_col]
+                            if isinstance(tc, str):
+                                _h, _m = _parse_time_str(tc)
+                                if _h is not None: hr, mn = _h, _m
+                            elif isinstance(tc, datetime): hr, mn = tc.hour, tc.minute
+                            elif hasattr(tc, 'hour'): hr, mn = tc.hour, tc.minute
+                        for col_idx, comp_id in comp_cols:
+                            if col_idx >= len(row) or row[col_idx] is None: continue
+                            try: val = float(row[col_idx])
+                            except (ValueError, TypeError): continue
+                            ct = _detect_comp_type_from_id(comp_id)
+                            if ct == "UNKNOWN": ct = auto_comp_type if auto_comp_type != "UNKNOWN" else _detect_comp_type_from_id(comp_id)
+                            yield (ct, comp_id, kpi_name, d_val, hr, mn, val, batch_id)
+                else:
+                    # Layout B: row = [comp_id, time, interval?, val_for_date1, val_for_date2, ...]
+                    for row in data_rows:
+                        if not row or len(row) < 2: continue
+                        comp_id = str(row[comp_id_col] if comp_id_col < len(row) else "").strip()
+                        if not comp_id: continue
+                        # Determine component type: prefer from comp_id (PCRF1→PCRF), then from header/KPI name
+                        ct = _detect_comp_type_from_id(comp_id)
+                        if ct == "UNKNOWN" and auto_comp_type and auto_comp_type != "UNKNOWN":
+                            ct = auto_comp_type
+                        # Extract time from time_col if available
+                        hr, mn = 0, 0
+                        if time_col is not None and time_col < len(row) and row[time_col] is not None:
+                            tc = row[time_col]
+                            if isinstance(tc, str):
+                                _h, _m = _parse_time_str(tc)
+                                if _h is not None: hr, mn = _h, _m
+                            elif isinstance(tc, datetime): hr, mn = tc.hour, tc.minute
+                            elif hasattr(tc, 'hour'): hr, mn = tc.hour, getattr(tc, 'minute', 0)
+                        for col_idx, dt_val in date_header_cols:
+                            if col_idx >= len(row) or row[col_idx] is None: continue
+                            try: val = float(row[col_idx])
+                            except (ValueError, TypeError): continue
+                            d_val = dt_val.date() if isinstance(dt_val, datetime) else dt_val
+                            yield (ct, comp_id, kpi_name, d_val, hr, mn, val, batch_id)
+
+            sheet_inserted = bulk_insert_core_component_rows(db, _row_gen())
+            total_inserted += sheet_inserted
+            comp_names = [c[1] for c in comp_cols] if layout == "A" else [str(data_rows[0][comp_id_col])[:20] if data_rows else "?"]
+            if sheet_inserted == 0:
+                errors.append(f"Sheet '{kpi_name}': 0 rows inserted (layout={layout}, date_col={date_col}, comp_cols={len(comp_cols)}, date_headers={len(date_header_cols)})")
+            kpi_summary.append({
+                "name": kpi_name,
+                "component_type": auto_comp_type,
+                "layout": layout,
+                "components": comp_names,
+                "rows": sheet_inserted,
+            })
+            app.logger.info(f"Core component upload: sheet '{kpi_name}' ({auto_comp_type}) "
+                            f"components={comp_names} — {sheet_inserted} rows")
+
+    except Exception as e:
+        app.logger.error(f"Core component upload error: {e}")
+        return jsonify({"error": f"Upload failed: {e}"}), 500
+    finally:
+        wb.close()
+
+    clear_analytics_cache()
+    return jsonify({
+        "inserted": total_inserted,
+        "kpis_processed": len(kpi_summary),
+        "kpi_summary": kpi_summary,
+        "errors": errors,
+        "batch_id": batch_id,
+    })
+
+
+@app.route("/api/admin/core-component-kpi-status", methods=["GET"])
+@jwt_required()
+def admin_core_component_kpi_status():
+    """Return status of core component KPI data."""
+    from models import CoreComponentKpi
+    try:
+        with db.engine.connect() as conn:
+            r = conn.execute(text("""
+                SELECT COUNT(*) AS total_rows,
+                       COUNT(DISTINCT component_type) AS unique_types,
+                       COUNT(DISTINCT component_id) AS unique_components,
+                       COUNT(DISTINCT kpi_name) AS unique_kpis,
+                       MIN(date) AS date_from,
+                       MAX(date) AS date_to
+                FROM core_component_kpi
+            """)).mappings().first()
+            comp_types = [row["component_type"] for row in conn.execute(
+                text("SELECT DISTINCT component_type FROM core_component_kpi ORDER BY component_type")
+            ).mappings()]
+            kpi_names = [{"kpi_name": row["kpi_name"], "component_type": row["component_type"]}
+                         for row in conn.execute(
+                text("SELECT DISTINCT kpi_name, component_type FROM core_component_kpi ORDER BY component_type, kpi_name")
+            ).mappings()]
+        return jsonify({
+            "total_rows": r["total_rows"] if r else 0,
+            "unique_types": r["unique_types"] if r else 0,
+            "unique_components": r["unique_components"] if r else 0,
+            "unique_kpis": r["unique_kpis"] if r else 0,
+            "date_from": str(r["date_from"]) if r and r["date_from"] else None,
+            "date_to": str(r["date_to"]) if r and r["date_to"] else None,
+            "component_types": comp_types,
+            "kpi_names": kpi_names,
+        })
+    except Exception:
+        return jsonify({"total_rows": 0, "unique_types": 0, "unique_components": 0,
+                        "unique_kpis": 0, "component_types": [], "kpi_names": []})
+
+
+@app.route("/api/admin/delete-core-component-kpi", methods=["DELETE"])
+@jwt_required()
+def admin_delete_core_component_kpi():
+    """Delete core component KPI data. Optional ?component_type=MME to delete only one component."""
+    user = User.query.get(int(get_jwt_identity()))
+    if not user or user.role not in ("admin", "cto"):
+        return jsonify({"error": "Unauthorized"}), 403
+    comp_type = request.args.get("component_type", "").strip().upper()
+    try:
+        with db.engine.connect() as conn:
+            if comp_type and comp_type in ("MME", "SGW", "PGW", "HSS", "PCRF"):
+                r = conn.execute(text("DELETE FROM core_component_kpi WHERE component_type = :ct"), {"ct": comp_type})
+            else:
+                r = conn.execute(text("DELETE FROM core_component_kpi"))
+            conn.commit()
+            deleted = r.rowcount
+    except Exception:
+        deleted = 0
+    clear_analytics_cache()
+    return jsonify({"deleted": deleted, "component_type": comp_type or "ALL"})
+
+
+@app.route("/api/admin/core-component-status-by-type", methods=["GET"])
+@jwt_required()
+def admin_core_component_status_by_type():
+    """Return per-component upload status for the 5 core components."""
+    user = User.query.get(int(get_jwt_identity()))
+    if not user or user.role not in ("admin", "cto"):
+        return jsonify({"error": "Unauthorized"}), 403
+    result = {}
+    for ct in ("MME", "SGW", "PGW", "HSS", "PCRF"):
+        try:
+            from sqlalchemy import text as _t
+            r = db.session.execute(_t(
+                "SELECT COUNT(*) AS rows, COUNT(DISTINCT kpi_name) AS kpis, "
+                "COUNT(DISTINCT component_id) AS nodes, MIN(date) AS date_from, MAX(date) AS date_to "
+                "FROM core_component_kpi WHERE component_type = :ct"
+            ), {"ct": ct}).fetchone()
+            result[ct] = {
+                "rows": int(r.rows or 0), "kpis": int(r.kpis or 0),
+                "nodes": int(r.nodes or 0),
+                "date_from": str(r.date_from) if r.date_from else None,
+                "date_to": str(r.date_to) if r.date_to else None,
+            }
+        except Exception:
+            result[ct] = {"rows": 0, "kpis": 0, "nodes": 0, "date_from": None, "date_to": None}
+    return jsonify(result)
 
 
 @app.route("/api/admin/delete-sites", methods=["DELETE"])
@@ -6019,21 +7575,40 @@ def _flex_display_label(kpi_type, raw_name):
 
 
 def _detect_col_type(values):
-    """Given a list of raw cell values, return 'numeric', 'date', or 'text'."""
+    """Given a list of raw cell values, return 'numeric', 'date', or 'text'.
+    More permissive than before — if ANY sample parses as numeric and no
+    samples are clearly text, treats the whole column as numeric. This fixes
+    columns like 'Feb Total' / 'Mar Total' that were being silently
+    classified as text when the first few rows happened to be None.
+    """
     import numbers
     numeric_count = 0
+    text_count = 0
+    non_empty = 0
     for v in values:
         if v is None or v == "":
             continue
+        non_empty += 1
         if isinstance(v, numbers.Number):
             numeric_count += 1
-        elif isinstance(v, str):
+            continue
+        if isinstance(v, str):
+            s = v.replace(",", "").replace("%", "").strip()
             try:
-                float(v.replace(",", ""))
+                float(s)
                 numeric_count += 1
+                continue
             except ValueError:
                 pass
-    return "numeric" if numeric_count >= max(1, len([v for v in values if v not in (None, "")]) * 0.5) else "text"
+        text_count += 1
+    if non_empty == 0:
+        # Don't guess — assume numeric so the column still gets stored
+        # (revenue/business/transport uploads are overwhelmingly numeric KPIs).
+        return "numeric"
+    # Numeric wins unless we saw MORE text samples than numeric samples
+    if numeric_count >= text_count and numeric_count > 0:
+        return "numeric"
+    return "text"
 
 
 @app.route("/api/admin/upload-flexible-kpi", methods=["POST"])
@@ -6054,8 +7629,8 @@ def admin_upload_flexible_kpi():
         return jsonify({"error": "Unauthorized"}), 403
 
     kpi_type = request.args.get("type", "").strip().lower()
-    if kpi_type not in ("core", "revenue"):
-        return jsonify({"error": "Invalid type. Use ?type=core or ?type=revenue"}), 400
+    if kpi_type not in ("core", "revenue", "business", "transport"):
+        return jsonify({"error": "Invalid type. Use ?type=core, ?type=revenue, ?type=business or ?type=transport"}), 400
 
     if "file" not in request.files:
         return jsonify({"error": "No file provided"}), 400
@@ -6165,6 +7740,8 @@ def admin_upload_flexible_kpi():
                 total_inserted += len(records)
                 _flush_chunk(records)
                 db.session.commit()
+                _cache_clear("business_kpi", "technical_kpi")
+                clear_analytics_cache()
                 return jsonify({
                     "rows_in_file": total_inserted,
                     "records_inserted": total_inserted,
@@ -6181,23 +7758,36 @@ def admin_upload_flexible_kpi():
                 if not all_rows:
                     return jsonify({"error": "Empty file"}), 400
 
-                # Find the header row: first row containing "site_id" (case-insensitive)
-                SITE_ID_VARIANTS = {"site_id", "site id", "siteid", "site name", "sitename", "site"}
-                header_idx = 0
-                for idx, row in enumerate(all_rows[:10]):  # scan first 10 rows
+                # Find the header row: the row with the MOST header-like cells
+                # (string values, at least one matching a site ID variant).
+                SITE_ID_VARIANTS = {
+                    "site_id", "site id", "siteid", "site name", "sitename", "site",
+                    "site abs id", "abs site id", "abs id", "absid", "siteabsid",
+                }
+                best_idx = 0
+                best_score = -1
+                for idx, row in enumerate(all_rows[:15]):
                     if row is None:
                         continue
+                    has_site_id = False
+                    str_cells = 0
                     for cell in row:
-                        if cell is not None and str(cell).strip().lower().replace("_", " ").replace("-", " ") in SITE_ID_VARIANTS:
-                            header_idx = idx
-                            break
-                    else:
-                        continue
-                    break
+                        if cell is None or cell == "":
+                            continue
+                        cs = str(cell).strip()
+                        str_cells += 1
+                        norm = cs.lower().replace("_", " ").replace("-", " ")
+                        if norm in SITE_ID_VARIANTS:
+                            has_site_id = True
+                    score = (str_cells if has_site_id else -1)
+                    if score > best_score:
+                        best_score = score
+                        best_idx = idx
+                header_idx = best_idx
 
                 raw_headers = all_rows[header_idx]
                 headers = [str(h).strip() if h is not None else "" for h in raw_headers]
-                print(f"[FLEX UPLOAD] Detected header row at index {header_idx}: {headers[:10]}")
+                print(f"[FLEX UPLOAD] Detected header row at index {header_idx} ({len([h for h in headers if h])} non-empty cols): {headers[:20]}")
                 rows = []
                 for r in all_rows[header_idx + 1:]:
                     rows.append({headers[i]: (r[i] if i < len(r) else None) for i in range(len(headers))})
@@ -6210,15 +7800,22 @@ def admin_upload_flexible_kpi():
         return jsonify({"error": f"Failed to read file: {e}"}), 400
 
     # --- single-sheet path ---
-    site_col = next(
-        (h for h in headers if h.strip().lower().replace("_", " ").replace("-", " ") in (
+    # PREFER "SITE ABS ID" as the canonical site key — it is the ONLY column
+    # that matches across site-data / revenue / business / transport uploads.
+    # Falls back to SITE ID / Site Name only if ABS ID isn't present.
+    def _norm_h(h):
+        return h.strip().lower().replace("_", " ").replace("-", " ")
+    abs_id_col = next((h for h in headers if _norm_h(h) in ("site abs id", "siteabsid", "abs site id", "abssiteid", "abs id", "absid")), None)
+    site_col = abs_id_col or next(
+        (h for h in headers if _norm_h(h) in (
             "site id", "siteid", "site name", "sitename", "site"
         )),
         None
     )
     if not site_col:
-        print(f"[FLEX UPLOAD] Missing Site_ID. Headers found: {headers[:15]}")
-        return jsonify({"error": f"Missing required column: Site_ID. Found columns: {headers[:10]}"}), 400
+        print(f"[FLEX UPLOAD] Missing Site ID/ABS ID. Headers found: {headers[:15]}")
+        return jsonify({"error": f"Missing required column: SITE ABS ID or SITE ID. Found columns: {headers[:10]}"}), 400
+    print(f"[FLEX UPLOAD] Using '{site_col}' as linking key (ABS ID preferred)")
 
     kpi_cols = [h for h in headers if h and h != site_col]
     if not kpi_cols:
@@ -6226,14 +7823,50 @@ def admin_upload_flexible_kpi():
 
     col_type_map = {}
     for col in kpi_cols:
-        sample = [r.get(col) for r in rows[:50]]
+        # Larger sample + scan all rows if file is small. Fixes the case where
+        # "Feb Total" / "Mar Total" happen to be None for the first 50 rows
+        # (formula-backed cells not cached in openpyxl).
+        sample_size = min(len(rows), 500)
+        sample = [r.get(col) for r in rows[:sample_size]]
         col_type_map[col] = _detect_col_type(sample)
+    # Debug: log the detected columns so field issues are easier to trace.
+    try:
+        _num_cols = [c for c, t in col_type_map.items() if t == "numeric"]
+        _txt_cols = [c for c, t in col_type_map.items() if t == "text"]
+        print(f"[FLEX UPLOAD] type={kpi_type} site_col='{site_col}' numeric_cols={_num_cols} text_cols={_txt_cols}")
+    except Exception:
+        pass
 
     # Append mode — no deletion of previous data
     batch_id = str(uuid.uuid4())
     records = []
     total_inserted = 0
     skipped = 0
+
+    # ── Currency detection (revenue uploads only) ─────────────────────────
+    # Default = USD. If any header contains a non-USD currency symbol, all
+    # numeric values for that column are converted to USD using a fixed
+    # rate table. If a header explicitly says "USD" or has no symbol, no
+    # conversion is performed.
+    CURRENCY_TO_USD = {
+        "$": 1.0, "usd": 1.0, "us$": 1.0,
+        "€": 1.10, "eur": 1.10,
+        "£": 1.27, "gbp": 1.27,
+        "¥": 0.0067, "jpy": 0.0067,
+        "₹": 0.012, "inr": 0.012, "rs": 0.012,
+        "៛": 0.00024, "khr": 0.00024,  # Cambodian Riel
+        "฿": 0.028, "thb": 0.028,
+        "₫": 0.000040, "vnd": 0.000040,
+    }
+    def _detect_rate(col_name):
+        if kpi_type != "revenue":
+            return 1.0
+        cl = (col_name or "").lower()
+        for sym, rate in CURRENCY_TO_USD.items():
+            if sym in cl:
+                return rate
+        return 1.0  # default USD
+    col_rate = {c: _detect_rate(c) for c in kpi_cols}
 
     for row in rows:
         site_id = str(row.get(site_col, "") or "").strip()
@@ -6247,6 +7880,8 @@ def admin_upload_flexible_kpi():
             label = _flex_display_label(kpi_type, col_norm)
             if ctype == "numeric":
                 num = to_float(raw_val)
+                if num is not None:
+                    num *= col_rate.get(col, 1.0)
                 records.append(FlexibleKpiUpload(
                     kpi_type=kpi_type,
                     upload_batch=batch_id,
@@ -6274,6 +7909,28 @@ def admin_upload_flexible_kpi():
     _flush_chunk(records)
     db.session.commit()
 
+    # Drop any cached business/CTO KPI response so the next dashboard load
+    # picks up the freshly uploaded rows.
+    _cache_clear("business_kpi", "technical_kpi")
+    clear_analytics_cache()
+
+    # Invalidate priority/urgency bracket caches so new uploads are reflected immediately
+    try:
+        from network_issues import _REVENUE_BRACKETS_CACHE, _USERS_BRACKETS_CACHE
+        _REVENUE_BRACKETS_CACHE["data"] = None
+        _REVENUE_BRACKETS_CACHE["date"] = None
+        _USERS_BRACKETS_CACHE["data"] = None
+        _USERS_BRACKETS_CACHE["date"] = None
+    except Exception:
+        pass
+    try:
+        from change_workflow import _AUTO_BRACKETS
+        _AUTO_BRACKETS["date"] = None
+        _AUTO_BRACKETS["rev"] = None
+        _AUTO_BRACKETS["usr"] = None
+    except Exception:
+        pass
+
     return jsonify({
         "rows_in_file": len(rows),
         "records_inserted": total_inserted,
@@ -6294,7 +7951,7 @@ def admin_flexible_kpi_status():
         return jsonify({"error": "Unauthorized"}), 403
 
     kpi_type = request.args.get("type", "").strip().lower()
-    if kpi_type not in ("core", "revenue"):
+    if kpi_type not in ("core", "revenue", "business", "transport"):
         return jsonify({"error": "Invalid type"}), 400
 
     total = FlexibleKpiUpload.query.filter_by(kpi_type=kpi_type).count()
@@ -6346,11 +8003,13 @@ def admin_delete_flexible_kpi():
         return jsonify({"error": "Unauthorized"}), 403
 
     kpi_type = request.args.get("type", "").strip().lower()
-    if kpi_type not in ("core", "revenue"):
+    if kpi_type not in ("core", "revenue", "business", "transport"):
         return jsonify({"error": "Invalid type"}), 400
 
     deleted = FlexibleKpiUpload.query.filter_by(kpi_type=kpi_type).delete()
     db.session.commit()
+    _cache_clear("business_kpi", "technical_kpi")
+    clear_analytics_cache()
     return jsonify({"deleted": deleted, "kpi_type": kpi_type})
 
 
@@ -7475,28 +9134,56 @@ def agent_dashboard():
         _geo_cache[cache_key] = result
         return result
 
-    # --- Tier 3: Hardcoded fallback (Indian cities + some international) ---
-    CITY_FALLBACK = {
-        "mumbai": ("Maharashtra", "India"), "pune": ("Maharashtra", "India"),
-        "thane": ("Maharashtra", "India"), "nashik": ("Maharashtra", "India"),
-        "nagpur": ("Maharashtra", "India"),
-        "delhi": ("Delhi", "India"), "new delhi": ("Delhi", "India"),
-        "gurgaon": ("Haryana", "India"), "gurugram": ("Haryana", "India"),
-        "noida": ("Uttar Pradesh", "India"), "lucknow": ("Uttar Pradesh", "India"),
-        "bangalore": ("Karnataka", "India"), "bengaluru": ("Karnataka", "India"),
-        "chennai": ("Tamil Nadu", "India"), "hyderabad": ("Telangana", "India"),
-        "kolkata": ("West Bengal", "India"), "ahmedabad": ("Gujarat", "India"),
-        "jaipur": ("Rajasthan", "India"), "bhopal": ("Madhya Pradesh", "India"),
-        "indore": ("Madhya Pradesh", "India"), "patna": ("Bihar", "India"),
-        "chandigarh": ("Chandigarh", "India"), "kochi": ("Kerala", "India"),
-        "guwahati": ("Assam", "India"), "ranchi": ("Jharkhand", "India"),
-        "bhubaneswar": ("Odisha", "India"), "raipur": ("Chhattisgarh", "India"),
-        "visakhapatnam": ("Andhra Pradesh", "India"),
-        "london": ("England", "United Kingdom"),
-        "new york": ("New York", "United States"),
-        "dubai": ("Dubai", "United Arab Emirates"),
-        "singapore": ("Singapore", "Singapore"),
-    }
+    # --- Tier 3: DB-driven fallback — build city→(state,country) from telecom_sites ---
+    CITY_FALLBACK = {}
+    try:
+        from sqlalchemy import text as _sa_text
+        _fb_rows = db.session.execute(_sa_text(
+            "SELECT DISTINCT LOWER(city) AS city, state, province, commune, country "
+            "FROM telecom_sites WHERE city IS NOT NULL AND city != '' LIMIT 500"
+        )).fetchall()
+        for _fbr in _fb_rows:
+            _c = str(_fbr.city or "").strip().lower()
+            _s = str(_fbr.province or _fbr.state or "").strip()
+            _cn = str(_fbr.country or "").strip()
+            if _c and _s:
+                CITY_FALLBACK[_c] = (_s, _cn)
+        # Also add commune → province mapping
+        _com_rows = db.session.execute(_sa_text(
+            "SELECT DISTINCT LOWER(commune) AS commune, province, country "
+            "FROM telecom_sites WHERE commune IS NOT NULL AND commune != '' LIMIT 500"
+        )).fetchall()
+        for _cr in _com_rows:
+            _cm = str(_cr.commune or "").strip().lower()
+            _pv = str(_cr.province or "").strip()
+            _cn = str(_cr.country or "").strip()
+            if _cm and _pv:
+                CITY_FALLBACK[_cm] = (_pv, _cn)
+    except Exception:
+        pass
+
+    # Cache: state_val -> (centroid_lat, centroid_lng) computed from telecom_sites.
+    # When chat-session lat/lng is wrong (e.g. customer in India but site is in
+    # Cambodia), we fall back to the resolved state's actual centroid so the map
+    # circle lands on the correct province.
+    _state_centroid_cache = {}
+    def _state_centroid(state_val):
+        if not state_val: return (None, None)
+        if state_val in _state_centroid_cache:
+            return _state_centroid_cache[state_val]
+        try:
+            from sqlalchemy import text as _sa_text
+            r = db.session.execute(_sa_text(
+                "SELECT AVG(latitude) AS la, AVG(longitude) AS lo "
+                "FROM telecom_sites WHERE state = :s OR province = :s OR city = :s"
+            ), {"s": state_val}).fetchone()
+            la = float(r.la) if r and r.la is not None else None
+            lo = float(r.lo) if r and r.lo is not None else None
+            if la == 0 and lo == 0: la = lo = None
+        except Exception:
+            la = lo = None
+        _state_centroid_cache[state_val] = (la, lo)
+        return (la, lo)
 
     # --- Resolve each ticket ---
     location_counts = {}
@@ -7504,6 +9191,7 @@ def agent_dashboard():
     for t in my_tickets:
         state_val, country_val = None, None
         lat, lng, city = None, None, ""
+        site_lat = site_lng = None  # coordinates of the resolved telecom site
 
         if t.chat_session_id:
             cs = db.session.get(ChatSession, t.chat_session_id)
@@ -7518,17 +9206,20 @@ def agent_dashboard():
 
         # Tier 1.5: For tickets with lat/lng, find nearest telecom site
         # and use its state/country from telecom_sites table
-        if not state_val and lat and lng:
+        if lat and lng:
             try:
                 nearest = find_nearest_sites(lat, lng, n=1)
                 if nearest and len(nearest) > 0:
                     site = nearest[0]
                     site_state = site.get('state', '') if isinstance(site, dict) else ''
                     site_city = site.get('city', '') if isinstance(site, dict) else ''
-                    if site_state:
-                        state_val = site_state
-                    elif site_city:
-                        state_val = site_city
+                    site_lat = site.get('latitude') if isinstance(site, dict) else None
+                    site_lng = site.get('longitude') if isinstance(site, dict) else None
+                    if not state_val:
+                        if site_state:
+                            state_val = site_state
+                        elif site_city:
+                            state_val = site_city
                     # Get country from telecom_sites table
                     if site_state and not country_val:
                         try:
@@ -7575,18 +9266,61 @@ def agent_dashboard():
             country_set.add(country_val)
 
         if state_val not in location_counts:
-            location_counts[state_val] = {"total": 0, "resolved": 0}
+            location_counts[state_val] = {"total": 0, "resolved": 0, "lats": [], "lngs": []}
         location_counts[state_val]["total"] += 1
         if t.status == "resolved":
             location_counts[state_val]["resolved"] += 1
 
-    state_data = [
-        {"state": loc, "total": v["total"], "resolved": v["resolved"],
-         "rate": round(v["resolved"] / max(v["total"], 1) * 100, 1)}
-        for loc, v in sorted(location_counts.items(), key=lambda x: x[1]["total"], reverse=True)
-    ]
+        # Accumulate coordinates for centroid. Priority order:
+        #   1. State centroid computed from telecom_sites WHERE state=state_val
+        #      (definitive — every site with this state averages to a point
+        #      inside the correct country, so a Takeo ticket plots in Cambodia
+        #      even if the customer's chat-session lat/lng was in India).
+        #   2. Resolved-telecom-site lat/lng — only used if no state centroid is
+        #      available (state has no rows in telecom_sites).
+        #   3. Chat-session lat/lng — last resort.
+        plot_lat = plot_lng = None
+        cla, clo = _state_centroid(state_val)
+        if cla is not None and clo is not None:
+            plot_lat, plot_lng = cla, clo
+        if (plot_lat is None or plot_lng is None) and site_lat is not None and site_lng is not None:
+            plot_lat, plot_lng = site_lat, site_lng
+        if (plot_lat is None or plot_lng is None) and lat and lng:
+            try:
+                _la, _lo = float(lat), float(lng)
+                if _la != 0 and _lo != 0:
+                    plot_lat, plot_lng = _la, _lo
+            except (ValueError, TypeError):
+                pass
+        if plot_lat is not None and plot_lng is not None:
+            try:
+                location_counts[state_val]["lats"].append(float(plot_lat))
+                location_counts[state_val]["lngs"].append(float(plot_lng))
+            except (ValueError, TypeError):
+                pass
+
+    state_data = []
+    for loc, v in sorted(location_counts.items(), key=lambda x: x[1]["total"], reverse=True):
+        avg_lat = round(sum(v["lats"]) / len(v["lats"]), 6) if v["lats"] else None
+        avg_lng = round(sum(v["lngs"]) / len(v["lngs"]), 6) if v["lngs"] else None
+        state_data.append({
+            "state": loc, "total": v["total"], "resolved": v["resolved"],
+            "rate": round(v["resolved"] / max(v["total"], 1) * 100, 1),
+            "lat": avg_lat, "lng": avg_lng,
+        })
     zone_data = [{"zone": s["state"], **{k: s[k] for k in ("total", "resolved", "rate")}} for s in state_data]
-    detected_country = list(country_set)[0] if len(country_set) == 1 else ("India" if not country_set else "Multiple")
+    # Derive country from tickets or fall back to most common country in telecom_sites DB
+    if len(country_set) == 1:
+        detected_country = list(country_set)[0]
+    elif not country_set:
+        try:
+            from sqlalchemy import text as _t
+            _cr = db.session.execute(_t("SELECT country FROM telecom_sites WHERE country IS NOT NULL AND country != '' GROUP BY country ORDER BY COUNT(*) DESC LIMIT 1")).fetchone()
+            detected_country = _cr[0] if _cr else ""
+        except Exception:
+            detected_country = ""
+    else:
+        detected_country = "Multiple"
 
     # ── SLA Risk Predictor (enhanced) ────────────────────────────────────
     sla_risk_items = []
@@ -8573,6 +10307,56 @@ def run_sla_checks():
 # INIT DB + SEED ADMIN
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _ensure_kpi_merged_view():
+    """Create/refresh the kpi_data_merged VIEW.
+
+    This view presents every (site_id, kpi_name, date) ONCE:
+      - If site-level rows exist, they pass through as-is.
+      - For sites with NO site-level data for a given (kpi, date), the cell-level
+        rows are averaged across all cells of that site and surfaced with
+        data_level='site' so existing analytics queries pick them up transparently.
+    All read-heavy dashboards (network_analytics, CTO dashboards) should read
+    from this view instead of the raw kpi_data table.
+    """
+    from sqlalchemy import text as _t
+    ddl = """
+        CREATE OR REPLACE VIEW kpi_data_merged AS
+        SELECT id, site_id, site_abs_id, kpi_name, date, hour, value,
+               data_level, cell_id, cell_site_id
+        FROM kpi_data
+        WHERE data_level = 'site'
+        UNION ALL
+        SELECT
+            MIN(k.id)            AS id,
+            k.site_id,
+            MAX(k.site_abs_id)   AS site_abs_id,
+            k.kpi_name,
+            k.date,
+            0                    AS hour,
+            AVG(k.value)         AS value,
+            'site'               AS data_level,
+            NULL::varchar        AS cell_id,
+            NULL::varchar        AS cell_site_id
+        FROM kpi_data k
+        WHERE k.data_level = 'cell' AND k.value IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM kpi_data s
+              WHERE s.site_id   = k.site_id
+                AND s.kpi_name  = k.kpi_name
+                AND s.date      = k.date
+                AND s.data_level = 'site'
+          )
+        GROUP BY k.site_id, k.kpi_name, k.date
+    """
+    try:
+        with db.engine.connect() as conn:
+            conn.execute(_t(ddl))
+            conn.commit()
+        print(">>> kpi_data_merged view ready (site-level preferred, cell-level fallback)")
+    except Exception as e:
+        print(f">>> kpi_data_merged view create failed (non-fatal): {e}")
+
+
 with app.app_context():
     db.create_all()
 
@@ -8619,13 +10403,30 @@ with app.app_context():
                 conn.commit()
                 print(">>> Added state column to telecom_sites")
             if "country" not in existing_cols:
-                conn.execute(sa_text("ALTER TABLE telecom_sites ADD COLUMN country VARCHAR(100) DEFAULT 'India'"))
+                conn.execute(sa_text("ALTER TABLE telecom_sites ADD COLUMN country VARCHAR(100) DEFAULT ''"))
                 conn.commit()
                 print(">>> Added country column to telecom_sites")
             if "technology" not in existing_cols:
                 conn.execute(sa_text("ALTER TABLE telecom_sites ADD COLUMN technology VARCHAR(50)"))
                 conn.commit()
                 print(">>> Added technology column to telecom_sites")
+            # New columns for updated site data model
+            for col, typ in [("province", "VARCHAR(100) DEFAULT ''"), ("commune", "VARCHAR(100) DEFAULT ''"),
+                             ("site_abs_id", "VARCHAR(100)"), ("vendor_name", "VARCHAR(100)"),
+                             ("extra_params", "JSONB")]:
+                if col not in existing_cols:
+                    conn.execute(sa_text(f"ALTER TABLE telecom_sites ADD COLUMN {col} {typ}"))
+                    conn.commit()
+                    print(f">>> Added {col} column to telecom_sites")
+
+    # Migrate: add site_abs_id to kpi_data if missing
+    if insp.has_table("kpi_data"):
+        existing_cols = [c["name"] for c in insp.get_columns("kpi_data")]
+        with db.engine.connect() as conn:
+            if "site_abs_id" not in existing_cols:
+                conn.execute(sa_text("ALTER TABLE kpi_data ADD COLUMN site_abs_id VARCHAR(100)"))
+                conn.commit()
+                print(">>> Added site_abs_id column to kpi_data")
 
     # Auto-populate geo data for sites missing city/state/country
     try:
@@ -8783,14 +10584,76 @@ from network_ai import network_ai_bp
 app.register_blueprint(network_ai_bp)
 
 # ─── Register Network Issues Blueprint ─────────────────────────────────────
-from network_issues import network_issues_bp, NetworkIssueTicket, schedule_daily_job
+from network_issues import network_issues_bp, NetworkIssueTicket, OverutilizedTicket, schedule_daily_job, run_overutilized_job
 app.register_blueprint(network_issues_bp)
 
-# Create network_issue_tickets table if not exists
+# Create network_issue_tickets + overutilized_tickets tables if not exist
 with app.app_context():
     NetworkIssueTicket.__table__.create(db.engine, checkfirst=True)
+    OverutilizedTicket.__table__.create(db.engine, checkfirst=True)
+    # Migrate: add new columns to overutilized_tickets if missing
+    try:
+        _ou_insp = sa_inspect(db.engine)
+        if _ou_insp.has_table("overutilized_tickets"):
+            _ou_cols = [c["name"] for c in _ou_insp.get_columns("overutilized_tickets")]
+            with db.engine.connect() as _ouc:
+                for col, typ in [("sites_list", "TEXT DEFAULT ''"), ("site_count", "INTEGER DEFAULT 1"), ("site_status", "TEXT DEFAULT ''")]:
+                    if col not in _ou_cols:
+                        _ouc.execute(sa_text(f"ALTER TABLE overutilized_tickets ADD COLUMN {col} {typ}"))
+                        _ouc.commit()
+                        print(f">>> Added {col} column to overutilized_tickets")
+    except Exception as _oe:
+        print(f">>> Overutilized migration: {_oe}")
 
-# Schedule daily 07:30/08:00 AM IST jobs for worst cell detection/ticketing
+# ── One-time cleanup: purge legacy GUR_LTE_* seeded rows + nuke ALL existing
+# AI tickets (operator wants a clean slate after migrating between machines).
+# Guarded by a marker row in a tiny `_one_time_migrations` table — runs once
+# per database, never again.
+with app.app_context():
+    try:
+        with db.engine.connect() as _c:
+            # Marker table
+            _c.execute(sa_text(
+                "CREATE TABLE IF NOT EXISTS _one_time_migrations ("
+                "  id SERIAL PRIMARY KEY, "
+                "  name VARCHAR(120) UNIQUE NOT NULL, "
+                "  applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"))
+            _c.commit()
+
+            MIGRATION_NAME = "purge_seed_and_existing_ai_tickets_2026_04_15"
+            already = _c.execute(
+                sa_text("SELECT 1 FROM _one_time_migrations WHERE name = :n"),
+                {"n": MIGRATION_NAME}
+            ).fetchone()
+
+            if not already:
+                # 1. Purge legacy seed rows
+                _c.execute(sa_text(
+                    "DELETE FROM overutilized_tickets WHERE site_id LIKE 'GUR\\_LTE\\_%' ESCAPE '\\' "
+                    "OR sites_list LIKE '%GUR\\_LTE\\_%' ESCAPE '\\'"))
+                _c.execute(sa_text(
+                    "DELETE FROM network_issue_tickets WHERE site_id LIKE 'GUR\\_LTE\\_%' ESCAPE '\\'"))
+                _c.execute(sa_text(
+                    "DELETE FROM telecom_sites WHERE site_id LIKE 'GUR\\_LTE\\_%' ESCAPE '\\'"))
+
+                # 2. Wipe ALL existing AI tickets so the next 08:00 daily job
+                #    rebuilds them fresh from the operator's uploaded data.
+                _c.execute(sa_text("DELETE FROM overutilized_tickets"))
+                _c.execute(sa_text("DELETE FROM network_issue_tickets"))
+
+                # 3. Mark migration as applied (won't run again)
+                _c.execute(
+                    sa_text("INSERT INTO _one_time_migrations (name) VALUES (:n)"),
+                    {"n": MIGRATION_NAME}
+                )
+                _c.commit()
+                print(">>> One-time migration applied: purged GUR_LTE seed + cleared all AI tickets")
+            else:
+                print(">>> One-time AI-ticket purge already applied; skipping")
+    except Exception as _e:
+        print(f">>> One-time migration skipped: {_e}")
+
+# Schedule daily 07:30/08:00 AM IST jobs for worst cell + overutilized detection
 schedule_daily_job(app)
 
 # ─── Register Change Workflow Blueprint ───────────────────────────────────
@@ -8847,6 +10710,10 @@ with app.app_context():
                     _conn.commit()
                 except Exception:
                     _conn.rollback()
+
+    # Build the merged KPI read view so analytics queries transparently
+    # see cell-only sites.
+    _ensure_kpi_merged_view()
 
 
 if __name__ == "__main__":
