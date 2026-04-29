@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Cell, Line, LineChart, CartesianGrid, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
+import { Cell, Line, LineChart, CartesianGrid, Pie, PieChart, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
 import { useNavigate } from 'react-router-dom';
 import { apiGet, apiPut } from '../../api';
 
@@ -256,6 +256,9 @@ export default function OperationalKPI() {
                       </div>
                     );
                   }} />
+                  <ReferenceLine y={cdo.workload.target_rate ? Math.round(cdo.workload.series?.reduce((s, d) => s + (d.count || 0), 0) / Math.max(cdo.workload.series?.length || 1, 1) * 1.2) : undefined}
+                    stroke="#ef4444" strokeDasharray="6 4" strokeWidth={1.5} ifOverflow="extendDomain"
+                    label={{ value: 'Capacity Alert', position: 'right', fill: '#ef4444', fontSize: 9, fontWeight: 700 }} />
                   <Line type="monotone" dataKey="count" stroke="#4F46E5" strokeWidth={3}
                     activeDot={{ r: 6, fill: '#4F46E5', stroke: '#fff', strokeWidth: 2 }}
                     dot={(props) => {

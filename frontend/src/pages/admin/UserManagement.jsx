@@ -314,11 +314,10 @@ function StaffTab() {
                               <option value="">Expertise</option>
                               {['NETWORK_RF','NETWORK_OPTIMIZATION','LTE','5G','CORE','TRANSPORT','VoLTE','GENERAL'].map(v=><option key={v} value={v}>{v}</option>)}
                             </select>
-                            <select className="filter-select" value={editData.location || ''} style={{padding:'4px 6px',fontSize:10,width:110}}
-                              onChange={e => setEditData(d => ({ ...d, location: e.target.value }))}>
-                              <option value="">Location</option>
-                              {['Gurgaon','Delhi','Noida','Faridabad','Manesar','Mumbai','Bangalore','Hyderabad','Chennai','Pune'].map(v=><option key={v} value={v}>{v}</option>)}
-                            </select>
+                            <input type="text" className="form-input" placeholder="Location"
+                              style={{padding:'4px 6px',fontSize:10,width:110}}
+                              value={editData.location || ''}
+                              onChange={e => setEditData(d => ({ ...d, location: e.target.value }))} />
                           </>
                         )}
                         <input type="password" className="form-input" placeholder="Password"

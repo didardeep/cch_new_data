@@ -27,7 +27,7 @@ class User(db.Model):
     is_online = db.Column(db.Boolean, default=False, nullable=False)
     # Expert fields (applicable when role == "human_agent")
     domain = db.Column(db.String(50), nullable=True)           # e.g. "mobile", "broadband", "dth", "landline", "enterprise", "fiber"
-    location = db.Column(db.String(100), nullable=True)        # City name, e.g. "Gurugram", "Mumbai"
+    location = db.Column(db.String(100), nullable=True)        # City/Province name, e.g. "Phnom Penh", "Siem Reap"
     expertise = db.Column(db.String(100), nullable=True)       # e.g. "NETWORK_RF", "NETWORK_OPTIMIZATION", "LTE", "5G"
     specialization = db.Column(db.String(200), nullable=True)  # Additional specialization details
     bandwidth_capacity = db.Column(db.Integer, default=10, nullable=False)  # Max concurrent open tickets
@@ -406,13 +406,17 @@ class TelecomSite(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     site_id = db.Column(db.String(50), nullable=False, index=True)
     site_name = db.Column(db.String(100), nullable=True)
-    cell_id = db.Column(db.String(100), nullable=True)
-    latitude = db.Column(db.Float, nullable=False)
-    longitude = db.Column(db.Float, nullable=False)
-    zone = db.Column(db.String(100), default="")
+    site_abs_id = db.Column(db.String(100), nullable=True, index=True)
+    cell_id = db.Column(db.String(100), nullable=True)          # mapped from "Cell Name" in new uploads
+    vendor_name = db.Column(db.String(100), nullable=True)
+    latitude = db.Column(db.Float, nullable=True, default=0.0)
+    longitude = db.Column(db.Float, nullable=True, default=0.0)
+    province = db.Column(db.String(100), default="")            # replaces zone
+    commune = db.Column(db.String(100), default="")
+    zone = db.Column(db.String(100), default="")                # kept for backward compat
     city = db.Column(db.String(100), nullable=True)
     state = db.Column(db.String(100), nullable=True)
-    country = db.Column(db.String(100), default="India")
+    country = db.Column(db.String(100), default="")
     technology = db.Column(db.String(50), nullable=True)
     site_status = db.Column(db.String(20), default="on_air")   # 'on_air' or 'off_air'
     alarms = db.Column(db.Text, default="")
@@ -424,23 +428,29 @@ class TelecomSite(db.Model):
     antenna_height_agl_m = db.Column(db.Float, nullable=True)
     e_tilt_degree = db.Column(db.Float, nullable=True)
     crs_gain = db.Column(db.Float, nullable=True)
+    extra_params = db.Column(db.JSON, nullable=True)            # stores any extra columns from upload
 
     __table_args__ = (
         db.UniqueConstraint("site_id", "cell_id", name="uq_telecom_sites_site_cell"),
     )
 
     def to_dict(self):
-        return {
+        d = {
             "id": self.id,
             "site_id": self.site_id,
             "site_name": self.site_name or self.site_id,
-            "cell_id": self.cell_id,
+            "site_abs_id": self.site_abs_id,
+            "cell_name": self.cell_id,        # expose as cell_name
+            "cell_id": self.cell_id,           # backward compat
+            "vendor_name": self.vendor_name,
             "latitude": self.latitude,
             "longitude": self.longitude,
-            "zone": self.zone,
+            "province": self.province or self.zone or "",
+            "commune": self.commune or "",
+            "zone": self.zone or self.province or "",
             "city": self.city,
             "state": self.state,
-            "country": self.country or "India",
+            "country": self.country or "",
             "technology": self.technology or "",
             "site_status": self.site_status or "on_air",
             "alarms": self.alarms or "",
@@ -453,6 +463,9 @@ class TelecomSite(db.Model):
             "e_tilt_degree": self.e_tilt_degree,
             "crs_gain": self.crs_gain,
         }
+        if self.extra_params:
+            d["extra_params"] = self.extra_params
+        return d
 
 
 class ParameterChange(db.Model):
@@ -762,12 +775,13 @@ class KpiData(db.Model):
 
     id = db.Column(db.Integer, primary_key=True)
     site_id = db.Column(db.String(50), nullable=False, index=True)
+    site_abs_id = db.Column(db.String(100), nullable=True, index=True)
     kpi_name = db.Column(db.String(100), nullable=False, index=True)
     date = db.Column(db.Date, nullable=False)
     hour = db.Column(db.Integer, nullable=False, default=0)
     value = db.Column(db.Float, nullable=True)
     data_level = db.Column(db.String(10), nullable=False, default="site")  # 'site' or 'cell'
-    cell_id = db.Column(db.String(100), nullable=True)
+    cell_id = db.Column(db.String(100), nullable=True)       # stores cell_name from new uploads
     cell_site_id = db.Column(db.String(100), nullable=True)
 
     __table_args__ = (
@@ -898,4 +912,35 @@ class SiteKpiSummary(db.Model):
         db.Index("idx_sks_anomaly", "is_anomaly", "kpi_name", "date"),
         db.Index("idx_sks_zone_kpi", "zone", "kpi_name", "date"),
         db.UniqueConstraint("site_id", "date", "kpi_name", name="uq_sks_site_date_kpi"),
+    )
+
+
+class CoreComponentKpi(db.Model):
+    """
+    Stores Core network KPI data per component instance (MME1, SGW2, PGW1, …).
+    Data is stored at 15-minute granularity.  Four 15-min rows aggregate to one
+    hourly value for dashboard display.
+
+    component_type : MME | SGW | PGW | HSS | PCRF
+    component_id   : e.g. MME1, MME2, SGW1, PGW3, HSS1, PCRF2
+    kpi_name       : sheet name from uploaded workbook
+    date / hour / minute : timestamp broken out for efficient range queries
+    """
+    __tablename__ = "core_component_kpi"
+
+    id             = db.Column(db.Integer, primary_key=True)
+    component_type = db.Column(db.String(20), nullable=False, index=True)
+    component_id   = db.Column(db.String(50), nullable=False, index=True)
+    kpi_name       = db.Column(db.String(120), nullable=False, index=True)
+    date           = db.Column(db.Date, nullable=False)
+    hour           = db.Column(db.Integer, nullable=False, default=0)
+    minute         = db.Column(db.Integer, nullable=False, default=0)
+    value          = db.Column(db.Float, nullable=True)
+    upload_batch   = db.Column(db.String(40), nullable=True, index=True)
+    uploaded_at    = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (
+        db.Index("idx_cckpi_type_id_name", "component_type", "component_id", "kpi_name"),
+        db.Index("idx_cckpi_name_date", "kpi_name", "date"),
+        db.Index("idx_cckpi_type_date", "component_type", "date"),
     )

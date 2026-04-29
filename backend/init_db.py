@@ -58,33 +58,49 @@ with app.app_context():
     else:
         print("⚠️ CTO already exists, skipping!")
 
-    # ── Domain Experts (human_agents with domain/location/capacity) ──────────
-    EXPERTS = [
-        # Mobile experts
-        {"name": "Mobile Expert 1",     "email": "mobile.expert1@example.com",     "employee_id": "HA00001", "domain": "mobile",     "location": "Delhi",  "bandwidth_capacity": 8},
-        {"name": "Mobile Expert 2",     "email": "mobile.expert2@example.com",     "employee_id": "HA00002", "domain": "mobile",     "location": "Mumbai", "bandwidth_capacity": 8},
-        # Broadband experts
-        {"name": "Broadband Expert 1",  "email": "broadband.expert1@example.com",  "employee_id": "HA00003", "domain": "broadband",  "location": "Delhi",  "bandwidth_capacity": 8},
-        {"name": "Broadband Expert 2",  "email": "broadband.expert2@example.com",  "employee_id": "HA00004", "domain": "broadband",  "location": "Mumbai", "bandwidth_capacity": 8},
-        # DTH experts
-        {"name": "DTH Expert 1",        "email": "dth.expert1@example.com",        "employee_id": "HA00005", "domain": "dth",        "location": "Delhi",  "bandwidth_capacity": 8},
-        {"name": "DTH Expert 2",        "email": "dth.expert2@example.com",        "employee_id": "HA00006", "domain": "dth",        "location": "Mumbai", "bandwidth_capacity": 8},
-        # Landline experts
-        {"name": "Landline Expert 1",   "email": "landline.expert1@example.com",   "employee_id": "HA00007", "domain": "landline",   "location": "Delhi",  "bandwidth_capacity": 8},
-        {"name": "Landline Expert 2",   "email": "landline.expert2@example.com",   "employee_id": "HA00008", "domain": "landline",   "location": "Mumbai", "bandwidth_capacity": 8},
-        # Enterprise experts
-        {"name": "Enterprise Expert 1", "email": "enterprise.expert1@example.com", "employee_id": "HA00009", "domain": "enterprise", "location": "Delhi",  "bandwidth_capacity": 6},
-        {"name": "Enterprise Expert 2", "email": "enterprise.expert2@example.com", "employee_id": "HA00010", "domain": "enterprise", "location": "Mumbai", "bandwidth_capacity": 6},
+    # ── Domain Experts (human_agents with domain/expertise/location/capacity) ──
+    # Seeded to cover every (domain × expertise × major Cambodian province) so
+    # the load-balancer has genuine headroom regardless of where a ticket lands.
+    PROVINCES = [
+        "Phnom Penh", "Siem Reap", "Battambang", "Kampong Cham",
+        "Sihanoukville", "Kampong Speu", "Kandal", "Takeo",
     ]
+    DOMAIN_EXPERTISE = [
+        # (domain_label, expertise_tag)
+        ("mobile",     "NETWORK_RF"),
+        ("mobile",     "LTE"),
+        ("mobile",     "5G"),
+        ("broadband",  "TRANSPORT"),
+        ("broadband",  "BACKHAUL"),
+        ("dth",        "TRANSMISSION"),
+        ("landline",   "CORE"),
+        ("enterprise", "IP"),
+        ("enterprise", "MPLS"),
+    ]
+    EXPERTS = []
+    _eid = 1
+    for prov in PROVINCES:
+        for dom, exp in DOMAIN_EXPERTISE:
+            slug = f"{dom}.{exp.lower()}.{prov.split()[0].lower()}{_eid}"
+            EXPERTS.append({
+                "name":  f"{dom.title()} {exp} Expert — {prov} #{_eid}",
+                "email": f"{slug}@example.com",
+                "employee_id": f"HA{_eid:05d}",
+                "domain":   dom,
+                "expertise": exp,
+                "location": prov,
+                "bandwidth_capacity": 8,
+            })
+            _eid += 1
 
     for e in EXPERTS:
         existing = User.query.filter_by(employee_id=e["employee_id"]).first()
         if existing:
-            # Update domain/location/capacity in case they were missing
             existing.domain = e["domain"]
+            existing.expertise = e.get("expertise") or existing.expertise
             existing.location = e["location"]
             existing.bandwidth_capacity = e["bandwidth_capacity"]
-            print(f"  [UPDATE] {e['employee_id']} {e['name']} -> domain={e['domain']}, loc={e['location']}")
+            print(f"  [UPDATE] {e['employee_id']} {e['name']} -> domain={e['domain']}, exp={e.get('expertise','')}, loc={e['location']}")
         elif not User.query.filter_by(email=e["email"]).first():
             expert = User(
                 name=e["name"],
@@ -92,6 +108,7 @@ with app.app_context():
                 role="human_agent",
                 employee_id=e["employee_id"],
                 domain=e["domain"],
+                expertise=e.get("expertise"),
                 location=e["location"],
                 bandwidth_capacity=e["bandwidth_capacity"],
             )

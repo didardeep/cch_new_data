@@ -203,13 +203,13 @@ function ActionModal({ cr, onClose, onDone, isDark }) {
       zIndex: 1000, padding: 16,
     }} onClick={onClose}>
       <div onClick={e => e.stopPropagation()} style={{
-        width: '100%', maxWidth: 540, background: '#fff', borderRadius: 14,
+        width: '100%', maxWidth: 540, background: isDark ? '#1e293b' : '#fff', borderRadius: 14,
         boxShadow: '0 24px 48px rgba(15,23,42,0.2)', padding: 28,
       }}>
         {/* Header */}
         <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 18 }}>
           <div>
-            <h3 style={{ margin: '0 0 4px', fontSize: 16, fontWeight: 700, color: '#0f172a' }}>
+            <h3 style={{ margin: '0 0 4px', fontSize: 16, fontWeight: 700, color: isDark ? '#e2e8f0' : '#0f172a' }}>
               {STEP_TITLES[step]}
             </h3>
             <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
@@ -246,11 +246,11 @@ function ActionModal({ cr, onClose, onDone, isDark }) {
         {!successMsg && <>
         {/* CR summary box */}
         <div style={{
-          background: '#f8fafc', border: '1px solid #e2e8f0', borderRadius: 8,
+          background: isDark ? '#0f172a' : '#f8fafc', border: `1px solid ${isDark ? '#334155' : '#e2e8f0'}`, borderRadius: 8,
           padding: '10px 14px', marginBottom: 18,
         }}>
-          <div style={{ fontSize: 13, fontWeight: 600, color: '#0f172a', marginBottom: 4 }}>{cr.title}</div>
-          <div style={{ fontSize: 12, color: '#64748b', lineHeight: 1.5 }}>{cr.description}</div>
+          <div style={{ fontSize: 13, fontWeight: 600, color: isDark ? '#e2e8f0' : '#0f172a', marginBottom: 4 }}>{cr.title}</div>
+          <div style={{ fontSize: 12, color: isDark ? '#94a3b8' : '#64748b', lineHeight: 1.5 }}>{cr.description}</div>
           {cr.rejection_count > 0 && (
             <div style={{
               marginTop: 8, fontSize: 11, fontWeight: 700, color: '#dc2626',
@@ -460,7 +460,7 @@ function ActionModal({ cr, onClose, onDone, isDark }) {
 }
 
 /* ── Detail Drawer ──────────────────────────────────────────────────────────── */
-function DetailDrawer({ cr, onClose }) {
+function DetailDrawer({ cr, onClose, isDark }) {
   if (!cr) return null;
   const Row = ({ label, value, mono }) => value ? (
     <div style={{ display: 'grid', gridTemplateColumns: '130px 1fr', gap: 8, padding: '7px 0', borderBottom: '1px solid #f1f5f9' }}>
@@ -858,7 +858,7 @@ export default function ManagerChangeWorkflow() {
   const [actionCR, setActionCR] = useState(null);
   const [detailCR, setDetailCR] = useState(null);
   const [remarksCR, setRemarksCR] = useState(null);
-  const [section, setSection] = useState('customer'); // 'customer' or 'ai'
+  const [section, setSection] = useState('customer'); // 'customer' | 'ai' | 'overutilized'
 
   const fetchCRs = useCallback(async () => {
     try {
@@ -876,10 +876,11 @@ export default function ManagerChangeWorkflow() {
     return () => clearInterval(iv);
   }, [fetchCRs]);
 
-  // Split CRs into customer complaint vs AI ticket
+  // Split CRs into customer complaint vs worst cell vs overutilized
   const customerCRs = crs.filter(c => c.ticket_id && !c.network_issue_id);
-  const aiCRs = crs.filter(c => c.network_issue_id);
-  const activeCRs = section === 'customer' ? customerCRs : aiCRs;
+  const worstCellCRs = crs.filter(c => c.network_issue_id && c.network_issue_id < 100000);
+  const overutilizedCRs = crs.filter(c => c.network_issue_id && c.network_issue_id >= 100000);
+  const activeCRs = section === 'customer' ? customerCRs : section === 'ai' ? worstCellCRs : overutilizedCRs;
 
   // Client-side filtering by tab
   const filteredCRs = filter ? activeCRs.filter(c => {
@@ -888,7 +889,7 @@ export default function ManagerChangeWorkflow() {
     return c.status === filter;
   }) : activeCRs;
 
-  const sectionColor = section === 'customer' ? '#00338D' : '#7c3aed';
+  const sectionColor = section === 'customer' ? '#00338D' : section === 'ai' ? '#7c3aed' : '#E65100';
 
   // Compute stats for active section
   const activeStats = {
@@ -927,7 +928,7 @@ export default function ManagerChangeWorkflow() {
 
       {/* Modals */}
       {actionCR && (
-        <ActionModal cr={actionCR} onClose={() => setActionCR(null)} onDone={fetchCRs} />
+        <ActionModal cr={actionCR} onClose={() => setActionCR(null)} onDone={fetchCRs} isDark={isDark} />
       )}
       {detailCR && (
         <DetailDrawer cr={detailCR} onClose={() => setDetailCR(null)} isDark={isDark} />
@@ -952,7 +953,16 @@ export default function ManagerChangeWorkflow() {
           display: 'flex', alignItems: 'center', gap: 8,
         }}>
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 2a4 4 0 0 1 4 4v1h2a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2h2V6a4 4 0 0 1 4-4z"/><circle cx="9" cy="14" r="1"/><circle cx="15" cy="14" r="1"/></svg>
-          AI Tickets ({aiCRs.length})
+          Worst Cell ({worstCellCRs.length})
+        </button>
+        <button onClick={() => { setSection('overutilized'); setFilter(''); }} style={{
+          padding: '10px 24px', fontSize: 13, fontWeight: 700, cursor: 'pointer', border: 'none',
+          borderLeft: `1px solid ${isDark ? '#334155' : '#e2e8f0'}`,
+          background: section === 'overutilized' ? '#E65100' : (isDark ? '#1e293b' : '#f8fafc'),
+          color: section === 'overutilized' ? '#fff' : (isDark ? '#94a3b8' : '#64748b'),
+          display: 'flex', alignItems: 'center', gap: 8,
+        }}>
+          Overutilized ({overutilizedCRs.length})
         </button>
       </div>
 
