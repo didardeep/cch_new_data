@@ -2230,63 +2230,70 @@ def ran_analytics():
                     return n
         return default
 
-    _DROP   = _ran_resolve("E-RAB Call Drop Rate_1",       ["e-rab call drop", "call drop rate", "erab drop", "drop rate"])
-    _PRB    = _ran_resolve("DL PRB Utilization (1BH)",     ["dl prb util", "dl_prb", "dl prb"])
-    _TPUT   = _ran_resolve("LTE DL - Cell Ave Throughput", ["dl cell ave", "cell ave throughput", "dl cell"])
-    _ULTPUT = _ran_resolve("LTE UL - Cell Ave Throughput", ["ul cell ave", "ul cell"])
-    _RRC    = _ran_resolve("Ave RRC Connected Ue",         ["ave rrc", "rrc connected"])
-    _RRC_SR = _ran_resolve("LTE RRC Setup Success Rate",   ["rrc setup success"])
-    _CALL_SR= _ran_resolve("LTE Call Setup Success Rate",  ["call setup success", "cssr"])
-    _ERAB_SR= _ran_resolve("LTE E-RAB Setup Success Rate", ["e-rab setup success", "erab setup"])
-    _AVAIL  = _ran_resolve("Availability",                 ["availability", "avail"])
-    _DL_VOL = _ran_resolve("DL Data Total Volume",         ["dl data total", "dl total volume", "dl volume"])
-    _UL_VOL = _ran_resolve("UL Data Total Volume",         ["ul data total", "ul total volume", "ul volume"])
-    _USR_TPUT = _ran_resolve("LTE DL - Usr Ave Throughput",["dl usr ave", "usr ave throughput", "user throughput"])
+    _DROP    = _ran_resolve("E-RAB Call Drop Rate_1",       ["e-rab call drop", "call drop rate", "erab drop", "drop rate"])
+    _PRB     = _ran_resolve("DL PRB Utilization (1BH)",     ["dl prb util", "dl_prb", "dl prb"])
+    _UL_PRB  = _ran_resolve("UL PRB Utilization (1BH)",     ["ul prb util", "ul_prb", "ul prb"])
+    _TPUT    = _ran_resolve("LTE DL - Cell Ave Throughput", ["dl cell ave", "cell ave throughput", "dl cell"])
+    _ULTPUT  = _ran_resolve("LTE UL - Cell Ave Throughput", ["ul cell ave", "ul cell"])
+    _RRC     = _ran_resolve("Ave RRC Connected Ue",         ["ave rrc", "rrc connected"])
+    _RRC_SR  = _ran_resolve("LTE RRC Setup Success Rate",   ["rrc setup success"])
+    _CALL_SR = _ran_resolve("LTE Call Setup Success Rate",  ["call setup success", "cssr"])
+    _ERAB_SR = _ran_resolve("LTE E-RAB Setup Success Rate", ["e-rab setup success", "erab setup"])
+    _AVAIL   = _ran_resolve("Availability",                 ["availability", "avail"])
+    _DL_VOL  = _ran_resolve("DL Data Total Volume",         ["dl data total", "dl total volume", "dl volume"])
+    _UL_VOL  = _ran_resolve("UL Data Total Volume",         ["ul data total", "ul total volume", "ul volume"])
+    _USR_TPUT = _ran_resolve("LTE DL - Usr Ave Throughput", ["dl usr ave", "usr ave throughput", "user throughput"])
 
-    # Build filter clause from all active filters (zone, tech, region).
-    # Headline KPI cards use the last 30 days of data anchored to CURRENT_DATE
-    # so KPIs whose uploads ended weeks ago still surface real values, while
-    # the query stays index-bounded (avoids the 15s+ full table scan).
-    _ran_filters_no_time = dict(filters or {})
-    _ran_filters_no_time.pop("time_range", None)
-    _rfw_geo, _rfp, _r_needs_ts = _kpi_filter_clause(_ran_filters_no_time, "k", "ts")
+    # Build filter clause from all active filters (zone, tech, region, time_range).
+    # _kpi_filter_clause anchors the time window to the actual max date in kpi_data
+    # (via _get_kpi_max_date) so data uploaded in prior periods is always surfaced.
+    _rfw_geo, _rfp, _r_needs_ts = _kpi_filter_clause(filters or {}, "k", "ts")
     _rfp = dict(_rfp)
-    _rfp["_overall_start"] = (datetime.utcnow().date() - timedelta(days=30))
-    _rfw = _rfw_geo + " AND k.date >= :_overall_start"
+    _rfw = _rfw_geo
 
     base_where = "k.value IS NOT NULL AND k.data_level = 'site'"
     base_params: dict = dict(_rfp)  # include filter params
+    # Add resolved KPI names so queries can use exact = :name instead of ILIKE
+    base_params.update({
+        "_drop": _DROP, "_prb": _PRB, "_ul_prb": _UL_PRB,
+        "_tput": _TPUT, "_ul_tput": _ULTPUT, "_usr_tput": _USR_TPUT,
+        "_rrc": _RRC, "_rrc_sr": _RRC_SR, "_call_sr": _CALL_SR,
+        "_erab_sr": _ERAB_SR, "_avail": _AVAIL,
+        "_dl_vol": _DL_VOL, "_ul_vol": _UL_VOL,
+    })
     zone_join = ""  # per-site query already has LEFT JOIN telecom_sites ts
     zone_cond = _rfw  # includes zone/tech/city/state/time filters
     # For aggregate query (no ts join), add one if geo filters are active
     _agg_ts_join = "LEFT JOIN telecom_sites ts ON LOWER(k.site_id) = LOWER(ts.site_id)" if _r_needs_ts else ""
 
-    # ── 1. Network-wide KPI averages — read directly from kpi_data with
-    # per-site/per-date pre-aggregation so cell-level rows are first averaged
-    # per (site, kpi, date). No view dependency, no data_level filter,
-    # ILIKE substring matching for KPI-name casing variants.
+    # ── 1. Network-wide KPI averages — exact KPI name matching so the DB can
+    # use the idx_kpi_full_lookup index instead of doing a full table scan.
+    # The CTE filters to only the KPIs we need before aggregating.
     agg = {}
     try:
         r = _sql(f"""
             WITH per_skd AS (
                 SELECT k.site_id, k.kpi_name, k.date, AVG(k.value) AS v
                 FROM kpi_data k {_agg_ts_join}
-                WHERE k.value IS NOT NULL {zone_cond}
+                WHERE k.value IS NOT NULL
+                  AND k.kpi_name IN (:_drop,:_prb,:_ul_prb,:_tput,:_ul_tput,:_usr_tput,
+                                     :_rrc,:_rrc_sr,:_call_sr,:_erab_sr,:_avail,:_dl_vol)
+                  {zone_cond}
                 GROUP BY k.site_id, k.kpi_name, k.date
             )
             SELECT
-                AVG(CASE WHEN kpi_name ILIKE '%e-rab%call%drop%' OR kpi_name ILIKE '%call%drop%rate%' THEN v END) AS erab_drop_rate,
-                AVG(CASE WHEN kpi_name ILIKE '%dl%prb%util%' THEN v END) AS dl_prb_util,
-                AVG(CASE WHEN kpi_name ILIKE '%ul%prb%util%' THEN v END) AS ul_prb_util,
-                AVG(CASE WHEN kpi_name ILIKE '%dl%cell%ave%throughput%' OR kpi_name ILIKE '%dl%cell%tput%' THEN v END) AS dl_cell_tput,
-                AVG(CASE WHEN kpi_name ILIKE '%ul%cell%ave%throughput%' OR kpi_name ILIKE '%ul%cell%tput%' THEN v END) AS ul_cell_tput,
-                AVG(CASE WHEN kpi_name ILIKE '%dl%usr%ave%throughput%' OR kpi_name ILIKE '%dl%user%ave%throughput%' OR kpi_name ILIKE '%user%throughput%' THEN v END) AS dl_usr_tput,
-                AVG(CASE WHEN kpi_name ILIKE '%rrc%connected%' OR kpi_name ILIKE '%ave%rrc%' THEN v END) AS avg_rrc_ue,
-                AVG(CASE WHEN kpi_name ILIKE '%rrc%setup%success%' THEN v END) AS lte_rrc_setup_sr,
-                AVG(CASE WHEN kpi_name ILIKE '%call%setup%success%' OR kpi_name ILIKE '%cssr%' THEN v END) AS lte_call_setup_sr,
-                AVG(CASE WHEN kpi_name ILIKE '%e-rab%setup%success%' OR kpi_name ILIKE '%erab%setup%' THEN v END) AS erab_setup_sr,
-                AVG(CASE WHEN kpi_name ILIKE '%availability%' THEN v END) AS availability,
-                AVG(CASE WHEN kpi_name ILIKE '%dl%data%total%volume%' OR kpi_name ILIKE '%dl%volume%' THEN v END) AS dl_data_vol
+                AVG(CASE WHEN kpi_name=:_drop     THEN v END) AS erab_drop_rate,
+                AVG(CASE WHEN kpi_name=:_prb      THEN v END) AS dl_prb_util,
+                AVG(CASE WHEN kpi_name=:_ul_prb   THEN v END) AS ul_prb_util,
+                AVG(CASE WHEN kpi_name=:_tput     THEN v END) AS dl_cell_tput,
+                AVG(CASE WHEN kpi_name=:_ul_tput  THEN v END) AS ul_cell_tput,
+                AVG(CASE WHEN kpi_name=:_usr_tput THEN v END) AS dl_usr_tput,
+                AVG(CASE WHEN kpi_name=:_rrc      THEN v END) AS avg_rrc_ue,
+                AVG(CASE WHEN kpi_name=:_rrc_sr   THEN v END) AS lte_rrc_setup_sr,
+                AVG(CASE WHEN kpi_name=:_call_sr  THEN v END) AS lte_call_setup_sr,
+                AVG(CASE WHEN kpi_name=:_erab_sr  THEN v END) AS erab_setup_sr,
+                AVG(CASE WHEN kpi_name=:_avail    THEN v END) AS availability,
+                AVG(CASE WHEN kpi_name=:_dl_vol   THEN v END) AS dl_data_vol
             FROM per_skd
         """, base_params)
         if r:
@@ -2294,11 +2301,8 @@ def ran_analytics():
     except Exception as e:
         _LOG.error("ran_analytics agg: %s", e)
 
-    # ── 2. Per-site pivot — read kpi_data directly with per-site/per-date
-    # pre-aggregation. No view dependency, no data_level filter (cell-level
-    # rows for a (site,kpi,date) are first averaged into a single value, then
-    # collapsed across dates per site). ILIKE matching tolerates KPI-name
-    # casing variants. No fallback defaults — missing metrics surface as NULL.
+    # ── 2. Per-site pivot — exact KPI name matching + early IN filter so only
+    # the relevant rows are read from kpi_data before the GROUP BY.
     site_kpis = []
     site_rows = []
     try:
@@ -2308,27 +2312,30 @@ def ran_analytics():
                 FROM kpi_data k
                 LEFT JOIN telecom_sites ts ON LOWER(k.site_id) = LOWER(ts.site_id)
                 {zone_join}
-                WHERE k.value IS NOT NULL {zone_cond}
+                WHERE k.value IS NOT NULL
+                  AND k.kpi_name IN (:_drop,:_prb,:_ul_prb,:_tput,:_usr_tput,
+                                     :_rrc,:_rrc_sr,:_call_sr,:_avail,:_dl_vol)
+                  {zone_cond}
                 GROUP BY k.site_id, k.kpi_name, k.date
             )
             SELECT psk.site_id,
                    MAX(ts.zone)      AS zone,
                    AVG(ts.latitude)  AS lat,
                    AVG(ts.longitude) AS lng,
-                   AVG(CASE WHEN psk.kpi_name ILIKE '%e-rab%call%drop%' OR psk.kpi_name ILIKE '%call%drop%rate%' THEN psk.v END) AS erab_drop_rate,
-                   AVG(CASE WHEN psk.kpi_name ILIKE '%dl%prb%util%' THEN psk.v END) AS dl_prb_util,
-                   AVG(CASE WHEN psk.kpi_name ILIKE '%ul%prb%util%' THEN psk.v END) AS ul_prb_util,
-                   AVG(CASE WHEN psk.kpi_name ILIKE '%dl%cell%ave%throughput%' OR psk.kpi_name ILIKE '%dl%cell%tput%' THEN psk.v END) AS dl_cell_tput,
-                   AVG(CASE WHEN psk.kpi_name ILIKE '%dl%usr%ave%throughput%' OR psk.kpi_name ILIKE '%dl%user%ave%throughput%' OR psk.kpi_name ILIKE '%user%throughput%' THEN psk.v END) AS dl_usr_tput,
-                   AVG(CASE WHEN psk.kpi_name ILIKE '%rrc%connected%ue%' OR psk.kpi_name ILIKE '%ave%rrc%' THEN psk.v END) AS avg_rrc_ue,
-                   AVG(CASE WHEN psk.kpi_name ILIKE '%rrc%setup%success%' THEN psk.v END) AS lte_rrc_setup_sr,
-                   AVG(CASE WHEN psk.kpi_name ILIKE '%call%setup%success%' OR psk.kpi_name ILIKE '%cssr%' THEN psk.v END) AS lte_call_setup_sr,
-                   AVG(CASE WHEN psk.kpi_name ILIKE '%availability%' THEN psk.v END) AS availability,
-                   AVG(CASE WHEN psk.kpi_name ILIKE '%dl%data%total%volume%' OR psk.kpi_name ILIKE '%dl%volume%' THEN psk.v END) AS dl_data_vol
+                   AVG(CASE WHEN psk.kpi_name=:_drop     THEN psk.v END) AS erab_drop_rate,
+                   AVG(CASE WHEN psk.kpi_name=:_prb      THEN psk.v END) AS dl_prb_util,
+                   AVG(CASE WHEN psk.kpi_name=:_ul_prb   THEN psk.v END) AS ul_prb_util,
+                   AVG(CASE WHEN psk.kpi_name=:_tput     THEN psk.v END) AS dl_cell_tput,
+                   AVG(CASE WHEN psk.kpi_name=:_usr_tput THEN psk.v END) AS dl_usr_tput,
+                   AVG(CASE WHEN psk.kpi_name=:_rrc      THEN psk.v END) AS avg_rrc_ue,
+                   AVG(CASE WHEN psk.kpi_name=:_rrc_sr   THEN psk.v END) AS lte_rrc_setup_sr,
+                   AVG(CASE WHEN psk.kpi_name=:_call_sr  THEN psk.v END) AS lte_call_setup_sr,
+                   AVG(CASE WHEN psk.kpi_name=:_avail    THEN psk.v END) AS availability,
+                   AVG(CASE WHEN psk.kpi_name=:_dl_vol   THEN psk.v END) AS dl_data_vol
             FROM per_skd psk
             LEFT JOIN telecom_sites ts ON LOWER(psk.site_id) = LOWER(ts.site_id)
             GROUP BY psk.site_id
-            ORDER BY AVG(CASE WHEN psk.kpi_name ILIKE '%dl%prb%util%' THEN psk.v END) DESC NULLS LAST
+            ORDER BY AVG(CASE WHEN psk.kpi_name=:_prb THEN psk.v END) DESC NULLS LAST
             LIMIT 500
         """, base_params)
     except Exception as e:
@@ -2391,7 +2398,7 @@ def ran_analytics():
     except Exception as e:
         _LOG.error("ran_analytics site_kpis: %s", e)
 
-    # ── 3. Call drop daily trend — kpi_data direct, ILIKE matching ───────────
+    # ── 3. Call drop daily trend — exact KPI name match
     call_drop = []
     try:
         drop_rows = _sql(f"""
@@ -2399,7 +2406,7 @@ def ran_analytics():
                 SELECT k.site_id, k.date, AVG(k.value) AS v
                 FROM kpi_data k {_agg_ts_join}
                 WHERE k.value IS NOT NULL
-                  AND (k.kpi_name ILIKE '%e-rab%call%drop%' OR k.kpi_name ILIKE '%call%drop%rate%')
+                  AND k.kpi_name = :_drop
                   {zone_cond}
                 GROUP BY k.site_id, k.date
             )
@@ -2423,7 +2430,7 @@ def ran_analytics():
         else:           buckets[">85% (Critical)"] += 1
     prb_dist = [{"range": k, "count": v} for k, v in buckets.items() if v > 0]
 
-    # ── 5. DL/UL traffic daily trend — kpi_data direct, ILIKE matching ──────
+    # ── 5. DL/UL traffic daily trend — exact KPI name match
     hourly_dl = []
     try:
         dl_rows = _sql(f"""
@@ -2431,14 +2438,13 @@ def ran_analytics():
                 SELECT k.site_id, k.kpi_name, k.date, AVG(k.value) AS v
                 FROM kpi_data k {_agg_ts_join}
                 WHERE k.value IS NOT NULL
-                  AND (k.kpi_name ILIKE '%dl%data%total%volume%' OR k.kpi_name ILIKE '%dl%volume%'
-                    OR k.kpi_name ILIKE '%ul%data%total%volume%' OR k.kpi_name ILIKE '%ul%volume%')
+                  AND k.kpi_name IN (:_dl_vol, :_ul_vol)
                   {zone_cond}
                 GROUP BY k.site_id, k.kpi_name, k.date
             )
             SELECT date::text AS date,
-                   AVG(CASE WHEN kpi_name ILIKE '%dl%data%total%volume%' OR kpi_name ILIKE '%dl%volume%' THEN v END) AS dl_volume,
-                   AVG(CASE WHEN kpi_name ILIKE '%ul%data%total%volume%' OR kpi_name ILIKE '%ul%volume%' THEN v END) AS ul_volume
+                   AVG(CASE WHEN kpi_name=:_dl_vol THEN v END) AS dl_volume,
+                   AVG(CASE WHEN kpi_name=:_ul_vol THEN v END) AS ul_volume
             FROM per_skd
             GROUP BY date ORDER BY date
         """, base_params)
@@ -5364,17 +5370,11 @@ def overview_stats():
     _DL_VOL   = _resolve_kpi("DL Data Total Volume",         ["dl data total", "dl total volume", "dl volume"])
 
     # ── Build filter clause for all queries ────────────────────────────────────
-    # Headline KPI cards = "overall network average" (per dashboard spec).
-    # Use the last 30 days of data anchored to CURRENT_DATE — fast (uses the
-    # date index) and captures all KPIs whose uploads land in that window.
-    # We avoid the full-scan / "all" path because it burns the request budget
-    # (15s+ per query × 6 aggregates).
-    _filters_overall = dict(filters or {})
-    _filters_overall.pop("time_range", None)  # we'll add our own date bounds
-    _fw_geo, _fp, _needs_ts = _kpi_filter_clause(_filters_overall, "k", "ts")
+    # Pass the real filters (including time_range) so _kpi_filter_clause anchors
+    # the date window to the actual max date in kpi_data via _get_kpi_max_date().
+    _fw_geo, _fp, _needs_ts = _kpi_filter_clause(filters or {}, "k", "ts")
     _fp = dict(_fp)
-    _fp["_overall_start"] = (datetime.utcnow().date() - timedelta(days=30))
-    _fw = _fw_geo + " AND k.date >= :_overall_start"
+    _fw = _fw_geo
     _TS_JOIN = "JOIN telecom_sites ts ON k.site_id = ts.site_id" if _needs_ts else ""
 
     # ── 1. Site & cell counts ──────────────────────────────────────────────
@@ -5457,12 +5457,21 @@ def overview_stats():
 
     try:
         _join = "JOIN telecom_sites ts ON LOWER(k.site_id) = LOWER(ts.site_id)" if _needs_ts else ""
+        _ov_params = dict(_fp)
+        _ov_params.update({
+            "_ov_prb": _PRB, "_ov_ul_prb": _UL_PRB, "_ov_tput": _TPUT,
+            "_ov_drop": _DROP, "_ov_rrc": _RRC, "_ov_avail": _AVAIL,
+            "_ov_cssr": _CSSR, "_ov_usr_tput": _USR_TPUT, "_ov_dl_vol": _DL_VOL,
+        })
         site_kpi_rows = _sql(f"""
             SELECT k.site_id, k.kpi_name, AVG(k.value) AS v
             FROM kpi_data k {_join}
-            WHERE k.value IS NOT NULL AND k.data_level = 'site' {_fw}
+            WHERE k.value IS NOT NULL AND k.data_level = 'site'
+              AND k.kpi_name IN (:_ov_prb,:_ov_ul_prb,:_ov_tput,:_ov_drop,
+                                  :_ov_rrc,:_ov_avail,:_ov_cssr,:_ov_usr_tput,:_ov_dl_vol)
+              {_fw}
             GROUP BY k.site_id, k.kpi_name
-        """, _fp)
+        """, _ov_params)
         # Bucket each row into the metric it represents.
         for kr in site_kpi_rows:
             sid, n, v = kr.get("site_id"), kr.get("kpi_name") or "", kr.get("v")

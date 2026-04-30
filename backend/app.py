@@ -10476,6 +10476,8 @@ with app.app_context():
                 conn.commit()
                 print(">>> Added site_abs_id column to kpi_data")
 
+    _ensure_kpi_merged_view()
+
     # Auto-populate geo data for sites missing city/state/country
     try:
         _auto_populate_geo()

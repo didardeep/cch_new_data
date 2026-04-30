@@ -685,6 +685,9 @@ export default function NetworkIssues() {
   const [showRouting, setShowRouting] = useState(false);
   const [routingData, setRoutingData] = useState([]);
   const [routingLoading, setRoutingLoading] = useState(false);
+  const [showLogs, setShowLogs] = useState(false);
+  const [logsData, setLogsData] = useState([]);
+  const [logsLoading, setLogsLoading] = useState(false);
   // Overutilized sites
   const [issueTab, setIssueTab] = useState('worst'); // 'worst' | 'overutilized'
   const [ouTickets, setOuTickets] = useState([]);
