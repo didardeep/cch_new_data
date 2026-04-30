@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, memo, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   LineChart, Line, BarChart, Bar, AreaChart, Area,
@@ -612,7 +612,7 @@ function AIView({result,T,onClose}) {
 }
 
 // ── Overview Page ─────────────────────────────────────────────────────────────
-function OverviewPage({T,data,mapSites,filters}) {
+const OverviewPage = memo(function OverviewPage({T,data,mapSites,filters}) {
   const d=data||{};
   const TipC=(p)=><Tip T={T} {...p}/>;
   const hs=Math.round(d.network_health_score||0);
@@ -869,10 +869,10 @@ function OverviewPage({T,data,mapSites,filters}) {
       </div>
     </div>
   );
-}
+});
 
 // ── RAN Page ──────────────────────────────────────────────────────────────────
-function RANPage({T,data,mapSites,filters,opts}) {
+const RANPage = memo(function RANPage({T,data,mapSites,filters,opts}) {
   const [viewMode,setViewMode]=useState('network');
   const [selectedSite,setSelectedSite]=useState(null);
   const [siteData,setSiteData]=useState(null);
@@ -1213,7 +1213,7 @@ function RANPage({T,data,mapSites,filters,opts}) {
       )}
     </div>
   );
-}
+});
 
 // ── Core Page ────────────────────────────────────────────────────────────────
 const CORE_COMP_COLORS = {MME:'#00338D',SGW:'#005EB8',PGW:'#0091DA',HSS:'#483698',PCRF:'#470A68'};
@@ -1507,7 +1507,7 @@ function CoreKpiOverlay({T,kpiName,compType,compId}){
   );
 }
 
-function CorePage({T,data}) {
+const CorePage = memo(function CorePage({T,data}) {
   const [compType,setCompType]=useState('');
   const [compId,setCompId]=useState('');
   const [scale,setScale]=useState('daily');
@@ -1988,10 +1988,10 @@ function CorePage({T,data}) {
       </>}
     </div>
   );
-}
+});
 
 // ── Transport Page ────────────────────────────────────────────────────────────
-function TransportPage({T,data,filters}) {
+const TransportPage = memo(function TransportPage({T,data,filters}) {
   const [selectedSite,setSelectedSite]=useState(null);
   const [siteData,setSiteData]=useState(null);
   const [siteLoading,setSiteLoading]=useState(false);
@@ -2181,10 +2181,10 @@ function TransportPage({T,data,filters}) {
       </CC>
     </div>
   );
-}
+});
 
 // ── KPI Filter Page ───────────────────────────────────────────────────────────
-function KPIFilterPage({T,kpiFilter,data,mapSites:_mapSites,filters}) {
+const KPIFilterPage = memo(function KPIFilterPage({T,kpiFilter,data,mapSites:_mapSites,filters}) {
   const TipC=(p)=><Tip T={T} {...p}/>;
   const kd=data||{};
   const sites=kd.sites||[];
@@ -2469,7 +2469,7 @@ function KPIFilterPage({T,kpiFilter,data,mapSites:_mapSites,filters}) {
       </CC>
     </div>
   );
-}
+});
 
 // ── MAIN COMPONENT ─────────────────────────────────────────────────────────────
 export default function NetworkAnalyticsDashboard() {
@@ -2515,48 +2515,41 @@ export default function NetworkAnalyticsDashboard() {
       .catch(e=>{clearTimeout(tid);console.warn('fetch failed',url,e);return null;});
   },[]);
 
+  // Track which heavy layers have been fetched so we only load them on demand.
+  const fetchedLayers=useRef({ran:false,core:false,transport:false});
+
+  // Shared layer-fetch helper (retry-on-empty, 60 s timeout).
+  const fetchLayer=useCallback(async(path,setter,fresh=false)=>{
+    const base=process.env.REACT_APP_API_URL||'';
+    const q=qs();
+    const fr=fresh?'&fresh=1':'';
+    let d=await fetchWithTimeout(`${base}${path}?${q}${fr}`,60000);
+    const isEmpty=!d||(typeof d==='object'&&!Array.isArray(d)&&Object.keys(d).length===0);
+    if(isEmpty) d=await fetchWithTimeout(`${base}${path}?${q}&fresh=1`,60000);
+    if(d){setter(d);setLastUpd(new Date());}
+  },[qs,fetchWithTimeout]);
+
   const fetchAll=useCallback(async(silent=false,fresh=false)=>{
     if(!silent)setRefreshing(true);
-    const q=qs();
     const base=process.env.REACT_APP_API_URL||'';
-    const fr=fresh?'&fresh=1':'';
 
-    // Helper: fetch a layer with retry-on-empty. On a cold cache the heavy
-    // aggregation queries can take 20-40s, so timeout is 60s. If the response
-    // is null OR an empty payload, retry once with fresh=1 to bypass any
-    // stale-empty entry the server cache may have stored.
-    const loadLayer = async (path, setter) => {
-      const url = `${base}${path}?${q}${fr}`;
-      let d = await fetchWithTimeout(url, 60000);
-      const isEmpty = !d || (typeof d === 'object' && !Array.isArray(d) && Object.keys(d).length === 0);
-      if (isEmpty) {
-        const retryUrl = `${base}${path}?${q}&fresh=1`;
-        d = await fetchWithTimeout(retryUrl, 60000);
-      }
-      if (d) { setter(d); setLastUpd(new Date()); }
-    };
-
-    // ── Phase 1: overview + filters — these feed the Overview page (the
-    // landing tab), so they must succeed reliably. Use the same retry-on-empty
-    // helper as Phase 2 instead of a single 15s try.
-    const filtersUrl = `${base}/api/network/filters?${['country','state'].filter(k=>filters[k]).map(k=>`${k}=${encodeURIComponent(filters[k])}`).join('&')}`;
+    // ── Phase 1: overview + filters (always needed for Overview page).
+    const filtersUrl=`${base}/api/network/filters?${['country','state'].filter(k=>filters[k]).map(k=>`${k}=${encodeURIComponent(filters[k])}`).join('&')}`;
     await Promise.allSettled([
-      loadLayer('/api/network/overview-stats', setOverview),
-      fetchWithTimeout(filtersUrl, 15000).then(fo => { if (fo) setOpts(fo); }),
+      fetchLayer('/api/network/overview-stats',setOverview,fresh),
+      fetchWithTimeout(filtersUrl,15000).then(fo=>{if(fo)setOpts(fo);}),
     ]);
     setLoading(false);
     setRefreshing(false);
 
-    // ── Phase 2: map + per-layer (RAN/Core/Transport) data — each layer is
-    // independent so a slow endpoint cannot block the rest; each renders as
-    // soon as it arrives.
-    Promise.allSettled([
-      loadLayer('/api/network/map',                 setMapData),
-      loadLayer('/api/network/ran-analytics',       setRan),
-      loadLayer('/api/network/core-analytics',      setCore),
-      loadLayer('/api/network/transport-analytics', setTransport),
-    ]);
-  },[qs,fetchWithTimeout]);
+    // ── Phase 2: map always; RAN/Core/Transport only if already visited.
+    // Un-visited layers are fetched lazily when the user first opens that tab.
+    const phase2=[fetchLayer('/api/network/map',setMapData,fresh)];
+    if(fetchedLayers.current.ran)       phase2.push(fetchLayer('/api/network/ran-analytics',      setRan,      fresh));
+    if(fetchedLayers.current.core)      phase2.push(fetchLayer('/api/network/core-analytics',     setCore,     fresh));
+    if(fetchedLayers.current.transport) phase2.push(fetchLayer('/api/network/transport-analytics',setTransport,fresh));
+    Promise.allSettled(phase2);
+  },[qs,fetchWithTimeout,fetchLayer,filters]);// eslint-disable-line
 
   // First mount: pass fresh=true so the backend always computes data (avoids
   // the case where a previous failed/aborted request left an empty entry in
@@ -2571,11 +2564,15 @@ export default function NetworkAnalyticsDashboard() {
   useEffect(()=>{pageRef.current=page;},[page]);
   useEffect(()=>{selKpiRef.current=selKpi;},[selKpi]);
 
+  const filterDebounce=useRef(null);
   useEffect(()=>{
     if(!mounted.current){mounted.current=true;return;}
-    fetchAll();
-    // Also re-fetch KPI filter page if currently open
-    if(pageRef.current==='kpi'&&selKpiRef.current) fetchKpiFilter(selKpiRef.current);
+    clearTimeout(filterDebounce.current);
+    filterDebounce.current=setTimeout(()=>{
+      fetchAll();
+      if(pageRef.current==='kpi'&&selKpiRef.current) fetchKpiFilter(selKpiRef.current);
+    },400);
+    return()=>clearTimeout(filterDebounce.current);
   },[filters]);// eslint-disable-line
 
   // Fetch KPI filter data when filter selected
@@ -2590,7 +2587,15 @@ export default function NetworkAnalyticsDashboard() {
   },[qs]);
 
   const goKpi=(kf)=>{setSelKpi(kf);setPage('kpi');setKpiDrop(false);fetchKpiFilter(kf);};
-  const goLayer=(l)=>{setPage(l);setLayerDrop(false);};
+  const LAYER_ENDPOINTS={ran:'/api/network/ran-analytics',core:'/api/network/core-analytics',transport:'/api/network/transport-analytics'};
+  const LAYER_SETTERS={ran:setRan,core:setCore,transport:setTransport};
+  const goLayer=(l)=>{
+    setPage(l);setLayerDrop(false);
+    if(LAYER_ENDPOINTS[l]&&!fetchedLayers.current[l]){
+      fetchedLayers.current[l]=true;
+      fetchLayer(LAYER_ENDPOINTS[l],LAYER_SETTERS[l]);
+    }
+  };
 
   // Close dropdowns on outside click
   useEffect(()=>{
@@ -2599,9 +2604,21 @@ export default function NetworkAnalyticsDashboard() {
     return()=>document.removeEventListener('click',h);
   },[]);
 
+  // Inject global CSS once (avoids re-parsing on every render).
+  useEffect(()=>{
+    const el=document.createElement('style');
+    el.id='nad-styles';
+    el.textContent=CSS;
+    if(!document.getElementById('nad-styles'))document.head.appendChild(el);
+    return()=>{const s=document.getElementById('nad-styles');if(s)s.remove();};
+  },[]);
+
+  // Stable array reference so memoized page components don't re-render
+  // just because mapData was re-assigned to the same object structure.
+  const mapSites=useMemo(()=>mapSites,[mapData]);
+
   if(loading) return (
     <div style={{minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',background:T.bg,fontFamily:"'Plus Jakarta Sans',system-ui,sans-serif"}}>
-      <style>{CSS}</style>
       <div style={{textAlign:'center'}}>
         <div style={{width:38,height:38,borderRadius:'50%',border:`4px solid ${T.border}`,borderTopColor:T.kpmgBlue,animation:'spin .8s linear infinite',margin:'0 auto 12px'}}/>
         <div style={{fontSize:12,color:T.muted}}>Loading Network Dashboard…</div>
@@ -2614,7 +2631,6 @@ export default function NetworkAnalyticsDashboard() {
 
   return (
     <div style={{minHeight:'100vh',background:T.bg,fontFamily:"'Plus Jakarta Sans',system-ui,sans-serif",color:T.text}}>
-      <style>{CSS}</style>
 
       {/* ── HEADER ── */}
       <div style={{position:'sticky',top:0,zIndex:200,background:T.headerBg,borderBottom:`1px solid ${T.border}`,boxShadow:T.cardShadow}}>
@@ -2791,20 +2807,20 @@ export default function NetworkAnalyticsDashboard() {
           </div>
         )}
         {page==='ran' ? (
-          <RANPage T={T} data={ran} mapSites={mapData?.sites||[]} filters={filters} opts={opts}/>
+          <RANPage T={T} data={ran} mapSites={mapSites} filters={filters} opts={opts}/>
         ) : page==='core' ? (
           <CorePage T={T} data={core}/>
         ) : page==='transport' ? (
           <TransportPage T={T} data={transport} filters={filters}/>
         ) : page==='kpi' ? (
           kpiFilterData
-            ? <KPIFilterPage T={T} kpiFilter={selKpi} data={kpiFilterData} mapSites={mapData?.sites||[]} filters={filters}/>
+            ? <KPIFilterPage T={T} kpiFilter={selKpi} data={kpiFilterData} mapSites={mapSites} filters={filters}/>
             : <div style={{display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',height:300,gap:12}}>
                 <div style={{width:28,height:28,border:`3px solid ${T.border}`,borderTopColor:T.kpmgBlue,borderRadius:'50%',animation:'spin .7s linear infinite'}}/>
                 <div style={{fontSize:12,color:T.muted}}>Loading filter data…</div>
               </div>
         ) : (
-          <OverviewPage T={T} data={overview} mapSites={mapData?.sites||[]} filters={filters}/>
+          <OverviewPage T={T} data={overview} mapSites={mapSites} filters={filters}/>
         )}
       </div>
 
