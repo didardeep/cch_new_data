@@ -223,6 +223,10 @@ function LeafletMap({sites=[],highlight=[],T,height=300}) {
         const map=L.map(mapRef.current,{zoomControl:true,attributionControl:true}).setView(center,zoom);
         leafRef.current=map;
         L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'© OSM'}).addTo(map);
+        // Click anywhere on the map to zoom in smoothly to that point
+        map.on('click',(e)=>{
+          map.flyTo(e.latlng,Math.min(map.getZoom()+2,18),{animate:true,duration:0.5});
+        });
       }catch(e){
         console.warn('[Leaflet] Map init failed:',e);
       }
@@ -279,6 +283,9 @@ function LeafletMap({sites=[],highlight=[],T,height=300}) {
         );
         const mk=L.marker([lat,lng],{icon}).bindPopup(popup);
         mk.on('mouseover',function(){this.openPopup();});
+        // Stop the click from bubbling to the map so clicking a marker
+        // opens the popup but does NOT trigger the zoom-in handler.
+        mk.on('click',(e)=>{L.DomEvent.stopPropagation(e);});
         mk.addTo(leafRef.current);
         markersRef.current.push(mk);
       });
@@ -2615,7 +2622,7 @@ export default function NetworkAnalyticsDashboard() {
 
   // Stable array reference so memoized page components don't re-render
   // just because mapData was re-assigned to the same object structure.
-  const mapSites=useMemo(()=>mapSites,[mapData]);
+  const mapSites=useMemo(()=>mapData?.sites||[],[mapData]);
 
   if(loading) return (
     <div style={{minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',background:T.bg,fontFamily:"'Plus Jakarta Sans',system-ui,sans-serif"}}>
