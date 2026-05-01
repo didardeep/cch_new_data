@@ -2478,20 +2478,26 @@ const KPIFilterPage = memo(function KPIFilterPage({T,kpiFilter,data,mapSites:_ma
   );
 });
 
+// Cache helpers — see ./networkDashboardCache.js
+import { DC as _DC, DC_TTL as _DC_TTL, DC_PATH as _DC_PATH,
+         saveLayer as _dcSaveLayer, saveMeta  as _dcSaveMeta,
+         loadLayerFromStore as _dcLoadLayer } from './networkDashboardCache';
+
 // ── MAIN COMPONENT ─────────────────────────────────────────────────────────────
 export default function NetworkAnalyticsDashboard() {
   const { isDark: dark, toggleTheme } = useTheme();
   const T=dark?T_DARK:T_LIGHT;
 
-  // Data
-  const [overview,   setOverview]   = useState(null);
-  const [mapData,    setMapData]    = useState(null);
-  const [ran,        setRan]        = useState(null);
-  const [core,       setCore]       = useState(null);
-  const [transport,  setTransport]  = useState(null);
+  // Data — seeded from module-level cache so remounts are instant.
+  const [overview,   setOverview]   = useState(_DC.overview);
+  const [mapData,    setMapData]    = useState(_DC.map);
+  const [ran,        setRan]        = useState(_DC.ran);
+  const [core,       setCore]       = useState(_DC.core);
+  const [transport,  setTransport]  = useState(_DC.transport);
   const [kpiFilterData,setKpiFilterData] = useState(null);
-  const [opts,       setOpts]       = useState({clusters:[],technologies:[],vendors:[],regions:[],sites:[]});
-  const [loading,    setLoading]    = useState(true);
+  const [opts,       setOpts]       = useState(_DC.opts||{clusters:[],technologies:[],vendors:[],regions:[],sites:[]});
+  // Skip the full-page loading screen when we have a cached overview to show.
+  const [loading,    setLoading]    = useState(!_DC.overview);
   const [refreshing, setRefreshing] = useState(false);
   const [lastUpd,    setLastUpd]    = useState(null);
 
@@ -2522,8 +2528,8 @@ export default function NetworkAnalyticsDashboard() {
       .catch(e=>{clearTimeout(tid);console.warn('fetch failed',url,e);return null;});
   },[]);
 
-  // Track which heavy layers have been fetched so we only load them on demand.
-  const fetchedLayers=useRef({ran:false,core:false,transport:false});
+  // Track which heavy layers have been fetched — restored from cache on remount.
+  const fetchedLayers=useRef({..._DC.fetchedLayers});
 
   // Shared layer-fetch helper (retry-on-empty, 60 s timeout).
   const fetchLayer=useCallback(async(path,setter,fresh=false)=>{
@@ -2533,7 +2539,11 @@ export default function NetworkAnalyticsDashboard() {
     let d=await fetchWithTimeout(`${base}${path}?${q}${fr}`,60000);
     const isEmpty=!d||(typeof d==='object'&&!Array.isArray(d)&&Object.keys(d).length===0);
     if(isEmpty) d=await fetchWithTimeout(`${base}${path}?${q}&fresh=1`,60000);
-    if(d){setter(d);setLastUpd(new Date());}
+    if(d){
+      setter(d);setLastUpd(new Date());
+      const ck=_DC_PATH[path];
+      if(ck) _dcSaveLayer(ck,d,_DC); // writes just this layer to storage
+    }
   },[qs,fetchWithTimeout]);
 
   const fetchAll=useCallback(async(silent=false,fresh=false)=>{
@@ -2544,7 +2554,7 @@ export default function NetworkAnalyticsDashboard() {
     const filtersUrl=`${base}/api/network/filters?${['country','state'].filter(k=>filters[k]).map(k=>`${k}=${encodeURIComponent(filters[k])}`).join('&')}`;
     await Promise.allSettled([
       fetchLayer('/api/network/overview-stats',setOverview,fresh),
-      fetchWithTimeout(filtersUrl,15000).then(fo=>{if(fo)setOpts(fo);}),
+      fetchWithTimeout(filtersUrl,15000).then(fo=>{if(fo){setOpts(fo);_DC.opts=fo;_dcSaveMeta(_DC);}}),
     ]);
     setLoading(false);
     setRefreshing(false);
@@ -2558,12 +2568,30 @@ export default function NetworkAnalyticsDashboard() {
     Promise.allSettled(phase2);
   },[qs,fetchWithTimeout,fetchLayer,filters]);// eslint-disable-line
 
-  // First mount: pass fresh=true so the backend always computes data (avoids
-  // the case where a previous failed/aborted request left an empty entry in
-  // the 5-minute server cache, which would make every subsequent fresh=false
-  // fetch return empty for 5 minutes). After this first compute, the cache
-  // is populated and filter changes / refreshes use it.
-  useEffect(()=>{fetchAll(false,true);},[]);// eslint-disable-line
+  // On mount: if we have fresh cached data, show it immediately and refresh
+  // silently in the background. Otherwise run a full blocking fetch.
+  useEffect(()=>{
+    const age=Date.now()-_DC.ts;
+    if(_DC.overview && age<_DC_TTL){
+      // Cache hit — data is already in state; refresh silently in background.
+      fetchAll(true,false);
+    } else {
+      // Cache miss or stale — fetch normally (shows loading spinner).
+      fetchAll(false,true);
+    }
+  },[]);// eslint-disable-line
+
+  // Lazy-restore heavy layers from storage on remount.
+  // map/ran/core/transport start as null in DC (not pre-loaded at module init).
+  // This effect runs after render so it never delays the first paint.
+  useEffect(()=>{
+    const fl=_DC.fetchedLayers;
+    if(!mapData){      const d=_dcLoadLayer('map',_DC);      if(d) setMapData(d);}
+    if(fl.ran&&!ran){  const d=_dcLoadLayer('ran',_DC);      if(d) setRan(d);}
+    if(fl.core&&!core){const d=_dcLoadLayer('core',_DC);     if(d) setCore(d);}
+    if(fl.transport&&!transport){const d=_dcLoadLayer('transport',_DC);if(d) setTransport(d);}
+  },[]);// eslint-disable-line
+
   const mounted=useRef(false);
   // Keep refs so filter-change effect can see current page/selKpi without stale closure
   const pageRef=useRef('overview');
@@ -2600,6 +2628,8 @@ export default function NetworkAnalyticsDashboard() {
     setPage(l);setLayerDrop(false);
     if(LAYER_ENDPOINTS[l]&&!fetchedLayers.current[l]){
       fetchedLayers.current[l]=true;
+      _DC.fetchedLayers[l]=true;
+      _dcSaveMeta(_DC); // persist fetchedLayers flag without rewriting layer data
       fetchLayer(LAYER_ENDPOINTS[l],LAYER_SETTERS[l]);
     }
   };
