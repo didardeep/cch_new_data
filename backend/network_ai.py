@@ -60,7 +60,11 @@ _ALLOWED_TABLES = frozenset({
     'kpi_data', 'telecom_sites', 'flexible_kpi_uploads',
     'revenue_data', 'core_kpi_data', 'transport_kpi_data',
     'network_issue_tickets',
-    'site_kpi_summary',  # ML-categorized pre-aggregated KPI data
+    'site_kpi_summary',       # ML-categorized pre-aggregated KPI data
+    'mv_daily_site_kpi',      # pre-aggregated daily site KPI summary (fast)
+    'mv_zone_kpi_summary',    # pre-aggregated zone-level KPI summary (fast)
+    'mv_zone_daily_kpi',      # pre-aggregated zone+date daily KPI summary (fast)
+    'kpi_data_merged',        # materialized view with site+cell fallback
 })
 _BLOCKED_SQL_PATTERNS = re.compile(
     r'\b(DROP|DELETE|UPDATE|INSERT|ALTER|TRUNCATE|CREATE|GRANT|REVOKE|EXEC|EXECUTE)\b',
@@ -328,11 +332,24 @@ def ensure_db_optimizations():
         JOIN telecom_sites ts ON k.site_id = ts.site_id
         WHERE k.data_level = 'site' AND k.value IS NOT NULL
         GROUP BY ts.zone, k.kpi_name""",
+
+        # Zone-level daily KPI with date — enables zone trend queries
+        """CREATE MATERIALIZED VIEW IF NOT EXISTS mv_zone_daily_kpi AS
+        SELECT COALESCE(ts.zone, 'Unknown') AS zone,
+               k.kpi_name, k.date,
+               AVG(k.avg_value) AS avg_val,
+               COUNT(DISTINCT k.site_id) AS site_count
+        FROM mv_daily_site_kpi k
+        LEFT JOIN telecom_sites ts ON LOWER(k.site_id) = LOWER(ts.site_id)
+        GROUP BY COALESCE(ts.zone, 'Unknown'), k.kpi_name, k.date""",
     ]
 
     _mv_indexes = [
+        # UNIQUE index required for REFRESH MATERIALIZED VIEW CONCURRENTLY (non-blocking).
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_mv_daily_site_uniq ON mv_daily_site_kpi(site_id, kpi_name, date)",
         "CREATE INDEX IF NOT EXISTS idx_mv_daily_site ON mv_daily_site_kpi(site_id, kpi_name, date)",
         "CREATE INDEX IF NOT EXISTS idx_mv_zone_kpi ON mv_zone_kpi_summary(zone, kpi_name)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_mv_zone_daily_uniq ON mv_zone_daily_kpi(zone, kpi_name, date)",
     ]
 
     try:
@@ -367,15 +384,20 @@ def ensure_db_optimizations():
 
 
 def refresh_materialized_views():
-    """Refresh all materialized views. Call periodically or after data uploads."""
-    try:
-        with db.engine.connect() as conn:
-            conn.execute(sa_text("REFRESH MATERIALIZED VIEW CONCURRENTLY mv_daily_site_kpi"))
-            conn.execute(sa_text("REFRESH MATERIALIZED VIEW CONCURRENTLY mv_zone_kpi_summary"))
-            conn.commit()
-        _LOG.info("Materialized views refreshed successfully.")
-    except Exception as e:
-        _LOG.debug("MV refresh skip: %s", str(e)[:80])
+    """Refresh all AI materialized views. Call periodically or after data uploads."""
+    for _mv in ["mv_daily_site_kpi", "mv_zone_kpi_summary", "mv_zone_daily_kpi"]:
+        try:
+            with db.engine.connect() as conn:
+                conn.execute(sa_text(f"REFRESH MATERIALIZED VIEW CONCURRENTLY {_mv}"))
+                conn.commit()
+        except Exception:
+            try:
+                with db.engine.connect() as conn:
+                    conn.execute(sa_text(f"REFRESH MATERIALIZED VIEW {_mv}"))
+                    conn.commit()
+            except Exception as _e:
+                _LOG.debug("MV refresh skip %s: %s", _mv, str(_e)[:80])
+    _LOG.info("Materialized views refreshed successfully.")
 
 # ─── Module-level schema discovery cache (populated on first ai_query call) ──
 _schema_cache = {
@@ -413,11 +435,13 @@ def _kpi_date_ref():
 
 
 def _kpi_date_clause(days_val, alias='k'):
-    """Build a date range WHERE clause using the actual data max date."""
+    """Build a date range WHERE clause using the actual data max date.
+    Always applies a lower bound — defaults to 90 days when the user
+    did not specify a period, preventing full-history table scans.
+    """
     _ref = _kpi_date_ref()
-    if days_val:
-        return f"AND {alias}.date >= {_ref} - INTERVAL '{days_val} days' AND {alias}.date <= {_ref}"
-    return f"AND {alias}.date <= {_ref}"
+    _days = days_val or 90  # default window prevents unbounded scans
+    return f"AND {alias}.date >= {_ref} - INTERVAL '{_days} days' AND {alias}.date <= {_ref}"
 
 
 def _get_dynamic_time_filter():
@@ -590,7 +614,38 @@ def ai_query():
     ai_result = None
 
     SCHEMA_HINT = """
-Tables:
+=== FAST MATERIALIZED VIEWS — USE THESE AS PRIMARY QUERY TARGETS ===
+These views are pre-aggregated and 10-100x faster than querying raw kpi_data.
+
+mv_daily_site_kpi(site_id TEXT, kpi_name TEXT, date DATE,
+                  avg_value FLOAT, min_value FLOAT, max_value FLOAT, sample_count INT)
+  Daily KPI averages per site. Use for: trends, top-N, comparisons, threshold queries.
+  JOIN telecom_sites ts ON LOWER(mv.site_id) = LOWER(ts.site_id) for zone/city/location.
+  Example: SELECT site_id, avg_value FROM mv_daily_site_kpi
+           WHERE kpi_name = '...' AND date >= CURRENT_DATE - INTERVAL '30 days'
+           ORDER BY avg_value DESC LIMIT 20
+
+mv_zone_daily_kpi(zone TEXT, kpi_name TEXT, date DATE, avg_val FLOAT, site_count INT)
+  Daily zone-level KPI averages. Use for zone trends and comparisons over time.
+  No JOIN needed for zone questions.
+  Example: SELECT zone, AVG(avg_val) FROM mv_zone_daily_kpi
+           WHERE kpi_name = '...' AND date >= CURRENT_DATE - INTERVAL '30 days'
+           GROUP BY zone ORDER BY AVG(avg_val) DESC LIMIT 20
+
+mv_zone_kpi_summary(zone TEXT, kpi_name TEXT,
+                    avg_value FLOAT, min_value FLOAT, max_value FLOAT, site_count INT)
+  All-time zone aggregate (no date column). Use for zone snapshots when date is not needed.
+
+MANDATORY QUERY RULES (violating these causes slow or empty results):
+1. ALWAYS prefer mv_daily_site_kpi over kpi_data for any site-level KPI query.
+2. ALWAYS add a date filter: date >= CURRENT_DATE - INTERVAL '30 days' (or shorter).
+3. ALWAYS add LIMIT 1000 to every query.
+4. Only use raw kpi_data for HOURLY data (WHERE hour = X) or cell-level data.
+5. For zone trends over time: use mv_zone_daily_kpi.
+   For zone snapshot (no time): use mv_zone_kpi_summary.
+
+======================================================================
+Tables (FALLBACK — use kpi_data only when MVs unavailable or hourly/cell data needed):
 1. kpi_data(id, site_id, kpi_name, value, date, hour, data_level, cell_id, cell_site_id)
    - data_level = 'site' for site-level, 'cell' for cell-level
    - IMPORTANT: kpi_name values are EXACT strings. Use these EXACTLY as listed below.
@@ -878,6 +933,24 @@ ALWAYS use ILIKE for column_name matching:
         else:
             _tbl_note += f"  {_tn}: DOES NOT EXIST — data not uploaded yet\n"
     SCHEMA_HINT += _tbl_note
+
+    # ── Materialized view availability — query pg_matviews (MVs don't appear in information_schema) ──
+    try:
+        _mv_status_rows = _sql(
+            "SELECT matviewname FROM pg_matviews "
+            "WHERE schemaname = 'public' AND matviewname IN "
+            "('mv_daily_site_kpi','mv_zone_daily_kpi','mv_zone_kpi_summary','kpi_data_merged')"
+        )
+        _mv_ready = {r['matviewname'] for r in _mv_status_rows}
+    except Exception:
+        _mv_ready = set()
+    _mv_note = "\n=== MATERIALIZED VIEW STATUS (fast pre-aggregated tables) ===\n"
+    for _mvn in ['mv_daily_site_kpi', 'mv_zone_daily_kpi', 'mv_zone_kpi_summary', 'kpi_data_merged']:
+        if _mvn in _mv_ready:
+            _mv_note += f"  {_mvn}: READY — use this\n"
+        else:
+            _mv_note += f"  {_mvn}: NOT YET CREATED — fall back to kpi_data\n"
+    SCHEMA_HINT += _mv_note
 
     # ── Dynamic revenue column discovery — tell LLM the EXACT column names ──
     if 'flexible_kpi_uploads' in _available_tables:
@@ -1792,22 +1865,35 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
 
     _emit_progress(_ws_sid, 'executing', 'Running query...')
 
-    # ── MULTI-CHART: execute each chart's SQL separately ───────────────────────
+    # ── MULTI-CHART: execute each chart's SQL in PARALLEL ──────────────────────
     if ai_result.get("multi_chart") and ai_result.get("charts"):
-        charts_out = []
-        for chart_spec in ai_result["charts"]:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def _exec_chart(chart_spec):
             c_sql = chart_spec.get("sql", "")
-            c_error = None
-            c_rows = []
             try:
-                c_rows = _sql_with_timeout(c_sql, timeout_sec=15)
-                if not c_rows:
+                rows = _sql_with_timeout(c_sql, timeout_sec=15)
+                if not rows:
                     _LOG.warning("Multi-chart SQL returned 0 rows — SQL: %s", c_sql[:300])
-                    c_error = "Query returned no data. The site ID or KPI may not exist in the database."
+                    return chart_spec, rows, "Query returned no data. The site ID or KPI may not exist in the database."
+                return chart_spec, rows, None
             except Exception as e:
                 _LOG.warning("Multi-chart SQL failed: %s — SQL: %s", e, c_sql[:300])
-                c_error = str(e)
-                c_rows = []
+                return chart_spec, [], str(e)
+
+        charts_out = []
+        chart_specs = ai_result["charts"]
+        results_map = {}
+        with ThreadPoolExecutor(max_workers=min(len(chart_specs), 4)) as _pool:
+            futures = {_pool.submit(_exec_chart, spec): i for i, spec in enumerate(chart_specs)}
+            for fut in as_completed(futures):
+                idx = futures[fut]
+                results_map[idx] = fut.result()
+
+        # Rebuild charts in original order
+        for idx, chart_spec in enumerate(chart_specs):
+            chart_spec, c_rows, c_error = results_map.get(idx, (chart_spec, [], "Execution failed"))
+            c_sql = chart_spec.get("sql", "")
             c_cols = list(c_rows[0].keys()) if c_rows else []
             c_safe = [{k: _serial(v) for k, v in r.items()} for r in c_rows]
 
@@ -2718,11 +2804,16 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
 
     # _try_split_compound REMOVED — caused incorrect KPI-site pairing on "and" keyword
 
-    try:
-        cnt = _sql("SELECT COUNT(*) AS n FROM kpi_data")
-        USE_KD = int((cnt[0].get("n") or 0) if cnt else 0) > 0
-    except Exception:
-        USE_KD = False
+    # Cache the kpi_data presence check — avoids a COUNT(*) scan on every call.
+    if "use_kd" in _schema_cache:
+        USE_KD = _schema_cache["use_kd"]
+    else:
+        try:
+            cnt = _sql("SELECT 1 FROM kpi_data LIMIT 1")
+            USE_KD = len(cnt) > 0
+        except Exception:
+            USE_KD = False
+        _schema_cache["use_kd"] = USE_KD
 
     if not USE_KD:
         return _rule_based_legacy(p, time_filter)
@@ -2771,17 +2862,23 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
             site_filter_t = f"AND t.site_id IN ({in_clause})"
             site_filter_n = f"AND n.site_id IN ({in_clause})"
 
-        # Check which optional tables actually exist
+        # Check which optional tables actually exist — cached in _schema_cache
+        # so information_schema is only queried once per process restart.
         def _tbl_exists(name):
+            _avail = _schema_cache.setdefault("available_tables", {})
+            if name in _avail:
+                return _avail[name]
             try:
                 rows = _sql(
                     "SELECT 1 FROM information_schema.tables "
                     "WHERE table_schema = 'public' AND table_name = :tbl",
                     {"tbl": name},
                 )
-                return len(rows) > 0
+                result = len(rows) > 0
             except Exception:
-                return False
+                result = False
+            _avail[name] = result
+            return result
 
         # ── Revenue queries (revenue_data → flexible_kpi_uploads fallback) ──
         if _is_revenue:
@@ -3379,22 +3476,49 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
     if nums:
         N = min(int(nums[0]), 100)
 
+    # Prefer the pre-aggregated MV when available — avoids scanning 500K+ raw rows.
+    _mv_avail = _schema_cache.get("available_tables", {}).get("mv_daily_site_kpi")
+    if _mv_avail is None:
+        try:
+            _mv_avail = len(_sql("SELECT 1 FROM mv_daily_site_kpi LIMIT 1")) > 0
+        except Exception:
+            _mv_avail = False
+        _schema_cache.setdefault("available_tables", {})["mv_daily_site_kpi"] = _mv_avail
+
+    _MV_GEO_JOIN = "LEFT JOIN telecom_sites ts ON LOWER(m.site_id) = LOWER(ts.site_id)"
+
     def _kd_site_query(kpi_names_and_aliases, order_col, order_dir="DESC"):
-        case_parts      = []
+        case_parts       = []
         kpi_names_for_in = []
         for kpi_name, alias in kpi_names_and_aliases:
-            case_parts.append(f"AVG(CASE WHEN k.kpi_name = '{kpi_name}' THEN k.value END) AS {alias}")
             kpi_names_for_in.append(f"'{kpi_name}'")
+            if _mv_avail:
+                case_parts.append(f"AVG(CASE WHEN m.kpi_name = '{kpi_name}' THEN m.avg_value END) AS {alias}")
+            else:
+                case_parts.append(f"AVG(CASE WHEN k.kpi_name = '{kpi_name}' THEN k.value END) AS {alias}")
         cases     = ",\n                   ".join(case_parts)
         in_clause = ", ".join(kpi_names_for_in)
-        return f"""SELECT k.site_id, MAX(ts.zone) AS cluster,
-                       AVG(ts.latitude) AS lat, AVG(ts.longitude) AS lng,
-                       {cases}
-                FROM kpi_data k {GEO_JOIN}
-                WHERE k.data_level = 'site' AND k.value IS NOT NULL
-                  AND k.kpi_name IN ({in_clause})
-                GROUP BY k.site_id
-                ORDER BY {order_col} {order_dir} NULLS LAST LIMIT {N}"""
+        _ref      = _kpi_date_ref()
+        if _mv_avail:
+            # mv_daily_site_kpi already aggregated — far fewer rows to scan.
+            return f"""SELECT m.site_id, MAX(ts.zone) AS cluster,
+                           AVG(ts.latitude) AS lat, AVG(ts.longitude) AS lng,
+                           {cases}
+                    FROM mv_daily_site_kpi m {_MV_GEO_JOIN}
+                    WHERE m.kpi_name IN ({in_clause})
+                      AND m.date >= {_ref} - INTERVAL '90 days' AND m.date <= {_ref}
+                    GROUP BY m.site_id
+                    ORDER BY {order_col} {order_dir} NULLS LAST LIMIT {N}"""
+        else:
+            return f"""SELECT k.site_id, MAX(ts.zone) AS cluster,
+                           AVG(ts.latitude) AS lat, AVG(ts.longitude) AS lng,
+                           {cases}
+                    FROM kpi_data k {GEO_JOIN}
+                    WHERE k.data_level = 'site' AND k.value IS NOT NULL
+                      AND k.kpi_name IN ({in_clause})
+                      AND k.date >= {_ref} - INTERVAL '90 days' AND k.date <= {_ref}
+                    GROUP BY k.site_id
+                    ORDER BY {order_col} {order_dir} NULLS LAST LIMIT {N}"""
 
     if 'rrc' in p or 'accessibility' in p:
         sql = _kd_site_query([("LTE RRC Setup Success Rate","lte_rrc_setup_sr"),("LTE E-RAB Setup Success Rate","erab_setup_sr"),("LTE Call Setup Success Rate","lte_call_setup_sr"),("DL PRB Utilization (1BH)","dl_prb_util")],"lte_rrc_setup_sr","ASC")

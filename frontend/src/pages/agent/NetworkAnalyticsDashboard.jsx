@@ -215,7 +215,7 @@ function LeafletMap({sites=[],highlight=[],T,height=300}) {
       const L=window.L;
       let center=[12.5657,104.9910], zoom=6; // Cambodia centroid fallback
       try{
-        const token=localStorage.getItem('token');
+        const token=sessionStorage.getItem('token');
         const r=await fetch(`${API_BASE}/api/network/geo-center`,{headers:{'Authorization':`Bearer ${token}`}});
         if(r.ok){const d=await r.json();if(d.center){center=d.center;zoom=d.zoom||6;}}
       }catch(_){}
@@ -734,16 +734,15 @@ const OverviewPage = memo(function OverviewPage({T,data,mapSites,filters}) {
             <div style={{width:'100%',maxWidth:'100%',height:190,overflow:'hidden'}}>
               <ResponsiveContainer width="100%" height="100%">
                 <BarChart
+                  layout="vertical"
                   data={(zone.slice().sort((a,b)=>(b.avg_prb||0)-(a.avg_prb||0))).slice(0,5)}
-                  margin={{top:4,right:6,left:0,bottom:44}}
+                  margin={{top:4,right:16,left:4,bottom:4}}
                 >
-                  <CartesianGrid strokeDasharray="3 3" stroke={T.border} vertical={false}/>
-                  <XAxis dataKey="zone" tick={{fontSize:9,fill:T.muted}} axisLine={false} tickLine={false}
-                         interval={0} angle={-30} textAnchor="end" height={48}
-                         tickFormatter={(v)=>{const s=(v||'').toString();return s.length>10?s.slice(0,9)+'…':s;}}/>
-                  <YAxis tick={{fontSize:9,fill:T.muted}} axisLine={false} tickLine={false} width={26}/>
+                  <CartesianGrid strokeDasharray="3 3" stroke={T.border} horizontal={false}/>
+                  <XAxis type="number" tick={{fontSize:9,fill:T.muted}} axisLine={false} tickLine={false} domain={[0,'auto']}/>
+                  <YAxis type="category" dataKey="zone" tick={{fontSize:9,fill:T.muted}} axisLine={false} tickLine={false} width={90}/>
                   <Tooltip content={<TipC/>}/>
-                  <Bar dataKey="avg_prb" name="Avg PRB %" radius={[3,3,0,0]}>
+                  <Bar dataKey="avg_prb" name="Avg PRB %" radius={[0,3,3,0]}>
                     {zone.slice().sort((a,b)=>(b.avg_prb||0)-(a.avg_prb||0)).slice(0,5).map((d,i)=>
                       <Cell key={i} fill={d.avg_prb>75?T.red:d.avg_prb>55?T.amber:T.green}/>
                     )}

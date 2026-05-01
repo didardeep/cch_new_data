@@ -6671,8 +6671,8 @@ def admin_upload_kpi_site_level():
         wb.close()
 
     clear_analytics_cache()
-    refresh_kpi_data_merged()
     upsert_kpi_data_stats()
+    threading.Thread(target=refresh_all_matviews, daemon=True).start()
     return jsonify({
         "inserted": total_inserted,
         "kpis_processed": len(kpi_summary),
@@ -6939,8 +6939,8 @@ def admin_upload_kpi_cell_level():
         wb.close()
 
     clear_analytics_cache()
-    refresh_kpi_data_merged()
     upsert_kpi_data_stats()
+    threading.Thread(target=refresh_all_matviews, daemon=True).start()
     return jsonify({
         "inserted": total_inserted,
         "kpis_processed": len(kpi_summary),
@@ -7547,8 +7547,8 @@ def admin_delete_kpi_site_level():
     KpiData.query.filter_by(data_level="site").delete()
     db.session.commit()
     clear_analytics_cache()
-    refresh_kpi_data_merged()
     upsert_kpi_data_stats()
+    threading.Thread(target=refresh_all_matviews, daemon=True).start()
     return jsonify({"deleted": count})
 
 
@@ -7563,8 +7563,8 @@ def admin_delete_kpi_cell_level():
     KpiData.query.filter_by(data_level="cell").delete()
     db.session.commit()
     clear_analytics_cache()
-    refresh_kpi_data_merged()
     upsert_kpi_data_stats()
+    threading.Thread(target=refresh_all_matviews, daemon=True).start()
     return jsonify({"deleted": count})
 
 
@@ -10443,6 +10443,28 @@ def _ensure_kpi_merged_view():
         print(f">>> kpi_data_merged materialized view create failed (non-fatal): {e}")
 
 
+def refresh_all_matviews():
+    """Refresh all KPI materialized views. Call after upload/delete.
+
+    Order matters: kpi_data_merged first (no deps), then mv_daily_site_kpi
+    (sourced from kpi_data), then mv_zone_daily_kpi (sourced from mv_daily_site_kpi).
+    Each refresh is attempted CONCURRENTLY first; falls back to plain REFRESH on error.
+    """
+    from sqlalchemy import text as _t
+    for _mv in ["kpi_data_merged", "mv_daily_site_kpi", "mv_zone_kpi_summary", "mv_zone_daily_kpi"]:
+        try:
+            with db.engine.connect() as conn:
+                conn.execute(_t(f"REFRESH MATERIALIZED VIEW CONCURRENTLY {_mv}"))
+                conn.commit()
+        except Exception:
+            try:
+                with db.engine.connect() as conn:
+                    conn.execute(_t(f"REFRESH MATERIALIZED VIEW {_mv}"))
+                    conn.commit()
+            except Exception as _e:
+                print(f"refresh {_mv} failed (non-fatal): {_e}")
+
+
 with app.app_context():
     db.create_all()
 
@@ -10668,7 +10690,7 @@ from network_analytics import network_bp, clear_analytics_cache, refresh_kpi_dat
 app.register_blueprint(network_bp)
 
 # ─── Register Network AI Blueprint ───────────────────────────────────────────
-from network_ai import network_ai_bp, ensure_db_optimizations
+from network_ai import network_ai_bp, ensure_db_optimizations, refresh_materialized_views as _refresh_ai_mvs
 app.register_blueprint(network_ai_bp)
 
 # ─── Startup schema warm-up for network AI ────────────────────────────────────
