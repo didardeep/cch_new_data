@@ -80,6 +80,30 @@ def clear_analytics_cache():
     _KPI_COUNTS_CACHE.clear()
 
 
+def refresh_kpi_data_merged():
+    """Refresh the kpi_data_merged MATERIALIZED VIEW after kpi_data changes.
+
+    Tries CONCURRENTLY first (reads are not blocked during refresh).
+    Falls back to a standard (blocking) refresh if the unique index is not
+    ready yet (e.g. first deployment before the index was created).
+    Safe to call even if the view does not exist yet.
+    """
+    try:
+        with db.engine.connect() as conn:
+            try:
+                conn.execute(sa_text("REFRESH MATERIALIZED VIEW CONCURRENTLY kpi_data_merged"))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                try:
+                    conn.execute(sa_text("REFRESH MATERIALIZED VIEW kpi_data_merged"))
+                    conn.commit()
+                except Exception:
+                    pass
+    except Exception as e:
+        print(f">>> kpi_data_merged refresh failed (non-fatal): {e}")
+
+
 # Process-level memo for site/cell counts derived from kpi_data — these
 # scans take 20s+ on multi-million-row tables; refresh every hour.
 _KPI_COUNTS_CACHE: dict = {}
@@ -104,9 +128,23 @@ def _distinct_kpi_names_cached() -> list:
 
 def _kpi_data_counts_cached() -> dict:
     now_ts = datetime.utcnow().timestamp()
+    # 1. In-memory cache (fastest — avoids any DB hit on warm path)
     cached = _KPI_COUNTS_CACHE.get("v")
     if cached and (now_ts - cached["ts"] < _KPI_COUNTS_TTL):
         return cached["data"]
+    # 2. Pre-computed stats table (survives server restart; written after every upload)
+    try:
+        r = _sql("SELECT sites, cells, updated_at FROM kpi_data_stats WHERE id = 1")
+        if r:
+            row = r[0]
+            row_ts = row["updated_at"].timestamp() if row.get("updated_at") else 0
+            if (now_ts - row_ts) < _KPI_COUNTS_TTL:
+                data = {"sites": int(row["sites"] or 0), "cells": int(row["cells"] or 0)}
+                _KPI_COUNTS_CACHE["v"] = {"data": data, "ts": now_ts}
+                return data
+    except Exception:
+        pass
+    # 3. Live COUNT DISTINCT fallback (expensive — used only on first load / stale stats)
     sites = cells = 0
     try:
         # Distinct site_id — uses the (site_id, kpi_name) index for an
@@ -129,6 +167,45 @@ def _kpi_data_counts_cached() -> dict:
     data = {"sites": sites, "cells": cells}
     _KPI_COUNTS_CACHE["v"] = {"data": data, "ts": now_ts}
     return data
+
+
+def upsert_kpi_data_stats():
+    """Re-compute site/cell counts from kpi_data and persist to kpi_data_stats.
+
+    Called after every upload or delete that modifies kpi_data so the next
+    call to _kpi_data_counts_cached() reads the cheap pre-computed values
+    even after a server restart.
+    """
+    sites = cells = 0
+    try:
+        r = _sql("SELECT COUNT(*) AS n FROM (SELECT DISTINCT site_id FROM kpi_data) sub")
+        sites = int((r or [{"n": 0}])[0].get("n") or 0)
+    except Exception:
+        pass
+    try:
+        r = _sql("""
+            SELECT COUNT(*) AS n FROM (
+                SELECT DISTINCT site_id, cell_id FROM kpi_data
+                WHERE data_level = 'cell' AND cell_id IS NOT NULL AND cell_id <> ''
+            ) sub
+        """)
+        cells = int((r or [{"n": 0}])[0].get("n") or 0)
+    except Exception:
+        pass
+    try:
+        with db.engine.connect() as conn:
+            conn.execute(sa_text("""
+                INSERT INTO kpi_data_stats (id, sites, cells, updated_at)
+                VALUES (1, :s, :c, NOW())
+                ON CONFLICT (id) DO UPDATE
+                  SET sites = EXCLUDED.sites,
+                      cells = EXCLUDED.cells,
+                      updated_at = NOW()
+            """), {"s": sites, "c": cells})
+            conn.commit()
+        _KPI_COUNTS_CACHE.clear()
+    except Exception as e:
+        print(f">>> kpi_data_stats upsert failed (non-fatal): {e}")
 
 _FLEX_TABLES_ENSURED = False  # run DDL only once per process
 
@@ -155,6 +232,26 @@ def _ensure_kpi_indexes():
             conn.commit()
     except Exception:
         pass
+
+
+def _ensure_kpi_data_stats_table():
+    """Create the kpi_data_stats singleton table if it does not exist.
+    This table holds pre-computed site/cell counts so dashboards never
+    need to run expensive COUNT DISTINCT queries on startup.
+    """
+    try:
+        with db.engine.connect() as conn:
+            conn.execute(sa_text("""
+                CREATE TABLE IF NOT EXISTS kpi_data_stats (
+                    id      INTEGER PRIMARY KEY DEFAULT 1,
+                    sites   INTEGER NOT NULL DEFAULT 0,
+                    cells   INTEGER NOT NULL DEFAULT 0,
+                    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+                )
+            """))
+            conn.commit()
+    except Exception as e:
+        print(f">>> kpi_data_stats table create failed (non-fatal): {e}")
 
 
 def _cache_key(prefix: str, params: dict) -> str:
@@ -6070,7 +6167,8 @@ def _bg_ensure_indexes():
         import time as _time
         _time.sleep(3)          # wait for app to finish starting
         _ensure_kpi_indexes()
-        _LOG.info("kpi_data indexes ensured")
+        _ensure_kpi_data_stats_table()
+        _LOG.info("kpi_data indexes and stats table ensured")
     except Exception as e:
         _LOG.warning("Index creation skipped: %s", e)
 _threading.Thread(target=_bg_ensure_indexes, daemon=True).start()

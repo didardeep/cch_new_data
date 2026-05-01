@@ -6671,6 +6671,8 @@ def admin_upload_kpi_site_level():
         wb.close()
 
     clear_analytics_cache()
+    refresh_kpi_data_merged()
+    upsert_kpi_data_stats()
     return jsonify({
         "inserted": total_inserted,
         "kpis_processed": len(kpi_summary),
@@ -6937,6 +6939,8 @@ def admin_upload_kpi_cell_level():
         wb.close()
 
     clear_analytics_cache()
+    refresh_kpi_data_merged()
+    upsert_kpi_data_stats()
     return jsonify({
         "inserted": total_inserted,
         "kpis_processed": len(kpi_summary),
@@ -7543,6 +7547,8 @@ def admin_delete_kpi_site_level():
     KpiData.query.filter_by(data_level="site").delete()
     db.session.commit()
     clear_analytics_cache()
+    refresh_kpi_data_merged()
+    upsert_kpi_data_stats()
     return jsonify({"deleted": count})
 
 
@@ -7557,6 +7563,8 @@ def admin_delete_kpi_cell_level():
     KpiData.query.filter_by(data_level="cell").delete()
     db.session.commit()
     clear_analytics_cache()
+    refresh_kpi_data_merged()
+    upsert_kpi_data_stats()
     return jsonify({"deleted": count})
 
 
@@ -10356,19 +10364,32 @@ def run_sla_checks():
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _ensure_kpi_merged_view():
-    """Create/refresh the kpi_data_merged VIEW.
+    """Create the kpi_data_merged MATERIALIZED VIEW (first-time only).
 
-    This view presents every (site_id, kpi_name, date) ONCE:
-      - If site-level rows exist, they pass through as-is.
-      - For sites with NO site-level data for a given (kpi, date), the cell-level
-        rows are averaged across all cells of that site and surfaced with
-        data_level='site' so existing analytics queries pick them up transparently.
-    All read-heavy dashboards (network_analytics, CTO dashboards) should read
-    from this view instead of the raw kpi_data table.
+    This materialized view persists query results physically so every dashboard
+    query hits a pre-built snapshot instead of re-executing the 30 M-row UNION.
+
+    Upgrade path: drops the legacy regular VIEW if it exists so the first
+    deployment converts it transparently.
+
+    Indexes created:
+      • UNIQUE on id          — enables REFRESH CONCURRENTLY (non-blocking)
+      • (site_id, kpi_name, date)     — main analytics filter
+      • (kpi_name, date) WHERE value IS NOT NULL  — trends queries
+      • (data_level, kpi_name, date)  — level-filtered scans
     """
     from sqlalchemy import text as _t
+    with db.engine.connect() as conn:
+        # Drop the old regular VIEW so we can replace it with a MATERIALIZED VIEW.
+        # CASCADE removes any dependent objects; re-created below.
+        try:
+            conn.execute(_t("DROP VIEW IF EXISTS kpi_data_merged CASCADE"))
+            conn.commit()
+        except Exception:
+            pass
+
     ddl = """
-        CREATE OR REPLACE VIEW kpi_data_merged AS
+        CREATE MATERIALIZED VIEW IF NOT EXISTS kpi_data_merged AS
         SELECT id, site_id, site_abs_id, kpi_name, date, hour, value,
                data_level, cell_id, cell_site_id
         FROM kpi_data
@@ -10395,14 +10416,31 @@ def _ensure_kpi_merged_view():
                 AND s.data_level = 'site'
           )
         GROUP BY k.site_id, k.kpi_name, k.date
+        WITH DATA
     """
+    idx_ddls = [
+        # Required for REFRESH CONCURRENTLY (non-blocking refresh).
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_kdm_id ON kpi_data_merged (id)",
+        # Main analytics filter.
+        "CREATE INDEX IF NOT EXISTS idx_kdm_site_kpi_date ON kpi_data_merged (site_id, kpi_name, date)",
+        # Trends queries scan by kpi_name + date.
+        "CREATE INDEX IF NOT EXISTS idx_kdm_kpi_date ON kpi_data_merged (kpi_name, date) WHERE value IS NOT NULL",
+        # Level-filtered scans.
+        "CREATE INDEX IF NOT EXISTS idx_kdm_level_kpi_date ON kpi_data_merged (data_level, kpi_name, date)",
+    ]
     try:
         with db.engine.connect() as conn:
             conn.execute(_t(ddl))
             conn.commit()
-        print(">>> kpi_data_merged view ready (site-level preferred, cell-level fallback)")
+            for idx in idx_ddls:
+                try:
+                    conn.execute(_t(idx))
+                    conn.commit()
+                except Exception:
+                    pass
+        print(">>> kpi_data_merged materialized view ready")
     except Exception as e:
-        print(f">>> kpi_data_merged view create failed (non-fatal): {e}")
+        print(f">>> kpi_data_merged materialized view create failed (non-fatal): {e}")
 
 
 with app.app_context():
@@ -10626,7 +10664,7 @@ with app.app_context():
 
 
 # ─── Register Network Analytics Blueprint ─────────────────────────────────────
-from network_analytics import network_bp, clear_analytics_cache
+from network_analytics import network_bp, clear_analytics_cache, refresh_kpi_data_merged, upsert_kpi_data_stats
 app.register_blueprint(network_bp)
 
 # ─── Register Network AI Blueprint ───────────────────────────────────────────
