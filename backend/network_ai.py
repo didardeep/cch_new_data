@@ -1261,26 +1261,21 @@ def ai_query():
     print(f"[TIMING] Schema discovery: {time.time()-_t0:.2f}s", flush=True)
 
     # ── Semantic Layer: resolve cross-device concepts ──────────────────────
-    _semantic_sql_hint = ""
+    _used_semantic_path = False
+    _semantic_sql = None
     try:
         from semantic_layer import resolve_concepts, compose_sql as sl_compose_sql
-        _resolved = resolve_concepts(user_msg, _schema_cache)
-        if _resolved and _resolved[0].get("confidence", 0) >= 0.8:
-            _sl_filters = {}
-            if ai_session:
-                _sctx_tmp = getattr(ai_session, 'session_context', None) or {}
-                _sl_filters["sites"] = _sctx_tmp.get("active_sites", [])
-                _sl_filters["date_range"] = _sctx_tmp.get("active_days")
-            _semantic_sql_hint = sl_compose_sql(_resolved, intent="trend", filters=_sl_filters)
-            _LOG.info("[SEMANTIC] Resolved %d concepts (conf=%.2f), injecting SQL hint",
-                      len(_resolved), _resolved[0]["confidence"])
+        _plan = resolve_concepts(prompt, _schema_cache)
+        _confs = [c.get("confidence", 0) for c in _plan.get("concepts", [])]
+        if _confs and min(_confs) >= 0.7:
+            _semantic_sql = sl_compose_sql(_plan)
+            _LOG.info("[SEMANTIC] Using semantic path | intent=%s | concepts=%s",
+                      _plan.get("intent"), [c["concept_name"] for c in _plan["concepts"]])
+            _used_semantic_path = True
     except ImportError:
-        pass  # semantic_layer not available — skip gracefully
+        pass
     except Exception as _sl_err:
-        _LOG.debug("[SEMANTIC] resolve_concepts failed (non-fatal): %s", _sl_err)
-
-    if _semantic_sql_hint:
-        SCHEMA_HINT += f"\n\n[SEMANTIC LAYER — PRE-COMPOSED CROSS-DEVICE SQL]\n{_semantic_sql_hint}"
+        _LOG.warning("[SEMANTIC] resolve failed, falling through: %s", _sl_err, exc_info=True)
 
     # ── CHANGE: read session_context for dynamic prompt injection ──
     _sctx = (getattr(ai_session, 'session_context', None) or {}) if ai_session else {}
@@ -1632,26 +1627,46 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
     _LOG.info("AI provider: global client (%s)", _llm_model)
 
 
-    # ── LLM Call ──────────────────────────────────────────────────────────────
+    # ── Semantic Path: skip LLM if semantic layer produced SQL ─────────────
     _t1 = time.time()
-    try:
-        _llm_resp = _llm_client.chat.completions.create(
-            model=_llm_model,
-            messages=llm_messages,
-            temperature=0.1,
-            max_tokens=2000,
-        )
-        raw_content = _llm_resp.choices[0].message.content
-        if raw_content:
-            ai_result = _parse_ai_result(raw_content)
-            provider = {"provider": _llm_model}
-            _LOG.info("AI query handled by %s", _llm_model)
-    except json.JSONDecodeError as je:
-        _LOG.warning("LLM returned bad JSON: %s", str(je)[:200])
-    except Exception as e:
-        _LOG.warning("LLM call failed: %s", str(e)[:200])
+    if _used_semantic_path and _semantic_sql:
+        # Build ai_result directly from semantic SQL — bypass LLM entirely
+        _sl_intent = _plan.get("intent", "trend")
+        _sl_chart = "bar" if _sl_intent in ("top_n", "threshold", "comparison") else "composed"
+        _sl_x = "site_id" if _sl_intent in ("top_n", "threshold", "comparison") else "date"
+        ai_result = {
+            "sql": _semantic_sql,
+            "title": prompt[:60],
+            "response": f"Results for: {prompt[:80]}",
+            "chart_type": _sl_chart,
+            "x_axis": _sl_x,
+            "y_axes": ["value"],
+            "chart_config": {},
+            "filter_update": {},
+        }
+        provider = {"provider": "semantic_layer"}
+        _LOG.info("[SEMANTIC] Bypassed LLM SQL gen — using composed SQL directly")
+        print(f"[TIMING] Semantic SQL compose: {time.time()-_t1:.2f}s", flush=True)
+    else:
+        # ── Legacy LLM Call ────────────────────────────────────────────────────
+        try:
+            _llm_resp = _llm_client.chat.completions.create(
+                model=_llm_model,
+                messages=llm_messages,
+                temperature=0.1,
+                max_tokens=2000,
+            )
+            raw_content = _llm_resp.choices[0].message.content
+            if raw_content:
+                ai_result = _parse_ai_result(raw_content)
+                provider = {"provider": _llm_model}
+                _LOG.info("AI query handled by %s", _llm_model)
+        except json.JSONDecodeError as je:
+            _LOG.warning("LLM returned bad JSON: %s", str(je)[:200])
+        except Exception as e:
+            _LOG.warning("LLM call failed: %s", str(e)[:200])
 
-    print(f"[TIMING] LLM SQL gen: {time.time()-_t1:.2f}s", flush=True)
+        print(f"[TIMING] LLM SQL gen: {time.time()-_t1:.2f}s", flush=True)
 
     if not ai_result:
         _emit_progress(_ws_sid, "complete", "Error")

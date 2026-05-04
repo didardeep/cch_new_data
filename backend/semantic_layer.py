@@ -7,8 +7,8 @@ heterogeneous schemas.
 
 Public API:
   - seed_catalog_from_existing_data()  — auto-discover & cluster KPIs into concepts
-  - resolve_concepts(query, schema_cache) — NL query → matched concepts with mappings
-  - compose_sql(concepts, intent, filters) — concepts → valid SQL
+  - resolve_concepts(query, schema_cache) — NL query → full plan dict
+  - compose_sql(plan)                   — plan dict → validated SQL
   - embed_schema_objects()              — generate & store vector embeddings
 """
 
@@ -16,6 +16,7 @@ import os
 import json
 import logging
 import time
+import hashlib
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -25,6 +26,16 @@ from sqlalchemy import text as sa_text
 load_dotenv()
 
 _LOG = logging.getLogger("semantic_layer")
+
+# ─── Plan cache (5-minute TTL) ───────────────────────────────────────────────
+_plan_cache: dict = {}  # key → {"plan": dict, "ts": float}
+_PLAN_CACHE_TTL = 300  # 5 minutes
+
+
+def _plan_cache_key(prompt: str, sites: list, kpis: list) -> str:
+    raw = f"{prompt}|{'|'.join(sorted(sites or []))}|{'|'.join(sorted(kpis or []))}"
+    return hashlib.md5(raw.encode()).hexdigest()
+
 
 # ─── DB helper (reuse pattern from network_ai) ──────────────────────────────
 
@@ -59,15 +70,19 @@ def _get_llm_client():
     return _build_llm_client()
 
 
-def _llm_chat(messages: list, temperature: float = 0.1, max_tokens: int = 2000) -> str:
+def _llm_chat(messages: list, temperature: float = 0.1, max_tokens: int = 2000,
+              response_format: dict = None) -> str:
     """Send chat completion and return response text."""
     client, model = _get_llm_client()
-    resp = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        temperature=temperature,
-        max_tokens=max_tokens,
-    )
+    kwargs = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    if response_format:
+        kwargs["response_format"] = response_format
+    resp = client.chat.completions.create(**kwargs)
     return resp.choices[0].message.content.strip()
 
 
@@ -338,128 +353,36 @@ Only output the JSON array, nothing else."""
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 3. compose_sql()
+# 3. resolve_concepts() — returns FULL PLAN dict
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def compose_sql(resolved_concepts: list, intent: str = "trend", filters: dict = None) -> str:
+def resolve_concepts(user_query: str, schema_cache: dict = None) -> dict:
     """
-    Given resolved concepts (with physical mappings), compose a SQL query
-    that correctly pulls data from all mapped physical locations.
+    Given a user's natural language query, produce a full execution plan:
 
-    Args:
-        resolved_concepts: list of dicts from resolve_concepts()
-        intent: query intent — "trend", "comparison", "threshold", "aggregate"
-        filters: dict with optional keys: sites (list), date_range (int days), start_date, end_date
-
-    Returns:
-        SQL string ready to execute
+    Returns dict:
+    {
+        "concepts": [{"concept_name", "confidence", "display_name", "unit", "mappings": [...]}],
+        "intent": "trend|top_n|threshold|comparison|aggregate",
+        "aggregation": "AVG|SUM|MAX|MIN",
+        "top_n": int or None,
+        "threshold": {"op": "<|>|<=|>=", "value": float} or None,
+        "filters": {"sites": [...], "zones": [...], "time_range_days": int or None},
+        "group_by": [...]
+    }
     """
-    filters = filters or {}
-    sites = filters.get("sites", [])
-    date_range = filters.get("date_range")
-    start_date = filters.get("start_date")
-    end_date = filters.get("end_date")
+    # Check plan cache
+    _sites = []
+    _kpis = []
+    if schema_cache:
+        _sites = schema_cache.get("active_sites", []) if isinstance(schema_cache, dict) else []
+        _kpis = schema_cache.get("kpi_names_list", [])[:10] if isinstance(schema_cache, dict) else []
+    ck = _plan_cache_key(user_query, _sites, _kpis)
+    cached = _plan_cache.get(ck)
+    if cached and (time.time() - cached["ts"]) < _PLAN_CACHE_TTL:
+        _LOG.info("[SEMANTIC] Plan cache hit")
+        return cached["plan"]
 
-    # Build date filter clause
-    date_clause = ""
-    if start_date and end_date:
-        date_clause = f"AND date BETWEEN '{start_date}' AND '{end_date}'"
-    elif date_range:
-        date_clause = f"AND date >= CURRENT_DATE - INTERVAL '{date_range} days'"
-    else:
-        date_clause = "AND date >= CURRENT_DATE - INTERVAL '30 days'"
-
-    # Build site filter clause
-    site_clause = ""
-    if sites:
-        site_list = ", ".join(f"'{s}'" for s in sites)
-        site_clause = f"AND site_id IN ({site_list})"
-
-    parts = []
-
-    for concept in resolved_concepts:
-        concept_name = concept.get("concept_name", "unknown")
-        display_name = concept.get("display_name", concept_name)
-        mappings = concept.get("mappings", [])
-
-        for mapping in mappings:
-            table_name = mapping.get("table_name", "kpi_data")
-            column_expr = mapping.get("column_expr", "value")
-            filter_expr = mapping.get("filter_expr", "")
-            device_type = mapping.get("device_type", "generic")
-
-            # Build WHERE clause
-            where_parts = ["1=1"]
-            if filter_expr:
-                where_parts.append(filter_expr)
-            if date_clause:
-                where_parts.append(date_clause.lstrip("AND "))
-            if site_clause:
-                where_parts.append(site_clause.lstrip("AND "))
-
-            where_sql = " AND ".join(where_parts)
-
-            if intent == "trend":
-                sql = f"""SELECT date, '{display_name}' AS metric, '{device_type}' AS device_type,
-    AVG({column_expr}) AS avg_value, site_id
-FROM {table_name}
-WHERE {where_sql}
-GROUP BY date, site_id
-ORDER BY date"""
-            elif intent == "comparison":
-                sql = f"""SELECT site_id, '{display_name}' AS metric, '{device_type}' AS device_type,
-    AVG({column_expr}) AS avg_value
-FROM {table_name}
-WHERE {where_sql}
-GROUP BY site_id
-ORDER BY avg_value DESC"""
-            elif intent == "threshold":
-                sql = f"""SELECT site_id, date, '{display_name}' AS metric, '{device_type}' AS device_type,
-    {column_expr} AS value
-FROM {table_name}
-WHERE {where_sql}
-ORDER BY {column_expr} DESC
-LIMIT 100"""
-            else:  # aggregate
-                sql = f"""SELECT '{display_name}' AS metric, '{device_type}' AS device_type,
-    AVG({column_expr}) AS avg_value,
-    MIN({column_expr}) AS min_value,
-    MAX({column_expr}) AS max_value,
-    COUNT(*) AS sample_count
-FROM {table_name}
-WHERE {where_sql}"""
-
-            parts.append(sql)
-
-    if not parts:
-        return "SELECT 'No mappings found' AS error"
-
-    # Combine with UNION ALL
-    if len(parts) == 1:
-        return parts[0]
-
-    return "\nUNION ALL\n".join(parts)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 4. resolve_concepts()
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def resolve_concepts(user_query: str, schema_cache: dict = None) -> list:
-    """
-    Given a user's natural language query, identify which metric concepts
-    are being referenced and return their physical mappings.
-
-    Returns list of dicts:
-    [
-        {
-            "concept_name": str,
-            "display_name": str,
-            "confidence": float (0-1),
-            "mappings": [{"table_name", "column_expr", "filter_expr", "device_type"}]
-        }
-    ]
-    """
     # Get available concepts from catalog
     concepts = _sql("""
         SELECT mc.id, mc.concept_name, mc.display_name, mc.unit, mc.description
@@ -468,7 +391,8 @@ def resolve_concepts(user_query: str, schema_cache: dict = None) -> list:
     """)
 
     if not concepts:
-        return []
+        return {"concepts": [], "intent": "trend", "aggregation": "AVG",
+                "top_n": None, "threshold": None, "filters": {}, "group_by": []}
 
     # Build concept list for LLM
     concept_list = "\n".join(
@@ -481,53 +405,85 @@ def resolve_concepts(user_query: str, schema_cache: dict = None) -> list:
     if schema_cache and schema_cache.get("kpi_names_list"):
         kpi_names_str = f"\n\nRaw KPI names in database:\n{', '.join(schema_cache['kpi_names_list'][:100])}"
 
-    prompt = f"""Given this user query about data analytics:
-"{user_query}"
+    prompt = f"""Analyze this user query and produce a structured execution plan.
+
+User query: "{user_query}"
 
 Available metric concepts in our catalog:
 {concept_list}
 {kpi_names_str}
 
-Which concepts from the catalog does this query reference? Consider synonyms and related terms.
-
-Return a JSON array of matched concepts:
-[
-  {{
-    "concept_name": "exact_name_from_catalog",
-    "confidence": 0.0-1.0
-  }}
-]
+Return a JSON object with these fields:
+{{
+  "concepts": [
+    {{"concept_name": "exact_name_from_catalog", "confidence": 0.0-1.0}}
+  ],
+  "intent": "trend|top_n|threshold|comparison|aggregate",
+  "aggregation": "AVG|SUM|MAX|MIN",
+  "top_n": null or integer (e.g. 5 for "top 5 sites"),
+  "threshold": null or {{"op": "<|>|<=|>=", "value": number}},
+  "filters": {{
+    "sites": [],
+    "zones": [],
+    "time_range_days": null or integer
+  }},
+  "group_by": ["site_id"] or ["date"] or ["site_id", "date"] etc.
+}}
 
 Rules:
-- Only return concepts that the user is clearly asking about
-- confidence >= 0.9 for exact matches, 0.7-0.9 for synonym/related matches
-- Return empty array [] if no concepts match
-- Output ONLY valid JSON, nothing else"""
+- "intent" detection:
+  - "trend" = time series / show over time / last N days
+  - "top_n" = top/bottom N sites, ranking, best/worst
+  - "threshold" = sites where metric > X or < Y
+  - "comparison" = compare sites or metrics side by side
+  - "aggregate" = average, sum, total, overall stats
+- Only include concepts the user clearly references (synonyms OK)
+- confidence >= 0.9 for exact match, 0.7-0.9 for synonym/related
+- Extract site IDs, zone names, time ranges from the query text
+- "top 5" → top_n=5, "last 7 days" → time_range_days=7
+- "below 5 mbps" → threshold={{"op":"<","value":5}}
+- group_by: ["date"] for trends, ["site_id"] for rankings/comparisons
+- If no concepts match, return empty concepts array"""
 
     messages = [
-        {"role": "system", "content": "You are a metric concept resolver. Output valid JSON only."},
+        {"role": "system", "content": "You are a query plan generator. Output valid JSON only."},
         {"role": "user", "content": prompt},
     ]
 
-    response = _llm_chat(messages, temperature=0.0, max_tokens=500)
+    response = _llm_chat(messages, temperature=0.0, max_tokens=800,
+                         response_format={"type": "json_object"})
 
     # Parse response
     try:
+        plan = json.loads(response)
+    except json.JSONDecodeError:
+        # Try stripping code fences
         cleaned = response.strip()
         if cleaned.startswith("```"):
             cleaned = cleaned.split("\n", 1)[1]
             cleaned = cleaned.rsplit("```", 1)[0]
-        matched = json.loads(cleaned)
-    except json.JSONDecodeError:
-        _LOG.warning("[SEMANTIC] Failed to parse resolve_concepts response")
-        return []
+        try:
+            plan = json.loads(cleaned)
+        except json.JSONDecodeError:
+            _LOG.warning("[SEMANTIC] Failed to parse resolve_concepts response: %s", response[:200])
+            return {"concepts": [], "intent": "trend", "aggregation": "AVG",
+                    "top_n": None, "threshold": None, "filters": {}, "group_by": []}
 
-    if not matched:
-        return []
+    # Normalize plan structure
+    plan.setdefault("concepts", [])
+    plan.setdefault("intent", "trend")
+    plan.setdefault("aggregation", "AVG")
+    plan.setdefault("top_n", None)
+    plan.setdefault("threshold", None)
+    plan.setdefault("filters", {})
+    plan.setdefault("group_by", [])
 
-    # Enrich with physical mappings
-    result = []
-    for match in matched:
+    if not plan["concepts"]:
+        return plan
+
+    # Enrich each concept with physical mappings from DB
+    enriched_concepts = []
+    for match in plan["concepts"]:
         cname = match.get("concept_name", "")
         confidence = match.get("confidence", 0.0)
 
@@ -538,7 +494,7 @@ Rules:
         """, {"cn": cname})
 
         if not concept_row:
-            # Try pgvector fallback for fuzzy match
+            # Try vector similarity fallback
             fallback = _vector_search(cname, top_k=1)
             if fallback:
                 concept_row = _sql("""
@@ -558,7 +514,7 @@ Rules:
             ORDER BY priority DESC
         """, {"cid": concept_id})
 
-        result.append({
+        enriched_concepts.append({
             "concept_name": concept_row[0]["concept_name"],
             "display_name": concept_row[0]["display_name"],
             "unit": concept_row[0].get("unit"),
@@ -566,10 +522,168 @@ Rules:
             "mappings": [dict(m) for m in mappings],
         })
 
-    return result
+    plan["concepts"] = enriched_concepts
+
+    # Cache the plan
+    _plan_cache[ck] = {"plan": plan, "ts": time.time()}
+
+    return plan
 
 
-# ─── Vector search fallback (cosine similarity in Python, JSONB storage) ─────
+# ═══════════════════════════════════════════════════════════════════════════════
+# 4. compose_sql() — reads from plan dict, produces validated SQL
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def compose_sql(plan: dict) -> str:
+    """
+    Given a plan from resolve_concepts(), compose a SQL query that correctly
+    pulls data from all mapped physical locations.
+
+    Reads intent, filters, aggregation, top_n, threshold from plan.
+    Validates the SQL before returning. Raises ValueError if validation fails.
+
+    Returns SQL string ready to execute.
+    """
+    concepts = plan.get("concepts", [])
+    intent = plan.get("intent", "trend")
+    aggregation = plan.get("aggregation", "AVG")
+    top_n = plan.get("top_n")
+    threshold = plan.get("threshold")
+    filters = plan.get("filters", {})
+    group_by = plan.get("group_by", [])
+
+    sites = filters.get("sites", [])
+    zones = filters.get("zones", [])
+    time_range_days = filters.get("time_range_days")
+
+    # Build date filter clause
+    date_clause = ""
+    if time_range_days:
+        date_clause = f"date >= CURRENT_DATE - INTERVAL '{int(time_range_days)} days'"
+    else:
+        date_clause = "date >= CURRENT_DATE - INTERVAL '30 days'"
+
+    # Build site filter clause
+    site_clause = ""
+    if sites:
+        site_list = ", ".join(f"'{s}'" for s in sites)
+        site_clause = f"site_id IN ({site_list})"
+
+    parts = []
+
+    for concept in concepts:
+        display_name = concept.get("display_name", concept.get("concept_name", "metric"))
+        mappings = concept.get("mappings", [])
+
+        for mapping in mappings:
+            table_name = mapping.get("table_name", "kpi_data")
+            column_expr = mapping.get("column_expr", "value")
+            filter_expr = mapping.get("filter_expr", "")
+            device_type = mapping.get("device_type", "generic")
+
+            # Build WHERE clause
+            where_parts = []
+            if filter_expr:
+                where_parts.append(filter_expr)
+            where_parts.append(date_clause)
+            if site_clause:
+                where_parts.append(site_clause)
+            # Add data_level and value IS NOT NULL for kpi_data
+            if table_name == "kpi_data":
+                where_parts.append("data_level = 'site'")
+                where_parts.append("value IS NOT NULL")
+
+            where_sql = " AND ".join(where_parts)
+
+            if intent == "trend":
+                sql = (
+                    f"SELECT date::text AS date, site_id, "
+                    f"'{display_name}' AS kpi_name, "
+                    f"{aggregation}({column_expr}) AS value\n"
+                    f"FROM {table_name}\n"
+                    f"WHERE {where_sql}\n"
+                    f"GROUP BY date, site_id"
+                )
+            elif intent == "top_n":
+                sql = (
+                    f"SELECT site_id, "
+                    f"'{display_name}' AS kpi_name, "
+                    f"{aggregation}({column_expr}) AS value\n"
+                    f"FROM {table_name}\n"
+                    f"WHERE {where_sql}\n"
+                    f"GROUP BY site_id\n"
+                    f"ORDER BY value DESC"
+                )
+            elif intent == "threshold":
+                th_op = threshold.get("op", "<") if threshold else "<"
+                th_val = threshold.get("value", 0) if threshold else 0
+                sql = (
+                    f"SELECT site_id, "
+                    f"'{display_name}' AS kpi_name, "
+                    f"{aggregation}({column_expr}) AS value\n"
+                    f"FROM {table_name}\n"
+                    f"WHERE {where_sql}\n"
+                    f"GROUP BY site_id\n"
+                    f"HAVING {aggregation}({column_expr}) {th_op} {th_val}\n"
+                    f"ORDER BY value"
+                )
+            elif intent == "comparison":
+                sql = (
+                    f"SELECT site_id, "
+                    f"'{display_name}' AS kpi_name, "
+                    f"{aggregation}({column_expr}) AS value\n"
+                    f"FROM {table_name}\n"
+                    f"WHERE {where_sql}\n"
+                    f"GROUP BY site_id\n"
+                    f"ORDER BY value DESC"
+                )
+            else:  # aggregate
+                sql = (
+                    f"SELECT '{display_name}' AS kpi_name, "
+                    f"{aggregation}({column_expr}) AS value, "
+                    f"MIN({column_expr}) AS min_value, "
+                    f"MAX({column_expr}) AS max_value, "
+                    f"COUNT(*) AS sample_count\n"
+                    f"FROM {table_name}\n"
+                    f"WHERE {where_sql}"
+                )
+
+            parts.append(sql)
+
+    if not parts:
+        raise ValueError("No physical mappings found for resolved concepts")
+
+    # Combine with UNION ALL
+    if len(parts) == 1:
+        combined = parts[0]
+    else:
+        combined = "\nUNION ALL\n".join(parts)
+
+    # Add ORDER BY for trends (after UNION ALL)
+    if intent == "trend" and len(parts) > 1:
+        combined += "\nORDER BY date"
+
+    # Add LIMIT
+    if top_n:
+        combined += f"\nLIMIT {int(top_n)}"
+    elif intent in ("top_n", "threshold", "comparison"):
+        combined += f"\nLIMIT {top_n or 50}"
+    else:
+        combined += "\nLIMIT 1000"
+
+    # Validate using network_ai's _validate_sql
+    from network_ai import _validate_sql
+    is_safe, result_or_error = _validate_sql(combined)
+    if not is_safe:
+        raise ValueError(f"SQL validation failed: {result_or_error}")
+
+    # result_or_error is normalized SQL when safe
+    return result_or_error
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Vector search fallback (cosine similarity in Python, JSONB storage)
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def _cosine_similarity(a: list, b: list) -> float:
     """Compute cosine similarity between two vectors."""
