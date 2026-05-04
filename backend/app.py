@@ -6498,6 +6498,7 @@ def admin_upload_sites():
         print(f">>> Geo auto-populate failed (non-fatal): {e}")
 
     clear_analytics_cache()
+    _invalidate_ai_schema()
     return jsonify({
         "created": created, "skipped": skipped, "total": created,
         "detected_columns": list(col_map.keys()),
@@ -6561,6 +6562,7 @@ def admin_populate_geo():
         return jsonify({"error": "Unauthorized"}), 403
     _auto_populate_geo()
     clear_analytics_cache()
+    _invalidate_ai_schema()
     count = TelecomSite.query.filter(TelecomSite.city.isnot(None), TelecomSite.city != '').count()
     total = TelecomSite.query.count()
     return jsonify({"message": f"Geo populated: {count}/{total} sites have city data"})
@@ -6671,6 +6673,7 @@ def admin_upload_kpi_site_level():
         wb.close()
 
     clear_analytics_cache()
+    _invalidate_ai_schema()
     upsert_kpi_data_stats()
     threading.Thread(target=refresh_all_matviews, daemon=True).start()
     return jsonify({
@@ -6939,6 +6942,7 @@ def admin_upload_kpi_cell_level():
         wb.close()
 
     clear_analytics_cache()
+    _invalidate_ai_schema()
     upsert_kpi_data_stats()
     threading.Thread(target=refresh_all_matviews, daemon=True).start()
     return jsonify({
@@ -7426,6 +7430,7 @@ def admin_upload_core_component_kpi():
         wb.close()
 
     clear_analytics_cache()
+    _invalidate_ai_schema()
     return jsonify({
         "inserted": total_inserted,
         "kpis_processed": len(kpi_summary),
@@ -7492,6 +7497,7 @@ def admin_delete_core_component_kpi():
     except Exception:
         deleted = 0
     clear_analytics_cache()
+    _invalidate_ai_schema()
     return jsonify({"deleted": deleted, "component_type": comp_type or "ALL"})
 
 
@@ -7533,6 +7539,7 @@ def admin_delete_sites():
     TelecomSite.query.delete()
     db.session.commit()
     clear_analytics_cache()
+    _invalidate_ai_schema()
     return jsonify({"deleted": count})
 
 
@@ -7547,6 +7554,7 @@ def admin_delete_kpi_site_level():
     KpiData.query.filter_by(data_level="site").delete()
     db.session.commit()
     clear_analytics_cache()
+    _invalidate_ai_schema()
     upsert_kpi_data_stats()
     threading.Thread(target=refresh_all_matviews, daemon=True).start()
     return jsonify({"deleted": count})
@@ -7563,6 +7571,7 @@ def admin_delete_kpi_cell_level():
     KpiData.query.filter_by(data_level="cell").delete()
     db.session.commit()
     clear_analytics_cache()
+    _invalidate_ai_schema()
     upsert_kpi_data_stats()
     threading.Thread(target=refresh_all_matviews, daemon=True).start()
     return jsonify({"deleted": count})
@@ -7785,6 +7794,7 @@ def admin_upload_flexible_kpi():
                 db.session.commit()
                 _cache_clear("business_kpi", "technical_kpi")
                 clear_analytics_cache()
+                _invalidate_ai_schema()
                 return jsonify({
                     "rows_in_file": total_inserted,
                     "records_inserted": total_inserted,
@@ -7956,6 +7966,7 @@ def admin_upload_flexible_kpi():
     # picks up the freshly uploaded rows.
     _cache_clear("business_kpi", "technical_kpi")
     clear_analytics_cache()
+    _invalidate_ai_schema()
 
     # Invalidate priority/urgency bracket caches so new uploads are reflected immediately
     try:
@@ -8053,6 +8064,7 @@ def admin_delete_flexible_kpi():
     db.session.commit()
     _cache_clear("business_kpi", "technical_kpi")
     clear_analytics_cache()
+    _invalidate_ai_schema()
     return jsonify({"deleted": deleted, "kpi_type": kpi_type})
 
 
@@ -10690,7 +10702,7 @@ from network_analytics import network_bp, clear_analytics_cache, refresh_kpi_dat
 app.register_blueprint(network_bp)
 
 # ─── Register Network AI Blueprint ───────────────────────────────────────────
-from network_ai import network_ai_bp, ensure_db_optimizations, refresh_materialized_views as _refresh_ai_mvs
+from network_ai import network_ai_bp, ensure_db_optimizations, refresh_materialized_views as _refresh_ai_mvs, invalidate_schema_cache as _invalidate_ai_schema
 app.register_blueprint(network_ai_bp)
 
 # ─── Startup schema warm-up for network AI ────────────────────────────────────

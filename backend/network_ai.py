@@ -425,7 +425,16 @@ _schema_cache = {
 # ─── SCHEMA_HINT cache — avoids re-running expensive discovery on every query ──
 # Rebuilt once per TTL (5 min) or when refresh_materialized_views() is called.
 _schema_hint_cache: dict = {"hint": None, "ts": 0.0}
-_SCHEMA_HINT_TTL = 300  # 5 minutes
+_SCHEMA_HINT_TTL = 3600  # 1 hour — schema only changes on data upload
+
+
+def invalidate_schema_cache():
+    """Reset schema caches so next AI query rebuilds from DB.
+    Call this after data uploads or matview refreshes."""
+    _schema_hint_cache["hint"] = None
+    _schema_hint_cache["ts"] = 0.0
+    _schema_cache["populated"] = False
+    _LOG.info("[SCHEMA] Cache invalidated — next query will rebuild")
 
 # ─── Shared helpers (imported lazily from network_analytics) ─────────────────
 
@@ -641,602 +650,617 @@ def ai_query():
     _t_total = time.time()
     _t0 = time.time()
 
-    # ── Dynamic KPI name discovery (no hardcoded values) ──────────────────────
-    # Discovers actual KPI names from the live database so the chatbot works
-    # with any uploaded dataset without requiring code changes.
-    _kpi_names_list = []
-    try:
-        _kn = _sql(
-            "SELECT DISTINCT kpi_name FROM mv_daily_site_kpi "
-            "ORDER BY kpi_name LIMIT 100"
-        )
-        _kpi_names_list = [r['kpi_name'] for r in _kn if r.get('kpi_name')]
-    except Exception:
-        pass
-    if not _kpi_names_list:
+    _schema_hit = (
+        _schema_hint_cache["hint"] is not None
+        and time.time() - _schema_hint_cache["ts"] < _SCHEMA_HINT_TTL
+    )
+
+    if _schema_hit:
+        SCHEMA_HINT = _schema_hint_cache["hint"]
+        _available_tables = _schema_cache.get("available_tables", set())
+        _LOG.debug("[SCHEMA_HINT] Cache HIT - skipping discovery")
+    else:
+        _LOG.debug("[SCHEMA_HINT] Cache MISS - rebuilding from DB")
+        # ── Dynamic KPI name discovery (no hardcoded values) ──────────────────────
+        # Discovers actual KPI names from the live database so the chatbot works
+        # with any uploaded dataset without requiring code changes.
+        _kpi_names_list = []
         try:
             _kn = _sql(
-                "SELECT DISTINCT kpi_name FROM kpi_data "
-                "WHERE data_level = 'site' AND kpi_name IS NOT NULL "
+                "SELECT DISTINCT kpi_name FROM mv_daily_site_kpi "
                 "ORDER BY kpi_name LIMIT 100"
             )
             _kpi_names_list = [r['kpi_name'] for r in _kn if r.get('kpi_name')]
         except Exception:
             pass
-
-    SCHEMA_HINT = """
-=== FAST MATERIALIZED VIEWS — USE THESE AS PRIMARY QUERY TARGETS ===
-These views are pre-aggregated and 10-100x faster than querying raw kpi_data.
-
-mv_daily_site_kpi(site_id TEXT, kpi_name TEXT, date DATE,
-                  avg_value FLOAT, min_value FLOAT, max_value FLOAT, sample_count INT)
-  Daily KPI averages per site. Use for: trends, top-N, comparisons, threshold queries.
-  JOIN telecom_sites ts ON LOWER(mv.site_id) = LOWER(ts.site_id) for zone/city/location.
-  Example: SELECT site_id, avg_value FROM mv_daily_site_kpi
-           WHERE kpi_name = '...' AND date >= CURRENT_DATE - INTERVAL '30 days'
-           ORDER BY avg_value DESC LIMIT 20
-
-mv_zone_daily_kpi(zone TEXT, kpi_name TEXT, date DATE, avg_val FLOAT, site_count INT)
-  Daily zone-level KPI averages. Use for zone trends and comparisons over time.
-  No JOIN needed for zone questions.
-  Example: SELECT zone, AVG(avg_val) FROM mv_zone_daily_kpi
-           WHERE kpi_name = '...' AND date >= CURRENT_DATE - INTERVAL '30 days'
-           GROUP BY zone ORDER BY AVG(avg_val) DESC LIMIT 20
-
-mv_zone_kpi_summary(zone TEXT, kpi_name TEXT,
-                    avg_value FLOAT, min_value FLOAT, max_value FLOAT, site_count INT)
-  All-time zone aggregate (no date column). Use for zone snapshots when date is not needed.
-
-MANDATORY QUERY RULES (violating these causes slow or empty results):
-1. ALWAYS prefer mv_daily_site_kpi over kpi_data for any site-level KPI query.
-2. ALWAYS add a date filter: date >= CURRENT_DATE - INTERVAL '30 days' (or shorter).
-3. ALWAYS add LIMIT 1000 to every query.
-4. Only use raw kpi_data for HOURLY data (WHERE hour = X) or cell-level data.
-5. For zone trends over time: use mv_zone_daily_kpi.
-   For zone snapshot (no time): use mv_zone_kpi_summary.
-
-======================================================================
-Tables (FALLBACK — use kpi_data only when MVs unavailable or hourly/cell data needed):
-1. kpi_data(id, site_id, kpi_name, value, date, hour, data_level, cell_id, cell_site_id)
-   - data_level = 'site' for site-level, 'cell' for cell-level
-   - kpi_name is CASE-SENSITIVE. Exact strings are in the "RAN KPI Names" section (discovered at runtime).
-   - For fuzzy matching use ILIKE: WHERE kpi_name ILIKE '%drop%'
-
-2. telecom_sites(site_id, cell_id, latitude, longitude, zone, city, state, technology, site_status, alarms)
-   - JOIN with kpi_data: kpi_data k JOIN telecom_sites ts ON k.site_id = ts.site_id
-   - zone = cluster/region name, city = city name, state = state name
-   - technology = 'LTE', '4G', '5G', etc.
-   - site_status = 'on_air' or 'off_air'
-
-3. flexible_kpi_uploads — EAV (Entity-Attribute-Value) table for Core and Revenue data
-   Columns: id, kpi_type, site_id, column_name, column_type, num_value, str_value
-   - This is NOT a flat table. Each ROW stores ONE metric for ONE site.
-   - column_type = 'numeric' → value is in num_value column
-   - column_type = 'text'    → value is in str_value column
-   - Alias the table as f: FROM flexible_kpi_uploads f
-
-   === Revenue data (kpi_type = 'revenue') ===
-   column_name values for revenue:
-     'subscribers'      — subscriber count per site (numeric)
-     'revenue_jan_l'    — January revenue in Lakhs (numeric)
-     'revenue_feb_l'    — February revenue in Lakhs (numeric)
-     'revenue_mar_l'    — March revenue in Lakhs (numeric)
-     'revenue_total'    — TOTAL revenue (sum of all months, numeric) — USE THIS for total revenue queries
-     'opex_jan_l'       — January OPEX in Lakhs (numeric)
-     'opex_feb_l'       — February OPEX in Lakhs (numeric)
-     'opex_mar_l'       — March OPEX in Lakhs (numeric)
-     'opex_total'       — TOTAL OPEX (sum of all months, numeric) — USE THIS for total OPEX queries
-     'difference'       — Revenue minus OPEX (numeric)
-     'zone'             — geographic zone (text, in str_value)
-     'technology'       — technology type (text, in str_value)
-     'site_category'    — site classification (text, in str_value)
-
-   IMPORTANT: column_name values may have mixed casing (e.g. 'Subscribers', 'Revenue_Jan_L').
-   ALWAYS use ILIKE (case-insensitive) for column_name matching, NEVER use = or LIKE.
-   IMPORTANT: For total revenue, use 'revenue_total' directly — do NOT SUM all revenue columns
-              (that would double-count because revenue_total = jan + feb + mar).
-
-   Example: Get total revenue per site (use revenue_total, NOT SUM of monthly):
-     SELECT f.site_id, f.num_value AS total_revenue
-     FROM flexible_kpi_uploads f
-     WHERE f.kpi_type = 'revenue'
-       AND f.column_name ILIKE '%revenue_total%' AND f.column_type = 'numeric'
-     ORDER BY total_revenue DESC
-
-   Example: Get subscribers for a specific site:
-     SELECT f.site_id, f.num_value AS subscribers
-     FROM flexible_kpi_uploads f
-     WHERE f.kpi_type = 'revenue' AND f.column_name ILIKE '%subscriber%'
-       AND f.site_id = 'GUR_LTE_1500'
-
-   Example: Get revenue for a specific month (March):
-     SELECT f.site_id, f.num_value AS revenue_mar
-     FROM flexible_kpi_uploads f
-     WHERE f.kpi_type = 'revenue' AND f.column_name ILIKE '%revenue%mar%'
-
-   Example: Compare revenue vs OPEX for a site:
-     SELECT f.site_id, f.column_name, f.num_value
-     FROM flexible_kpi_uploads f
-     WHERE f.kpi_type = 'revenue'
-       AND (f.column_name ILIKE '%revenue%' OR f.column_name ILIKE '%opex%')
-       AND f.site_id = 'GUR_LTE_1500'
-
-   === Core KPI data (kpi_type = 'core') ===
-   IMPORTANT: Core data uses kpi_name (NOT column_name) for the metric type.
-   kpi_name values: 'Authentication Success Rate', 'CPU Utilization', 'Attach Success Rate', 'PDP Bearer Setup Success Rate'
-   column_name contains DATES (e.g., '2026_03_07_000000'), num_value contains the metric value.
-   ALWAYS use ILIKE for kpi_name matching.
-
-   Example: Get average core KPIs per site:
-     SELECT f.site_id,
-       AVG(CASE WHEN f.kpi_name ILIKE '%auth%' THEN f.num_value END) AS auth_sr,
-       AVG(CASE WHEN f.kpi_name ILIKE '%cpu%' THEN f.num_value END) AS cpu_util,
-       AVG(CASE WHEN f.kpi_name ILIKE '%attach%' THEN f.num_value END) AS attach_sr,
-       AVG(CASE WHEN f.kpi_name ILIKE '%pdp%' THEN f.num_value END) AS pdp_sr
-     FROM flexible_kpi_uploads f
-     WHERE f.kpi_type = 'core' AND f.column_type = 'numeric'
-     GROUP BY f.site_id
-
-=== Natural Language → Data Source Mapping ===
-For RAN KPI queries (any network performance metric):
-  → Use mv_daily_site_kpi (preferred for site/daily data) or kpi_data (for hourly/cell data).
-  → Match kpi_name with ILIKE for concept search: WHERE kpi_name ILIKE '%drop%'
-  → For exact names check the "RAN KPI Names" section (discovered from live database above).
-User asks about revenue / income / OPEX / subscribers / ARPU:
-  → revenue_data (flat table) OR flexible_kpi_uploads WHERE kpi_type = 'revenue'
-User asks about core network / authentication / CPU / attach / PDP bearer:
-  → core_kpi_data (flat) OR flexible_kpi_uploads WHERE kpi_type = 'core'
-User asks about transport / backhaul / microwave / jitter / packet loss / link utilization:
-  → transport_kpi_data table
-User asks about network issues / worst cells / AI tickets / open tickets:
-  → network_issue_tickets table
-User asks about site info / location / zone / city / state / status / alarms:
-  → telecom_sites table
-Time references:
-  "last 7 days" / "last week" → INTERVAL '7 days'
-  "last month" / "30 days"    → INTERVAL '30 days'
-  "last year"                 → INTERVAL '365 days'
-ALWAYS add AND k.date <= CURRENT_DATE when any date range is used, to exclude future data.
-
-4. transport_kpi_data — Transport/backhaul network KPI data
-   NOTE: Actual columns are discovered at runtime — see "ACTUAL COLUMNS in transport_kpi_data" section below.
-   Typical columns: site_id, zone, backhaul_type, link_capacity, avg_util, peak_util,
-            packet_loss, avg_latency, jitter, availability, error_rate, tput_efficiency, alarms
-   Do NOT assume specific column names — use ONLY the columns listed in the runtime discovery section.
-
-   Example: Get transport KPIs for a site:
-     SELECT t.* FROM transport_kpi_data t WHERE t.site_id = 'GUR_LTE_1500'
-
-5. core_kpi_data — Core network KPIs with date (flat table, NOT EAV)
-   NOTE: Actual columns are discovered at runtime — see "ACTUAL COLUMNS in core_kpi_data" section below.
-   Typical columns: site_id, date, auth_sr, cpu_util, attach_sr, pdp_sr
-   Do NOT assume specific column names — use ONLY the columns listed in the runtime discovery section.
-   If the runtime section is not present, fall back to flexible_kpi_uploads with kpi_type='core'.
-
-   Example: Core KPIs for a site over time:
-     SELECT c.* FROM core_kpi_data c WHERE c.site_id = 'GUR_LTE_1500' ORDER BY c.date
-
-6. revenue_data — Revenue per site (flat table, one row per site)
-   NOTE: Actual columns are discovered at runtime — see "ACTUAL COLUMNS in revenue_data" section below.
-   The table may have monthly revenue columns (like rev_jan, rev_feb, ...) and OPEX columns.
-   Do NOT assume specific column names — use ONLY the columns listed in the runtime discovery section.
-   If the runtime section is not present, fall back to flexible_kpi_uploads with kpi_type='revenue'.
-
-7. network_issue_tickets — Auto-generated tickets for worst-performing cells
-   NOTE: Actual columns are discovered at runtime — see "ACTUAL COLUMNS in network_issue_tickets" section below.
-   Typical columns: site_id, cells_affected, category, priority, priority_score, sla_hours,
-            avg_drop_rate, avg_cssr, avg_tput, violations, status, zone, location,
-            assigned_agent, root_cause, recommendation, created_at
-   Do NOT assume specific column names — use ONLY the columns listed in the runtime discovery section.
-
-   Example: Open network issue tickets:
-     SELECT n.* FROM network_issue_tickets n WHERE n.status IN ('open','in_progress') ORDER BY n.priority_score DESC
-
-8. site_kpi_summary — ML-categorized pre-aggregated daily KPI summary per site
-   Columns: site_id, date, kpi_name, avg_value, min_value, max_value, stddev_value, sample_count,
-            health_label, health_confidence, is_anomaly, anomaly_score, site_tier, health_score, zone
-   - health_label = 'healthy', 'degraded', or 'critical' (ML K-Means per KPI)
-   - is_anomaly = true/false (ML Isolation Forest outlier detection)
-   - site_tier = 'top_performer', 'good', 'average', or 'underperformer' (ML K-Means multi-KPI)
-   - health_score = 0-100 composite score (higher = healthier)
-   - health_confidence = 0-1 (how confident the ML model is in the health_label)
-   - anomaly_score = negative float (more negative = more anomalous)
-
-   USE THIS TABLE for questions about:
-   - site health, performance categories, degraded/critical sites
-   - anomalies, outliers, unusual behavior
-   - site rankings, top/worst performers, performance tiers
-   - health scores, health trends over time
-   - comparing site performance across zones
-
-   Example: Get worst-performing sites today:
-     SELECT s.site_id, s.zone, s.health_score, s.site_tier, s.health_label, s.kpi_name, s.avg_value
-     FROM site_kpi_summary s
-     WHERE s.date = (SELECT MAX(date) FROM site_kpi_summary)
-       AND s.health_label = 'critical'
-     ORDER BY s.health_score ASC LIMIT 20
-
-   Example: Anomalies detected in last 7 days:
-     SELECT s.site_id, s.date::text, s.kpi_name, s.avg_value, s.anomaly_score, s.health_label
-     FROM site_kpi_summary s
-     WHERE s.is_anomaly = true
-       AND s.date >= (SELECT MAX(date) FROM site_kpi_summary) - INTERVAL '7 days'
-     ORDER BY s.anomaly_score ASC LIMIT 50
-
-   Example: Site health trend over time:
-     SELECT s.date::text, s.health_score, s.health_label
-     FROM site_kpi_summary s
-     WHERE s.site_id = 'GUR_LTE_1500' AND s.kpi_name = 'E-RAB Call Drop Rate_1'
-     ORDER BY s.date LIMIT 30
-
-   Example: Zone-wise health comparison:
-     SELECT s.zone, s.kpi_name,
-            AVG(s.health_score) AS avg_health,
-            COUNT(*) FILTER (WHERE s.health_label = 'critical') AS critical_count,
-            COUNT(*) FILTER (WHERE s.is_anomaly = true) AS anomaly_count
-     FROM site_kpi_summary s
-     WHERE s.date = (SELECT MAX(date) FROM site_kpi_summary)
-     GROUP BY s.zone, s.kpi_name
-     ORDER BY avg_health ASC LIMIT 30
-
-   Example: Top performing sites:
-     SELECT s.site_id, s.zone, AVG(s.health_score) AS avg_health, s.site_tier
-     FROM site_kpi_summary s
-     WHERE s.date >= (SELECT MAX(date) FROM site_kpi_summary) - INTERVAL '7 days'
-     GROUP BY s.site_id, s.zone, s.site_tier
-     HAVING s.site_tier = 'top_performer'
-     ORDER BY avg_health DESC LIMIT 20
-
-=== TABLE SELECTION RULE ===
-- Health/performance categories, anomalies, site tiers, rankings → query site_kpi_summary table (PREFERRED for categorized insights)
-- RAN performance KPIs (raw values, specific hours, cell-level) → query kpi_data table
-- Revenue, OPEX, subscribers, ARPU → query revenue_data table FIRST; fallback to flexible_kpi_uploads with kpi_type='revenue'
-- Core network KPIs (authentication, CPU, attach, PDP) → query core_kpi_data table FIRST; fallback to flexible_kpi_uploads with kpi_type='core'
-- Transport/backhaul KPIs (link capacity, jitter, packet loss, backhaul) → query transport_kpi_data table
-- Network issue tickets (worst cells, AI tickets, open issues) → query network_issue_tickets table
-- Site info (zone, city, state, technology, location) → query telecom_sites table
-NEVER query kpi_data for revenue/subscriber/OPEX data — it does not exist there.
-If a table returns 0 rows, try the alternative table (e.g., revenue_data → flexible_kpi_uploads).
-
-=== WHEN TO USE site_kpi_summary vs kpi_data ===
-PREFER site_kpi_summary when the user asks about:
-- "healthy", "degraded", "critical" sites/KPIs
-- "anomalies", "outliers", "unusual" readings
-- "top performers", "worst sites", "underperformers", site "tiers"
-- "health score", "performance score"
-- general aggregated trends (daily averages)
-- zone-level comparisons
-PREFER kpi_data when the user asks about:
-- hourly data, specific hours of the day
-- cell-level data (data_level = 'cell')
-- raw unaggregated values
-- data that may not yet be in the summary (just uploaded)
-
-=== CRITICAL: column_name matching in flexible_kpi_uploads ===
-Column names may have MIXED CASING (e.g., 'Subscribers', 'Revenue_Jan_L', 'OPEX_Feb (L)').
-ALWAYS use ILIKE for column_name matching:
-  CORRECT: f.column_name ILIKE '%revenue%'
-  WRONG:   f.column_name LIKE 'revenue%'  -- case-sensitive, will miss 'Revenue_Jan'
-  WRONG:   f.column_name = 'subscribers'   -- exact match, will miss 'Subscribers'
-"""
-
-    # ── Inject discovered KPI names (replaces hardcoded list) ─────────────────
-    if _kpi_names_list:
-        _kpi_section = "\n=== RAN KPI Names (discovered from live database — EXACT strings) ===\n"
-        _kpi_section += "These are the ACTUAL kpi_name values in your database, discovered at runtime.\n"
-        _kpi_section += "kpi_name is CASE-SENSITIVE. Copy exactly, or use ILIKE for fuzzy: kpi_name ILIKE '%drop%'\n"
-        for _k in _kpi_names_list:
-            _kpi_section += f"  '{_k}'\n"
-        SCHEMA_HINT += _kpi_section
-
-    # ── Dynamic table availability — tell LLM which tables actually exist ──
-    try:
-        _tbl_rows = _sql(
-            "SELECT table_name FROM information_schema.tables "
-            "WHERE table_schema = 'public' AND table_name IN "
-            "('revenue_data','core_kpi_data','transport_kpi_data',"
-            "'network_issue_tickets','flexible_kpi_uploads','kpi_data','telecom_sites',"
-            "'site_kpi_summary')"
-        )
-        _available_tables = {r['table_name'] for r in _tbl_rows}
-    except Exception:
-        _available_tables = set()
-
-    _tbl_note = "\n=== AVAILABLE TABLES (real-time, checked just now) ===\n"
-    for _tn, _fb in [
-        ('kpi_data', None),
-        ('telecom_sites', None),
-        ('site_kpi_summary', "kpi_data (raw, no ML categories)"),
-        ('revenue_data', "flexible_kpi_uploads WHERE kpi_type='revenue'"),
-        ('core_kpi_data', "flexible_kpi_uploads WHERE kpi_type='core'"),
-        ('transport_kpi_data', None),
-        ('network_issue_tickets', None),
-        ('flexible_kpi_uploads', None),
-    ]:
-        if _tn in _available_tables:
-            _tbl_note += f"  {_tn}: EXISTS — use it\n"
-        elif _fb:
-            _tbl_note += f"  {_tn}: DOES NOT EXIST — use {_fb} instead\n"
-        else:
-            _tbl_note += f"  {_tn}: DOES NOT EXIST — data not uploaded yet\n"
-    SCHEMA_HINT += _tbl_note
-
-    # ── Materialized view availability — query pg_matviews (MVs don't appear in information_schema) ──
-    try:
-        _mv_status_rows = _sql(
-            "SELECT matviewname FROM pg_matviews "
-            "WHERE schemaname = 'public' AND matviewname IN "
-            "('mv_daily_site_kpi','mv_zone_daily_kpi','mv_zone_kpi_summary','kpi_data_merged')"
-        )
-        _mv_ready = {r['matviewname'] for r in _mv_status_rows}
-    except Exception:
-        _mv_ready = set()
-    _mv_note = "\n=== MATERIALIZED VIEW STATUS (fast pre-aggregated tables) ===\n"
-    for _mvn in ['mv_daily_site_kpi', 'mv_zone_daily_kpi', 'mv_zone_kpi_summary', 'kpi_data_merged']:
-        if _mvn in _mv_ready:
-            _mv_note += f"  {_mvn}: READY — use this\n"
-        else:
-            _mv_note += f"  {_mvn}: NOT YET CREATED — fall back to kpi_data\n"
-    SCHEMA_HINT += _mv_note
-
-    # ── Dynamic revenue column discovery — tell LLM the EXACT column names ──
-    if 'flexible_kpi_uploads' in _available_tables:
-        try:
-            _rev_cols = _sql(
-                "SELECT DISTINCT column_name, column_type "
-                "FROM flexible_kpi_uploads WHERE kpi_type = 'revenue' "
-                "ORDER BY column_name LIMIT 40"
-            )
-            if _rev_cols:
-                _rcn = "\n=== ACTUAL COLUMN NAMES in flexible_kpi_uploads (kpi_type='revenue') ===\n"
-                _rcn += "These are the REAL column_name values — use these EXACT values in queries.\n"
-                _rcn += "IMPORTANT: ALWAYS use ILIKE (not LIKE or =) for column_name matching.\n"
-                for _rc in _rev_cols:
-                    _rcn += f"  '{_rc['column_name']}' ({_rc['column_type']})\n"
-                _rcn += "Example: WHERE f.column_name ILIKE '%revenue%' (not LIKE or =)\n"
-                _rcn += "Example: WHERE f.column_name ILIKE '%subscriber%' (not = 'subscribers')\n"
-                SCHEMA_HINT += _rcn
-        except Exception:
-            pass
-
-    # ── Dynamic schema discovery → populate module-level _schema_cache ──
-    global _schema_cache
-    _schema_cache["available_tables"] = _available_tables
-    _LOG.info("[DISCOVERY] Available tables: %s", _available_tables)
-
-    if 'revenue_data' in _available_tables:
-        try:
-            _rdc = _sql(
-                "SELECT column_name FROM information_schema.columns "
-                "WHERE table_schema = 'public' AND table_name = 'revenue_data' "
-                "AND column_name NOT IN ('id', 'uploaded_at') "
-                "ORDER BY ordinal_position"
-            )
-            _schema_cache["rev_data_cols"] = [r['column_name'] for r in _rdc]
-            _skip = {'id', 'uploaded_at', 'site_id', 'zone', 'technology', 'site_category', 'subscribers'}
-            _schema_cache["rev_rev_cols"] = [c for c in _schema_cache["rev_data_cols"] if 'rev' in c.lower() and c.lower() not in _skip]
-            _schema_cache["rev_opex_cols"] = [c for c in _schema_cache["rev_data_cols"] if 'opex' in c.lower()]
-            _schema_cache["rev_has_subscribers"] = any(c.lower() == 'subscribers' for c in _schema_cache["rev_data_cols"])
-            if _schema_cache["rev_data_cols"]:
-                _rds = "\n=== ACTUAL COLUMNS in revenue_data table (discovered at runtime) ===\n"
-                _rds += f"  All columns: {', '.join(_schema_cache['rev_data_cols'])}\n"
-                if _schema_cache["rev_rev_cols"]:
-                    _rds += f"  Revenue columns: {', '.join(_schema_cache['rev_rev_cols'])}\n"
-                    _total_ex = ' + '.join(f'COALESCE(r.{c},0)' for c in _schema_cache["rev_rev_cols"])
-                    _rds += f"  Total revenue: SELECT r.site_id, ({_total_ex}) AS total_revenue FROM revenue_data r\n"
-                if _schema_cache["rev_opex_cols"]:
-                    _rds += f"  OPEX columns: {', '.join(_schema_cache['rev_opex_cols'])}\n"
-                if _schema_cache["rev_has_subscribers"]:
-                    _rds += "  Subscribers column: subscribers\n"
-                _rds += "Use ONLY these column names — they are the real ones from the database.\n"
-                SCHEMA_HINT += _rds
-        except Exception:
-            pass
-
-    if 'core_kpi_data' in _available_tables:
-        try:
-            _cdc = _sql(
-                "SELECT column_name FROM information_schema.columns "
-                "WHERE table_schema = 'public' AND table_name = 'core_kpi_data' "
-                "AND column_name NOT IN ('id', 'uploaded_at') "
-                "ORDER BY ordinal_position"
-            )
-            _schema_cache["core_data_cols"] = [r['column_name'] for r in _cdc]
-            _core_skip = {'id', 'uploaded_at', 'site_id', 'date', 'zone', 'city', 'state'}
-            _schema_cache["core_metric_cols"] = [c for c in _schema_cache["core_data_cols"] if c.lower() not in _core_skip]
-            if _schema_cache["core_data_cols"]:
-                _cds = "\n=== ACTUAL COLUMNS in core_kpi_data table (discovered at runtime) ===\n"
-                _cds += f"  All columns: {', '.join(_schema_cache['core_data_cols'])}\n"
-                if _schema_cache["core_metric_cols"]:
-                    _cds += f"  Metric columns: {', '.join(_schema_cache['core_metric_cols'])}\n"
-                    _cds += f"  Example: SELECT c.site_id, c.date::text, {', '.join('c.' + c for c in _schema_cache['core_metric_cols'][:4])} FROM core_kpi_data c\n"
-                _cds += "Use ONLY these column names — they are the real ones from the database.\n"
-                SCHEMA_HINT += _cds
-        except Exception:
-            pass
-
-    if 'transport_kpi_data' in _available_tables:
-        try:
-            _tdc = _sql(
-                "SELECT column_name FROM information_schema.columns "
-                "WHERE table_schema = 'public' AND table_name = 'transport_kpi_data' "
-                "AND column_name NOT IN ('id', 'uploaded_at') "
-                "ORDER BY ordinal_position"
-            )
-            _schema_cache["transport_data_cols"] = [r['column_name'] for r in _tdc]
-            _transport_skip = {'id', 'uploaded_at', 'site_id', 'zone'}
-            _schema_cache["transport_metric_cols"] = [c for c in _schema_cache["transport_data_cols"]
-                                                       if c.lower() not in _transport_skip
-                                                       and c.lower() != 'backhaul_type']
-            if _schema_cache["transport_data_cols"]:
-                _tds = "\n=== ACTUAL COLUMNS in transport_kpi_data table (discovered at runtime) ===\n"
-                _tds += f"  All columns: {', '.join(_schema_cache['transport_data_cols'])}\n"
-                if _schema_cache["transport_metric_cols"]:
-                    _tds += f"  Metric columns: {', '.join(_schema_cache['transport_metric_cols'])}\n"
-                _tds += "Use ONLY these column names — they are the real ones from the database.\n"
-                SCHEMA_HINT += _tds
-        except Exception:
-            pass
-
-    if 'network_issue_tickets' in _available_tables:
-        try:
-            _ntc = _sql(
-                "SELECT column_name FROM information_schema.columns "
-                "WHERE table_schema = 'public' AND table_name = 'network_issue_tickets' "
-                "AND column_name NOT IN ('id') "
-                "ORDER BY ordinal_position"
-            )
-            _schema_cache["ticket_cols"] = [r['column_name'] for r in _ntc]
-            if _schema_cache["ticket_cols"]:
-                _nts = "\n=== ACTUAL COLUMNS in network_issue_tickets table (discovered at runtime) ===\n"
-                _nts += f"  All columns: {', '.join(_schema_cache['ticket_cols'])}\n"
-                _nts += "Use ONLY these column names — they are the real ones from the database.\n"
-                SCHEMA_HINT += _nts
-        except Exception:
-            pass
-
-    # ── Data freshness — discover actual max date in kpi_data ──
-    # Many KPIs may lag behind CURRENT_DATE. Using CURRENT_DATE in WHERE clauses
-    # would return 0 rows. We discover the actual max date and use it as reference.
-    if 'kpi_data' in _available_tables:
-        try:
-            _date_info = _sql(
-                "SELECT MAX(date)::text AS max_date FROM kpi_data WHERE data_level = 'site'"
-            )
-            if _date_info and _date_info[0].get('max_date'):
-                _schema_cache["kpi_max_date"] = _date_info[0]['max_date']
-                # Also get the "main" max date (excluding KPIs that may have future/synthetic data)
-                _main_dates = _sql(
-                    "SELECT MAX(date)::text AS max_date FROM kpi_data "
-                    "WHERE data_level = 'site' AND kpi_name NOT IN ('Site Revenue','Site Users')"
+        if not _kpi_names_list:
+            try:
+                _kn = _sql(
+                    "SELECT DISTINCT kpi_name FROM kpi_data "
+                    "WHERE data_level = 'site' AND kpi_name IS NOT NULL "
+                    "ORDER BY kpi_name LIMIT 100"
                 )
-                if _main_dates and _main_dates[0].get('max_date'):
-                    _schema_cache["kpi_max_date_recent"] = _main_dates[0]['max_date']
-                else:
-                    _schema_cache["kpi_max_date_recent"] = _schema_cache["kpi_max_date"]
-            _LOG.info("[DISCOVERY] kpi_max_date=%s kpi_max_date_recent=%s",
-                      _schema_cache["kpi_max_date"], _schema_cache["kpi_max_date_recent"])
-            # Tell LLM about the actual date range so it doesn't use CURRENT_DATE blindly
-            if _schema_cache["kpi_max_date_recent"]:
-                _date_hint = f"\n=== DATA FRESHNESS (CRITICAL — read carefully) ===\n"
-                _date_hint += f"The LATEST date with RAN KPI data is: {_schema_cache['kpi_max_date_recent']}\n"
-                _date_hint += f"Today's date is: {datetime.now().strftime('%Y-%m-%d')}\n"
-                _date_hint += "IMPORTANT: If these dates differ, the data is NOT up-to-date.\n"
-                _date_hint += f"Use '{_schema_cache['kpi_max_date_recent']}'::date instead of CURRENT_DATE as the end date.\n"
-                _date_hint += f"Example: AND k.date >= '{_schema_cache['kpi_max_date_recent']}'::date - INTERVAL '7 days' "
-                _date_hint += f"AND k.date <= '{_schema_cache['kpi_max_date_recent']}'::date\n"
-                _date_hint += "NEVER use CURRENT_DATE if it is more recent than the latest data date.\n"
-                SCHEMA_HINT += _date_hint
-        except Exception as e:
-            _LOG.warning("[DISCOVERY] Failed to get kpi_data date range: %s", e)
+                _kpi_names_list = [r['kpi_name'] for r in _kn if r.get('kpi_name')]
+            except Exception:
+                pass
 
-    # ── KPI value ranges — inject actual min/avg/median/max so LLM knows realistic thresholds ──
-    # Without this, the LLM has no idea if "< 8 Mbps" is a tight or loose filter,
-    # leading to threshold queries that confidently return 0 rows with no explanation.
-    if 'kpi_data' in _available_tables:
+        SCHEMA_HINT = """
+    === FAST MATERIALIZED VIEWS — USE THESE AS PRIMARY QUERY TARGETS ===
+    These views are pre-aggregated and 10-100x faster than querying raw kpi_data.
+
+    mv_daily_site_kpi(site_id TEXT, kpi_name TEXT, date DATE,
+                      avg_value FLOAT, min_value FLOAT, max_value FLOAT, sample_count INT)
+      Daily KPI averages per site. Use for: trends, top-N, comparisons, threshold queries.
+      JOIN telecom_sites ts ON LOWER(mv.site_id) = LOWER(ts.site_id) for zone/city/location.
+      Example: SELECT site_id, avg_value FROM mv_daily_site_kpi
+               WHERE kpi_name = '...' AND date >= CURRENT_DATE - INTERVAL '30 days'
+               ORDER BY avg_value DESC LIMIT 20
+
+    mv_zone_daily_kpi(zone TEXT, kpi_name TEXT, date DATE, avg_val FLOAT, site_count INT)
+      Daily zone-level KPI averages. Use for zone trends and comparisons over time.
+      No JOIN needed for zone questions.
+      Example: SELECT zone, AVG(avg_val) FROM mv_zone_daily_kpi
+               WHERE kpi_name = '...' AND date >= CURRENT_DATE - INTERVAL '30 days'
+               GROUP BY zone ORDER BY AVG(avg_val) DESC LIMIT 20
+
+    mv_zone_kpi_summary(zone TEXT, kpi_name TEXT,
+                        avg_value FLOAT, min_value FLOAT, max_value FLOAT, site_count INT)
+      All-time zone aggregate (no date column). Use for zone snapshots when date is not needed.
+
+    MANDATORY QUERY RULES (violating these causes slow or empty results):
+    1. ALWAYS prefer mv_daily_site_kpi over kpi_data for any site-level KPI query.
+    2. ALWAYS add a date filter: date >= CURRENT_DATE - INTERVAL '30 days' (or shorter).
+    3. ALWAYS add LIMIT 1000 to every query.
+    4. Only use raw kpi_data for HOURLY data (WHERE hour = X) or cell-level data.
+    5. For zone trends over time: use mv_zone_daily_kpi.
+       For zone snapshot (no time): use mv_zone_kpi_summary.
+
+    ======================================================================
+    Tables (FALLBACK — use kpi_data only when MVs unavailable or hourly/cell data needed):
+    1. kpi_data(id, site_id, kpi_name, value, date, hour, data_level, cell_id, cell_site_id)
+       - data_level = 'site' for site-level, 'cell' for cell-level
+       - kpi_name is CASE-SENSITIVE. Exact strings are in the "RAN KPI Names" section (discovered at runtime).
+       - For fuzzy matching use ILIKE: WHERE kpi_name ILIKE '%drop%'
+
+    2. telecom_sites(site_id, cell_id, latitude, longitude, zone, city, state, technology, site_status, alarms)
+       - JOIN with kpi_data: kpi_data k JOIN telecom_sites ts ON k.site_id = ts.site_id
+       - zone = cluster/region name, city = city name, state = state name
+       - technology = 'LTE', '4G', '5G', etc.
+       - site_status = 'on_air' or 'off_air'
+
+    3. flexible_kpi_uploads — EAV (Entity-Attribute-Value) table for Core and Revenue data
+       Columns: id, kpi_type, site_id, column_name, column_type, num_value, str_value
+       - This is NOT a flat table. Each ROW stores ONE metric for ONE site.
+       - column_type = 'numeric' → value is in num_value column
+       - column_type = 'text'    → value is in str_value column
+       - Alias the table as f: FROM flexible_kpi_uploads f
+
+       === Revenue data (kpi_type = 'revenue') ===
+       column_name values for revenue:
+         'subscribers'      — subscriber count per site (numeric)
+         'revenue_jan_l'    — January revenue in Lakhs (numeric)
+         'revenue_feb_l'    — February revenue in Lakhs (numeric)
+         'revenue_mar_l'    — March revenue in Lakhs (numeric)
+         'revenue_total'    — TOTAL revenue (sum of all months, numeric) — USE THIS for total revenue queries
+         'opex_jan_l'       — January OPEX in Lakhs (numeric)
+         'opex_feb_l'       — February OPEX in Lakhs (numeric)
+         'opex_mar_l'       — March OPEX in Lakhs (numeric)
+         'opex_total'       — TOTAL OPEX (sum of all months, numeric) — USE THIS for total OPEX queries
+         'difference'       — Revenue minus OPEX (numeric)
+         'zone'             — geographic zone (text, in str_value)
+         'technology'       — technology type (text, in str_value)
+         'site_category'    — site classification (text, in str_value)
+
+       IMPORTANT: column_name values may have mixed casing (e.g. 'Subscribers', 'Revenue_Jan_L').
+       ALWAYS use ILIKE (case-insensitive) for column_name matching, NEVER use = or LIKE.
+       IMPORTANT: For total revenue, use 'revenue_total' directly — do NOT SUM all revenue columns
+                  (that would double-count because revenue_total = jan + feb + mar).
+
+       Example: Get total revenue per site (use revenue_total, NOT SUM of monthly):
+         SELECT f.site_id, f.num_value AS total_revenue
+         FROM flexible_kpi_uploads f
+         WHERE f.kpi_type = 'revenue'
+           AND f.column_name ILIKE '%revenue_total%' AND f.column_type = 'numeric'
+         ORDER BY total_revenue DESC
+
+       Example: Get subscribers for a specific site:
+         SELECT f.site_id, f.num_value AS subscribers
+         FROM flexible_kpi_uploads f
+         WHERE f.kpi_type = 'revenue' AND f.column_name ILIKE '%subscriber%'
+           AND f.site_id = 'GUR_LTE_1500'
+
+       Example: Get revenue for a specific month (March):
+         SELECT f.site_id, f.num_value AS revenue_mar
+         FROM flexible_kpi_uploads f
+         WHERE f.kpi_type = 'revenue' AND f.column_name ILIKE '%revenue%mar%'
+
+       Example: Compare revenue vs OPEX for a site:
+         SELECT f.site_id, f.column_name, f.num_value
+         FROM flexible_kpi_uploads f
+         WHERE f.kpi_type = 'revenue'
+           AND (f.column_name ILIKE '%revenue%' OR f.column_name ILIKE '%opex%')
+           AND f.site_id = 'GUR_LTE_1500'
+
+       === Core KPI data (kpi_type = 'core') ===
+       IMPORTANT: Core data uses kpi_name (NOT column_name) for the metric type.
+       kpi_name values: 'Authentication Success Rate', 'CPU Utilization', 'Attach Success Rate', 'PDP Bearer Setup Success Rate'
+       column_name contains DATES (e.g., '2026_03_07_000000'), num_value contains the metric value.
+       ALWAYS use ILIKE for kpi_name matching.
+
+       Example: Get average core KPIs per site:
+         SELECT f.site_id,
+           AVG(CASE WHEN f.kpi_name ILIKE '%auth%' THEN f.num_value END) AS auth_sr,
+           AVG(CASE WHEN f.kpi_name ILIKE '%cpu%' THEN f.num_value END) AS cpu_util,
+           AVG(CASE WHEN f.kpi_name ILIKE '%attach%' THEN f.num_value END) AS attach_sr,
+           AVG(CASE WHEN f.kpi_name ILIKE '%pdp%' THEN f.num_value END) AS pdp_sr
+         FROM flexible_kpi_uploads f
+         WHERE f.kpi_type = 'core' AND f.column_type = 'numeric'
+         GROUP BY f.site_id
+
+    === Natural Language → Data Source Mapping ===
+    For RAN KPI queries (any network performance metric):
+      → Use mv_daily_site_kpi (preferred for site/daily data) or kpi_data (for hourly/cell data).
+      → Match kpi_name with ILIKE for concept search: WHERE kpi_name ILIKE '%drop%'
+      → For exact names check the "RAN KPI Names" section (discovered from live database above).
+    User asks about revenue / income / OPEX / subscribers / ARPU:
+      → revenue_data (flat table) OR flexible_kpi_uploads WHERE kpi_type = 'revenue'
+    User asks about core network / authentication / CPU / attach / PDP bearer:
+      → core_kpi_data (flat) OR flexible_kpi_uploads WHERE kpi_type = 'core'
+    User asks about transport / backhaul / microwave / jitter / packet loss / link utilization:
+      → transport_kpi_data table
+    User asks about network issues / worst cells / AI tickets / open tickets:
+      → network_issue_tickets table
+    User asks about site info / location / zone / city / state / status / alarms:
+      → telecom_sites table
+    Time references:
+      "last 7 days" / "last week" → INTERVAL '7 days'
+      "last month" / "30 days"    → INTERVAL '30 days'
+      "last year"                 → INTERVAL '365 days'
+    ALWAYS add AND k.date <= CURRENT_DATE when any date range is used, to exclude future data.
+
+    4. transport_kpi_data — Transport/backhaul network KPI data
+       NOTE: Actual columns are discovered at runtime — see "ACTUAL COLUMNS in transport_kpi_data" section below.
+       Typical columns: site_id, zone, backhaul_type, link_capacity, avg_util, peak_util,
+                packet_loss, avg_latency, jitter, availability, error_rate, tput_efficiency, alarms
+       Do NOT assume specific column names — use ONLY the columns listed in the runtime discovery section.
+
+       Example: Get transport KPIs for a site:
+         SELECT t.* FROM transport_kpi_data t WHERE t.site_id = 'GUR_LTE_1500'
+
+    5. core_kpi_data — Core network KPIs with date (flat table, NOT EAV)
+       NOTE: Actual columns are discovered at runtime — see "ACTUAL COLUMNS in core_kpi_data" section below.
+       Typical columns: site_id, date, auth_sr, cpu_util, attach_sr, pdp_sr
+       Do NOT assume specific column names — use ONLY the columns listed in the runtime discovery section.
+       If the runtime section is not present, fall back to flexible_kpi_uploads with kpi_type='core'.
+
+       Example: Core KPIs for a site over time:
+         SELECT c.* FROM core_kpi_data c WHERE c.site_id = 'GUR_LTE_1500' ORDER BY c.date
+
+    6. revenue_data — Revenue per site (flat table, one row per site)
+       NOTE: Actual columns are discovered at runtime — see "ACTUAL COLUMNS in revenue_data" section below.
+       The table may have monthly revenue columns (like rev_jan, rev_feb, ...) and OPEX columns.
+       Do NOT assume specific column names — use ONLY the columns listed in the runtime discovery section.
+       If the runtime section is not present, fall back to flexible_kpi_uploads with kpi_type='revenue'.
+
+    7. network_issue_tickets — Auto-generated tickets for worst-performing cells
+       NOTE: Actual columns are discovered at runtime — see "ACTUAL COLUMNS in network_issue_tickets" section below.
+       Typical columns: site_id, cells_affected, category, priority, priority_score, sla_hours,
+                avg_drop_rate, avg_cssr, avg_tput, violations, status, zone, location,
+                assigned_agent, root_cause, recommendation, created_at
+       Do NOT assume specific column names — use ONLY the columns listed in the runtime discovery section.
+
+       Example: Open network issue tickets:
+         SELECT n.* FROM network_issue_tickets n WHERE n.status IN ('open','in_progress') ORDER BY n.priority_score DESC
+
+    8. site_kpi_summary — ML-categorized pre-aggregated daily KPI summary per site
+       Columns: site_id, date, kpi_name, avg_value, min_value, max_value, stddev_value, sample_count,
+                health_label, health_confidence, is_anomaly, anomaly_score, site_tier, health_score, zone
+       - health_label = 'healthy', 'degraded', or 'critical' (ML K-Means per KPI)
+       - is_anomaly = true/false (ML Isolation Forest outlier detection)
+       - site_tier = 'top_performer', 'good', 'average', or 'underperformer' (ML K-Means multi-KPI)
+       - health_score = 0-100 composite score (higher = healthier)
+       - health_confidence = 0-1 (how confident the ML model is in the health_label)
+       - anomaly_score = negative float (more negative = more anomalous)
+
+       USE THIS TABLE for questions about:
+       - site health, performance categories, degraded/critical sites
+       - anomalies, outliers, unusual behavior
+       - site rankings, top/worst performers, performance tiers
+       - health scores, health trends over time
+       - comparing site performance across zones
+
+       Example: Get worst-performing sites today:
+         SELECT s.site_id, s.zone, s.health_score, s.site_tier, s.health_label, s.kpi_name, s.avg_value
+         FROM site_kpi_summary s
+         WHERE s.date = (SELECT MAX(date) FROM site_kpi_summary)
+           AND s.health_label = 'critical'
+         ORDER BY s.health_score ASC LIMIT 20
+
+       Example: Anomalies detected in last 7 days:
+         SELECT s.site_id, s.date::text, s.kpi_name, s.avg_value, s.anomaly_score, s.health_label
+         FROM site_kpi_summary s
+         WHERE s.is_anomaly = true
+           AND s.date >= (SELECT MAX(date) FROM site_kpi_summary) - INTERVAL '7 days'
+         ORDER BY s.anomaly_score ASC LIMIT 50
+
+       Example: Site health trend over time:
+         SELECT s.date::text, s.health_score, s.health_label
+         FROM site_kpi_summary s
+         WHERE s.site_id = 'GUR_LTE_1500' AND s.kpi_name = 'E-RAB Call Drop Rate_1'
+         ORDER BY s.date LIMIT 30
+
+       Example: Zone-wise health comparison:
+         SELECT s.zone, s.kpi_name,
+                AVG(s.health_score) AS avg_health,
+                COUNT(*) FILTER (WHERE s.health_label = 'critical') AS critical_count,
+                COUNT(*) FILTER (WHERE s.is_anomaly = true) AS anomaly_count
+         FROM site_kpi_summary s
+         WHERE s.date = (SELECT MAX(date) FROM site_kpi_summary)
+         GROUP BY s.zone, s.kpi_name
+         ORDER BY avg_health ASC LIMIT 30
+
+       Example: Top performing sites:
+         SELECT s.site_id, s.zone, AVG(s.health_score) AS avg_health, s.site_tier
+         FROM site_kpi_summary s
+         WHERE s.date >= (SELECT MAX(date) FROM site_kpi_summary) - INTERVAL '7 days'
+         GROUP BY s.site_id, s.zone, s.site_tier
+         HAVING s.site_tier = 'top_performer'
+         ORDER BY avg_health DESC LIMIT 20
+
+    === TABLE SELECTION RULE ===
+    - Health/performance categories, anomalies, site tiers, rankings → query site_kpi_summary table (PREFERRED for categorized insights)
+    - RAN performance KPIs (raw values, specific hours, cell-level) → query kpi_data table
+    - Revenue, OPEX, subscribers, ARPU → query revenue_data table FIRST; fallback to flexible_kpi_uploads with kpi_type='revenue'
+    - Core network KPIs (authentication, CPU, attach, PDP) → query core_kpi_data table FIRST; fallback to flexible_kpi_uploads with kpi_type='core'
+    - Transport/backhaul KPIs (link capacity, jitter, packet loss, backhaul) → query transport_kpi_data table
+    - Network issue tickets (worst cells, AI tickets, open issues) → query network_issue_tickets table
+    - Site info (zone, city, state, technology, location) → query telecom_sites table
+    NEVER query kpi_data for revenue/subscriber/OPEX data — it does not exist there.
+    If a table returns 0 rows, try the alternative table (e.g., revenue_data → flexible_kpi_uploads).
+
+    === WHEN TO USE site_kpi_summary vs kpi_data ===
+    PREFER site_kpi_summary when the user asks about:
+    - "healthy", "degraded", "critical" sites/KPIs
+    - "anomalies", "outliers", "unusual" readings
+    - "top performers", "worst sites", "underperformers", site "tiers"
+    - "health score", "performance score"
+    - general aggregated trends (daily averages)
+    - zone-level comparisons
+    PREFER kpi_data when the user asks about:
+    - hourly data, specific hours of the day
+    - cell-level data (data_level = 'cell')
+    - raw unaggregated values
+    - data that may not yet be in the summary (just uploaded)
+
+    === CRITICAL: column_name matching in flexible_kpi_uploads ===
+    Column names may have MIXED CASING (e.g., 'Subscribers', 'Revenue_Jan_L', 'OPEX_Feb (L)').
+    ALWAYS use ILIKE for column_name matching:
+      CORRECT: f.column_name ILIKE '%revenue%'
+      WRONG:   f.column_name LIKE 'revenue%'  -- case-sensitive, will miss 'Revenue_Jan'
+      WRONG:   f.column_name = 'subscribers'   -- exact match, will miss 'Subscribers'
+    """
+
+        # ── Inject discovered KPI names (replaces hardcoded list) ─────────────────
+        if _kpi_names_list:
+            _kpi_section = "\n=== RAN KPI Names (discovered from live database — EXACT strings) ===\n"
+            _kpi_section += "These are the ACTUAL kpi_name values in your database, discovered at runtime.\n"
+            _kpi_section += "kpi_name is CASE-SENSITIVE. Copy exactly, or use ILIKE for fuzzy: kpi_name ILIKE '%drop%'\n"
+            for _k in _kpi_names_list:
+                _kpi_section += f"  '{_k}'\n"
+            SCHEMA_HINT += _kpi_section
+
+        # ── Dynamic table availability — tell LLM which tables actually exist ──
         try:
-            _kpi_ranges = _sql(
-                """SELECT kpi_name,
-                          ROUND(MIN(value)::numeric, 2)    AS min_val,
-                          ROUND(AVG(value)::numeric, 2)    AS avg_val,
-                          ROUND(MAX(value)::numeric, 2)    AS max_val,
-                          ROUND(PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY value)::numeric, 2) AS p25,
-                          ROUND(PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY value)::numeric, 2) AS p75,
-                          COUNT(DISTINCT site_id) AS site_count
-                   FROM kpi_data
-                   WHERE data_level = 'site' AND value IS NOT NULL
-                   GROUP BY kpi_name
-                   ORDER BY kpi_name"""
+            _tbl_rows = _sql(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema = 'public' AND table_name IN "
+                "('revenue_data','core_kpi_data','transport_kpi_data',"
+                "'network_issue_tickets','flexible_kpi_uploads','kpi_data','telecom_sites',"
+                "'site_kpi_summary')"
             )
-            if _kpi_ranges:
-                _schema_cache["kpi_ranges"] = {r["kpi_name"]: r for r in _kpi_ranges}
-                _rng_hint = "\n=== KPI VALUE RANGES (actual data — use for threshold calibration) ===\n"
-                _rng_hint += "Format: kpi_name → min | p25 | avg | p75 | max | sites\n"
-                for r in _kpi_ranges:
-                    _rng_hint += (
-                        f"  '{r['kpi_name']}': "
-                        f"min={r['min_val']} | p25={r['p25']} | avg={r['avg_val']} "
-                        f"| p75={r['p75']} | max={r['max_val']} | {r['site_count']} sites\n"
+            _available_tables = {r['table_name'] for r in _tbl_rows}
+        except Exception:
+            _available_tables = set()
+
+        _tbl_note = "\n=== AVAILABLE TABLES (real-time, checked just now) ===\n"
+        for _tn, _fb in [
+            ('kpi_data', None),
+            ('telecom_sites', None),
+            ('site_kpi_summary', "kpi_data (raw, no ML categories)"),
+            ('revenue_data', "flexible_kpi_uploads WHERE kpi_type='revenue'"),
+            ('core_kpi_data', "flexible_kpi_uploads WHERE kpi_type='core'"),
+            ('transport_kpi_data', None),
+            ('network_issue_tickets', None),
+            ('flexible_kpi_uploads', None),
+        ]:
+            if _tn in _available_tables:
+                _tbl_note += f"  {_tn}: EXISTS — use it\n"
+            elif _fb:
+                _tbl_note += f"  {_tn}: DOES NOT EXIST — use {_fb} instead\n"
+            else:
+                _tbl_note += f"  {_tn}: DOES NOT EXIST — data not uploaded yet\n"
+        SCHEMA_HINT += _tbl_note
+
+        # ── Materialized view availability — query pg_matviews (MVs don't appear in information_schema) ──
+        try:
+            _mv_status_rows = _sql(
+                "SELECT matviewname FROM pg_matviews "
+                "WHERE schemaname = 'public' AND matviewname IN "
+                "('mv_daily_site_kpi','mv_zone_daily_kpi','mv_zone_kpi_summary','kpi_data_merged')"
+            )
+            _mv_ready = {r['matviewname'] for r in _mv_status_rows}
+        except Exception:
+            _mv_ready = set()
+        _mv_note = "\n=== MATERIALIZED VIEW STATUS (fast pre-aggregated tables) ===\n"
+        for _mvn in ['mv_daily_site_kpi', 'mv_zone_daily_kpi', 'mv_zone_kpi_summary', 'kpi_data_merged']:
+            if _mvn in _mv_ready:
+                _mv_note += f"  {_mvn}: READY — use this\n"
+            else:
+                _mv_note += f"  {_mvn}: NOT YET CREATED — fall back to kpi_data\n"
+        SCHEMA_HINT += _mv_note
+
+        # ── Dynamic revenue column discovery — tell LLM the EXACT column names ──
+        if 'flexible_kpi_uploads' in _available_tables:
+            try:
+                _rev_cols = _sql(
+                    "SELECT DISTINCT column_name, column_type "
+                    "FROM flexible_kpi_uploads WHERE kpi_type = 'revenue' "
+                    "ORDER BY column_name LIMIT 40"
+                )
+                if _rev_cols:
+                    _rcn = "\n=== ACTUAL COLUMN NAMES in flexible_kpi_uploads (kpi_type='revenue') ===\n"
+                    _rcn += "These are the REAL column_name values — use these EXACT values in queries.\n"
+                    _rcn += "IMPORTANT: ALWAYS use ILIKE (not LIKE or =) for column_name matching.\n"
+                    for _rc in _rev_cols:
+                        _rcn += f"  '{_rc['column_name']}' ({_rc['column_type']})\n"
+                    _rcn += "Example: WHERE f.column_name ILIKE '%revenue%' (not LIKE or =)\n"
+                    _rcn += "Example: WHERE f.column_name ILIKE '%subscriber%' (not = 'subscribers')\n"
+                    SCHEMA_HINT += _rcn
+            except Exception:
+                pass
+
+        # ── Dynamic schema discovery → populate module-level _schema_cache ──
+        _schema_cache["available_tables"] = _available_tables
+        _LOG.info("[DISCOVERY] Available tables: %s", _available_tables)
+
+        if 'revenue_data' in _available_tables:
+            try:
+                _rdc = _sql(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = 'public' AND table_name = 'revenue_data' "
+                    "AND column_name NOT IN ('id', 'uploaded_at') "
+                    "ORDER BY ordinal_position"
+                )
+                _schema_cache["rev_data_cols"] = [r['column_name'] for r in _rdc]
+                _skip = {'id', 'uploaded_at', 'site_id', 'zone', 'technology', 'site_category', 'subscribers'}
+                _schema_cache["rev_rev_cols"] = [c for c in _schema_cache["rev_data_cols"] if 'rev' in c.lower() and c.lower() not in _skip]
+                _schema_cache["rev_opex_cols"] = [c for c in _schema_cache["rev_data_cols"] if 'opex' in c.lower()]
+                _schema_cache["rev_has_subscribers"] = any(c.lower() == 'subscribers' for c in _schema_cache["rev_data_cols"])
+                if _schema_cache["rev_data_cols"]:
+                    _rds = "\n=== ACTUAL COLUMNS in revenue_data table (discovered at runtime) ===\n"
+                    _rds += f"  All columns: {', '.join(_schema_cache['rev_data_cols'])}\n"
+                    if _schema_cache["rev_rev_cols"]:
+                        _rds += f"  Revenue columns: {', '.join(_schema_cache['rev_rev_cols'])}\n"
+                        _total_ex = ' + '.join(f'COALESCE(r.{c},0)' for c in _schema_cache["rev_rev_cols"])
+                        _rds += f"  Total revenue: SELECT r.site_id, ({_total_ex}) AS total_revenue FROM revenue_data r\n"
+                    if _schema_cache["rev_opex_cols"]:
+                        _rds += f"  OPEX columns: {', '.join(_schema_cache['rev_opex_cols'])}\n"
+                    if _schema_cache["rev_has_subscribers"]:
+                        _rds += "  Subscribers column: subscribers\n"
+                    _rds += "Use ONLY these column names — they are the real ones from the database.\n"
+                    SCHEMA_HINT += _rds
+            except Exception:
+                pass
+
+        if 'core_kpi_data' in _available_tables:
+            try:
+                _cdc = _sql(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = 'public' AND table_name = 'core_kpi_data' "
+                    "AND column_name NOT IN ('id', 'uploaded_at') "
+                    "ORDER BY ordinal_position"
+                )
+                _schema_cache["core_data_cols"] = [r['column_name'] for r in _cdc]
+                _core_skip = {'id', 'uploaded_at', 'site_id', 'date', 'zone', 'city', 'state'}
+                _schema_cache["core_metric_cols"] = [c for c in _schema_cache["core_data_cols"] if c.lower() not in _core_skip]
+                if _schema_cache["core_data_cols"]:
+                    _cds = "\n=== ACTUAL COLUMNS in core_kpi_data table (discovered at runtime) ===\n"
+                    _cds += f"  All columns: {', '.join(_schema_cache['core_data_cols'])}\n"
+                    if _schema_cache["core_metric_cols"]:
+                        _cds += f"  Metric columns: {', '.join(_schema_cache['core_metric_cols'])}\n"
+                        _cds += f"  Example: SELECT c.site_id, c.date::text, {', '.join('c.' + c for c in _schema_cache['core_metric_cols'][:4])} FROM core_kpi_data c\n"
+                    _cds += "Use ONLY these column names — they are the real ones from the database.\n"
+                    SCHEMA_HINT += _cds
+            except Exception:
+                pass
+
+        if 'transport_kpi_data' in _available_tables:
+            try:
+                _tdc = _sql(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = 'public' AND table_name = 'transport_kpi_data' "
+                    "AND column_name NOT IN ('id', 'uploaded_at') "
+                    "ORDER BY ordinal_position"
+                )
+                _schema_cache["transport_data_cols"] = [r['column_name'] for r in _tdc]
+                _transport_skip = {'id', 'uploaded_at', 'site_id', 'zone'}
+                _schema_cache["transport_metric_cols"] = [c for c in _schema_cache["transport_data_cols"]
+                                                           if c.lower() not in _transport_skip
+                                                           and c.lower() != 'backhaul_type']
+                if _schema_cache["transport_data_cols"]:
+                    _tds = "\n=== ACTUAL COLUMNS in transport_kpi_data table (discovered at runtime) ===\n"
+                    _tds += f"  All columns: {', '.join(_schema_cache['transport_data_cols'])}\n"
+                    if _schema_cache["transport_metric_cols"]:
+                        _tds += f"  Metric columns: {', '.join(_schema_cache['transport_metric_cols'])}\n"
+                    _tds += "Use ONLY these column names — they are the real ones from the database.\n"
+                    SCHEMA_HINT += _tds
+            except Exception:
+                pass
+
+        if 'network_issue_tickets' in _available_tables:
+            try:
+                _ntc = _sql(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = 'public' AND table_name = 'network_issue_tickets' "
+                    "AND column_name NOT IN ('id') "
+                    "ORDER BY ordinal_position"
+                )
+                _schema_cache["ticket_cols"] = [r['column_name'] for r in _ntc]
+                if _schema_cache["ticket_cols"]:
+                    _nts = "\n=== ACTUAL COLUMNS in network_issue_tickets table (discovered at runtime) ===\n"
+                    _nts += f"  All columns: {', '.join(_schema_cache['ticket_cols'])}\n"
+                    _nts += "Use ONLY these column names — they are the real ones from the database.\n"
+                    SCHEMA_HINT += _nts
+            except Exception:
+                pass
+
+        # ── Data freshness — discover actual max date in kpi_data ──
+        # Many KPIs may lag behind CURRENT_DATE. Using CURRENT_DATE in WHERE clauses
+        # would return 0 rows. We discover the actual max date and use it as reference.
+        if 'kpi_data' in _available_tables:
+            try:
+                _date_info = _sql(
+                    "SELECT MAX(date)::text AS max_date FROM kpi_data WHERE data_level = 'site'"
+                )
+                if _date_info and _date_info[0].get('max_date'):
+                    _schema_cache["kpi_max_date"] = _date_info[0]['max_date']
+                    # Also get the "main" max date (excluding KPIs that may have future/synthetic data)
+                    _main_dates = _sql(
+                        "SELECT MAX(date)::text AS max_date FROM kpi_data "
+                        "WHERE data_level = 'site' AND kpi_name NOT IN ('Site Revenue','Site Users')"
                     )
-                _rng_hint += (
-                    "CRITICAL: When a threshold query returns 0 rows, it means NO site breaches "
-                    "that threshold — check ranges above and inform the user.\n"
+                    if _main_dates and _main_dates[0].get('max_date'):
+                        _schema_cache["kpi_max_date_recent"] = _main_dates[0]['max_date']
+                    else:
+                        _schema_cache["kpi_max_date_recent"] = _schema_cache["kpi_max_date"]
+                _LOG.info("[DISCOVERY] kpi_max_date=%s kpi_max_date_recent=%s",
+                          _schema_cache["kpi_max_date"], _schema_cache["kpi_max_date_recent"])
+                # Tell LLM about the actual date range so it doesn't use CURRENT_DATE blindly
+                if _schema_cache["kpi_max_date_recent"]:
+                    _date_hint = f"\n=== DATA FRESHNESS (CRITICAL — read carefully) ===\n"
+                    _date_hint += f"The LATEST date with RAN KPI data is: {_schema_cache['kpi_max_date_recent']}\n"
+                    _date_hint += f"Today's date is: {datetime.now().strftime('%Y-%m-%d')}\n"
+                    _date_hint += "IMPORTANT: If these dates differ, the data is NOT up-to-date.\n"
+                    _date_hint += f"Use '{_schema_cache['kpi_max_date_recent']}'::date instead of CURRENT_DATE as the end date.\n"
+                    _date_hint += f"Example: AND k.date >= '{_schema_cache['kpi_max_date_recent']}'::date - INTERVAL '7 days' "
+                    _date_hint += f"AND k.date <= '{_schema_cache['kpi_max_date_recent']}'::date\n"
+                    _date_hint += "NEVER use CURRENT_DATE if it is more recent than the latest data date.\n"
+                    SCHEMA_HINT += _date_hint
+            except Exception as e:
+                _LOG.warning("[DISCOVERY] Failed to get kpi_data date range: %s", e)
+
+        # ── KPI value ranges — inject actual min/avg/median/max so LLM knows realistic thresholds ──
+        # Without this, the LLM has no idea if "< 8 Mbps" is a tight or loose filter,
+        # leading to threshold queries that confidently return 0 rows with no explanation.
+        if 'kpi_data' in _available_tables:
+            try:
+                _kpi_ranges = _sql(
+                    """SELECT kpi_name,
+                              ROUND(MIN(value)::numeric, 2)    AS min_val,
+                              ROUND(AVG(value)::numeric, 2)    AS avg_val,
+                              ROUND(MAX(value)::numeric, 2)    AS max_val,
+                              ROUND(PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY value)::numeric, 2) AS p25,
+                              ROUND(PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY value)::numeric, 2) AS p75,
+                              COUNT(DISTINCT site_id) AS site_count
+                       FROM kpi_data
+                       WHERE data_level = 'site' AND value IS NOT NULL
+                       GROUP BY kpi_name
+                       ORDER BY kpi_name"""
                 )
-                SCHEMA_HINT += _rng_hint
-                _LOG.info("[DISCOVERY] KPI ranges loaded for %d KPIs", len(_kpi_ranges))
-        except Exception as e:
-            _LOG.warning("[DISCOVERY] KPI ranges query failed (non-fatal): %s", e)
+                if _kpi_ranges:
+                    _schema_cache["kpi_ranges"] = {r["kpi_name"]: r for r in _kpi_ranges}
+                    _rng_hint = "\n=== KPI VALUE RANGES (actual data — use for threshold calibration) ===\n"
+                    _rng_hint += "Format: kpi_name → min | p25 | avg | p75 | max | sites\n"
+                    for r in _kpi_ranges:
+                        _rng_hint += (
+                            f"  '{r['kpi_name']}': "
+                            f"min={r['min_val']} | p25={r['p25']} | avg={r['avg_val']} "
+                            f"| p75={r['p75']} | max={r['max_val']} | {r['site_count']} sites\n"
+                        )
+                    _rng_hint += (
+                        "CRITICAL: When a threshold query returns 0 rows, it means NO site breaches "
+                        "that threshold — check ranges above and inform the user.\n"
+                    )
+                    SCHEMA_HINT += _rng_hint
+                    _LOG.info("[DISCOVERY] KPI ranges loaded for %d KPIs", len(_kpi_ranges))
+            except Exception as e:
+                _LOG.warning("[DISCOVERY] KPI ranges query failed (non-fatal): %s", e)
 
-    _schema_cache["populated"] = True
-    _LOG.info("[DISCOVERY] rev_data_cols=%s rev_rev_cols=%s rev_opex=%s rev_subs=%s",
-              _schema_cache["rev_data_cols"][:5], _schema_cache["rev_rev_cols"][:5],
-              _schema_cache["rev_opex_cols"][:3], _schema_cache["rev_has_subscribers"])
-    _LOG.info("[DISCOVERY] core_metric=%s transport_metric=%s ticket_cols=%d",
-              _schema_cache["core_metric_cols"][:4], _schema_cache["transport_metric_cols"][:4],
-              len(_schema_cache["ticket_cols"]))
+        _schema_cache["populated"] = True
+        _LOG.info("[DISCOVERY] rev_data_cols=%s rev_rev_cols=%s rev_opex=%s rev_subs=%s",
+                  _schema_cache["rev_data_cols"][:5], _schema_cache["rev_rev_cols"][:5],
+                  _schema_cache["rev_opex_cols"][:3], _schema_cache["rev_has_subscribers"])
+        _LOG.info("[DISCOVERY] core_metric=%s transport_metric=%s ticket_cols=%d",
+                  _schema_cache["core_metric_cols"][:4], _schema_cache["transport_metric_cols"][:4],
+                  len(_schema_cache["ticket_cols"]))
 
-    # ── Dynamic flexible_kpi_uploads core column discovery ──
-    if 'flexible_kpi_uploads' in _available_tables:
-        try:
-            _core_eav_cols = _sql(
-                "SELECT DISTINCT column_name, column_type "
-                "FROM flexible_kpi_uploads WHERE kpi_type = 'core' "
-                "ORDER BY column_name LIMIT 40"
-            )
-            if _core_eav_cols:
-                _ccn = "\n=== ACTUAL COLUMN NAMES in flexible_kpi_uploads (kpi_type='core') ===\n"
-                _ccn += "These are the REAL column_name values — use these EXACT values in queries.\n"
-                _ccn += "IMPORTANT: ALWAYS use ILIKE (not LIKE or =) for column_name matching.\n"
-                for _cc in _core_eav_cols:
-                    _ccn += f"  '{_cc['column_name']}' ({_cc['column_type']})\n"
-                _ccn += "Example: WHERE f.kpi_type = 'core' AND f.column_name ILIKE '%auth%'\n"
-                SCHEMA_HINT += _ccn
-        except Exception:
-            pass
+        # ── Dynamic flexible_kpi_uploads core column discovery ──
+        if 'flexible_kpi_uploads' in _available_tables:
+            try:
+                _core_eav_cols = _sql(
+                    "SELECT DISTINCT column_name, column_type "
+                    "FROM flexible_kpi_uploads WHERE kpi_type = 'core' "
+                    "ORDER BY column_name LIMIT 40"
+                )
+                if _core_eav_cols:
+                    _ccn = "\n=== ACTUAL COLUMN NAMES in flexible_kpi_uploads (kpi_type='core') ===\n"
+                    _ccn += "These are the REAL column_name values — use these EXACT values in queries.\n"
+                    _ccn += "IMPORTANT: ALWAYS use ILIKE (not LIKE or =) for column_name matching.\n"
+                    for _cc in _core_eav_cols:
+                        _ccn += f"  '{_cc['column_name']}' ({_cc['column_type']})\n"
+                    _ccn += "Example: WHERE f.kpi_type = 'core' AND f.column_name ILIKE '%auth%'\n"
+                    SCHEMA_HINT += _ccn
+            except Exception:
+                pass
 
-    # ── Dynamic site_kpi_summary discovery — tell LLM about ML categories ──
-    # Auto-trigger ML pipeline if table is empty (first-time or after data refresh)
-    _sks_row_count = 0
-    if 'site_kpi_summary' in _available_tables:
-        try:
-            _sks_info = _sql(
-                "SELECT COUNT(*) AS row_count, "
-                "MIN(date)::text AS min_date, MAX(date)::text AS max_date, "
-                "COUNT(DISTINCT site_id) AS site_count, "
-                "COUNT(DISTINCT kpi_name) AS kpi_count, "
-                "COUNT(*) FILTER (WHERE health_label = 'critical') AS critical_count, "
-                "COUNT(*) FILTER (WHERE health_label = 'degraded') AS degraded_count, "
-                "COUNT(*) FILTER (WHERE health_label = 'healthy') AS healthy_count, "
-                "COUNT(*) FILTER (WHERE is_anomaly = true) AS anomaly_count "
-                "FROM site_kpi_summary"
-            )
-            _sks_row_count = _sks_info[0].get('row_count', 0) if _sks_info else 0
-            if _sks_row_count > 0:
-                _si = _sks_info[0]
-                _sks_hint = "\n=== ML-CATEGORIZED SUMMARY (site_kpi_summary) ===\n"
-                _sks_hint += f"Total rows: {_si['row_count']} | Sites: {_si['site_count']} | KPIs: {_si['kpi_count']}\n"
-                _sks_hint += f"Date range: {_si['min_date']} to {_si['max_date']}\n"
-                _sks_hint += f"Health distribution: {_si['healthy_count']} healthy, {_si['degraded_count']} degraded, {_si['critical_count']} critical\n"
-                _sks_hint += f"Anomalies detected: {_si['anomaly_count']}\n"
-                _sks_hint += "PREFER this table for performance/health queries — it has ML-generated labels.\n"
-                _sks_hint += f"For date references in this table, use '{_si['max_date']}'::date as the latest date.\n"
-                SCHEMA_HINT += _sks_hint
-                _LOG.info("[DISCOVERY] site_kpi_summary: %d rows, %s to %s, %d anomalies",
-                          _si['row_count'], _si['min_date'], _si['max_date'], _si['anomaly_count'])
-        except Exception as e:
-            _LOG.debug("[DISCOVERY] site_kpi_summary check failed: %s", e)
+        # ── Dynamic site_kpi_summary discovery — tell LLM about ML categories ──
+        # Auto-trigger ML pipeline if table is empty (first-time or after data refresh)
+        _sks_row_count = 0
+        if 'site_kpi_summary' in _available_tables:
+            try:
+                _sks_info = _sql(
+                    "SELECT COUNT(*) AS row_count, "
+                    "MIN(date)::text AS min_date, MAX(date)::text AS max_date, "
+                    "COUNT(DISTINCT site_id) AS site_count, "
+                    "COUNT(DISTINCT kpi_name) AS kpi_count, "
+                    "COUNT(*) FILTER (WHERE health_label = 'critical') AS critical_count, "
+                    "COUNT(*) FILTER (WHERE health_label = 'degraded') AS degraded_count, "
+                    "COUNT(*) FILTER (WHERE health_label = 'healthy') AS healthy_count, "
+                    "COUNT(*) FILTER (WHERE is_anomaly = true) AS anomaly_count "
+                    "FROM site_kpi_summary"
+                )
+                _sks_row_count = _sks_info[0].get('row_count', 0) if _sks_info else 0
+                if _sks_row_count > 0:
+                    _si = _sks_info[0]
+                    _sks_hint = "\n=== ML-CATEGORIZED SUMMARY (site_kpi_summary) ===\n"
+                    _sks_hint += f"Total rows: {_si['row_count']} | Sites: {_si['site_count']} | KPIs: {_si['kpi_count']}\n"
+                    _sks_hint += f"Date range: {_si['min_date']} to {_si['max_date']}\n"
+                    _sks_hint += f"Health distribution: {_si['healthy_count']} healthy, {_si['degraded_count']} degraded, {_si['critical_count']} critical\n"
+                    _sks_hint += f"Anomalies detected: {_si['anomaly_count']}\n"
+                    _sks_hint += "PREFER this table for performance/health queries — it has ML-generated labels.\n"
+                    _sks_hint += f"For date references in this table, use '{_si['max_date']}'::date as the latest date.\n"
+                    SCHEMA_HINT += _sks_hint
+                    _LOG.info("[DISCOVERY] site_kpi_summary: %d rows, %s to %s, %d anomalies",
+                              _si['row_count'], _si['min_date'], _si['max_date'], _si['anomaly_count'])
+            except Exception as e:
+                _LOG.debug("[DISCOVERY] site_kpi_summary check failed: %s", e)
 
-    # Auto-run ML pipeline in background if summary table is empty
-    if _sks_row_count == 0 and 'kpi_data' in _available_tables:
-        try:
-            from ml_pipeline import run_ml_pipeline_async, get_pipeline_status
-            _ml_st = get_pipeline_status()
-            if not _ml_st.get("running"):
-                _LOG.info("[AUTO-ML] site_kpi_summary is empty — triggering ML pipeline in background")
-                run_ml_pipeline_async(current_app._get_current_object())
-        except Exception as e:
-            _LOG.debug("[AUTO-ML] Failed to auto-trigger ML pipeline: %s", e)
+        # Auto-run ML pipeline in background if summary table is empty
+        if _sks_row_count == 0 and 'kpi_data' in _available_tables:
+            try:
+                from ml_pipeline import run_ml_pipeline_async, get_pipeline_status
+                _ml_st = get_pipeline_status()
+                if not _ml_st.get("running"):
+                    _LOG.info("[AUTO-ML] site_kpi_summary is empty — triggering ML pipeline in background")
+                    run_ml_pipeline_async(current_app._get_current_object())
+            except Exception as e:
+                _LOG.debug("[AUTO-ML] Failed to auto-trigger ML pipeline: %s", e)
 
+
+        # Store freshly built SCHEMA_HINT in cache
+        _schema_hint_cache["hint"] = SCHEMA_HINT
+        _schema_hint_cache["ts"] = time.time()
+        _LOG.info("[SCHEMA_HINT] Cached (%d chars)", len(SCHEMA_HINT))
     print(f"[TIMING] Schema discovery: {time.time()-_t0:.2f}s", flush=True)
 
     # ── CHANGE: read session_context for dynamic prompt injection ──
