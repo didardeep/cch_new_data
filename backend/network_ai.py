@@ -81,7 +81,7 @@ _BLOCKED_SQL_PATTERNS = re.compile(
 
 def _strip_sql_strings(sql: str) -> str:
     """Remove all string literals from SQL so keyword checks don't match
-    words inside values like 'E-RAB Call Drop Rate_1'."""
+    words inside values (e.g. a KPI name containing 'Drop')."""
     return re.sub(r"'[^']*'", "''", sql)
 
 
@@ -99,7 +99,7 @@ def _validate_sql(sql: str) -> tuple:
         return False, "Only SELECT queries are allowed"
 
     # Strip string literals before checking for blocked keywords.
-    # This prevents false positives like 'E-RAB Call Drop Rate_1' matching DROP
+    # This prevents false positives like a KPI name containing 'Drop' matching DROP
     stripped = _strip_sql_strings(normalized)
 
     # Block dangerous operations (only check SQL keywords, not string content)
@@ -151,21 +151,19 @@ _INFORMATIONAL_PATTERNS = [
 _ANALYTICAL_INDICATORS = [
     'show', 'display', 'plot', 'chart', 'graph', 'trend', 'compare',
     'top', 'bottom', 'worst', 'best', 'highest', 'lowest',
-    'average', 'sum', 'count', 'total', 'aggregate',
-    'last', 'days', 'week', 'month', 'daily', 'hourly',
-    'site', 'cell', 'zone', 'revenue', 'throughput', 'drop rate',
-    'cssr', 'prb', 'availability', 'latency', 'volte',
+    'average', 'sum', 'count', 'total', 'aggregate', 'mean', 'median',
+    'last', 'days', 'week', 'month', 'year', 'daily', 'hourly',
+    'list', 'rank', 'group by', 'filter', 'where',
     # ML category indicators
     'healthy', 'degraded', 'critical', 'anomaly', 'anomalies', 'outlier',
-    'health score', 'health', 'tier', 'performer', 'underperformer',
-    'top performer', 'classification', 'category', 'categorize',
+    'health', 'tier', 'performer', 'category', 'categorize',
 ]
 
 
 def _classify_query(prompt: str) -> str:
     """Classify a user query into: 'analytical', 'informational', or 'followup'.
     - analytical: needs SQL generation → data fetch → chart
-    - informational: general telecom knowledge → direct LLM response
+    - informational: general domain knowledge → direct LLM response
     - followup: modifies previous result"""
     p = prompt.lower().strip()
 
@@ -197,14 +195,25 @@ def _handle_informational_query(prompt: str) -> dict:
     """Handle informational queries with direct LLM response (no SQL)."""
     from app import client as _llm_client, DEPLOYMENT_NAME as _llm_model
 
-    system_msg = """You are a telecom network expert. Answer the user's question about
-telecom concepts, KPIs, network architecture, or industry terminology.
+    # Build a domain-neutral system message that adapts to the discovered schema
+    discovered_tables = sorted(_schema_cache.get("available_tables", set()))
+    discovered_kpis = _schema_cache.get("kpi_names_list", [])[:30]
 
-Be concise (2-4 sentences). Use bullet points for lists. Include the standard value ranges
-where applicable (e.g., "Call Drop Rate should be below 1.5%").
+    domain_hint = ""
+    if discovered_tables:
+        domain_hint = f"\nThe user's database contains these tables: {', '.join(discovered_tables)}."
+    if discovered_kpis:
+        domain_hint += f"\nKnown metric/KPI names include: {', '.join(repr(k) for k in discovered_kpis[:10])}."
 
-If the question is actually asking for data analysis (e.g., "what is the drop rate for site X"),
-respond with: {"redirect": "analytical"} to redirect to the SQL engine."""
+    system_msg = (
+        "You are a data analytics assistant. Answer the user's question about "
+        "the available data, metrics, or general analytical concepts.\n"
+        "Be concise (2-4 sentences). Use bullet points for lists.\n"
+        + domain_hint +
+        "\nIf the question requires fetching specific data values, charts, or "
+        "filtering rows, respond with the JSON {\"redirect\": \"analytical\"} "
+        "to route to the SQL engine instead."
+    )
 
     try:
         resp = _llm_client.chat.completions.create(
@@ -409,6 +418,7 @@ def refresh_materialized_views():
 _schema_cache = {
     "populated": False,
     "available_tables": set(),
+    "kpi_names_list": [],
     # revenue_data
     "rev_data_cols": [], "rev_rev_cols": [], "rev_opex_cols": [], "rev_has_subscribers": False,
     # core_kpi_data
@@ -684,6 +694,8 @@ def ai_query():
             except Exception:
                 pass
 
+        _schema_cache["kpi_names_list"] = _kpi_names_list
+
         SCHEMA_HINT = """
     === FAST MATERIALIZED VIEWS — USE THESE AS PRIMARY QUERY TARGETS ===
     These views are pre-aggregated and 10-100x faster than querying raw kpi_data.
@@ -736,63 +748,40 @@ def ai_query():
        - Alias the table as f: FROM flexible_kpi_uploads f
 
        === Revenue data (kpi_type = 'revenue') ===
-       column_name values for revenue:
-         'subscribers'      — subscriber count per site (numeric)
-         'revenue_jan_l'    — January revenue in Lakhs (numeric)
-         'revenue_feb_l'    — February revenue in Lakhs (numeric)
-         'revenue_mar_l'    — March revenue in Lakhs (numeric)
-         'revenue_total'    — TOTAL revenue (sum of all months, numeric) — USE THIS for total revenue queries
-         'opex_jan_l'       — January OPEX in Lakhs (numeric)
-         'opex_feb_l'       — February OPEX in Lakhs (numeric)
-         'opex_mar_l'       — March OPEX in Lakhs (numeric)
-         'opex_total'       — TOTAL OPEX (sum of all months, numeric) — USE THIS for total OPEX queries
-         'difference'       — Revenue minus OPEX (numeric)
-         'zone'             — geographic zone (text, in str_value)
-         'technology'       — technology type (text, in str_value)
-         'site_category'    — site classification (text, in str_value)
+       column_name and kpi_name values are listed in the
+       'ACTUAL COLUMN NAMES in flexible_kpi_uploads' section that follows
+       (discovered from your live database). Use ILIKE for matching to handle
+       case differences.
 
-       IMPORTANT: column_name values may have mixed casing (e.g. 'Subscribers', 'Revenue_Jan_L').
+       IMPORTANT: column_name values may have mixed casing.
        ALWAYS use ILIKE (case-insensitive) for column_name matching, NEVER use = or LIKE.
-       IMPORTANT: For total revenue, use 'revenue_total' directly — do NOT SUM all revenue columns
-                  (that would double-count because revenue_total = jan + feb + mar).
+       If a column named like 'total' or 'sum' exists, use it directly — do NOT SUM monthly columns
+       (that would double-count).
 
-       Example: Get total revenue per site (use revenue_total, NOT SUM of monthly):
-         SELECT f.site_id, f.num_value AS total_revenue
+       Example: Get a numeric metric per site:
+         SELECT f.site_id, f.num_value AS metric_value
          FROM flexible_kpi_uploads f
          WHERE f.kpi_type = 'revenue'
-           AND f.column_name ILIKE '%revenue_total%' AND f.column_type = 'numeric'
-         ORDER BY total_revenue DESC
+           AND f.column_name ILIKE '%<metric_keyword>%' AND f.column_type = 'numeric'
+         ORDER BY metric_value DESC
 
-       Example: Get subscribers for a specific site:
-         SELECT f.site_id, f.num_value AS subscribers
+       Example: Get a metric for a specific site:
+         SELECT f.site_id, f.num_value AS metric_value
          FROM flexible_kpi_uploads f
-         WHERE f.kpi_type = 'revenue' AND f.column_name ILIKE '%subscriber%'
-           AND f.site_id = 'GUR_LTE_1500'
-
-       Example: Get revenue for a specific month (March):
-         SELECT f.site_id, f.num_value AS revenue_mar
-         FROM flexible_kpi_uploads f
-         WHERE f.kpi_type = 'revenue' AND f.column_name ILIKE '%revenue%mar%'
-
-       Example: Compare revenue vs OPEX for a site:
-         SELECT f.site_id, f.column_name, f.num_value
-         FROM flexible_kpi_uploads f
-         WHERE f.kpi_type = 'revenue'
-           AND (f.column_name ILIKE '%revenue%' OR f.column_name ILIKE '%opex%')
-           AND f.site_id = 'GUR_LTE_1500'
+         WHERE f.kpi_type = 'revenue' AND f.column_name ILIKE '%<metric_keyword>%'
+           AND f.site_id = '<example_site_id>'
 
        === Core KPI data (kpi_type = 'core') ===
        IMPORTANT: Core data uses kpi_name (NOT column_name) for the metric type.
-       kpi_name values: 'Authentication Success Rate', 'CPU Utilization', 'Attach Success Rate', 'PDP Bearer Setup Success Rate'
+       column_name and kpi_name values are listed in the
+       'ACTUAL COLUMN NAMES in flexible_kpi_uploads' section that follows
+       (discovered from your live database). Use ILIKE for matching.
        column_name contains DATES (e.g., '2026_03_07_000000'), num_value contains the metric value.
-       ALWAYS use ILIKE for kpi_name matching.
 
        Example: Get average core KPIs per site:
          SELECT f.site_id,
-           AVG(CASE WHEN f.kpi_name ILIKE '%auth%' THEN f.num_value END) AS auth_sr,
-           AVG(CASE WHEN f.kpi_name ILIKE '%cpu%' THEN f.num_value END) AS cpu_util,
-           AVG(CASE WHEN f.kpi_name ILIKE '%attach%' THEN f.num_value END) AS attach_sr,
-           AVG(CASE WHEN f.kpi_name ILIKE '%pdp%' THEN f.num_value END) AS pdp_sr
+           AVG(CASE WHEN f.kpi_name ILIKE '%<keyword_a>%' THEN f.num_value END) AS metric_a,
+           AVG(CASE WHEN f.kpi_name ILIKE '%<keyword_b>%' THEN f.num_value END) AS metric_b
          FROM flexible_kpi_uploads f
          WHERE f.kpi_type = 'core' AND f.column_type = 'numeric'
          GROUP BY f.site_id
@@ -825,7 +814,7 @@ def ai_query():
        Do NOT assume specific column names — use ONLY the columns listed in the runtime discovery section.
 
        Example: Get transport KPIs for a site:
-         SELECT t.* FROM transport_kpi_data t WHERE t.site_id = 'GUR_LTE_1500'
+         SELECT t.* FROM transport_kpi_data t WHERE t.site_id = '<example_site_id>'
 
     5. core_kpi_data — Core network KPIs with date (flat table, NOT EAV)
        NOTE: Actual columns are discovered at runtime — see "ACTUAL COLUMNS in core_kpi_data" section below.
@@ -834,7 +823,7 @@ def ai_query():
        If the runtime section is not present, fall back to flexible_kpi_uploads with kpi_type='core'.
 
        Example: Core KPIs for a site over time:
-         SELECT c.* FROM core_kpi_data c WHERE c.site_id = 'GUR_LTE_1500' ORDER BY c.date
+         SELECT c.* FROM core_kpi_data c WHERE c.site_id = '<example_site_id>' ORDER BY c.date
 
     6. revenue_data — Revenue per site (flat table, one row per site)
        NOTE: Actual columns are discovered at runtime — see "ACTUAL COLUMNS in revenue_data" section below.
@@ -886,7 +875,7 @@ def ai_query():
        Example: Site health trend over time:
          SELECT s.date::text, s.health_score, s.health_label
          FROM site_kpi_summary s
-         WHERE s.site_id = 'GUR_LTE_1500' AND s.kpi_name = 'E-RAB Call Drop Rate_1'
+         WHERE s.site_id = '<example_site_id>' AND s.kpi_name = '<example_kpi_name>'
          ORDER BY s.date LIMIT 30
 
        Example: Zone-wise health comparison:
@@ -1124,11 +1113,19 @@ def ai_query():
                 )
                 if _date_info and _date_info[0].get('max_date'):
                     _schema_cache["kpi_max_date"] = _date_info[0]['max_date']
-                    # Also get the "main" max date (excluding KPIs that may have future/synthetic data)
-                    _main_dates = _sql(
-                        "SELECT MAX(date)::text AS max_date FROM kpi_data "
-                        "WHERE data_level = 'site' AND kpi_name NOT IN ('Site Revenue','Site Users')"
-                    )
+                    # Also get the "main" max date (exclude synthetic KPIs if configured)
+                    _exclude_kpis = os.environ.get('AI_EXCLUDE_KPIS', '').strip()
+                    if _exclude_kpis:
+                        _excl_list = ",".join(f"'{k.strip()}'" for k in _exclude_kpis.split(",") if k.strip())
+                        _main_dates = _sql(
+                            f"SELECT MAX(date)::text AS max_date FROM kpi_data "
+                            f"WHERE data_level = 'site' AND kpi_name NOT IN ({_excl_list})"
+                        )
+                    else:
+                        _main_dates = _sql(
+                            "SELECT MAX(date)::text AS max_date FROM kpi_data "
+                            "WHERE data_level = 'site'"
+                        )
                     if _main_dates and _main_dates[0].get('max_date'):
                         _schema_cache["kpi_max_date_recent"] = _main_dates[0]['max_date']
                     else:
@@ -1347,27 +1344,28 @@ When the user asks for "worst N sites where KPI1 > X OR KPI2 < Y OR KPI3 < Z":
 → Use HAVING clause with OR conditions to filter sites meeting ANY threshold.
 → Add a "violations" count column to rank sites by how many thresholds they breach.
 
-CORRECT approach for "show 5 worst sites where E-RAB Drop > 1.5% OR CSSR < 98.5% OR DL Usr Tput < 8":
+CORRECT approach for "show 5 worst sites where MetricA > X OR MetricB < Y OR MetricC < Z":
 ```sql
 SELECT k.site_id,
-       AVG(CASE WHEN k.kpi_name = 'E-RAB Call Drop Rate_1' THEN k.value END) AS drop_rate,
-       AVG(CASE WHEN k.kpi_name = 'LTE Call Setup Success Rate' THEN k.value END) AS cssr,
-       AVG(CASE WHEN k.kpi_name = 'LTE DL - Usr Ave Throughput' THEN k.value END) AS dl_usr_tput,
-       (CASE WHEN AVG(CASE WHEN k.kpi_name = 'E-RAB Call Drop Rate_1' THEN k.value END) > 1.5 THEN 1 ELSE 0 END +
-        CASE WHEN AVG(CASE WHEN k.kpi_name = 'LTE Call Setup Success Rate' THEN k.value END) < 98.5 THEN 1 ELSE 0 END +
-        CASE WHEN AVG(CASE WHEN k.kpi_name = 'LTE DL - Usr Ave Throughput' THEN k.value END) < 8 THEN 1 ELSE 0 END
+       AVG(CASE WHEN k.kpi_name = '<MetricA>' THEN k.value END) AS metric_a,
+       AVG(CASE WHEN k.kpi_name = '<MetricB>' THEN k.value END) AS metric_b,
+       AVG(CASE WHEN k.kpi_name = '<MetricC>' THEN k.value END) AS metric_c,
+       (CASE WHEN AVG(CASE WHEN k.kpi_name = '<MetricA>' THEN k.value END) > <X> THEN 1 ELSE 0 END +
+        CASE WHEN AVG(CASE WHEN k.kpi_name = '<MetricB>' THEN k.value END) < <Y> THEN 1 ELSE 0 END +
+        CASE WHEN AVG(CASE WHEN k.kpi_name = '<MetricC>' THEN k.value END) < <Z> THEN 1 ELSE 0 END
        ) AS violations
 FROM kpi_data k
 WHERE k.data_level = 'site' AND k.value IS NOT NULL
-  AND k.kpi_name IN ('E-RAB Call Drop Rate_1', 'LTE Call Setup Success Rate', 'LTE DL - Usr Ave Throughput')
+  AND k.kpi_name IN ('<MetricA>', '<MetricB>', '<MetricC>')
 GROUP BY k.site_id
-HAVING AVG(CASE WHEN k.kpi_name = 'E-RAB Call Drop Rate_1' THEN k.value END) > 1.5
-    OR AVG(CASE WHEN k.kpi_name = 'LTE Call Setup Success Rate' THEN k.value END) < 98.5
-    OR AVG(CASE WHEN k.kpi_name = 'LTE DL - Usr Ave Throughput' THEN k.value END) < 8
-ORDER BY violations DESC, drop_rate DESC NULLS LAST
+HAVING AVG(CASE WHEN k.kpi_name = '<MetricA>' THEN k.value END) > <X>
+    OR AVG(CASE WHEN k.kpi_name = '<MetricB>' THEN k.value END) < <Y>
+    OR AVG(CASE WHEN k.kpi_name = '<MetricC>' THEN k.value END) < <Z>
+ORDER BY violations DESC, metric_a DESC NULLS LAST
 LIMIT 5
 ```
-chart_type: "bar", x_axis: "site_id", y_axes: ["drop_rate","cssr","dl_usr_tput","violations"]
+chart_type: "bar", x_axis: "site_id", y_axes: ["metric_a","metric_b","metric_c","violations"]
+The angle brackets signal "substitute the user's actual KPIs and thresholds discovered from the schema."
 
 
 ═══════════════════════════════════════════════════════════
@@ -1388,13 +1386,13 @@ Example: "show E-RAB drop rate and CSSR last 18 days for SITE_A and SITE_A"
 → Each chart: composed chart_type, UNION ALL SQL filtering by that site.
 
 Example SQL for one site with two KPIs:
-SELECT k.date::text AS date, k.site_id, AVG(k.value) AS value, 'E-RAB Call Drop Rate_1' AS kpi_name
-FROM kpi_data k WHERE k.kpi_name = 'E-RAB Call Drop Rate_1' AND k.site_id = 'SITE_A'
+SELECT k.date::text AS date, k.site_id, AVG(k.value) AS value, '<KpiA>' AS kpi_name
+FROM kpi_data k WHERE k.kpi_name = '<KpiA>' AND k.site_id = 'SITE_A'
   AND k.data_level='site' AND k.value IS NOT NULL AND k.date >= CURRENT_DATE - INTERVAL '18 days' AND k.date <= CURRENT_DATE
 GROUP BY k.date, k.site_id
 UNION ALL
-SELECT k.date::text AS date, k.site_id, AVG(k.value) AS value, 'LTE Call Setup Success Rate' AS kpi_name
-FROM kpi_data k WHERE k.kpi_name = 'LTE Call Setup Success Rate' AND k.site_id = 'SITE_A'
+SELECT k.date::text AS date, k.site_id, AVG(k.value) AS value, '<KpiB>' AS kpi_name
+FROM kpi_data k WHERE k.kpi_name = '<KpiB>' AND k.site_id = 'SITE_A'
   AND k.data_level='site' AND k.value IS NOT NULL AND k.date >= CURRENT_DATE - INTERVAL '18 days' AND k.date <= CURRENT_DATE
 GROUP BY k.date, k.site_id
 ORDER BY date
