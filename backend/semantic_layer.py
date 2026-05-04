@@ -31,6 +31,41 @@ _LOG = logging.getLogger("semantic_layer")
 _plan_cache: dict = {}  # key → {"plan": dict, "ts": float}
 _PLAN_CACHE_TTL = 300  # 5 minutes
 
+# ─── Auto-seed state ────────────────────────────────────────────────────────
+_auto_seed_started = False
+
+
+def _trigger_auto_seed():
+    """Seed the catalog in a background thread if not already started."""
+    global _auto_seed_started
+    if _auto_seed_started:
+        return
+    _auto_seed_started = True
+    _LOG.info("[SEMANTIC] Catalog empty — auto-seeding in background thread")
+
+    import threading
+    def _seed_worker():
+        try:
+            from flask import current_app
+            # Need app context for DB access in background thread
+            app = current_app._get_current_object()
+            with app.app_context():
+                # Ensure tables exist first
+                try:
+                    _sql("SELECT 1 FROM metric_catalog LIMIT 1")
+                except Exception:
+                    _LOG.warning("[SEMANTIC] metric_catalog table missing — run migrate_add_semantic_layer.py first")
+                    return
+                result = seed_catalog_from_existing_data()
+                _LOG.info("[SEMANTIC] Auto-seed complete: %s", result)
+        except Exception as e:
+            _LOG.warning("[SEMANTIC] Auto-seed failed: %s", e, exc_info=True)
+            global _auto_seed_started
+            _auto_seed_started = False  # Allow retry on next query
+
+    t = threading.Thread(target=_seed_worker, daemon=True)
+    t.start()
+
 
 def _plan_cache_key(prompt: str, sites: list, kpis: list) -> str:
     raw = f"{prompt}|{'|'.join(sorted(sites or []))}|{'|'.join(sorted(kpis or []))}"
@@ -80,8 +115,15 @@ def _llm_chat(messages: list, temperature: float = 0.1, max_tokens: int = 2000,
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
+    # Try with response_format first, fall back without if unsupported
     if response_format:
-        kwargs["response_format"] = response_format
+        try:
+            kwargs["response_format"] = response_format
+            resp = client.chat.completions.create(**kwargs)
+            return resp.choices[0].message.content.strip()
+        except Exception:
+            _LOG.debug("[SEMANTIC] response_format not supported, retrying without")
+            del kwargs["response_format"]
     resp = client.chat.completions.create(**kwargs)
     return resp.choices[0].message.content.strip()
 
@@ -384,13 +426,19 @@ def resolve_concepts(user_query: str, schema_cache: dict = None) -> dict:
         return cached["plan"]
 
     # Get available concepts from catalog
-    concepts = _sql("""
-        SELECT mc.id, mc.concept_name, mc.display_name, mc.unit, mc.description
-        FROM metric_catalog mc
-        ORDER BY mc.concept_name
-    """)
+    try:
+        concepts = _sql("""
+            SELECT mc.id, mc.concept_name, mc.display_name, mc.unit, mc.description
+            FROM metric_catalog mc
+            ORDER BY mc.concept_name
+        """)
+    except Exception:
+        # Table might not exist yet
+        concepts = []
 
     if not concepts:
+        # Auto-seed in background so next query will work
+        _trigger_auto_seed()
         return {"concepts": [], "intent": "trend", "aggregation": "AVG",
                 "top_n": None, "threshold": None, "filters": {}, "group_by": []}
 
@@ -556,12 +604,22 @@ def compose_sql(plan: dict) -> str:
     zones = filters.get("zones", [])
     time_range_days = filters.get("time_range_days")
 
+    # Use actual max data date instead of CURRENT_DATE (data may lag behind today)
+    _date_ref = "CURRENT_DATE"
+    try:
+        from network_ai import _schema_cache as _sc
+        _max_d = _sc.get("kpi_max_date_recent") or _sc.get("kpi_max_date")
+        if _max_d:
+            _date_ref = f"'{_max_d}'::date"
+    except Exception:
+        pass
+
     # Build date filter clause
     date_clause = ""
     if time_range_days:
-        date_clause = f"date >= CURRENT_DATE - INTERVAL '{int(time_range_days)} days'"
+        date_clause = f"date >= {_date_ref} - INTERVAL '{int(time_range_days)} days' AND date <= {_date_ref}"
     else:
-        date_clause = "date >= CURRENT_DATE - INTERVAL '30 days'"
+        date_clause = f"date >= {_date_ref} - INTERVAL '30 days' AND date <= {_date_ref}"
 
     # Build site filter clause
     site_clause = ""
