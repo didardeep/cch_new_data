@@ -638,6 +638,9 @@ def ai_query():
     provider = None
     ai_result = None
 
+    _t_total = time.time()
+    _t0 = time.time()
+
     # ── Dynamic KPI name discovery (no hardcoded values) ──────────────────────
     # Discovers actual KPI names from the live database so the chatbot works
     # with any uploaded dataset without requiring code changes.
@@ -1234,6 +1237,8 @@ ALWAYS use ILIKE for column_name matching:
         except Exception as e:
             _LOG.debug("[AUTO-ML] Failed to auto-trigger ML pipeline: %s", e)
 
+    print(f"[TIMING] Schema discovery: {time.time()-_t0:.2f}s", flush=True)
+
     # ── CHANGE: read session_context for dynamic prompt injection ──
     _sctx = (getattr(ai_session, 'session_context', None) or {}) if ai_session else {}
     _active_sites = ", ".join(_sctx.get("active_sites", [])) or "none yet"
@@ -1584,6 +1589,7 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
 
 
     # ── LLM Call ──────────────────────────────────────────────────────────────
+    _t1 = time.time()
     try:
         _llm_resp = _llm_client.chat.completions.create(
             model=_llm_model,
@@ -1600,6 +1606,8 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
         _LOG.warning("LLM returned bad JSON: %s", str(je)[:200])
     except Exception as e:
         _LOG.warning("LLM call failed: %s", str(e)[:200])
+
+    print(f"[TIMING] LLM SQL gen: {time.time()-_t1:.2f}s", flush=True)
 
     if not ai_result:
         _emit_progress(_ws_sid, "complete", "Error")
@@ -1640,6 +1648,7 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
         except: return str(v)
 
     _emit_progress(_ws_sid, 'executing', 'Running query...')
+    _t2 = time.time()
 
     # ── MULTI-CHART: execute each chart's SQL in PARALLEL ──────────────────────
     if ai_result.get("multi_chart") and ai_result.get("charts"):
@@ -1724,9 +1733,12 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
                 chart_entry["error"] = c_error
             charts_out.append(chart_entry)
 
+        print(f"[TIMING] DB queries (multi-chart): {time.time()-_t2:.2f}s", flush=True)
+
         resp_text = ai_result.get("response", f"Here are {len(charts_out)} charts.")
         resp_title = ai_result.get("title", prompt[:70])
 
+        _t3 = time.time()
         if ai_session:
             try:
                 if ai_session.title == "New Chat":
@@ -1748,6 +1760,9 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
             _all_sqls = " ".join(ch.get("sql", "") for ch in charts_out)
             _update_session_context(ai_session, _all_sqls, "multi_chart")
             _maybe_summarize_conversation(ai_session)
+
+        print(f"[TIMING] Session persist + summarize: {time.time()-_t3:.2f}s", flush=True)
+        print(f"[TIMING] TOTAL (analytical): {time.time()-_t_total:.2f}s", flush=True)
 
         _emit_progress(_ws_sid, 'complete', 'Done')
         _elapsed = round(time.time() - _query_start, 2)
@@ -1777,6 +1792,7 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
     except Exception as e:
         _LOG.warning("AI SQL execution failed: %s — SQL: %s", e, sql[:200])
         rows = []
+    print(f"[TIMING] DB query (single-chart): {time.time()-_t2:.2f}s", flush=True)
 
     # ── 0-rows explanation: if still empty, check KPI ranges and explain why ──
     # This prevents the chart from silently showing nothing.
@@ -1902,6 +1918,9 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
         # ── update session context + maybe summarize ──
         _update_session_context(ai_session, sql, resp_chart)
         _maybe_summarize_conversation(ai_session)
+
+    print(f"[TIMING] Session persist + summarize: {time.time()-_t2:.2f}s", flush=True)
+    print(f"[TIMING] TOTAL (analytical): {time.time()-_t_total:.2f}s", flush=True)
 
     _emit_progress(_ws_sid, 'complete', 'Done')
     _elapsed = round(time.time() - _query_start, 2)
