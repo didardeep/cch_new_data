@@ -1260,6 +1260,28 @@ def ai_query():
         _LOG.info("[SCHEMA_HINT] Cached (%d chars)", len(SCHEMA_HINT))
     print(f"[TIMING] Schema discovery: {time.time()-_t0:.2f}s", flush=True)
 
+    # ── Semantic Layer: resolve cross-device concepts ──────────────────────
+    _semantic_sql_hint = ""
+    try:
+        from semantic_layer import resolve_concepts, compose_sql as sl_compose_sql
+        _resolved = resolve_concepts(user_msg, _schema_cache)
+        if _resolved and _resolved[0].get("confidence", 0) >= 0.8:
+            _sl_filters = {}
+            if ai_session:
+                _sctx_tmp = getattr(ai_session, 'session_context', None) or {}
+                _sl_filters["sites"] = _sctx_tmp.get("active_sites", [])
+                _sl_filters["date_range"] = _sctx_tmp.get("active_days")
+            _semantic_sql_hint = sl_compose_sql(_resolved, intent="trend", filters=_sl_filters)
+            _LOG.info("[SEMANTIC] Resolved %d concepts (conf=%.2f), injecting SQL hint",
+                      len(_resolved), _resolved[0]["confidence"])
+    except ImportError:
+        pass  # semantic_layer not available — skip gracefully
+    except Exception as _sl_err:
+        _LOG.debug("[SEMANTIC] resolve_concepts failed (non-fatal): %s", _sl_err)
+
+    if _semantic_sql_hint:
+        SCHEMA_HINT += f"\n\n[SEMANTIC LAYER — PRE-COMPOSED CROSS-DEVICE SQL]\n{_semantic_sql_hint}"
+
     # ── CHANGE: read session_context for dynamic prompt injection ──
     _sctx = (getattr(ai_session, 'session_context', None) or {}) if ai_session else {}
     _active_sites = ", ".join(_sctx.get("active_sites", [])) or "none yet"

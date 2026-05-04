@@ -5635,6 +5635,119 @@ def generate_employee_id(role):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# SEMANTIC LAYER ADMIN ROUTES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.route("/api/admin/semantic/catalog", methods=["GET"])
+@jwt_required()
+def semantic_catalog_list():
+    """List all metric concepts and their physical mappings."""
+    user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
+    if user.role != "admin":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    from semantic_layer import _sql as sl_sql
+    concepts = sl_sql("""
+        SELECT mc.id, mc.concept_name, mc.display_name, mc.unit, mc.description,
+               mc.created_at
+        FROM metric_catalog mc ORDER BY mc.concept_name
+    """)
+    # Attach mappings to each concept
+    for c in concepts:
+        c["mappings"] = sl_sql("""
+            SELECT id, table_name, column_expr, filter_expr, device_type, priority
+            FROM metric_physical_mapping WHERE concept_id = :cid
+            ORDER BY priority DESC
+        """, {"cid": c["id"]})
+        if c.get("created_at"):
+            c["created_at"] = str(c["created_at"])
+
+    return jsonify({"concepts": concepts, "count": len(concepts)})
+
+
+@app.route("/api/admin/semantic/catalog", methods=["POST"])
+@jwt_required()
+def semantic_catalog_upsert():
+    """Add or update a metric concept with its physical mappings."""
+    user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
+    if user.role != "admin":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    data = request.get_json()
+    if not data or not data.get("concept_name") or not data.get("display_name"):
+        return jsonify({"error": "concept_name and display_name required"}), 400
+
+    from semantic_layer import _sql as sl_sql, _sql_exec as sl_exec
+
+    cname = data["concept_name"].strip()
+    dname = data["display_name"].strip()
+    unit = data.get("unit")
+    desc = data.get("description")
+
+    # Upsert concept
+    existing = sl_sql("SELECT id FROM metric_catalog WHERE concept_name = :cn", {"cn": cname})
+    if existing:
+        concept_id = existing[0]["id"]
+        sl_exec("""
+            UPDATE metric_catalog SET display_name = :dn, unit = :unit, description = :desc
+            WHERE id = :cid
+        """, {"dn": dname, "unit": unit, "desc": desc, "cid": concept_id})
+    else:
+        sl_exec("""
+            INSERT INTO metric_catalog (concept_name, display_name, unit, description)
+            VALUES (:cn, :dn, :unit, :desc)
+        """, {"cn": cname, "dn": dname, "unit": unit, "desc": desc})
+        new_row = sl_sql("SELECT id FROM metric_catalog WHERE concept_name = :cn", {"cn": cname})
+        concept_id = new_row[0]["id"]
+
+    # Replace mappings if provided
+    mappings = data.get("mappings", [])
+    if mappings:
+        sl_exec("DELETE FROM metric_physical_mapping WHERE concept_id = :cid", {"cid": concept_id})
+        for m in mappings:
+            sl_exec("""
+                INSERT INTO metric_physical_mapping (concept_id, table_name, column_expr, filter_expr, device_type, priority)
+                VALUES (:cid, :tbl, :col, :filt, :dev, :pri)
+            """, {
+                "cid": concept_id, "tbl": m.get("table_name", ""),
+                "col": m.get("column_expr", "value"), "filt": m.get("filter_expr"),
+                "dev": m.get("device_type", "generic"), "pri": m.get("priority", 0),
+            })
+
+    return jsonify({"message": "Concept saved", "concept_id": concept_id})
+
+
+@app.route("/api/admin/semantic/seed", methods=["POST"])
+@jwt_required()
+def semantic_seed():
+    """Trigger auto-discovery: cluster existing KPIs into semantic concepts."""
+    user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
+    if user.role != "admin":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    from semantic_layer import seed_catalog_from_existing_data
+    result = seed_catalog_from_existing_data()
+    return jsonify(result)
+
+
+@app.route("/api/admin/semantic/embed", methods=["POST"])
+@jwt_required()
+def semantic_embed():
+    """Trigger embedding generation for all schema objects."""
+    user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
+    if user.role != "admin":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    from semantic_layer import embed_schema_objects
+    result = embed_schema_objects()
+    return jsonify(result)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # ADMIN ROUTES
 # ═══════════════════════════════════════════════════════════════════════════════
 
