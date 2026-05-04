@@ -401,6 +401,9 @@ def refresh_materialized_views():
             except Exception as _e:
                 _LOG.debug("MV refresh skip %s: %s", _mv, str(_e)[:80])
     _LOG.info("Materialized views refreshed successfully.")
+    # Invalidate schema hint cache so next query picks up fresh data
+    _schema_hint_cache["hint"] = None
+    _schema_hint_cache["ts"] = 0.0
 
 # ─── Module-level schema discovery cache (populated on first ai_query call) ──
 _schema_cache = {
@@ -419,6 +422,11 @@ _schema_cache = {
     "kpi_max_date_recent": None,  # max date among KPIs that have recent data
 }
 
+# ─── SCHEMA_HINT cache — avoids re-running expensive discovery on every query ──
+# Rebuilt once per TTL (5 min) or when refresh_materialized_views() is called.
+_schema_hint_cache: dict = {"hint": None, "ts": 0.0}
+_SCHEMA_HINT_TTL = 300  # 5 minutes
+
 # ─── Shared helpers (imported lazily from network_analytics) ─────────────────
 
 def _sql(query: str, params: dict = None) -> list:
@@ -427,6 +435,20 @@ def _sql(query: str, params: dict = None) -> list:
         result = conn.execute(sa_text(query), params or {})
         cols = list(result.keys())
         return [dict(zip(cols, row)) for row in result.fetchall()]
+
+
+def _sql_fast(query: str, timeout_ms: int = 4000) -> list:
+    """Execute SQL with a statement_timeout so schema-discovery queries never hang.
+    Falls back to empty list on timeout or error."""
+    try:
+        with db.engine.connect() as conn:
+            conn.execute(sa_text(f"SET LOCAL statement_timeout = '{timeout_ms}'"))
+            result = conn.execute(sa_text(query))
+            cols = list(result.keys())
+            return [dict(zip(cols, row)) for row in result.fetchall()]
+    except Exception as _e:
+        _LOG.debug("_sql_fast timed-out/failed (%dms): %s", timeout_ms, str(_e)[:120])
+        return []
 
 
 def _kpi_date_ref():
@@ -1623,10 +1645,15 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
     if ai_result.get("multi_chart") and ai_result.get("charts"):
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        def _exec_chart(chart_spec):
+        # Capture the real Flask app object in the request thread —
+        # worker threads need it to create their own app context.
+        _app_obj = current_app._get_current_object()
+
+        def _exec_chart(chart_spec, app):
             c_sql = chart_spec.get("sql", "")
             try:
-                rows = _sql_with_timeout(c_sql, timeout_sec=15)
+                with app.app_context():
+                    rows = _sql_with_timeout(c_sql, timeout_sec=15)
                 if not rows:
                     _LOG.warning("Multi-chart SQL returned 0 rows — SQL: %s", c_sql[:300])
                     return chart_spec, rows, "Query returned no data. The site ID or KPI may not exist in the database."
@@ -1639,7 +1666,7 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
         chart_specs = ai_result["charts"]
         results_map = {}
         with ThreadPoolExecutor(max_workers=min(len(chart_specs), 4)) as _pool:
-            futures = {_pool.submit(_exec_chart, spec): i for i, spec in enumerate(chart_specs)}
+            futures = {_pool.submit(_exec_chart, spec, _app_obj): i for i, spec in enumerate(chart_specs)}
             for fut in as_completed(futures):
                 idx = futures[fut]
                 results_map[idx] = fut.result()
