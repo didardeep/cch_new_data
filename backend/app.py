@@ -6786,8 +6786,8 @@ def admin_upload_kpi_site_level():
         wb.close()
 
     clear_analytics_cache()
-    _invalidate_ai_schema()
     upsert_kpi_data_stats()
+    # Schema cache invalidation happens INSIDE refresh_all_matviews after MVs are refreshed
     threading.Thread(target=refresh_all_matviews, daemon=True).start()
     return jsonify({
         "inserted": total_inserted,
@@ -7055,8 +7055,8 @@ def admin_upload_kpi_cell_level():
         wb.close()
 
     clear_analytics_cache()
-    _invalidate_ai_schema()
     upsert_kpi_data_stats()
+    # Schema cache invalidation happens INSIDE refresh_all_matviews after MVs are refreshed
     threading.Thread(target=refresh_all_matviews, daemon=True).start()
     return jsonify({
         "inserted": total_inserted,
@@ -7667,8 +7667,8 @@ def admin_delete_kpi_site_level():
     KpiData.query.filter_by(data_level="site").delete()
     db.session.commit()
     clear_analytics_cache()
-    _invalidate_ai_schema()
     upsert_kpi_data_stats()
+    # Schema cache invalidation happens INSIDE refresh_all_matviews after MVs are refreshed
     threading.Thread(target=refresh_all_matviews, daemon=True).start()
     return jsonify({"deleted": count})
 
@@ -7684,8 +7684,8 @@ def admin_delete_kpi_cell_level():
     KpiData.query.filter_by(data_level="cell").delete()
     db.session.commit()
     clear_analytics_cache()
-    _invalidate_ai_schema()
     upsert_kpi_data_stats()
+    # Schema cache invalidation happens INSIDE refresh_all_matviews after MVs are refreshed
     threading.Thread(target=refresh_all_matviews, daemon=True).start()
     return jsonify({"deleted": count})
 
@@ -10574,6 +10574,7 @@ def refresh_all_matviews():
     Order matters: kpi_data_merged first (no deps), then mv_daily_site_kpi
     (sourced from kpi_data), then mv_zone_daily_kpi (sourced from mv_daily_site_kpi).
     Each refresh is attempted CONCURRENTLY first; falls back to plain REFRESH on error.
+    Invalidates AI schema cache AFTER all refreshes complete (not before).
     """
     from sqlalchemy import text as _t
     for _mv in ["kpi_data_merged", "mv_daily_site_kpi", "mv_zone_kpi_summary", "mv_zone_daily_kpi"]:
@@ -10588,6 +10589,8 @@ def refresh_all_matviews():
                     conn.commit()
             except Exception as _e:
                 print(f"refresh {_mv} failed (non-fatal): {_e}")
+    # Invalidate AI schema cache AFTER refresh so next query rebuilds from fresh MVs
+    _invalidate_ai_schema()
 
 
 with app.app_context():

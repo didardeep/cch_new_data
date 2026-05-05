@@ -86,9 +86,9 @@ def _strip_sql_strings(sql: str) -> str:
 
 
 def _validate_sql(sql: str) -> tuple:
-    """Validate generated SQL for safety. Returns (is_safe, error_message).
+    """Validate generated SQL for safety. Returns (is_safe, normalized_sql | error_message).
     Rules: only SELECT allowed, no dangerous operations, must have LIMIT,
-    no SELECT *, must reference allowed tables only."""
+    must reference only allowed tables (uses sqlparse for accurate extraction)."""
     if not sql or not sql.strip():
         return False, "Empty SQL query"
 
@@ -99,7 +99,6 @@ def _validate_sql(sql: str) -> tuple:
         return False, "Only SELECT queries are allowed"
 
     # Strip string literals before checking for blocked keywords.
-    # This prevents false positives like a KPI name containing 'Drop' matching DROP
     stripped = _strip_sql_strings(normalized)
 
     # Block dangerous operations (only check SQL keywords, not string content)
@@ -111,21 +110,148 @@ def _validate_sql(sql: str) -> tuple:
     if 'LIMIT' not in normalized.upper():
         normalized = normalized.rstrip(';') + ' LIMIT 500'
 
-    # Check that only allowed tables are referenced (skip subquery aliases)
-    from_tables = re.findall(r'\bFROM\s+(\w+)', stripped, re.IGNORECASE)
-    join_tables = re.findall(r'\bJOIN\s+(\w+)', stripped, re.IGNORECASE)
-    all_tables = set(t.lower() for t in from_tables + join_tables)
-    # Remove SQL keywords, common aliases, and subquery refs
-    _skip = {'select', 'where', 'group', 'order', 'having', 'limit',
-             'union', 'all', 'as', 'lateral', 'each', 'unnest',
-             'k', 'f', 'r', 'c', 't', 'ts', 'n', 's'}  # common table aliases
-    all_tables -= _skip
-
-    invalid_tables = all_tables - _ALLOWED_TABLES
+    # Extract real table names using sqlparse (handles CTEs, subqueries, aliases)
+    real_tables = _extract_real_tables(normalized)
+    invalid_tables = real_tables - _ALLOWED_TABLES
     if invalid_tables:
         return False, f"Unknown table(s): {', '.join(invalid_tables)}"
 
     return True, normalized
+
+
+def _extract_real_tables(sql: str) -> set:
+    """Extract actual table names from SQL using sqlparse.
+    Correctly skips CTE names, subquery aliases, and table aliases."""
+    try:
+        import sqlparse
+        from sqlparse.sql import IdentifierList, Identifier, Parenthesis
+        from sqlparse.tokens import Keyword, DML
+
+        parsed = sqlparse.parse(sql)
+        if not parsed:
+            return set()
+
+        tables = set()
+        cte_names = set()
+
+        def _extract_from_statement(statement):
+            """Walk tokens to find tables after FROM/JOIN, and CTE names after WITH."""
+            _is_from = False
+            _is_with = False
+            _is_join = False
+
+            for token in statement.tokens:
+                # Recurse into parenthesized subqueries
+                if isinstance(token, Parenthesis):
+                    for sub_stmt in sqlparse.parse(token.value[1:-1]):
+                        _extract_from_statement(sub_stmt)
+                    _is_from = False
+                    continue
+
+                # Track WITH (CTE definitions)
+                if token.ttype is Keyword and token.normalized == 'WITH':
+                    _is_with = True
+                    _is_from = False
+                    continue
+
+                # Track FROM clause
+                if token.ttype is Keyword and token.normalized == 'FROM':
+                    _is_from = True
+                    _is_with = False
+                    continue
+
+                # Track JOIN clauses
+                if token.ttype is Keyword and 'JOIN' in (token.normalized or ''):
+                    _is_join = True
+                    _is_from = False
+                    continue
+
+                # SELECT/WHERE/GROUP/ORDER/HAVING/LIMIT end the FROM/JOIN context
+                if token.ttype is Keyword and token.normalized in (
+                    'SELECT', 'WHERE', 'GROUP', 'ORDER', 'HAVING', 'LIMIT',
+                    'UNION', 'INTERSECT', 'EXCEPT', 'ON', 'SET',
+                ):
+                    _is_from = False
+                    _is_join = False
+                    _is_with = False
+                    continue
+
+                if token.ttype is DML:
+                    _is_from = False
+                    _is_join = False
+                    continue
+
+                # CTE name: first identifier after WITH keyword
+                if _is_with and isinstance(token, Identifier):
+                    cte_name = token.get_name()
+                    if cte_name:
+                        cte_names.add(cte_name.lower())
+                    _is_with = False
+                    continue
+
+                if _is_with and isinstance(token, IdentifierList):
+                    for ident in token.get_identifiers():
+                        if isinstance(ident, Identifier):
+                            cte_name = ident.get_name()
+                            if cte_name:
+                                cte_names.add(cte_name.lower())
+                    _is_with = False
+                    continue
+
+                # Table name: identifier after FROM/JOIN
+                if (_is_from or _is_join) and isinstance(token, Identifier):
+                    # If it's a subquery (parenthesized), recurse
+                    if token.tokens and isinstance(token.tokens[0], Parenthesis):
+                        for sub_stmt in sqlparse.parse(token.tokens[0].value[1:-1]):
+                            _extract_from_statement(sub_stmt)
+                    else:
+                        real_name = token.get_real_name()
+                        if real_name and not real_name.startswith('('):
+                            tables.add(real_name.lower())
+                    _is_from = False
+                    _is_join = False
+                    continue
+
+                if (_is_from or _is_join) and isinstance(token, IdentifierList):
+                    for ident in token.get_identifiers():
+                        if isinstance(ident, Identifier):
+                            if ident.tokens and isinstance(ident.tokens[0], Parenthesis):
+                                for sub_stmt in sqlparse.parse(ident.tokens[0].value[1:-1]):
+                                    _extract_from_statement(sub_stmt)
+                            else:
+                                real_name = ident.get_real_name()
+                                if real_name and not real_name.startswith('('):
+                                    tables.add(real_name.lower())
+                    _is_from = False
+                    _is_join = False
+                    continue
+
+        for stmt in parsed:
+            _extract_from_statement(stmt)
+
+        # Remove CTE names from the result — they are not real tables
+        tables -= cte_names
+        return tables
+
+    except ImportError:
+        # Fallback to regex if sqlparse not available
+        _LOG.warning("[VALIDATE] sqlparse not installed, falling back to regex")
+        from_tables = re.findall(r'\bFROM\s+(\w+)', sql, re.IGNORECASE)
+        join_tables = re.findall(r'\bJOIN\s+(\w+)', sql, re.IGNORECASE)
+        all_tables = set(t.lower() for t in from_tables + join_tables)
+        _skip = {'select', 'where', 'group', 'order', 'having', 'limit',
+                 'union', 'all', 'as', 'lateral', 'each', 'unnest'}
+        all_tables -= _skip
+        return all_tables
+    except Exception as e:
+        _LOG.warning("[VALIDATE] sqlparse extraction failed: %s, falling back to regex", e)
+        from_tables = re.findall(r'\bFROM\s+(\w+)', sql, re.IGNORECASE)
+        join_tables = re.findall(r'\bJOIN\s+(\w+)', sql, re.IGNORECASE)
+        all_tables = set(t.lower() for t in from_tables + join_tables)
+        _skip = {'select', 'where', 'group', 'order', 'having', 'limit',
+                 'union', 'all', 'as', 'lateral', 'each', 'unnest'}
+        all_tables -= _skip
+        return all_tables
 
 
 def _add_safety_limits(sql: str, max_rows: int = 500) -> str:
@@ -410,9 +536,9 @@ def refresh_materialized_views():
             except Exception as _e:
                 _LOG.debug("MV refresh skip %s: %s", _mv, str(_e)[:80])
     _LOG.info("Materialized views refreshed successfully.")
-    # Invalidate schema hint cache so next query picks up fresh data
-    _schema_hint_cache["hint"] = None
-    _schema_hint_cache["ts"] = 0.0
+    # Invalidate full schema cache AFTER refresh completes (not before)
+    # so the next query rebuilds from fully-refreshed MVs.
+    invalidate_schema_cache()
 
 # ─── Module-level schema discovery cache (populated on first ai_query call) ──
 _schema_cache = {
@@ -697,245 +823,50 @@ def ai_query():
         _schema_cache["kpi_names_list"] = _kpi_names_list
 
         SCHEMA_HINT = """
-    === FAST MATERIALIZED VIEWS — USE THESE AS PRIMARY QUERY TARGETS ===
-    These views are pre-aggregated and 10-100x faster than querying raw kpi_data.
+=== MATERIALIZED VIEWS (PREFERRED — 10-100x faster) ===
+mv_daily_site_kpi(site_id, kpi_name, date, avg_value, min_value, max_value, sample_count)
+mv_zone_daily_kpi(zone, kpi_name, date, avg_val, site_count)
+mv_zone_kpi_summary(zone, kpi_name, avg_value, min_value, max_value, site_count) — no date col
+JOIN telecom_sites ts ON LOWER(mv.site_id)=LOWER(ts.site_id) for zone/city.
 
-    mv_daily_site_kpi(site_id TEXT, kpi_name TEXT, date DATE,
-                      avg_value FLOAT, min_value FLOAT, max_value FLOAT, sample_count INT)
-      Daily KPI averages per site. Use for: trends, top-N, comparisons, threshold queries.
-      JOIN telecom_sites ts ON LOWER(mv.site_id) = LOWER(ts.site_id) for zone/city/location.
-      Example: SELECT site_id, avg_value FROM mv_daily_site_kpi
-               WHERE kpi_name = '...' AND date >= CURRENT_DATE - INTERVAL '30 days'
-               ORDER BY avg_value DESC LIMIT 20
+RULES: 1) Prefer MVs over kpi_data. 2) Always add date filter. 3) Always add LIMIT. 4) Use kpi_data only for hourly/cell data.
 
-    mv_zone_daily_kpi(zone TEXT, kpi_name TEXT, date DATE, avg_val FLOAT, site_count INT)
-      Daily zone-level KPI averages. Use for zone trends and comparisons over time.
-      No JOIN needed for zone questions.
-      Example: SELECT zone, AVG(avg_val) FROM mv_zone_daily_kpi
-               WHERE kpi_name = '...' AND date >= CURRENT_DATE - INTERVAL '30 days'
-               GROUP BY zone ORDER BY AVG(avg_val) DESC LIMIT 20
+=== TABLES ===
+kpi_data(site_id, kpi_name, value, date, hour, data_level, cell_id)
+  data_level='site'|'cell'. kpi_name is CASE-SENSITIVE. Use ILIKE for fuzzy.
 
-    mv_zone_kpi_summary(zone TEXT, kpi_name TEXT,
-                        avg_value FLOAT, min_value FLOAT, max_value FLOAT, site_count INT)
-      All-time zone aggregate (no date column). Use for zone snapshots when date is not needed.
+telecom_sites(site_id, cell_id, latitude, longitude, zone, city, state, technology, site_status, alarms)
 
-    MANDATORY QUERY RULES (violating these causes slow or empty results):
-    1. ALWAYS prefer mv_daily_site_kpi over kpi_data for any site-level KPI query.
-    2. ALWAYS add a date filter: date >= CURRENT_DATE - INTERVAL '30 days' (or shorter).
-    3. ALWAYS add LIMIT 1000 to every query.
-    4. Only use raw kpi_data for HOURLY data (WHERE hour = X) or cell-level data.
-    5. For zone trends over time: use mv_zone_daily_kpi.
-       For zone snapshot (no time): use mv_zone_kpi_summary.
+flexible_kpi_uploads(kpi_type, site_id, column_name, column_type, num_value, str_value) — EAV table
+  kpi_type='revenue': column_name has metric name, num_value has value. ALWAYS use ILIKE for column_name.
+  kpi_type='core': kpi_name has metric type, column_name has dates, num_value has value.
+  If 'total'/'sum' column exists, use directly — do NOT SUM monthly columns.
 
-    ======================================================================
-    Tables (FALLBACK — use kpi_data only when MVs unavailable or hourly/cell data needed):
-    1. kpi_data(id, site_id, kpi_name, value, date, hour, data_level, cell_id, cell_site_id)
-       - data_level = 'site' for site-level, 'cell' for cell-level
-       - kpi_name is CASE-SENSITIVE. Exact strings are in the "RAN KPI Names" section (discovered at runtime).
-       - For fuzzy matching use ILIKE: WHERE kpi_name ILIKE '%drop%'
+transport_kpi_data — columns discovered at runtime (see below)
+core_kpi_data — flat table with date, columns discovered at runtime
+revenue_data — flat table, one row per site, columns discovered at runtime
+network_issue_tickets — columns discovered at runtime
 
-    2. telecom_sites(site_id, cell_id, latitude, longitude, zone, city, state, technology, site_status, alarms)
-       - JOIN with kpi_data: kpi_data k JOIN telecom_sites ts ON k.site_id = ts.site_id
-       - zone = cluster/region name, city = city name, state = state name
-       - technology = 'LTE', '4G', '5G', etc.
-       - site_status = 'on_air' or 'off_air'
+site_kpi_summary(site_id, date, kpi_name, avg_value, min_value, max_value, stddev_value,
+  sample_count, health_label, health_confidence, is_anomaly, anomaly_score, site_tier, health_score, zone)
+  health_label: healthy|degraded|critical. site_tier: top_performer|good|average|underperformer.
+  health_score: 0-100. is_anomaly: bool. Use for health/anomaly/ranking questions.
 
-    3. flexible_kpi_uploads — EAV (Entity-Attribute-Value) table for Core and Revenue data
-       Columns: id, kpi_type, site_id, column_name, column_type, num_value, str_value
-       - This is NOT a flat table. Each ROW stores ONE metric for ONE site.
-       - column_type = 'numeric' → value is in num_value column
-       - column_type = 'text'    → value is in str_value column
-       - Alias the table as f: FROM flexible_kpi_uploads f
-
-       === Revenue data (kpi_type = 'revenue') ===
-       column_name and kpi_name values are listed in the
-       'ACTUAL COLUMN NAMES in flexible_kpi_uploads' section that follows
-       (discovered from your live database). Use ILIKE for matching to handle
-       case differences.
-
-       IMPORTANT: column_name values may have mixed casing.
-       ALWAYS use ILIKE (case-insensitive) for column_name matching, NEVER use = or LIKE.
-       If a column named like 'total' or 'sum' exists, use it directly — do NOT SUM monthly columns
-       (that would double-count).
-
-       Example: Get a numeric metric per site:
-         SELECT f.site_id, f.num_value AS metric_value
-         FROM flexible_kpi_uploads f
-         WHERE f.kpi_type = 'revenue'
-           AND f.column_name ILIKE '%<metric_keyword>%' AND f.column_type = 'numeric'
-         ORDER BY metric_value DESC
-
-       Example: Get a metric for a specific site:
-         SELECT f.site_id, f.num_value AS metric_value
-         FROM flexible_kpi_uploads f
-         WHERE f.kpi_type = 'revenue' AND f.column_name ILIKE '%<metric_keyword>%'
-           AND f.site_id = '<example_site_id>'
-
-       === Core KPI data (kpi_type = 'core') ===
-       IMPORTANT: Core data uses kpi_name (NOT column_name) for the metric type.
-       column_name and kpi_name values are listed in the
-       'ACTUAL COLUMN NAMES in flexible_kpi_uploads' section that follows
-       (discovered from your live database). Use ILIKE for matching.
-       column_name contains DATES (e.g., '2026_03_07_000000'), num_value contains the metric value.
-
-       Example: Get average core KPIs per site:
-         SELECT f.site_id,
-           AVG(CASE WHEN f.kpi_name ILIKE '%<keyword_a>%' THEN f.num_value END) AS metric_a,
-           AVG(CASE WHEN f.kpi_name ILIKE '%<keyword_b>%' THEN f.num_value END) AS metric_b
-         FROM flexible_kpi_uploads f
-         WHERE f.kpi_type = 'core' AND f.column_type = 'numeric'
-         GROUP BY f.site_id
-
-    === Natural Language → Data Source Mapping ===
-    For RAN KPI queries (any network performance metric):
-      → Use mv_daily_site_kpi (preferred for site/daily data) or kpi_data (for hourly/cell data).
-      → Match kpi_name with ILIKE for concept search: WHERE kpi_name ILIKE '%drop%'
-      → For exact names check the "RAN KPI Names" section (discovered from live database above).
-    User asks about revenue / income / OPEX / subscribers / ARPU:
-      → revenue_data (flat table) OR flexible_kpi_uploads WHERE kpi_type = 'revenue'
-    User asks about core network / authentication / CPU / attach / PDP bearer:
-      → core_kpi_data (flat) OR flexible_kpi_uploads WHERE kpi_type = 'core'
-    User asks about transport / backhaul / microwave / jitter / packet loss / link utilization:
-      → transport_kpi_data table
-    User asks about network issues / worst cells / AI tickets / open tickets:
-      → network_issue_tickets table
-    User asks about site info / location / zone / city / state / status / alarms:
-      → telecom_sites table
-    Time references:
-      "last 7 days" / "last week" → INTERVAL '7 days'
-      "last month" / "30 days"    → INTERVAL '30 days'
-      "last year"                 → INTERVAL '365 days'
-    ALWAYS add AND k.date <= CURRENT_DATE when any date range is used, to exclude future data.
-
-    4. transport_kpi_data — Transport/backhaul network KPI data
-       NOTE: Actual columns are discovered at runtime — see "ACTUAL COLUMNS in transport_kpi_data" section below.
-       Typical columns: site_id, zone, backhaul_type, link_capacity, avg_util, peak_util,
-                packet_loss, avg_latency, jitter, availability, error_rate, tput_efficiency, alarms
-       Do NOT assume specific column names — use ONLY the columns listed in the runtime discovery section.
-
-       Example: Get transport KPIs for a site:
-         SELECT t.* FROM transport_kpi_data t WHERE t.site_id = '<example_site_id>'
-
-    5. core_kpi_data — Core network KPIs with date (flat table, NOT EAV)
-       NOTE: Actual columns are discovered at runtime — see "ACTUAL COLUMNS in core_kpi_data" section below.
-       Typical columns: site_id, date, auth_sr, cpu_util, attach_sr, pdp_sr
-       Do NOT assume specific column names — use ONLY the columns listed in the runtime discovery section.
-       If the runtime section is not present, fall back to flexible_kpi_uploads with kpi_type='core'.
-
-       Example: Core KPIs for a site over time:
-         SELECT c.* FROM core_kpi_data c WHERE c.site_id = '<example_site_id>' ORDER BY c.date
-
-    6. revenue_data — Revenue per site (flat table, one row per site)
-       NOTE: Actual columns are discovered at runtime — see "ACTUAL COLUMNS in revenue_data" section below.
-       The table may have monthly revenue columns (like rev_jan, rev_feb, ...) and OPEX columns.
-       Do NOT assume specific column names — use ONLY the columns listed in the runtime discovery section.
-       If the runtime section is not present, fall back to flexible_kpi_uploads with kpi_type='revenue'.
-
-    7. network_issue_tickets — Auto-generated tickets for worst-performing cells
-       NOTE: Actual columns are discovered at runtime — see "ACTUAL COLUMNS in network_issue_tickets" section below.
-       Typical columns: site_id, cells_affected, category, priority, priority_score, sla_hours,
-                avg_drop_rate, avg_cssr, avg_tput, violations, status, zone, location,
-                assigned_agent, root_cause, recommendation, created_at
-       Do NOT assume specific column names — use ONLY the columns listed in the runtime discovery section.
-
-       Example: Open network issue tickets:
-         SELECT n.* FROM network_issue_tickets n WHERE n.status IN ('open','in_progress') ORDER BY n.priority_score DESC
-
-    8. site_kpi_summary — ML-categorized pre-aggregated daily KPI summary per site
-       Columns: site_id, date, kpi_name, avg_value, min_value, max_value, stddev_value, sample_count,
-                health_label, health_confidence, is_anomaly, anomaly_score, site_tier, health_score, zone
-       - health_label = 'healthy', 'degraded', or 'critical' (ML K-Means per KPI)
-       - is_anomaly = true/false (ML Isolation Forest outlier detection)
-       - site_tier = 'top_performer', 'good', 'average', or 'underperformer' (ML K-Means multi-KPI)
-       - health_score = 0-100 composite score (higher = healthier)
-       - health_confidence = 0-1 (how confident the ML model is in the health_label)
-       - anomaly_score = negative float (more negative = more anomalous)
-
-       USE THIS TABLE for questions about:
-       - site health, performance categories, degraded/critical sites
-       - anomalies, outliers, unusual behavior
-       - site rankings, top/worst performers, performance tiers
-       - health scores, health trends over time
-       - comparing site performance across zones
-
-       Example: Get worst-performing sites today:
-         SELECT s.site_id, s.zone, s.health_score, s.site_tier, s.health_label, s.kpi_name, s.avg_value
-         FROM site_kpi_summary s
-         WHERE s.date = (SELECT MAX(date) FROM site_kpi_summary)
-           AND s.health_label = 'critical'
-         ORDER BY s.health_score ASC LIMIT 20
-
-       Example: Anomalies detected in last 7 days:
-         SELECT s.site_id, s.date::text, s.kpi_name, s.avg_value, s.anomaly_score, s.health_label
-         FROM site_kpi_summary s
-         WHERE s.is_anomaly = true
-           AND s.date >= (SELECT MAX(date) FROM site_kpi_summary) - INTERVAL '7 days'
-         ORDER BY s.anomaly_score ASC LIMIT 50
-
-       Example: Site health trend over time:
-         SELECT s.date::text, s.health_score, s.health_label
-         FROM site_kpi_summary s
-         WHERE s.site_id = '<example_site_id>' AND s.kpi_name = '<example_kpi_name>'
-         ORDER BY s.date LIMIT 30
-
-       Example: Zone-wise health comparison:
-         SELECT s.zone, s.kpi_name,
-                AVG(s.health_score) AS avg_health,
-                COUNT(*) FILTER (WHERE s.health_label = 'critical') AS critical_count,
-                COUNT(*) FILTER (WHERE s.is_anomaly = true) AS anomaly_count
-         FROM site_kpi_summary s
-         WHERE s.date = (SELECT MAX(date) FROM site_kpi_summary)
-         GROUP BY s.zone, s.kpi_name
-         ORDER BY avg_health ASC LIMIT 30
-
-       Example: Top performing sites:
-         SELECT s.site_id, s.zone, AVG(s.health_score) AS avg_health, s.site_tier
-         FROM site_kpi_summary s
-         WHERE s.date >= (SELECT MAX(date) FROM site_kpi_summary) - INTERVAL '7 days'
-         GROUP BY s.site_id, s.zone, s.site_tier
-         HAVING s.site_tier = 'top_performer'
-         ORDER BY avg_health DESC LIMIT 20
-
-    === TABLE SELECTION RULE ===
-    - Health/performance categories, anomalies, site tiers, rankings → query site_kpi_summary table (PREFERRED for categorized insights)
-    - RAN performance KPIs (raw values, specific hours, cell-level) → query kpi_data table
-    - Revenue, OPEX, subscribers, ARPU → query revenue_data table FIRST; fallback to flexible_kpi_uploads with kpi_type='revenue'
-    - Core network KPIs (authentication, CPU, attach, PDP) → query core_kpi_data table FIRST; fallback to flexible_kpi_uploads with kpi_type='core'
-    - Transport/backhaul KPIs (link capacity, jitter, packet loss, backhaul) → query transport_kpi_data table
-    - Network issue tickets (worst cells, AI tickets, open issues) → query network_issue_tickets table
-    - Site info (zone, city, state, technology, location) → query telecom_sites table
-    NEVER query kpi_data for revenue/subscriber/OPEX data — it does not exist there.
-    If a table returns 0 rows, try the alternative table (e.g., revenue_data → flexible_kpi_uploads).
-
-    === WHEN TO USE site_kpi_summary vs kpi_data ===
-    PREFER site_kpi_summary when the user asks about:
-    - "healthy", "degraded", "critical" sites/KPIs
-    - "anomalies", "outliers", "unusual" readings
-    - "top performers", "worst sites", "underperformers", site "tiers"
-    - "health score", "performance score"
-    - general aggregated trends (daily averages)
-    - zone-level comparisons
-    PREFER kpi_data when the user asks about:
-    - hourly data, specific hours of the day
-    - cell-level data (data_level = 'cell')
-    - raw unaggregated values
-    - data that may not yet be in the summary (just uploaded)
-
-    === CRITICAL: column_name matching in flexible_kpi_uploads ===
-    Column names may have MIXED CASING (e.g., 'Subscribers', 'Revenue_Jan_L', 'OPEX_Feb (L)').
-    ALWAYS use ILIKE for column_name matching:
-      CORRECT: f.column_name ILIKE '%revenue%'
-      WRONG:   f.column_name LIKE 'revenue%'  -- case-sensitive, will miss 'Revenue_Jan'
-      WRONG:   f.column_name = 'subscribers'   -- exact match, will miss 'Subscribers'
+=== TABLE SELECTION ===
+RAN KPIs (performance) → mv_daily_site_kpi (site/daily) or kpi_data (hourly/cell)
+Health/anomalies/tiers/rankings → site_kpi_summary
+Revenue/OPEX/subscribers → revenue_data, fallback: flexible_kpi_uploads kpi_type='revenue'
+Core network (auth/CPU/attach) → core_kpi_data, fallback: flexible_kpi_uploads kpi_type='core'
+Transport/backhaul → transport_kpi_data
+Network issues/tickets → network_issue_tickets
+Site info/zone/location → telecom_sites
+NEVER query kpi_data for revenue/OPEX data.
     """
 
-        # ── Inject discovered KPI names (replaces hardcoded list) ─────────────────
+        # ── Inject discovered KPI names (compact comma-separated) ─────────────────
         if _kpi_names_list:
-            _kpi_section = "\n=== RAN KPI Names (discovered from live database — EXACT strings) ===\n"
-            _kpi_section += "These are the ACTUAL kpi_name values in your database, discovered at runtime.\n"
-            _kpi_section += "kpi_name is CASE-SENSITIVE. Copy exactly, or use ILIKE for fuzzy: kpi_name ILIKE '%drop%'\n"
-            for _k in _kpi_names_list:
-                _kpi_section += f"  '{_k}'\n"
+            _kpi_section = "\n=== RAN KPI Names (EXACT, case-sensitive — use ILIKE for fuzzy) ===\n"
+            _kpi_section += ", ".join(f"'{k}'" for k in _kpi_names_list) + "\n"
             SCHEMA_HINT += _kpi_section
 
         # ── Dynamic table availability — tell LLM which tables actually exist ──
@@ -988,7 +919,7 @@ def ai_query():
                 _mv_note += f"  {_mvn}: NOT YET CREATED — fall back to kpi_data\n"
         SCHEMA_HINT += _mv_note
 
-        # ── Dynamic revenue column discovery — tell LLM the EXACT column names ──
+        # ── Dynamic revenue column discovery (compact) ──
         if 'flexible_kpi_uploads' in _available_tables:
             try:
                 _rev_cols = _sql(
@@ -997,13 +928,8 @@ def ai_query():
                     "ORDER BY column_name LIMIT 40"
                 )
                 if _rev_cols:
-                    _rcn = "\n=== ACTUAL COLUMN NAMES in flexible_kpi_uploads (kpi_type='revenue') ===\n"
-                    _rcn += "These are the REAL column_name values — use these EXACT values in queries.\n"
-                    _rcn += "IMPORTANT: ALWAYS use ILIKE (not LIKE or =) for column_name matching.\n"
-                    for _rc in _rev_cols:
-                        _rcn += f"  '{_rc['column_name']}' ({_rc['column_type']})\n"
-                    _rcn += "Example: WHERE f.column_name ILIKE '%revenue%' (not LIKE or =)\n"
-                    _rcn += "Example: WHERE f.column_name ILIKE '%subscriber%' (not = 'subscribers')\n"
+                    _rcn = "\nflexible_kpi_uploads column_names (kpi_type='revenue', use ILIKE): "
+                    _rcn += ", ".join(f"{r['column_name']}" for r in _rev_cols) + "\n"
                     SCHEMA_HINT += _rcn
             except Exception:
                 pass
@@ -1026,17 +952,10 @@ def ai_query():
                 _schema_cache["rev_opex_cols"] = [c for c in _schema_cache["rev_data_cols"] if 'opex' in c.lower()]
                 _schema_cache["rev_has_subscribers"] = any(c.lower() == 'subscribers' for c in _schema_cache["rev_data_cols"])
                 if _schema_cache["rev_data_cols"]:
-                    _rds = "\n=== ACTUAL COLUMNS in revenue_data table (discovered at runtime) ===\n"
-                    _rds += f"  All columns: {', '.join(_schema_cache['rev_data_cols'])}\n"
+                    _rds = f"\nrevenue_data columns: {', '.join(_schema_cache['rev_data_cols'])}\n"
                     if _schema_cache["rev_rev_cols"]:
-                        _rds += f"  Revenue columns: {', '.join(_schema_cache['rev_rev_cols'])}\n"
                         _total_ex = ' + '.join(f'COALESCE(r.{c},0)' for c in _schema_cache["rev_rev_cols"])
-                        _rds += f"  Total revenue: SELECT r.site_id, ({_total_ex}) AS total_revenue FROM revenue_data r\n"
-                    if _schema_cache["rev_opex_cols"]:
-                        _rds += f"  OPEX columns: {', '.join(_schema_cache['rev_opex_cols'])}\n"
-                    if _schema_cache["rev_has_subscribers"]:
-                        _rds += "  Subscribers column: subscribers\n"
-                    _rds += "Use ONLY these column names — they are the real ones from the database.\n"
+                        _rds += f"  total_revenue = ({_total_ex})\n"
                     SCHEMA_HINT += _rds
             except Exception:
                 pass
@@ -1053,13 +972,7 @@ def ai_query():
                 _core_skip = {'id', 'uploaded_at', 'site_id', 'date', 'zone', 'city', 'state'}
                 _schema_cache["core_metric_cols"] = [c for c in _schema_cache["core_data_cols"] if c.lower() not in _core_skip]
                 if _schema_cache["core_data_cols"]:
-                    _cds = "\n=== ACTUAL COLUMNS in core_kpi_data table (discovered at runtime) ===\n"
-                    _cds += f"  All columns: {', '.join(_schema_cache['core_data_cols'])}\n"
-                    if _schema_cache["core_metric_cols"]:
-                        _cds += f"  Metric columns: {', '.join(_schema_cache['core_metric_cols'])}\n"
-                        _cds += f"  Example: SELECT c.site_id, c.date::text, {', '.join('c.' + c for c in _schema_cache['core_metric_cols'][:4])} FROM core_kpi_data c\n"
-                    _cds += "Use ONLY these column names — they are the real ones from the database.\n"
-                    SCHEMA_HINT += _cds
+                    SCHEMA_HINT += f"\ncore_kpi_data columns: {', '.join(_schema_cache['core_data_cols'])}\n"
             except Exception:
                 pass
 
@@ -1077,12 +990,7 @@ def ai_query():
                                                            if c.lower() not in _transport_skip
                                                            and c.lower() != 'backhaul_type']
                 if _schema_cache["transport_data_cols"]:
-                    _tds = "\n=== ACTUAL COLUMNS in transport_kpi_data table (discovered at runtime) ===\n"
-                    _tds += f"  All columns: {', '.join(_schema_cache['transport_data_cols'])}\n"
-                    if _schema_cache["transport_metric_cols"]:
-                        _tds += f"  Metric columns: {', '.join(_schema_cache['transport_metric_cols'])}\n"
-                    _tds += "Use ONLY these column names — they are the real ones from the database.\n"
-                    SCHEMA_HINT += _tds
+                    SCHEMA_HINT += f"\ntransport_kpi_data columns: {', '.join(_schema_cache['transport_data_cols'])}\n"
             except Exception:
                 pass
 
@@ -1096,10 +1004,7 @@ def ai_query():
                 )
                 _schema_cache["ticket_cols"] = [r['column_name'] for r in _ntc]
                 if _schema_cache["ticket_cols"]:
-                    _nts = "\n=== ACTUAL COLUMNS in network_issue_tickets table (discovered at runtime) ===\n"
-                    _nts += f"  All columns: {', '.join(_schema_cache['ticket_cols'])}\n"
-                    _nts += "Use ONLY these column names — they are the real ones from the database.\n"
-                    SCHEMA_HINT += _nts
+                    SCHEMA_HINT += f"\nnetwork_issue_tickets columns: {', '.join(_schema_cache['ticket_cols'])}\n"
             except Exception:
                 pass
 
@@ -1132,16 +1037,13 @@ def ai_query():
                         _schema_cache["kpi_max_date_recent"] = _schema_cache["kpi_max_date"]
                 _LOG.info("[DISCOVERY] kpi_max_date=%s kpi_max_date_recent=%s",
                           _schema_cache["kpi_max_date"], _schema_cache["kpi_max_date_recent"])
-                # Tell LLM about the actual date range so it doesn't use CURRENT_DATE blindly
+                # Tell LLM about actual date reference
                 if _schema_cache["kpi_max_date_recent"]:
-                    _date_hint = f"\n=== DATA FRESHNESS (CRITICAL — read carefully) ===\n"
-                    _date_hint += f"The LATEST date with RAN KPI data is: {_schema_cache['kpi_max_date_recent']}\n"
-                    _date_hint += f"Today's date is: {datetime.now().strftime('%Y-%m-%d')}\n"
-                    _date_hint += "IMPORTANT: If these dates differ, the data is NOT up-to-date.\n"
-                    _date_hint += f"Use '{_schema_cache['kpi_max_date_recent']}'::date instead of CURRENT_DATE as the end date.\n"
-                    _date_hint += f"Example: AND k.date >= '{_schema_cache['kpi_max_date_recent']}'::date - INTERVAL '7 days' "
-                    _date_hint += f"AND k.date <= '{_schema_cache['kpi_max_date_recent']}'::date\n"
-                    _date_hint += "NEVER use CURRENT_DATE if it is more recent than the latest data date.\n"
+                    _date_hint = (
+                        f"\nDATA DATE: latest={_schema_cache['kpi_max_date_recent']}, "
+                        f"today={datetime.now().strftime('%Y-%m-%d')}. "
+                        f"Use '{_schema_cache['kpi_max_date_recent']}'::date NOT CURRENT_DATE.\n"
+                    )
                     SCHEMA_HINT += _date_hint
             except Exception as e:
                 _LOG.warning("[DISCOVERY] Failed to get kpi_data date range: %s", e)
@@ -1151,7 +1053,9 @@ def ai_query():
         # leading to threshold queries that confidently return 0 rows with no explanation.
         if 'kpi_data' in _available_tables:
             try:
-                _kpi_ranges = _sql(
+                # Use _sql_fast with 5s timeout + limit to last 30 days to avoid
+                # unbounded PERCENTILE_CONT scan over millions of rows.
+                _kpi_ranges = _sql_fast(
                     """SELECT kpi_name,
                               ROUND(MIN(value)::numeric, 2)    AS min_val,
                               ROUND(AVG(value)::numeric, 2)    AS avg_val,
@@ -1161,23 +1065,22 @@ def ai_query():
                               COUNT(DISTINCT site_id) AS site_count
                        FROM kpi_data
                        WHERE data_level = 'site' AND value IS NOT NULL
+                         AND date >= (SELECT MAX(date) - INTERVAL '30 days' FROM kpi_data)
                        GROUP BY kpi_name
-                       ORDER BY kpi_name"""
+                       ORDER BY kpi_name""",
+                    timeout_ms=5000
                 )
                 if _kpi_ranges:
                     _schema_cache["kpi_ranges"] = {r["kpi_name"]: r for r in _kpi_ranges}
-                    _rng_hint = "\n=== KPI VALUE RANGES (actual data — use for threshold calibration) ===\n"
-                    _rng_hint += "Format: kpi_name → min | p25 | avg | p75 | max | sites\n"
-                    for r in _kpi_ranges:
+                    # Compact format: limit to 20 KPIs sorted by site_count (most used first)
+                    _sorted_ranges = sorted(_kpi_ranges, key=lambda r: r['site_count'] or 0, reverse=True)[:20]
+                    _rng_hint = "\n=== KPI RANGES (top 20 by coverage, for threshold calibration) ===\n"
+                    for r in _sorted_ranges:
                         _rng_hint += (
-                            f"  '{r['kpi_name']}': "
-                            f"min={r['min_val']} | p25={r['p25']} | avg={r['avg_val']} "
-                            f"| p75={r['p75']} | max={r['max_val']} | {r['site_count']} sites\n"
+                            f"{r['kpi_name']}: [{r['min_val']},{r['p25']},{r['avg_val']},"
+                            f"{r['p75']},{r['max_val']}] {r['site_count']}sites\n"
                         )
-                    _rng_hint += (
-                        "CRITICAL: When a threshold query returns 0 rows, it means NO site breaches "
-                        "that threshold — check ranges above and inform the user.\n"
-                    )
+                    _rng_hint += "Format: kpi [min,p25,avg,p75,max] sites. If threshold query→0 rows, check these.\n"
                     SCHEMA_HINT += _rng_hint
                     _LOG.info("[DISCOVERY] KPI ranges loaded for %d KPIs", len(_kpi_ranges))
             except Exception as e:
@@ -1253,6 +1156,11 @@ def ai_query():
             except Exception as e:
                 _LOG.debug("[AUTO-ML] Failed to auto-trigger ML pipeline: %s", e)
 
+
+        # Hard cap: truncate to 8KB to keep LLM context manageable
+        if len(SCHEMA_HINT) > 8000:
+            SCHEMA_HINT = SCHEMA_HINT[:7900] + "\n...[TRUNCATED — use runtime column names above]\n"
+            _LOG.warning("[SCHEMA_HINT] Truncated from %d to 8KB", len(SCHEMA_HINT))
 
         # Store freshly built SCHEMA_HINT in cache
         _schema_hint_cache["hint"] = SCHEMA_HINT
@@ -1850,7 +1758,13 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
         rows = _sql_with_timeout(sql, timeout_sec=15)
     except Exception as e:
         _LOG.warning("AI SQL execution failed: %s — SQL: %s", e, sql[:200])
-        rows = []
+        _emit_progress(_ws_sid, "complete", "Error")
+        return jsonify({
+            "error": "SQL execution failed",
+            "reason": str(e)[:300],
+            "sql": sql[:500],
+            "response": f"Query failed: {str(e)[:200]}. Try rephrasing your question.",
+        }), 422
     print(f"[TIMING] DB query (single-chart): {time.time()-_t2:.2f}s", flush=True)
 
     # ── 0-rows explanation: if still empty, check KPI ranges and explain why ──

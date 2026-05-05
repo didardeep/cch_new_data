@@ -622,12 +622,15 @@ export default function NetworkAiChat() {
           s.id===sid&&s.title==='New Chat' ? {...s,title:result.title} : s
         ));
       }
-    }catch{
+    }catch(err){
+      const errMsg = err?.message || 'Could not reach the server. Please try again.';
       setMessages(prev=>[...prev,{
         id:Date.now()+1, role:'assistant',
-        content:'Could not reach the server. Please try again.',
+        content: errMsg,
+        isError: true,
         created_at:new Date().toISOString(),
       }]);
+      console.error('[NetworkAiChat] query failed:', err);
     }
     setLoading(false);
     setProgress(null);
@@ -738,15 +741,18 @@ export default function NetworkAiChat() {
                         <span style={{fontSize:9,fontWeight:700,opacity:.6,textTransform:'uppercase'}}>
                           {m.role==='user'?'You':'AI Assistant'}
                         </span>
-                        {m.role==='assistant'&&m.payload?.query_type==='informational'&&(
+                        {m.role==='assistant'&&m.isError&&(
+                          <span style={{fontSize:8,padding:'1px 6px',borderRadius:6,background:'#fee2e2',color:'#dc2626',fontWeight:600}}>Error</span>
+                        )}
+                        {m.role==='assistant'&&!m.isError&&m.payload?.query_type==='informational'&&(
                           <span style={{fontSize:8,padding:'1px 6px',borderRadius:6,background:T.teal+'22',color:T.teal,fontWeight:600}}>Knowledge</span>
                         )}
-                        {m.role==='assistant'&&m.payload?.provider&&m.payload.query_type!=='informational'&&(
+                        {m.role==='assistant'&&!m.isError&&m.payload?.provider&&m.payload.query_type!=='informational'&&(
                           <span style={{fontSize:8,padding:'1px 6px',borderRadius:6,background:T.kpmgBlue+'15',color:T.kpmgBlue,fontWeight:600}}>SQL</span>
                         )}
                       </div>
 
-                      <div style={{fontSize:12.5,lineHeight:1.65,whiteSpace:'pre-wrap'}}>{m.content}</div>
+                      <div style={{fontSize:12.5,lineHeight:1.65,whiteSpace:'pre-wrap',color:m.isError?'#dc2626':undefined}}>{m.content}</div>
 
                       {/* Multi-chart: render ALL charts including ones with no data */}
                       {m.role==='assistant'&&m.payload&&m.payload.chart_type==='multi_chart'&&m.payload.charts?.length>0&&(
