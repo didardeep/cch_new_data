@@ -831,6 +831,16 @@ JOIN telecom_sites ts ON LOWER(mv.site_id)=LOWER(ts.site_id) for zone/city.
 
 RULES: 1) Prefer MVs over kpi_data. 2) Always add date filter. 3) Always add LIMIT. 4) Use kpi_data only for hourly/cell data.
 
+=== MULTI-KPI PIVOT PATTERN (use for "show X along with Y and Z") ===
+SELECT site_id,
+  AVG(CASE WHEN kpi_name='KPI_A' THEN avg_value END) AS kpi_a,
+  AVG(CASE WHEN kpi_name='KPI_B' THEN avg_value END) AS kpi_b
+FROM mv_daily_site_kpi
+WHERE kpi_name IN ('KPI_A','KPI_B') AND date >= '...'::date - INTERVAL '7 days'
+GROUP BY site_id ORDER BY kpi_a ASC LIMIT 10
+IMPORTANT: For "bottom/top N by KPI_A with KPI_B", put ALL KPIs in one query with CASE WHEN pivots.
+Do NOT use correlated subqueries — they cause GroupingError. Use a single GROUP BY instead.
+
 === TABLES ===
 kpi_data(site_id, kpi_name, value, date, hour, data_level, cell_id)
   data_level='site'|'cell'. kpi_name is CASE-SENSITIVE. Use ILIKE for fuzzy.
@@ -1519,9 +1529,63 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
                 else:
                     sql = '\nUNION ALL\n'.join(cleaned) + '\nORDER BY date'
 
+        # 7. Fix correlated subquery referencing outer alias inside HAVING/WHERE subquery
+        # LLM often writes: HAVING k.site_id IN (SELECT site_id FROM kpi_data WHERE k.kpi_name = ...)
+        # The "k." inside the subquery references the outer query, causing GroupingError.
+        # Fix: remove outer alias prefix inside subqueries.
+        _subq_matches = list(re.finditer(
+            r'\(\s*SELECT\s+.*?\bFROM\s+(\w+)\s+',
+            sql, re.IGNORECASE | re.DOTALL
+        ))
+        for _m in reversed(_subq_matches):
+            _subq_start = _m.start()
+            # Find matching closing paren
+            _depth = 0
+            _subq_end = _subq_start
+            for _ci in range(_subq_start, len(sql)):
+                if sql[_ci] == '(':
+                    _depth += 1
+                elif sql[_ci] == ')':
+                    _depth -= 1
+                    if _depth == 0:
+                        _subq_end = _ci + 1
+                        break
+            _subq = sql[_subq_start:_subq_end]
+            # Remove outer alias references (k., mv., etc.) inside subquery
+            # Only fix if the subquery references the same table without alias
+            _fixed_subq = re.sub(r'\bk\.(kpi_name|site_id|value|date|data_level|hour)\b',
+                                 r'\1', _subq, flags=re.IGNORECASE)
+            if _fixed_subq != _subq:
+                sql = sql[:_subq_start] + _fixed_subq + sql[_subq_end:]
+                _LOG.info("[SQL-fix] removed outer alias 'k.' from correlated subquery")
+
         return sql
 
+    # ── KPI Name Fuzzy Matching: resolve user's natural language to EXACT DB names ──
+    # This prevents the LLM from guessing KPI names — we give it the exact matches.
+    _kpi_matches = []
+    _all_kpis = _schema_cache.get("kpi_names_list", [])
+    if _all_kpis:
+        _prompt_lower = prompt.lower()
+        for _kpi in _all_kpis:
+            _kpi_lower = _kpi.lower()
+            # Check if any significant substring of the KPI name appears in the prompt
+            # Split KPI name into words and check if enough words match
+            _kpi_words = [w for w in re.split(r'[\s_\-()]+', _kpi_lower) if len(w) > 2]
+            _matched_words = sum(1 for w in _kpi_words if w in _prompt_lower)
+            if _kpi_words and _matched_words >= max(1, len(_kpi_words) * 0.5):
+                _kpi_matches.append(_kpi)
+            # Also check if user typed exact or near-exact name
+            elif _kpi_lower in _prompt_lower or _prompt_lower.find(_kpi_lower.replace(' ', '')) >= 0:
+                _kpi_matches.append(_kpi)
+
     user_prompt = f"User query: {prompt}"
+    if _kpi_matches:
+        user_prompt += "\n\nEXACT KPI name matches from database (use these EXACT strings in SQL):\n"
+        for _km in _kpi_matches:
+            user_prompt += f"  → '{_km}'\n"
+        _LOG.info("[KPI-MATCH] Matched %d KPIs from user query: %s", len(_kpi_matches), _kpi_matches)
+
     if filters.get("cluster"):
         user_prompt += f"\nActive filter — Zone: {filters['cluster']}"
     if filters.get("time_range") and filters["time_range"] != "24h":
@@ -1757,14 +1821,48 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
     try:
         rows = _sql_with_timeout(sql, timeout_sec=15)
     except Exception as e:
-        _LOG.warning("AI SQL execution failed: %s — SQL: %s", e, sql[:200])
-        _emit_progress(_ws_sid, "complete", "Error")
-        return jsonify({
-            "error": "SQL execution failed",
-            "reason": str(e)[:300],
-            "sql": sql[:500],
-            "response": f"Query failed: {str(e)[:200]}. Try rephrasing your question.",
-        }), 422
+        _LOG.warning("AI SQL execution failed (attempt 1): %s — SQL: %s", e, sql[:200])
+        # ── RETRY: feed the error back to the LLM and ask it to fix the SQL ──
+        _retry_sql = None
+        try:
+            _retry_msgs = list(llm_messages) + [
+                {"role": "assistant", "content": json.dumps(ai_result)},
+                {"role": "user", "content": (
+                    f"The SQL you generated failed with this PostgreSQL error:\n{str(e)[:400]}\n\n"
+                    f"Failed SQL:\n{sql[:600]}\n\n"
+                    "Fix the SQL. Common fixes:\n"
+                    "- Do NOT reference outer aliases (k., mv.) inside subqueries\n"
+                    "- Use CASE WHEN pivot instead of correlated subqueries\n"
+                    "- Ensure all non-aggregated columns are in GROUP BY\n"
+                    "Return the SAME JSON format with the corrected sql field."
+                )},
+            ]
+            _retry_resp = _llm_client.chat.completions.create(
+                model=_llm_model, messages=_retry_msgs,
+                temperature=0.05, max_tokens=2000,
+            )
+            _retry_raw = _retry_resp.choices[0].message.content
+            if _retry_raw:
+                _retry_result = _parse_ai_result(_retry_raw)
+                _retry_sql = _retry_result.get("sql", "")
+                if _retry_sql and _retry_sql.strip().upper().startswith("SELECT"):
+                    _LOG.info("[RETRY] LLM returned fixed SQL, attempting execution")
+                    rows = _sql_with_timeout(_retry_sql, timeout_sec=15)
+                    # Success — update ai_result with the fixed version
+                    sql = _retry_sql
+                    ai_result = _retry_result
+                    _LOG.info("[RETRY] Fixed SQL succeeded!")
+                else:
+                    raise ValueError("Retry SQL empty or not SELECT")
+        except Exception as e2:
+            _LOG.warning("AI SQL retry also failed: %s", str(e2)[:200])
+            _emit_progress(_ws_sid, "complete", "Error")
+            return jsonify({
+                "error": "SQL execution failed",
+                "reason": str(e)[:300],
+                "sql": sql[:500],
+                "response": f"Query failed: {str(e)[:200]}. Try rephrasing your question.",
+            }), 422
     print(f"[TIMING] DB query (single-chart): {time.time()-_t2:.2f}s", flush=True)
 
     # ── 0-rows explanation: if still empty, check KPI ranges and explain why ──
