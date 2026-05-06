@@ -1,28 +1,9 @@
 """
-network_ai.py  — v7 (2026-05-01)
-==================================
+network_ai.py
+=============
 Flask Blueprint: Network AI Chat & Query Engine
-
-Architecture:
-  User NL Query
-    → Query Router (analytical / informational)
-    → Dynamic schema discovery (KPI names, tables, columns from live DB)
-    → LLM SQL Generation with schema-aware prompt (no hardcoded KPI names)
-    → SQL Validation & Safety Guards
-    → Parallel Query Execution (PostgreSQL, timeout, cache)
-    → Structured JSON + Visualization Output
-    → WebSocket streaming for intermediate states
-
-Features:
-  • LLM-first: no hardcoded KPI names, no rule-based interceptors
-  • Dynamic KPI discovery from live database at query time
-  • Materialized views as primary query targets (10-100x faster)
-  • No SELECT *, no DROP/DELETE/UPDATE — strict read-only safety
-  • In-memory LRU cache for schema discovery and query results
-  • WebSocket streaming: understanding → generating → executing → complete
-  • Database optimization: indexes, materialized views
-  • Parallel multi-chart SQL execution (ThreadPoolExecutor)
-  • Works with any uploaded dataset without code changes
+Extracted from network_analytics.py — handles all AI/LLM query logic,
+rule-based NL→SQL fallback, and session CRUD for the Network AI Chat page.
 
 Mount in app.py:
     from network_ai import network_ai_bp
@@ -33,12 +14,8 @@ import os
 import re
 import json
 import math
-import time
-import hashlib
 import logging
-import threading
 from datetime import datetime, timezone
-from functools import lru_cache
 
 from flask import Blueprint, request, jsonify, current_app
 from flask_jwt_extended import jwt_required, get_jwt_identity
@@ -47,530 +24,53 @@ from sqlalchemy import text as sa_text
 from models import db, User, NetworkAiSession, NetworkAiMessage
 
 _LOG = logging.getLogger("network_ai")
-NETWORK_AI_VERSION = "2026-05-01-v7"
+NETWORK_AI_VERSION = "2025-03-26-v5"  # bump this to confirm new file is loaded
+
+# Shared process-level schema metadata cache. app.py warms this on startup and
+# upload/delete flows invalidate it after changing KPI data.
+_schema_cache = {
+    "populated": False,
+}
+
+
+def invalidate_schema_cache():
+    """Clear cached AI schema metadata after network data changes."""
+    _schema_cache.clear()
+    _schema_cache["populated"] = False
+
+
+def refresh_materialized_views():
+    """Refresh AI-related materialized views, best-effort.
+
+    The merged KPI materialized view is owned by network_analytics; keep this
+    wrapper here so app.py can treat Network AI startup/upload hooks uniformly.
+    """
+    try:
+        from network_analytics import refresh_kpi_data_merged
+        refresh_kpi_data_merged()
+    except Exception as exc:
+        _LOG.warning("Network AI materialized view refresh skipped: %s", exc)
+
+
+def ensure_db_optimizations():
+    """Ensure database objects used by Network AI exist.
+
+    This is intentionally best-effort because these indexes/materialized views
+    are performance helpers; the app should still start if a deployment user
+    lacks DDL permissions or a table has not been created yet.
+    """
+    _ensure_ai_session_tables()
+    try:
+        from network_analytics import _ensure_kpi_data_stats_table, _ensure_kpi_indexes
+        _ensure_kpi_indexes()
+        _ensure_kpi_data_stats_table()
+    except Exception as exc:
+        _LOG.warning("Network AI DB optimization setup skipped: %s", exc)
+    refresh_materialized_views()
 
 # ─────────────────────────────────────────────────────────────────────────────
 network_ai_bp = Blueprint("network_ai", __name__)
 
-# ─── Query Result Cache (TTL-based in-memory) ───────────────────────────────
-_query_cache = {}          # {hash: {"data": ..., "ts": time.time()}}
-_cache_lock = threading.Lock()
-_CACHE_TTL = 300           # 5 minutes for query results
-_SCHEMA_CACHE_TTL = 600    # 10 minutes for schema discovery
-
-# ─── Allowed tables for SQL validation ───────────────────────────────────────
-_ALLOWED_TABLES = frozenset({
-    'kpi_data', 'telecom_sites', 'flexible_kpi_uploads',
-    'revenue_data', 'core_kpi_data', 'transport_kpi_data',
-    'network_issue_tickets',
-    'site_kpi_summary',       # ML-categorized pre-aggregated KPI data
-    'mv_daily_site_kpi',      # pre-aggregated daily site KPI summary (fast)
-    'mv_zone_kpi_summary',    # pre-aggregated zone-level KPI summary (fast)
-    'mv_zone_daily_kpi',      # pre-aggregated zone+date daily KPI summary (fast)
-    'kpi_data_merged',        # materialized view with site+cell fallback
-})
-_BLOCKED_SQL_PATTERNS = re.compile(
-    r'\b(DROP|DELETE|UPDATE|INSERT|ALTER|TRUNCATE|CREATE|GRANT|REVOKE|EXEC|EXECUTE)\b',
-    re.IGNORECASE,
-)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SQL Safety & Validation
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _strip_sql_strings(sql: str) -> str:
-    """Remove all string literals from SQL so keyword checks don't match
-    words inside values (e.g. a KPI name containing 'Drop')."""
-    return re.sub(r"'[^']*'", "''", sql)
-
-
-def _validate_sql(sql: str) -> tuple:
-    """Validate generated SQL for safety. Returns (is_safe, normalized_sql | error_message).
-    Rules: only SELECT allowed, no dangerous operations, must have LIMIT,
-    must reference only allowed tables (uses sqlparse for accurate extraction)."""
-    if not sql or not sql.strip():
-        return False, "Empty SQL query"
-
-    normalized = sql.strip()
-
-    # Must start with SELECT (or WITH for CTEs)
-    if not re.match(r'^(SELECT|WITH)\b', normalized, re.IGNORECASE):
-        return False, "Only SELECT queries are allowed"
-
-    # Strip string literals before checking for blocked keywords.
-    stripped = _strip_sql_strings(normalized)
-
-    # Block dangerous operations (only check SQL keywords, not string content)
-    if _BLOCKED_SQL_PATTERNS.search(stripped):
-        match = _BLOCKED_SQL_PATTERNS.search(stripped)
-        return False, f"Blocked SQL operation: {match.group(0)}"
-
-    # Ensure LIMIT exists (prevent unbounded queries on 22.5M rows)
-    if 'LIMIT' not in normalized.upper():
-        normalized = normalized.rstrip(';') + ' LIMIT 500'
-
-    # Extract real table names using sqlparse (handles CTEs, subqueries, aliases)
-    real_tables = _extract_real_tables(normalized)
-    invalid_tables = real_tables - _ALLOWED_TABLES
-    if invalid_tables:
-        return False, f"Unknown table(s): {', '.join(invalid_tables)}"
-
-    return True, normalized
-
-
-def _extract_real_tables(sql: str) -> set:
-    """Extract actual table names from SQL using sqlparse.
-    Correctly skips CTE names, subquery aliases, and table aliases."""
-    try:
-        import sqlparse
-        from sqlparse.sql import IdentifierList, Identifier, Parenthesis
-        from sqlparse.tokens import Keyword, DML
-
-        parsed = sqlparse.parse(sql)
-        if not parsed:
-            return set()
-
-        tables = set()
-        cte_names = set()
-
-        def _extract_from_statement(statement):
-            """Walk tokens to find tables after FROM/JOIN, and CTE names after WITH."""
-            _is_from = False
-            _is_with = False
-            _is_join = False
-
-            for token in statement.tokens:
-                # Recurse into parenthesized subqueries
-                if isinstance(token, Parenthesis):
-                    for sub_stmt in sqlparse.parse(token.value[1:-1]):
-                        _extract_from_statement(sub_stmt)
-                    _is_from = False
-                    continue
-
-                # Track WITH (CTE definitions)
-                if token.ttype is Keyword and token.normalized == 'WITH':
-                    _is_with = True
-                    _is_from = False
-                    continue
-
-                # Track FROM clause
-                if token.ttype is Keyword and token.normalized == 'FROM':
-                    _is_from = True
-                    _is_with = False
-                    continue
-
-                # Track JOIN clauses
-                if token.ttype is Keyword and 'JOIN' in (token.normalized or ''):
-                    _is_join = True
-                    _is_from = False
-                    continue
-
-                # SELECT/WHERE/GROUP/ORDER/HAVING/LIMIT end the FROM/JOIN context
-                if token.ttype is Keyword and token.normalized in (
-                    'SELECT', 'WHERE', 'GROUP', 'ORDER', 'HAVING', 'LIMIT',
-                    'UNION', 'INTERSECT', 'EXCEPT', 'ON', 'SET',
-                ):
-                    _is_from = False
-                    _is_join = False
-                    _is_with = False
-                    continue
-
-                if token.ttype is DML:
-                    _is_from = False
-                    _is_join = False
-                    continue
-
-                # CTE name: first identifier after WITH keyword
-                if _is_with and isinstance(token, Identifier):
-                    cte_name = token.get_name()
-                    if cte_name:
-                        cte_names.add(cte_name.lower())
-                    _is_with = False
-                    continue
-
-                if _is_with and isinstance(token, IdentifierList):
-                    for ident in token.get_identifiers():
-                        if isinstance(ident, Identifier):
-                            cte_name = ident.get_name()
-                            if cte_name:
-                                cte_names.add(cte_name.lower())
-                    _is_with = False
-                    continue
-
-                # Table name: identifier after FROM/JOIN
-                if (_is_from or _is_join) and isinstance(token, Identifier):
-                    # If it's a subquery (parenthesized), recurse
-                    if token.tokens and isinstance(token.tokens[0], Parenthesis):
-                        for sub_stmt in sqlparse.parse(token.tokens[0].value[1:-1]):
-                            _extract_from_statement(sub_stmt)
-                    else:
-                        real_name = token.get_real_name()
-                        if real_name and not real_name.startswith('('):
-                            tables.add(real_name.lower())
-                    _is_from = False
-                    _is_join = False
-                    continue
-
-                if (_is_from or _is_join) and isinstance(token, IdentifierList):
-                    for ident in token.get_identifiers():
-                        if isinstance(ident, Identifier):
-                            if ident.tokens and isinstance(ident.tokens[0], Parenthesis):
-                                for sub_stmt in sqlparse.parse(ident.tokens[0].value[1:-1]):
-                                    _extract_from_statement(sub_stmt)
-                            else:
-                                real_name = ident.get_real_name()
-                                if real_name and not real_name.startswith('('):
-                                    tables.add(real_name.lower())
-                    _is_from = False
-                    _is_join = False
-                    continue
-
-        for stmt in parsed:
-            _extract_from_statement(stmt)
-
-        # Remove CTE names from the result — they are not real tables
-        tables -= cte_names
-        return tables
-
-    except ImportError:
-        # Fallback to regex if sqlparse not available
-        _LOG.warning("[VALIDATE] sqlparse not installed, falling back to regex")
-        from_tables = re.findall(r'\bFROM\s+(\w+)', sql, re.IGNORECASE)
-        join_tables = re.findall(r'\bJOIN\s+(\w+)', sql, re.IGNORECASE)
-        all_tables = set(t.lower() for t in from_tables + join_tables)
-        _skip = {'select', 'where', 'group', 'order', 'having', 'limit',
-                 'union', 'all', 'as', 'lateral', 'each', 'unnest'}
-        all_tables -= _skip
-        return all_tables
-    except Exception as e:
-        _LOG.warning("[VALIDATE] sqlparse extraction failed: %s, falling back to regex", e)
-        from_tables = re.findall(r'\bFROM\s+(\w+)', sql, re.IGNORECASE)
-        join_tables = re.findall(r'\bJOIN\s+(\w+)', sql, re.IGNORECASE)
-        all_tables = set(t.lower() for t in from_tables + join_tables)
-        _skip = {'select', 'where', 'group', 'order', 'having', 'limit',
-                 'union', 'all', 'as', 'lateral', 'each', 'unnest'}
-        all_tables -= _skip
-        return all_tables
-
-
-def _add_safety_limits(sql: str, max_rows: int = 500) -> str:
-    """Ensure SQL has a LIMIT clause and is bounded."""
-    if not sql:
-        return sql
-    normalized = sql.strip().rstrip(';')
-    if 'LIMIT' not in normalized.upper():
-        normalized += f' LIMIT {max_rows}'
-    return normalized
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Query Router — Classify queries before processing
-# ─────────────────────────────────────────────────────────────────────────────
-
-_INFORMATIONAL_PATTERNS = [
-    r'^(?:what|how|why|explain|describe|tell me about|define|meaning of)\b',
-    r'\b(?:what is|what are|how does|how do|explain|describe)\b.*\b(?:kpi|metric|parameter|concept|term)\b',
-    r'\b(?:difference between|compare concept|meaning of)\b',
-]
-
-_ANALYTICAL_INDICATORS = [
-    'show', 'display', 'plot', 'chart', 'graph', 'trend', 'compare',
-    'top', 'bottom', 'worst', 'best', 'highest', 'lowest',
-    'average', 'sum', 'count', 'total', 'aggregate', 'mean', 'median',
-    'last', 'days', 'week', 'month', 'year', 'daily', 'hourly',
-    'list', 'rank', 'group by', 'filter', 'where',
-    # ML category indicators
-    'healthy', 'degraded', 'critical', 'anomaly', 'anomalies', 'outlier',
-    'health', 'tier', 'performer', 'category', 'categorize',
-]
-
-
-def _classify_query(prompt: str) -> str:
-    """Classify a user query into: 'analytical', 'informational', or 'followup'.
-    - analytical: needs SQL generation → data fetch → chart
-    - informational: general domain knowledge → direct LLM response
-    - followup: modifies previous result"""
-    p = prompt.lower().strip()
-
-    # Check for informational patterns
-    for pattern in _INFORMATIONAL_PATTERNS:
-        if re.search(pattern, p):
-            # But if it also has analytical indicators, it's analytical
-            if any(ind in p for ind in ['show', 'display', 'plot', 'chart', 'trend',
-                                         'top', 'bottom', 'worst', 'best', 'last', 'days']):
-                return 'analytical'
-            # Check if it mentions specific sites
-            if re.search(r'[A-Za-z]{2,}[_\-][A-Za-z]{2,}[_\-]\d{3,}', p):
-                return 'analytical'
-            return 'informational'
-
-    # Check for analytical indicators
-    if any(ind in p for ind in _ANALYTICAL_INDICATORS):
-        return 'analytical'
-
-    # Check for site IDs
-    if re.search(r'[A-Za-z]{2,}[_\-][A-Za-z]{2,}[_\-]\d{3,}', p):
-        return 'analytical'
-
-    # Default to analytical for ambiguous queries
-    return 'analytical'
-
-
-def _handle_informational_query(prompt: str) -> dict:
-    """Handle informational queries with direct LLM response (no SQL)."""
-    from app import client as _llm_client, DEPLOYMENT_NAME as _llm_model
-
-    # Build a domain-neutral system message that adapts to the discovered schema
-    discovered_tables = sorted(_schema_cache.get("available_tables", set()))
-    discovered_kpis = _schema_cache.get("kpi_names_list", [])[:30]
-
-    domain_hint = ""
-    if discovered_tables:
-        domain_hint = f"\nThe user's database contains these tables: {', '.join(discovered_tables)}."
-    if discovered_kpis:
-        domain_hint += f"\nKnown metric/KPI names include: {', '.join(repr(k) for k in discovered_kpis[:10])}."
-
-    system_msg = (
-        "You are a data analytics assistant. Answer the user's question about "
-        "the available data, metrics, or general analytical concepts.\n"
-        "Be concise (2-4 sentences). Use bullet points for lists.\n"
-        + domain_hint +
-        "\nIf the question requires fetching specific data values, charts, or "
-        "filtering rows, respond with the JSON {\"redirect\": \"analytical\"} "
-        "to route to the SQL engine instead."
-    )
-
-    try:
-        resp = _llm_client.chat.completions.create(
-            model=_llm_model,
-            messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.3,
-            max_tokens=500,
-        )
-        content = resp.choices[0].message.content.strip()
-
-        # Check if LLM redirected to analytical
-        if '{"redirect"' in content or '"redirect"' in content:
-            return None  # Signal to route to analytical path
-
-        return {
-            "type": "informational",
-            "response": content,
-            "chart_type": "none",
-            "data": [],
-            "columns": [],
-            "row_count": 0,
-        }
-    except Exception as e:
-        _LOG.warning("Informational query failed: %s", e)
-        return None  # Fallback to analytical
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Cache Layer
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _cache_key(sql: str) -> str:
-    """Generate cache key from SQL query."""
-    return hashlib.md5(sql.strip().lower().encode()).hexdigest()
-
-
-def _cache_get(key: str, ttl: int = None) -> dict:
-    """Get cached result if still valid."""
-    ttl = ttl or _CACHE_TTL
-    with _cache_lock:
-        entry = _query_cache.get(key)
-        if entry and (time.time() - entry["ts"]) < ttl:
-            _LOG.debug("Cache hit: %s", key[:8])
-            return entry["data"]
-        return None
-
-
-def _cache_set(key: str, data: dict):
-    """Store result in cache."""
-    with _cache_lock:
-        # Evict old entries if cache too large (max 200 entries)
-        if len(_query_cache) > 200:
-            oldest = sorted(_query_cache.items(), key=lambda x: x[1]["ts"])[:50]
-            for k, _ in oldest:
-                _query_cache.pop(k, None)
-        _query_cache[key] = {"data": data, "ts": time.time()}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# WebSocket Streaming for intermediate states
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _emit_progress(session_id: int, stage: str, message: str = ""):
-    """Emit a WebSocket event for query progress.
-    Stages: understanding → generating → executing → rendering → complete"""
-    try:
-        from flask_socketio import emit as ws_emit
-        ws_emit('ai_progress', {
-            'session_id': session_id,
-            'stage': stage,
-            'message': message,
-            'timestamp': datetime.now(timezone.utc).isoformat(),
-        }, room=f'ai_session_{session_id}', namespace='/')
-    except Exception:
-        pass  # WebSocket is optional, never break the flow
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Database Optimization — Indexes & Materialized Views
-# ─────────────────────────────────────────────────────────────────────────────
-
-def ensure_db_optimizations():
-    """Create indexes and materialized views for optimal query performance.
-    Safe to call multiple times (idempotent with IF NOT EXISTS)."""
-    _LOG.info("Ensuring database optimizations...")
-
-    _indexes = [
-        # kpi_data indexes for common query patterns
-        "CREATE INDEX IF NOT EXISTS idx_kpi_site_name_date ON kpi_data(site_id, kpi_name, date)",
-        "CREATE INDEX IF NOT EXISTS idx_kpi_level_name ON kpi_data(data_level, kpi_name)",
-        "CREATE INDEX IF NOT EXISTS idx_kpi_site_level_date ON kpi_data(site_id, kpi_name, data_level, date)",
-        "CREATE INDEX IF NOT EXISTS idx_kpi_date ON kpi_data(date DESC)",
-        # telecom_sites indexes
-        "CREATE INDEX IF NOT EXISTS idx_sites_zone ON telecom_sites(zone)",
-        "CREATE INDEX IF NOT EXISTS idx_sites_status ON telecom_sites(site_status)",
-        "CREATE INDEX IF NOT EXISTS idx_sites_city ON telecom_sites(city)",
-        # flexible_kpi_uploads indexes
-        "CREATE INDEX IF NOT EXISTS idx_flex_type_col ON flexible_kpi_uploads(kpi_type, column_name)",
-        "CREATE INDEX IF NOT EXISTS idx_flex_site ON flexible_kpi_uploads(site_id)",
-        # network_issue_tickets indexes
-        "CREATE INDEX IF NOT EXISTS idx_nit_status ON network_issue_tickets(status)",
-        "CREATE INDEX IF NOT EXISTS idx_nit_priority ON network_issue_tickets(priority_score DESC)",
-    ]
-
-    _materialized_views = [
-        # Pre-aggregated daily site KPI summary
-        """CREATE MATERIALIZED VIEW IF NOT EXISTS mv_daily_site_kpi AS
-        SELECT site_id, kpi_name, date,
-               AVG(value) AS avg_value,
-               MIN(value) AS min_value,
-               MAX(value) AS max_value,
-               COUNT(*) AS sample_count
-        FROM kpi_data
-        WHERE data_level = 'site' AND value IS NOT NULL
-        GROUP BY site_id, kpi_name, date""",
-
-        # Pre-aggregated zone-level KPI summary
-        """CREATE MATERIALIZED VIEW IF NOT EXISTS mv_zone_kpi_summary AS
-        SELECT ts.zone, k.kpi_name,
-               AVG(k.value) AS avg_value,
-               MIN(k.value) AS min_value,
-               MAX(k.value) AS max_value,
-               COUNT(DISTINCT k.site_id) AS site_count
-        FROM kpi_data k
-        JOIN telecom_sites ts ON k.site_id = ts.site_id
-        WHERE k.data_level = 'site' AND k.value IS NOT NULL
-        GROUP BY ts.zone, k.kpi_name""",
-
-        # Zone-level daily KPI with date — enables zone trend queries
-        """CREATE MATERIALIZED VIEW IF NOT EXISTS mv_zone_daily_kpi AS
-        SELECT COALESCE(ts.zone, 'Unknown') AS zone,
-               k.kpi_name, k.date,
-               AVG(k.avg_value) AS avg_val,
-               COUNT(DISTINCT k.site_id) AS site_count
-        FROM mv_daily_site_kpi k
-        LEFT JOIN telecom_sites ts ON LOWER(k.site_id) = LOWER(ts.site_id)
-        GROUP BY COALESCE(ts.zone, 'Unknown'), k.kpi_name, k.date""",
-    ]
-
-    _mv_indexes = [
-        # UNIQUE index required for REFRESH MATERIALIZED VIEW CONCURRENTLY (non-blocking).
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_mv_daily_site_uniq ON mv_daily_site_kpi(site_id, kpi_name, date)",
-        "CREATE INDEX IF NOT EXISTS idx_mv_daily_site ON mv_daily_site_kpi(site_id, kpi_name, date)",
-        "CREATE INDEX IF NOT EXISTS idx_mv_zone_kpi ON mv_zone_kpi_summary(zone, kpi_name)",
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_mv_zone_daily_uniq ON mv_zone_daily_kpi(zone, kpi_name, date)",
-    ]
-
-    try:
-        with db.engine.connect() as conn:
-            # Create indexes
-            for idx_sql in _indexes:
-                try:
-                    conn.execute(sa_text(idx_sql))
-                except Exception as e:
-                    _LOG.debug("Index skip: %s", str(e)[:80])
-            conn.commit()
-
-            # Create materialized views
-            for mv_sql in _materialized_views:
-                try:
-                    conn.execute(sa_text(mv_sql))
-                except Exception as e:
-                    _LOG.debug("MV skip: %s", str(e)[:80])
-            conn.commit()
-
-            # Create MV indexes
-            for mv_idx in _mv_indexes:
-                try:
-                    conn.execute(sa_text(mv_idx))
-                except Exception as e:
-                    _LOG.debug("MV index skip: %s", str(e)[:80])
-            conn.commit()
-
-        _LOG.info("Database optimizations complete.")
-    except Exception as e:
-        _LOG.warning("DB optimization failed (non-fatal): %s", e)
-
-
-def refresh_materialized_views():
-    """Refresh all AI materialized views. Call periodically or after data uploads."""
-    for _mv in ["mv_daily_site_kpi", "mv_zone_kpi_summary", "mv_zone_daily_kpi"]:
-        try:
-            with db.engine.connect() as conn:
-                conn.execute(sa_text(f"REFRESH MATERIALIZED VIEW CONCURRENTLY {_mv}"))
-                conn.commit()
-        except Exception:
-            try:
-                with db.engine.connect() as conn:
-                    conn.execute(sa_text(f"REFRESH MATERIALIZED VIEW {_mv}"))
-                    conn.commit()
-            except Exception as _e:
-                _LOG.debug("MV refresh skip %s: %s", _mv, str(_e)[:80])
-    _LOG.info("Materialized views refreshed successfully.")
-    # Invalidate full schema cache AFTER refresh completes (not before)
-    # so the next query rebuilds from fully-refreshed MVs.
-    invalidate_schema_cache()
-
-# ─── Module-level schema discovery cache (populated on first ai_query call) ──
-_schema_cache = {
-    "populated": False,
-    "available_tables": set(),
-    "kpi_names_list": [],
-    # revenue_data
-    "rev_data_cols": [], "rev_rev_cols": [], "rev_opex_cols": [], "rev_has_subscribers": False,
-    # core_kpi_data
-    "core_data_cols": [], "core_metric_cols": [],
-    # transport_kpi_data
-    "transport_data_cols": [], "transport_metric_cols": [],
-    # network_issue_tickets
-    "ticket_cols": [],
-    # data freshness — actual max date in kpi_data (may lag behind CURRENT_DATE)
-    "kpi_max_date": None,   # e.g. "2026-03-22"
-    "kpi_max_date_recent": None,  # max date among KPIs that have recent data
-}
-
-# ─── SCHEMA_HINT cache — avoids re-running expensive discovery on every query ──
-# Rebuilt once per TTL (5 min) or when refresh_materialized_views() is called.
-_schema_hint_cache: dict = {"hint": None, "ts": 0.0}
-_SCHEMA_HINT_TTL = 3600  # 1 hour — schema only changes on data upload
-
-
-def invalidate_schema_cache():
-    """Reset schema caches so next AI query rebuilds from DB.
-    Call this after data uploads or matview refreshes."""
-    _schema_hint_cache["hint"] = None
-    _schema_hint_cache["ts"] = 0.0
-    _schema_cache["populated"] = False
-    _LOG.info("[SCHEMA] Cache invalidated — next query will rebuild")
 
 # ─── Shared helpers (imported lazily from network_analytics) ─────────────────
 
@@ -580,38 +80,6 @@ def _sql(query: str, params: dict = None) -> list:
         result = conn.execute(sa_text(query), params or {})
         cols = list(result.keys())
         return [dict(zip(cols, row)) for row in result.fetchall()]
-
-
-def _sql_fast(query: str, timeout_ms: int = 4000) -> list:
-    """Execute SQL with a statement_timeout so schema-discovery queries never hang.
-    Falls back to empty list on timeout or error."""
-    try:
-        with db.engine.connect() as conn:
-            conn.execute(sa_text(f"SET LOCAL statement_timeout = '{timeout_ms}'"))
-            result = conn.execute(sa_text(query))
-            cols = list(result.keys())
-            return [dict(zip(cols, row)) for row in result.fetchall()]
-    except Exception as _e:
-        _LOG.debug("_sql_fast timed-out/failed (%dms): %s", timeout_ms, str(_e)[:120])
-        return []
-
-
-def _kpi_date_ref():
-    """Return a SQL expression for the latest KPI data date.
-    If the data lags behind today, returns e.g. '2026-03-22'::date.
-    Otherwise returns CURRENT_DATE."""
-    _max = _schema_cache.get("kpi_max_date_recent")
-    return f"'{_max}'::date" if _max else "CURRENT_DATE"
-
-
-def _kpi_date_clause(days_val, alias='k'):
-    """Build a date range WHERE clause using the actual data max date.
-    Always applies a lower bound — defaults to 90 days when the user
-    did not specify a period, preventing full-history table scans.
-    """
-    _ref = _kpi_date_ref()
-    _days = days_val or 90  # default window prevents unbounded scans
-    return f"AND {alias}.date >= {_ref} - INTERVAL '{_days} days' AND {alias}.date <= {_ref}"
 
 
 def _get_dynamic_time_filter():
@@ -625,19 +93,6 @@ def _ensure_ai_session_tables():
     try:
         NetworkAiSession.__table__.create(db.engine, checkfirst=True)
         NetworkAiMessage.__table__.create(db.engine, checkfirst=True)
-    except Exception:
-        pass
-    # ── CHANGE: migration-safe — add new columns if table already exists ──
-    try:
-        with db.engine.connect() as conn:
-            from sqlalchemy import inspect as sa_inspect
-            cols = {c["name"] for c in sa_inspect(db.engine).get_columns("network_ai_sessions")}
-            if "session_context" not in cols:
-                conn.execute(sa_text("ALTER TABLE network_ai_sessions ADD COLUMN session_context JSON DEFAULT '{}'"))
-                conn.commit()
-            if "conversation_summary" not in cols:
-                conn.execute(sa_text("ALTER TABLE network_ai_sessions ADD COLUMN conversation_summary TEXT"))
-                conn.commit()
     except Exception:
         pass
 
@@ -654,7 +109,6 @@ def ai_query():
         return jsonify({"error": "Forbidden"}), 403
 
     _LOG.info("network_ai version: %s", NETWORK_AI_VERSION)
-    _query_start = time.time()
     body    = request.get_json(silent=True) or {}
     prompt  = str(body.get("prompt", "")).strip()
     context = body.get("context", {})
@@ -665,10 +119,6 @@ def ai_query():
     if not prompt:
         return jsonify({"error": "No prompt provided"}), 400
 
-    # ── Query Router: classify the query type ──────────────────────────────
-    query_type = _classify_query(prompt)
-    _LOG.info("[ROUTER] Query classified as: %s | prompt: %s", query_type, prompt[:80])
-
     # ── Session context (optional) ────────────────────────────────────────────
     session_id = body.get("session_id")
     ai_session = None
@@ -678,19 +128,12 @@ def ai_query():
         _ensure_ai_session_tables()
         ai_session = db.session.get(NetworkAiSession, int(session_id))
         if ai_session and ai_session.user_id == int(uid):
-            # ── CHANGE: load last 10 messages (5 turns) + prepend summary ──
             recent_msgs = (NetworkAiMessage.query
                           .filter_by(session_id=session_id)
                           .order_by(NetworkAiMessage.created_at.desc())
-                          .limit(10)
+                          .limit(20)
                           .all())
             recent_msgs.reverse()
-            # Prepend rolling summary so LLM retains full history context
-            if getattr(ai_session, 'conversation_summary', None):
-                conversation_history.append({
-                    "role": "system",
-                    "content": f"Conversation so far: {ai_session.conversation_summary}",
-                })
             for m in recent_msgs:
                 if m.role == "user":
                     conversation_history.append({
@@ -736,472 +179,70 @@ def ai_query():
         else:
             ai_session = None
 
-    # ── WebSocket: signal query started ──────────────────────────────────────
-    _ws_sid = ai_session.id if ai_session else None
-    _emit_progress(_ws_sid, 'understanding', 'Analyzing your question...')
-
-    # ── Handle informational queries (no SQL needed) ─────────────────────────
-    if query_type == 'informational':
-        _emit_progress(_ws_sid, 'generating', 'Preparing answer...')
-        info_result = _handle_informational_query(prompt)
-        if info_result:
-            _emit_progress(_ws_sid, 'complete', 'Done')
-            resp_text = info_result["response"]
-            # Persist to session
-            if ai_session:
-                try:
-                    if ai_session.title == "New Chat":
-                        ai_session.title = prompt[:60]
-                    assistant_msg = NetworkAiMessage(
-                        session_id=ai_session.id, role="assistant",
-                        content=resp_text,
-                        content_json={"type": "informational", "response": resp_text},
-                    )
-                    db.session.add(assistant_msg)
-                    db.session.commit()
-                except Exception as e:
-                    _LOG.error("Failed to persist informational msg: %s", e)
-            _elapsed = round(time.time() - _query_start, 2)
-            _LOG.info("[COMPLETE] Informational query in %.2fs", _elapsed)
-            return jsonify({
-                "response": resp_text,
-                "query_type": "informational",
-                "chart_type": "none",
-                "title": prompt[:60],
-                "data": [],
-                "columns": [],
-                "row_count": 0,
-                "provider": "llm-informational",
-                "session_id": _ws_sid,
-                "elapsed_seconds": _elapsed,
-            })
-        # If info_result is None, LLM redirected to analytical — continue below
-
-    _emit_progress(_ws_sid, 'generating', 'Generating SQL query...')
-
     # ── Try LLM providers ─────────────────────────────────────────────────────
     provider = None
     ai_result = None
 
-    _t_total = time.time()
-    _t0 = time.time()
+    SCHEMA_HINT = """
+Tables:
+1. kpi_data(id, site_id, kpi_name, value, date, hour, data_level, cell_id, cell_site_id)
+   - data_level = 'site' for site-level, 'cell' for cell-level
+   - IMPORTANT: kpi_name values are EXACT strings. Use these EXACTLY as listed below.
 
-    _schema_hit = (
-        _schema_hint_cache["hint"] is not None
-        and time.time() - _schema_hint_cache["ts"] < _SCHEMA_HINT_TTL
-    )
+   === RAN KPI Names (EXACT values in kpi_name column) ===
+   'LTE RRC Setup Success Rate'        -- RRC success rate, accessibility
+   'LTE Call Setup Success Rate'        -- Call setup success, CSSR
+   'LTE E-RAB Setup Success Rate'       -- E-RAB setup
+   'E-RAB Call Drop Rate_1'             -- Call drop rate, CDR
+   'CSFB Access Success Rate'           -- CSFB fallback
+   'LTE Intra-Freq HO Success Rate'    -- Intra-frequency handover
+   'Intra-eNB HO Success Rate'         -- Intra-eNB handover
+   'Inter-eNBX2HO Success Rate'        -- Inter-eNB X2 handover
+   'Inter-eNBS1HO Success Rate'        -- Inter-eNB S1 handover
+   'LTE DL - Cell Ave Throughput'       -- DL cell throughput (Mbps)
+   'LTE UL - Cell Ave Throughput'       -- UL cell throughput
+   'LTE DL - Usr Ave Throughput'        -- DL user throughput (Mbps)
+   'LTE UL - User Ave Throughput'       -- UL user throughput
+   'Average Latency Downlink'           -- Latency (ms)
+   'DL Data Total Volume'               -- DL data volume (GB)
+   'UL Data Total Volume'               -- UL data volume
+   'VoLTE Traffic Erlang'               -- VoLTE traffic in Erlang
+   'VoLTE Traffic UL'                   -- VoLTE UL traffic
+   'VoLTE Traffic DL'                   -- VoLTE DL traffic
+   'Ave RRC Connected Ue'               -- Average connected users
+   'Max RRC Connected Ue'               -- Max connected users
+   'Average Act UE DL Per Cell'         -- Active DL users per cell
+   'Average Act UE UL Per Cell'         -- Active UL users per cell
+   'Availability'                       -- Site availability %
+   'Average NI of Carrier-'             -- Noise/interference
+   'DL PRB Utilization (1BH)'           -- DL PRB utilization %, congestion
+   'UL PRB Utilization (1BH)'           -- UL PRB utilization %
 
-    if _schema_hit:
-        SCHEMA_HINT = _schema_hint_cache["hint"]
-        _available_tables = _schema_cache.get("available_tables", set())
-        _LOG.debug("[SCHEMA_HINT] Cache HIT - skipping discovery")
-    else:
-        _LOG.debug("[SCHEMA_HINT] Cache MISS - rebuilding from DB")
-        # ── Dynamic KPI name discovery (no hardcoded values) ──────────────────────
-        # Discovers actual KPI names from the live database so the chatbot works
-        # with any uploaded dataset without requiring code changes.
-        _kpi_names_list = []
-        try:
-            _kn = _sql(
-                "SELECT DISTINCT kpi_name FROM mv_daily_site_kpi "
-                "ORDER BY kpi_name LIMIT 100"
-            )
-            _kpi_names_list = [r['kpi_name'] for r in _kn if r.get('kpi_name')]
-        except Exception:
-            pass
-        if not _kpi_names_list:
-            try:
-                _kn = _sql(
-                    "SELECT DISTINCT kpi_name FROM kpi_data "
-                    "WHERE data_level = 'site' AND kpi_name IS NOT NULL "
-                    "ORDER BY kpi_name LIMIT 100"
-                )
-                _kpi_names_list = [r['kpi_name'] for r in _kn if r.get('kpi_name')]
-            except Exception:
-                pass
+2. telecom_sites(site_id, cell_id, latitude, longitude, zone)
+   - JOIN: kpi_data k JOIN telecom_sites ts ON k.site_id = ts.site_id
+   - zone column has values like zone names / cluster names
 
-        _schema_cache["kpi_names_list"] = _kpi_names_list
+3. flexible_kpi_uploads(site_id, kpi_name, kpi_type, column_name, num_value, str_value)
+   - kpi_type = 'core' for core KPIs: Authentication Success Rate, CPU Utilization, Attach Success Rate, PDP Bearer Setup Success Rate
+   - kpi_type = 'revenue' for revenue data
 
-        SCHEMA_HINT = """
-=== MATERIALIZED VIEWS (PREFERRED — 10-100x faster) ===
-mv_daily_site_kpi(site_id, kpi_name, date, avg_value, min_value, max_value, sample_count)
-mv_zone_daily_kpi(zone, kpi_name, date, avg_val, site_count)
-mv_zone_kpi_summary(zone, kpi_name, avg_value, min_value, max_value, site_count) — no date col
-JOIN telecom_sites ts ON LOWER(mv.site_id)=LOWER(ts.site_id) for zone/city.
-
-RULES: 1) Prefer MVs over kpi_data. 2) Always add date filter. 3) Always add LIMIT. 4) Use kpi_data only for hourly/cell data.
-
-=== MULTI-KPI PIVOT PATTERN (use for "show X along with Y and Z") ===
-SELECT site_id,
-  AVG(CASE WHEN kpi_name='KPI_A' THEN avg_value END) AS kpi_a,
-  AVG(CASE WHEN kpi_name='KPI_B' THEN avg_value END) AS kpi_b
-FROM mv_daily_site_kpi
-WHERE kpi_name IN ('KPI_A','KPI_B') AND date >= '...'::date - INTERVAL '7 days'
-GROUP BY site_id ORDER BY kpi_a ASC LIMIT 10
-IMPORTANT: For "bottom/top N by KPI_A with KPI_B", put ALL KPIs in one query with CASE WHEN pivots.
-Do NOT use correlated subqueries — they cause GroupingError. Use a single GROUP BY instead.
-
-=== TABLES ===
-kpi_data(site_id, kpi_name, value, date, hour, data_level, cell_id)
-  data_level='site'|'cell'. kpi_name is CASE-SENSITIVE. Use ILIKE for fuzzy.
-
-telecom_sites(site_id, cell_id, latitude, longitude, zone, city, state, technology, site_status, alarms)
-
-flexible_kpi_uploads(kpi_type, site_id, column_name, column_type, num_value, str_value) — EAV table
-  kpi_type='revenue': column_name has metric name, num_value has value. ALWAYS use ILIKE for column_name.
-  kpi_type='core': kpi_name has metric type, column_name has dates, num_value has value.
-  If 'total'/'sum' column exists, use directly — do NOT SUM monthly columns.
-
-transport_kpi_data — columns discovered at runtime (see below)
-core_kpi_data — flat table with date, columns discovered at runtime
-revenue_data — flat table, one row per site, columns discovered at runtime
-network_issue_tickets — columns discovered at runtime
-
-site_kpi_summary(site_id, date, kpi_name, avg_value, min_value, max_value, stddev_value,
-  sample_count, health_label, health_confidence, is_anomaly, anomaly_score, site_tier, health_score, zone)
-  health_label: healthy|degraded|critical. site_tier: top_performer|good|average|underperformer.
-  health_score: 0-100. is_anomaly: bool. Use for health/anomaly/ranking questions.
-
-=== TABLE SELECTION ===
-RAN KPIs (performance) → mv_daily_site_kpi (site/daily) or kpi_data (hourly/cell)
-Health/anomalies/tiers/rankings → site_kpi_summary
-Revenue/OPEX/subscribers → revenue_data, fallback: flexible_kpi_uploads kpi_type='revenue'
-Core network (auth/CPU/attach) → core_kpi_data, fallback: flexible_kpi_uploads kpi_type='core'
-Transport/backhaul → transport_kpi_data
-Network issues/tickets → network_issue_tickets
-Site info/zone/location → telecom_sites
-NEVER query kpi_data for revenue/OPEX data.
-    """
-
-        # ── Inject discovered KPI names (compact comma-separated) ─────────────────
-        if _kpi_names_list:
-            _kpi_section = "\n=== RAN KPI Names (EXACT, case-sensitive — use ILIKE for fuzzy) ===\n"
-            _kpi_section += ", ".join(f"'{k}'" for k in _kpi_names_list) + "\n"
-            SCHEMA_HINT += _kpi_section
-
-        # ── Dynamic table availability — tell LLM which tables actually exist ──
-        try:
-            _tbl_rows = _sql(
-                "SELECT table_name FROM information_schema.tables "
-                "WHERE table_schema = 'public' AND table_name IN "
-                "('revenue_data','core_kpi_data','transport_kpi_data',"
-                "'network_issue_tickets','flexible_kpi_uploads','kpi_data','telecom_sites',"
-                "'site_kpi_summary')"
-            )
-            _available_tables = {r['table_name'] for r in _tbl_rows}
-        except Exception:
-            _available_tables = set()
-
-        _tbl_note = "\n=== AVAILABLE TABLES (real-time, checked just now) ===\n"
-        for _tn, _fb in [
-            ('kpi_data', None),
-            ('telecom_sites', None),
-            ('site_kpi_summary', "kpi_data (raw, no ML categories)"),
-            ('revenue_data', "flexible_kpi_uploads WHERE kpi_type='revenue'"),
-            ('core_kpi_data', "flexible_kpi_uploads WHERE kpi_type='core'"),
-            ('transport_kpi_data', None),
-            ('network_issue_tickets', None),
-            ('flexible_kpi_uploads', None),
-        ]:
-            if _tn in _available_tables:
-                _tbl_note += f"  {_tn}: EXISTS — use it\n"
-            elif _fb:
-                _tbl_note += f"  {_tn}: DOES NOT EXIST — use {_fb} instead\n"
-            else:
-                _tbl_note += f"  {_tn}: DOES NOT EXIST — data not uploaded yet\n"
-        SCHEMA_HINT += _tbl_note
-
-        # ── Materialized view availability — query pg_matviews (MVs don't appear in information_schema) ──
-        try:
-            _mv_status_rows = _sql(
-                "SELECT matviewname FROM pg_matviews "
-                "WHERE schemaname = 'public' AND matviewname IN "
-                "('mv_daily_site_kpi','mv_zone_daily_kpi','mv_zone_kpi_summary','kpi_data_merged')"
-            )
-            _mv_ready = {r['matviewname'] for r in _mv_status_rows}
-        except Exception:
-            _mv_ready = set()
-        _mv_note = "\n=== MATERIALIZED VIEW STATUS (fast pre-aggregated tables) ===\n"
-        for _mvn in ['mv_daily_site_kpi', 'mv_zone_daily_kpi', 'mv_zone_kpi_summary', 'kpi_data_merged']:
-            if _mvn in _mv_ready:
-                _mv_note += f"  {_mvn}: READY — use this\n"
-            else:
-                _mv_note += f"  {_mvn}: NOT YET CREATED — fall back to kpi_data\n"
-        SCHEMA_HINT += _mv_note
-
-        # ── Dynamic revenue column discovery (compact) ──
-        if 'flexible_kpi_uploads' in _available_tables:
-            try:
-                _rev_cols = _sql(
-                    "SELECT DISTINCT column_name, column_type "
-                    "FROM flexible_kpi_uploads WHERE kpi_type = 'revenue' "
-                    "ORDER BY column_name LIMIT 40"
-                )
-                if _rev_cols:
-                    _rcn = "\nflexible_kpi_uploads column_names (kpi_type='revenue', use ILIKE): "
-                    _rcn += ", ".join(f"{r['column_name']}" for r in _rev_cols) + "\n"
-                    SCHEMA_HINT += _rcn
-            except Exception:
-                pass
-
-        # ── Dynamic schema discovery → populate module-level _schema_cache ──
-        _schema_cache["available_tables"] = _available_tables
-        _LOG.info("[DISCOVERY] Available tables: %s", _available_tables)
-
-        if 'revenue_data' in _available_tables:
-            try:
-                _rdc = _sql(
-                    "SELECT column_name FROM information_schema.columns "
-                    "WHERE table_schema = 'public' AND table_name = 'revenue_data' "
-                    "AND column_name NOT IN ('id', 'uploaded_at') "
-                    "ORDER BY ordinal_position"
-                )
-                _schema_cache["rev_data_cols"] = [r['column_name'] for r in _rdc]
-                _skip = {'id', 'uploaded_at', 'site_id', 'zone', 'technology', 'site_category', 'subscribers'}
-                _schema_cache["rev_rev_cols"] = [c for c in _schema_cache["rev_data_cols"] if 'rev' in c.lower() and c.lower() not in _skip]
-                _schema_cache["rev_opex_cols"] = [c for c in _schema_cache["rev_data_cols"] if 'opex' in c.lower()]
-                _schema_cache["rev_has_subscribers"] = any(c.lower() == 'subscribers' for c in _schema_cache["rev_data_cols"])
-                if _schema_cache["rev_data_cols"]:
-                    _rds = f"\nrevenue_data columns: {', '.join(_schema_cache['rev_data_cols'])}\n"
-                    if _schema_cache["rev_rev_cols"]:
-                        _total_ex = ' + '.join(f'COALESCE(r.{c},0)' for c in _schema_cache["rev_rev_cols"])
-                        _rds += f"  total_revenue = ({_total_ex})\n"
-                    SCHEMA_HINT += _rds
-            except Exception:
-                pass
-
-        if 'core_kpi_data' in _available_tables:
-            try:
-                _cdc = _sql(
-                    "SELECT column_name FROM information_schema.columns "
-                    "WHERE table_schema = 'public' AND table_name = 'core_kpi_data' "
-                    "AND column_name NOT IN ('id', 'uploaded_at') "
-                    "ORDER BY ordinal_position"
-                )
-                _schema_cache["core_data_cols"] = [r['column_name'] for r in _cdc]
-                _core_skip = {'id', 'uploaded_at', 'site_id', 'date', 'zone', 'city', 'state'}
-                _schema_cache["core_metric_cols"] = [c for c in _schema_cache["core_data_cols"] if c.lower() not in _core_skip]
-                if _schema_cache["core_data_cols"]:
-                    SCHEMA_HINT += f"\ncore_kpi_data columns: {', '.join(_schema_cache['core_data_cols'])}\n"
-            except Exception:
-                pass
-
-        if 'transport_kpi_data' in _available_tables:
-            try:
-                _tdc = _sql(
-                    "SELECT column_name FROM information_schema.columns "
-                    "WHERE table_schema = 'public' AND table_name = 'transport_kpi_data' "
-                    "AND column_name NOT IN ('id', 'uploaded_at') "
-                    "ORDER BY ordinal_position"
-                )
-                _schema_cache["transport_data_cols"] = [r['column_name'] for r in _tdc]
-                _transport_skip = {'id', 'uploaded_at', 'site_id', 'zone'}
-                _schema_cache["transport_metric_cols"] = [c for c in _schema_cache["transport_data_cols"]
-                                                           if c.lower() not in _transport_skip
-                                                           and c.lower() != 'backhaul_type']
-                if _schema_cache["transport_data_cols"]:
-                    SCHEMA_HINT += f"\ntransport_kpi_data columns: {', '.join(_schema_cache['transport_data_cols'])}\n"
-            except Exception:
-                pass
-
-        if 'network_issue_tickets' in _available_tables:
-            try:
-                _ntc = _sql(
-                    "SELECT column_name FROM information_schema.columns "
-                    "WHERE table_schema = 'public' AND table_name = 'network_issue_tickets' "
-                    "AND column_name NOT IN ('id') "
-                    "ORDER BY ordinal_position"
-                )
-                _schema_cache["ticket_cols"] = [r['column_name'] for r in _ntc]
-                if _schema_cache["ticket_cols"]:
-                    SCHEMA_HINT += f"\nnetwork_issue_tickets columns: {', '.join(_schema_cache['ticket_cols'])}\n"
-            except Exception:
-                pass
-
-        # ── Data freshness — discover actual max date in kpi_data ──
-        # Many KPIs may lag behind CURRENT_DATE. Using CURRENT_DATE in WHERE clauses
-        # would return 0 rows. We discover the actual max date and use it as reference.
-        if 'kpi_data' in _available_tables:
-            try:
-                _date_info = _sql(
-                    "SELECT MAX(date)::text AS max_date FROM kpi_data WHERE data_level = 'site'"
-                )
-                if _date_info and _date_info[0].get('max_date'):
-                    _schema_cache["kpi_max_date"] = _date_info[0]['max_date']
-                    # Also get the "main" max date (exclude synthetic KPIs if configured)
-                    _exclude_kpis = os.environ.get('AI_EXCLUDE_KPIS', '').strip()
-                    if _exclude_kpis:
-                        _excl_list = ",".join(f"'{k.strip()}'" for k in _exclude_kpis.split(",") if k.strip())
-                        _main_dates = _sql(
-                            f"SELECT MAX(date)::text AS max_date FROM kpi_data "
-                            f"WHERE data_level = 'site' AND kpi_name NOT IN ({_excl_list})"
-                        )
-                    else:
-                        _main_dates = _sql(
-                            "SELECT MAX(date)::text AS max_date FROM kpi_data "
-                            "WHERE data_level = 'site'"
-                        )
-                    if _main_dates and _main_dates[0].get('max_date'):
-                        _schema_cache["kpi_max_date_recent"] = _main_dates[0]['max_date']
-                    else:
-                        _schema_cache["kpi_max_date_recent"] = _schema_cache["kpi_max_date"]
-                _LOG.info("[DISCOVERY] kpi_max_date=%s kpi_max_date_recent=%s",
-                          _schema_cache["kpi_max_date"], _schema_cache["kpi_max_date_recent"])
-                # Tell LLM about actual date reference
-                if _schema_cache["kpi_max_date_recent"]:
-                    _date_hint = (
-                        f"\nDATA DATE: latest={_schema_cache['kpi_max_date_recent']}, "
-                        f"today={datetime.now().strftime('%Y-%m-%d')}. "
-                        f"Use '{_schema_cache['kpi_max_date_recent']}'::date NOT CURRENT_DATE.\n"
-                    )
-                    SCHEMA_HINT += _date_hint
-            except Exception as e:
-                _LOG.warning("[DISCOVERY] Failed to get kpi_data date range: %s", e)
-
-        # ── KPI value ranges — inject actual min/avg/median/max so LLM knows realistic thresholds ──
-        # Without this, the LLM has no idea if "< 8 Mbps" is a tight or loose filter,
-        # leading to threshold queries that confidently return 0 rows with no explanation.
-        if 'kpi_data' in _available_tables:
-            try:
-                # Use _sql_fast with 5s timeout + limit to last 30 days to avoid
-                # unbounded PERCENTILE_CONT scan over millions of rows.
-                _kpi_ranges = _sql_fast(
-                    """SELECT kpi_name,
-                              ROUND(MIN(value)::numeric, 2)    AS min_val,
-                              ROUND(AVG(value)::numeric, 2)    AS avg_val,
-                              ROUND(MAX(value)::numeric, 2)    AS max_val,
-                              ROUND(PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY value)::numeric, 2) AS p25,
-                              ROUND(PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY value)::numeric, 2) AS p75,
-                              COUNT(DISTINCT site_id) AS site_count
-                       FROM kpi_data
-                       WHERE data_level = 'site' AND value IS NOT NULL
-                         AND date >= (SELECT MAX(date) - INTERVAL '30 days' FROM kpi_data)
-                       GROUP BY kpi_name
-                       ORDER BY kpi_name""",
-                    timeout_ms=5000
-                )
-                if _kpi_ranges:
-                    _schema_cache["kpi_ranges"] = {r["kpi_name"]: r for r in _kpi_ranges}
-                    # Compact format: limit to 20 KPIs sorted by site_count (most used first)
-                    _sorted_ranges = sorted(_kpi_ranges, key=lambda r: r['site_count'] or 0, reverse=True)[:20]
-                    _rng_hint = "\n=== KPI RANGES (top 20 by coverage, for threshold calibration) ===\n"
-                    for r in _sorted_ranges:
-                        _rng_hint += (
-                            f"{r['kpi_name']}: [{r['min_val']},{r['p25']},{r['avg_val']},"
-                            f"{r['p75']},{r['max_val']}] {r['site_count']}sites\n"
-                        )
-                    _rng_hint += "Format: kpi [min,p25,avg,p75,max] sites. If threshold query→0 rows, check these.\n"
-                    SCHEMA_HINT += _rng_hint
-                    _LOG.info("[DISCOVERY] KPI ranges loaded for %d KPIs", len(_kpi_ranges))
-            except Exception as e:
-                _LOG.warning("[DISCOVERY] KPI ranges query failed (non-fatal): %s", e)
-
-        _schema_cache["populated"] = True
-        _LOG.info("[DISCOVERY] rev_data_cols=%s rev_rev_cols=%s rev_opex=%s rev_subs=%s",
-                  _schema_cache["rev_data_cols"][:5], _schema_cache["rev_rev_cols"][:5],
-                  _schema_cache["rev_opex_cols"][:3], _schema_cache["rev_has_subscribers"])
-        _LOG.info("[DISCOVERY] core_metric=%s transport_metric=%s ticket_cols=%d",
-                  _schema_cache["core_metric_cols"][:4], _schema_cache["transport_metric_cols"][:4],
-                  len(_schema_cache["ticket_cols"]))
-
-        # ── Dynamic flexible_kpi_uploads core column discovery ──
-        if 'flexible_kpi_uploads' in _available_tables:
-            try:
-                _core_eav_cols = _sql(
-                    "SELECT DISTINCT column_name, column_type "
-                    "FROM flexible_kpi_uploads WHERE kpi_type = 'core' "
-                    "ORDER BY column_name LIMIT 40"
-                )
-                if _core_eav_cols:
-                    _ccn = "\n=== ACTUAL COLUMN NAMES in flexible_kpi_uploads (kpi_type='core') ===\n"
-                    _ccn += "These are the REAL column_name values — use these EXACT values in queries.\n"
-                    _ccn += "IMPORTANT: ALWAYS use ILIKE (not LIKE or =) for column_name matching.\n"
-                    for _cc in _core_eav_cols:
-                        _ccn += f"  '{_cc['column_name']}' ({_cc['column_type']})\n"
-                    _ccn += "Example: WHERE f.kpi_type = 'core' AND f.column_name ILIKE '%auth%'\n"
-                    SCHEMA_HINT += _ccn
-            except Exception:
-                pass
-
-        # ── Dynamic site_kpi_summary discovery — tell LLM about ML categories ──
-        # Auto-trigger ML pipeline if table is empty (first-time or after data refresh)
-        _sks_row_count = 0
-        if 'site_kpi_summary' in _available_tables:
-            try:
-                _sks_info = _sql(
-                    "SELECT COUNT(*) AS row_count, "
-                    "MIN(date)::text AS min_date, MAX(date)::text AS max_date, "
-                    "COUNT(DISTINCT site_id) AS site_count, "
-                    "COUNT(DISTINCT kpi_name) AS kpi_count, "
-                    "COUNT(*) FILTER (WHERE health_label = 'critical') AS critical_count, "
-                    "COUNT(*) FILTER (WHERE health_label = 'degraded') AS degraded_count, "
-                    "COUNT(*) FILTER (WHERE health_label = 'healthy') AS healthy_count, "
-                    "COUNT(*) FILTER (WHERE is_anomaly = true) AS anomaly_count "
-                    "FROM site_kpi_summary"
-                )
-                _sks_row_count = _sks_info[0].get('row_count', 0) if _sks_info else 0
-                if _sks_row_count > 0:
-                    _si = _sks_info[0]
-                    _sks_hint = "\n=== ML-CATEGORIZED SUMMARY (site_kpi_summary) ===\n"
-                    _sks_hint += f"Total rows: {_si['row_count']} | Sites: {_si['site_count']} | KPIs: {_si['kpi_count']}\n"
-                    _sks_hint += f"Date range: {_si['min_date']} to {_si['max_date']}\n"
-                    _sks_hint += f"Health distribution: {_si['healthy_count']} healthy, {_si['degraded_count']} degraded, {_si['critical_count']} critical\n"
-                    _sks_hint += f"Anomalies detected: {_si['anomaly_count']}\n"
-                    _sks_hint += "PREFER this table for performance/health queries — it has ML-generated labels.\n"
-                    _sks_hint += f"For date references in this table, use '{_si['max_date']}'::date as the latest date.\n"
-                    SCHEMA_HINT += _sks_hint
-                    _LOG.info("[DISCOVERY] site_kpi_summary: %d rows, %s to %s, %d anomalies",
-                              _si['row_count'], _si['min_date'], _si['max_date'], _si['anomaly_count'])
-            except Exception as e:
-                _LOG.debug("[DISCOVERY] site_kpi_summary check failed: %s", e)
-
-        # Auto-run ML pipeline in background if summary table is empty
-        if _sks_row_count == 0 and 'kpi_data' in _available_tables:
-            try:
-                from ml_pipeline import run_ml_pipeline_async, get_pipeline_status
-                _ml_st = get_pipeline_status()
-                if not _ml_st.get("running"):
-                    _LOG.info("[AUTO-ML] site_kpi_summary is empty — triggering ML pipeline in background")
-                    run_ml_pipeline_async(current_app._get_current_object())
-            except Exception as e:
-                _LOG.debug("[AUTO-ML] Failed to auto-trigger ML pipeline: %s", e)
-
-
-        # Hard cap: truncate to 8KB to keep LLM context manageable
-        if len(SCHEMA_HINT) > 8000:
-            SCHEMA_HINT = SCHEMA_HINT[:7900] + "\n...[TRUNCATED — use runtime column names above]\n"
-            _LOG.warning("[SCHEMA_HINT] Truncated from %d to 8KB", len(SCHEMA_HINT))
-
-        # Store freshly built SCHEMA_HINT in cache
-        _schema_hint_cache["hint"] = SCHEMA_HINT
-        _schema_hint_cache["ts"] = time.time()
-        _LOG.info("[SCHEMA_HINT] Cached (%d chars)", len(SCHEMA_HINT))
-    print(f"[TIMING] Schema discovery: {time.time()-_t0:.2f}s", flush=True)
-
-    # ── Semantic Layer: resolve cross-device concepts ──────────────────────
-    _used_semantic_path = False
-    _semantic_sql = None
-    try:
-        from semantic_layer import resolve_concepts, compose_sql as sl_compose_sql
-        _plan = resolve_concepts(prompt, _schema_cache)
-        _confs = [c.get("confidence", 0) for c in _plan.get("concepts", [])]
-        if _confs and min(_confs) >= 0.7:
-            _semantic_sql = sl_compose_sql(_plan)
-            _LOG.info("[SEMANTIC] Using semantic path | intent=%s | concepts=%s",
-                      _plan.get("intent"), [c["concept_name"] for c in _plan["concepts"]])
-            _used_semantic_path = True
-    except ImportError:
-        pass
-    except Exception as _sl_err:
-        _LOG.warning("[SEMANTIC] resolve failed, falling through: %s", _sl_err, exc_info=True)
-
-    # ── CHANGE: read session_context for dynamic prompt injection ──
-    _sctx = (getattr(ai_session, 'session_context', None) or {}) if ai_session else {}
-    _active_sites = ", ".join(_sctx.get("active_sites", [])) or "none yet"
-    _active_kpis  = ", ".join(_sctx.get("active_kpis", []))  or "none yet"
-    _active_days  = _sctx.get("active_days")
-    _active_days_str = f"last {_active_days} days" if _active_days else "not set"
-    _last_chart   = _sctx.get("last_chart_type", "bar")
+=== Natural Language → KPI Mapping Guide ===
+User says "call drop" / "drop rate" / "CDR" / "call failure" → 'E-RAB Call Drop Rate_1'
+User says "throughput" / "speed" / "download speed" → 'LTE DL - Usr Ave Throughput' (user) or 'LTE DL - Cell Ave Throughput' (cell)
+User says "PRB" / "congestion" / "load" / "utilization" → 'DL PRB Utilization (1BH)'
+User says "availability" / "uptime" / "downtime" → 'Availability'
+User says "connected users" / "RRC users" / "active users" → 'Ave RRC Connected Ue'
+User says "handover" / "HO" → 'LTE Intra-Freq HO Success Rate'
+User says "VoLTE" / "voice" → 'VoLTE Traffic Erlang'
+User says "latency" / "delay" / "ping" → 'Average Latency Downlink'
+User says "data volume" / "traffic volume" → 'DL Data Total Volume'
+User says "call setup" / "CSSR" → 'LTE Call Setup Success Rate'
+User says "RRC" / "accessibility" / "access" → 'LTE RRC Setup Success Rate'
+User says "noise" / "interference" → 'Average NI of Carrier-'
+User says "last 7 days" → AND k.date >= CURRENT_DATE - INTERVAL '7 days' AND k.date <= CURRENT_DATE
+User says "last month" → AND k.date >= CURRENT_DATE - INTERVAL '1 month' AND k.date <= CURRENT_DATE
+ALWAYS add AND k.date <= CURRENT_DATE when any date range is used, to exclude future data.
+"""
 
     LLM_SYSTEM = f"""You are a telecom network analytics SQL generator. Your ONLY job is to convert the user's natural-language query into an EXACT, STRICT SQL query that fetches PRECISELY what was asked — nothing more, nothing less.
 
@@ -1210,18 +251,6 @@ READ THE USER QUERY VERY CAREFULLY. Understand EVERY part of it before generatin
 The user may write in English, Hindi, Hinglish, or any language. Understand the intent and translate to SQL.
 
 {SCHEMA_HINT}
-
-═══════════════════════════════════════════════════════════
-ACTIVE SESSION STATE (always inherit this for follow-ups):
-═══════════════════════════════════════════════════════════
-- Sites currently in focus: {_active_sites}
-- KPIs currently in focus:  {_active_kpis}
-- Time range in use:        {_active_days_str}
-- Last chart type:          {_last_chart}
-
-If the user's query does not mention a new site, inherit the active_sites above.
-If the user's query does not mention a new KPI, inherit the active_kpis above.
-If the user's query does not mention a new time range, inherit the active_days above.
 
 ═══════════════════════════════════════════════════════════
 CRITICAL RULE #00 — CONVERSATION CONTEXT & FOLLOW-UPS:
@@ -1270,39 +299,7 @@ Follow-up patterns and how to handle them:
 - A prompt like "i want to see for site id X" with NO new KPI mentioned = SITE SWITCH → inherit all KPIs.
 
 ═══════════════════════════════════════════════════════════
-CRITICAL RULE #0b — THRESHOLD-BASED WORST SITE QUERIES:
-═══════════════════════════════════════════════════════════
-
-When the user asks for "worst N sites where KPI1 > X OR KPI2 < Y OR KPI3 < Z":
-→ NEVER generate 3 separate SQL queries (multi_chart). Generate ONE SQL query.
-→ ALWAYS use PIVOT (CASE WHEN) approach to compute all KPI averages in one query.
-→ Use HAVING clause with OR conditions to filter sites meeting ANY threshold.
-→ Add a "violations" count column to rank sites by how many thresholds they breach.
-
-CORRECT approach for "show 5 worst sites where MetricA > X OR MetricB < Y OR MetricC < Z":
-```sql
-SELECT k.site_id,
-       AVG(CASE WHEN k.kpi_name = '<MetricA>' THEN k.value END) AS metric_a,
-       AVG(CASE WHEN k.kpi_name = '<MetricB>' THEN k.value END) AS metric_b,
-       AVG(CASE WHEN k.kpi_name = '<MetricC>' THEN k.value END) AS metric_c,
-       (CASE WHEN AVG(CASE WHEN k.kpi_name = '<MetricA>' THEN k.value END) > <X> THEN 1 ELSE 0 END +
-        CASE WHEN AVG(CASE WHEN k.kpi_name = '<MetricB>' THEN k.value END) < <Y> THEN 1 ELSE 0 END +
-        CASE WHEN AVG(CASE WHEN k.kpi_name = '<MetricC>' THEN k.value END) < <Z> THEN 1 ELSE 0 END
-       ) AS violations
-FROM kpi_data k
-WHERE k.data_level = 'site' AND k.value IS NOT NULL
-  AND k.kpi_name IN ('<MetricA>', '<MetricB>', '<MetricC>')
-GROUP BY k.site_id
-HAVING AVG(CASE WHEN k.kpi_name = '<MetricA>' THEN k.value END) > <X>
-    OR AVG(CASE WHEN k.kpi_name = '<MetricB>' THEN k.value END) < <Y>
-    OR AVG(CASE WHEN k.kpi_name = '<MetricC>' THEN k.value END) < <Z>
-ORDER BY violations DESC, metric_a DESC NULLS LAST
-LIMIT 5
-```
-chart_type: "bar", x_axis: "site_id", y_axes: ["metric_a","metric_b","metric_c","violations"]
-The angle brackets signal "substitute the user's actual KPIs and thresholds discovered from the schema."
-
-
+CRITICAL RULE #0 — MULTI-PART / COMPOUND QUERIES:
 ═══════════════════════════════════════════════════════════
 
 Users often ask for MULTIPLE things in ONE query. You MUST handle ALL parts.
@@ -1321,13 +318,13 @@ Example: "show E-RAB drop rate and CSSR last 18 days for SITE_A and SITE_A"
 → Each chart: composed chart_type, UNION ALL SQL filtering by that site.
 
 Example SQL for one site with two KPIs:
-SELECT k.date::text AS date, k.site_id, AVG(k.value) AS value, '<KpiA>' AS kpi_name
-FROM kpi_data k WHERE k.kpi_name = '<KpiA>' AND k.site_id = 'SITE_A'
+SELECT k.date::text AS date, k.site_id, AVG(k.value) AS value, 'E-RAB Call Drop Rate_1' AS kpi_name
+FROM kpi_data k WHERE k.kpi_name = 'E-RAB Call Drop Rate_1' AND k.site_id = 'SITE_A'
   AND k.data_level='site' AND k.value IS NOT NULL AND k.date >= CURRENT_DATE - INTERVAL '18 days' AND k.date <= CURRENT_DATE
 GROUP BY k.date, k.site_id
 UNION ALL
-SELECT k.date::text AS date, k.site_id, AVG(k.value) AS value, '<KpiB>' AS kpi_name
-FROM kpi_data k WHERE k.kpi_name = '<KpiB>' AND k.site_id = 'SITE_A'
+SELECT k.date::text AS date, k.site_id, AVG(k.value) AS value, 'LTE Call Setup Success Rate' AS kpi_name
+FROM kpi_data k WHERE k.kpi_name = 'LTE Call Setup Success Rate' AND k.site_id = 'SITE_A'
   AND k.data_level='site' AND k.value IS NOT NULL AND k.date >= CURRENT_DATE - INTERVAL '18 days' AND k.date <= CURRENT_DATE
 GROUP BY k.date, k.site_id
 ORDER BY date
@@ -1344,13 +341,8 @@ STRICTNESS RULES — FOLLOW THESE EXACTLY:
 4. EXTRACT THE EXACT NUMBER OF DAYS mentioned. "last 18 days" = 18, NOT 7 or 30.
 5. KPI names are CASE-SENSITIVE — copy EXACTLY from the list above.
 6. Site IDs are EXACT — copy every character. NEVER truncate in SQL (only title has 60-char limit).
-7. ALWAYS: WHERE k.data_level='site' AND k.value IS NOT NULL. NEVER use data_level='cell'.
+7. ALWAYS: WHERE k.data_level='site' AND k.value IS NOT NULL
 8. JOIN telecom_sites only when you need zone/geo data.
-9. In UNION ALL queries, NEVER put ORDER BY or LIMIT inside individual SELECT branches. Put ONE ORDER BY at the very end AFTER the last UNION ALL branch.
-10. "a week" / "1 week" = INTERVAL '7 days'. "a month" = INTERVAL '30 days'. Always convert to days.
-11. When user says "for both" or "for site A and site B", you MUST include ALL mentioned sites — never drop any.
-12. NEVER filter by the `hour` column. All site-level data is stored with hour=0 — filtering by hour will always return 0 rows.
-13. NEVER invent or guess site_ids. Use only site_ids the user explicitly stated or that appeared in prior conversation context.
 
 ═══════════════════════════════════════════════════════════
 CHART TYPE — MUST MATCH THE DATA SHAPE:
@@ -1432,7 +424,7 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
                 parsed["response"] = parsed.get("title", "Results")
             for chart in parsed["charts"]:
                 if chart.get("sql"):
-                    chart["sql"] = _sanitize_llm_sql(chart["sql"])
+                    chart["sql"] = _fix_site_ids_in_sql(chart["sql"])
             return parsed
         ct = parsed.get("chart_type") or parsed.get("chart") or parsed.get("query_type") or "bar"
         parsed["chart_type"] = ct
@@ -1448,18 +440,14 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
         if "chart_config" not in parsed:
             parsed["chart_config"] = {}
         if parsed.get("sql"):
-            parsed["sql"] = _sanitize_llm_sql(parsed["sql"])
+            parsed["sql"] = _fix_site_ids_in_sql(parsed["sql"])
         return parsed
 
-    # ── CHANGE: comprehensive SQL sanitizer for all known LLM mistakes ──
-    def _sanitize_llm_sql(sql: str) -> str:
-        """Fix common LLM-generated SQL mistakes before execution."""
+    def _fix_site_ids_in_sql(sql: str) -> str:
         import re
-        if not sql or not sql.strip():
-            return sql
-
-        # 1. Fix truncated site IDs (LLM cuts off last chars)
         prompt_site_ids = re.findall(r'[A-Za-z]{2,}[_\-][A-Za-z]{2,}[_\-]\d{3,}', prompt)
+        if not prompt_site_ids:
+            return sql
         for correct_id in prompt_site_ids:
             for trim in range(1, 4):
                 truncated = correct_id[:-trim]
@@ -1469,123 +457,11 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
                 replacement = r"\g<1>" + correct_id + r"\g<3>"
                 fixed = re.sub(pattern, replacement, sql, flags=re.IGNORECASE)
                 if fixed != sql:
-                    _LOG.info("[SQL-fix] truncated site ID: '%s' → '%s'", truncated, correct_id)
+                    _LOG.info("Fixed truncated site ID in SQL: '%s' → '%s'", truncated, correct_id)
                     sql = fixed
-
-        # 2. Fix ORDER BY inside UNION ALL branches (PostgreSQL syntax error)
-        if re.search(r'\bUNION\s+ALL\b', sql, re.IGNORECASE):
-            parts = re.split(r'\bUNION\s+ALL\b', sql, flags=re.IGNORECASE)
-            if len(parts) > 1:
-                cleaned = []
-                for part in parts:
-                    part = re.sub(r'\s+ORDER\s+BY\s+[\w\s,.]+$', '', part.strip(), flags=re.IGNORECASE)
-                    cleaned.append(part)
-                sql = '\nUNION ALL\n'.join(cleaned) + '\nORDER BY date'
-                _LOG.info("[SQL-fix] moved ORDER BY to end of UNION ALL")
-
-        # 3. Fix data_level='cell' → 'site' (prompt rule #7 says ALWAYS 'site')
-        if re.search(r"data_level\s*=\s*'cell'", sql, re.IGNORECASE):
-            sql = re.sub(r"data_level\s*=\s*'cell'", "data_level = 'site'", sql, flags=re.IGNORECASE)
-            _LOG.info("[SQL-fix] changed data_level='cell' → 'site'")
-
-        # 4. Replace CURRENT_DATE with actual max data date if data is stale
-        _max_d = _schema_cache.get("kpi_max_date_recent")
-        if _max_d and 'kpi_data' in sql.lower():
-            sql = re.sub(r'\bCURRENT_DATE\b', f"'{_max_d}'::date", sql, flags=re.IGNORECASE)
-            _LOG.info("[SQL-fix] replaced CURRENT_DATE with actual max date %s", _max_d)
-
-        # 4b. Ensure date cap exists when date range is used
-        _date_ref_rx = re.escape(f"'{_max_d}'::date") if _max_d else r"CURRENT_DATE"
-        if re.search(_date_ref_rx + r"\s*-\s*INTERVAL", sql, re.IGNORECASE):
-            if not re.search(r"date\s*<=\s*" + _date_ref_rx, sql, re.IGNORECASE):
-                _cap = f"'{_max_d}'::date" if _max_d else "CURRENT_DATE"
-                sql = re.sub(
-                    r"(" + _date_ref_rx + r"\s*-\s*INTERVAL\s*'[^']+'\s*)",
-                    r"\1AND k.date <= " + _cap + " ",
-                    sql, count=1, flags=re.IGNORECASE,
-                )
-                _LOG.info("[SQL-fix] added missing date cap")
-
-        # 5. Ensure k.value IS NOT NULL exists
-        if 'kpi_data' in sql.lower() and 'is not null' not in sql.lower():
-            sql = re.sub(
-                r"(data_level\s*=\s*'site')",
-                r"\1 AND k.value IS NOT NULL",
-                sql, count=1, flags=re.IGNORECASE,
-            )
-            _LOG.info("[SQL-fix] added missing k.value IS NOT NULL")
-
-        # 6. Fix LIMIT inside UNION ALL branches (PostgreSQL syntax error)
-        if re.search(r'\bUNION\s+ALL\b', sql, re.IGNORECASE):
-            parts = re.split(r'\bUNION\s+ALL\b', sql, flags=re.IGNORECASE)
-            if len(parts) > 1:
-                cleaned = []
-                for part in parts:
-                    part = re.sub(r'\s+LIMIT\s+\d+\s*$', '', part.strip(), flags=re.IGNORECASE)
-                    cleaned.append(part)
-                # Preserve the ORDER BY we already placed at end
-                if re.search(r'\bORDER\s+BY\b', cleaned[-1], re.IGNORECASE):
-                    sql = '\nUNION ALL\n'.join(cleaned)
-                else:
-                    sql = '\nUNION ALL\n'.join(cleaned) + '\nORDER BY date'
-
-        # 7. Fix correlated subquery referencing outer alias inside HAVING/WHERE subquery
-        # LLM often writes: HAVING k.site_id IN (SELECT site_id FROM kpi_data WHERE k.kpi_name = ...)
-        # The "k." inside the subquery references the outer query, causing GroupingError.
-        # Fix: remove outer alias prefix inside subqueries.
-        _subq_matches = list(re.finditer(
-            r'\(\s*SELECT\s+.*?\bFROM\s+(\w+)\s+',
-            sql, re.IGNORECASE | re.DOTALL
-        ))
-        for _m in reversed(_subq_matches):
-            _subq_start = _m.start()
-            # Find matching closing paren
-            _depth = 0
-            _subq_end = _subq_start
-            for _ci in range(_subq_start, len(sql)):
-                if sql[_ci] == '(':
-                    _depth += 1
-                elif sql[_ci] == ')':
-                    _depth -= 1
-                    if _depth == 0:
-                        _subq_end = _ci + 1
-                        break
-            _subq = sql[_subq_start:_subq_end]
-            # Remove outer alias references (k., mv., etc.) inside subquery
-            # Only fix if the subquery references the same table without alias
-            _fixed_subq = re.sub(r'\bk\.(kpi_name|site_id|value|date|data_level|hour)\b',
-                                 r'\1', _subq, flags=re.IGNORECASE)
-            if _fixed_subq != _subq:
-                sql = sql[:_subq_start] + _fixed_subq + sql[_subq_end:]
-                _LOG.info("[SQL-fix] removed outer alias 'k.' from correlated subquery")
-
         return sql
 
-    # ── KPI Name Fuzzy Matching: resolve user's natural language to EXACT DB names ──
-    # This prevents the LLM from guessing KPI names — we give it the exact matches.
-    _kpi_matches = []
-    _all_kpis = _schema_cache.get("kpi_names_list", [])
-    if _all_kpis:
-        _prompt_lower = prompt.lower()
-        for _kpi in _all_kpis:
-            _kpi_lower = _kpi.lower()
-            # Check if any significant substring of the KPI name appears in the prompt
-            # Split KPI name into words and check if enough words match
-            _kpi_words = [w for w in re.split(r'[\s_\-()]+', _kpi_lower) if len(w) > 2]
-            _matched_words = sum(1 for w in _kpi_words if w in _prompt_lower)
-            if _kpi_words and _matched_words >= max(1, len(_kpi_words) * 0.5):
-                _kpi_matches.append(_kpi)
-            # Also check if user typed exact or near-exact name
-            elif _kpi_lower in _prompt_lower or _prompt_lower.find(_kpi_lower.replace(' ', '')) >= 0:
-                _kpi_matches.append(_kpi)
-
     user_prompt = f"User query: {prompt}"
-    if _kpi_matches:
-        user_prompt += "\n\nEXACT KPI name matches from database (use these EXACT strings in SQL):\n"
-        for _km in _kpi_matches:
-            user_prompt += f"  → '{_km}'\n"
-        _LOG.info("[KPI-MATCH] Matched %d KPIs from user query: %s", len(_kpi_matches), _kpi_matches)
-
     if filters.get("cluster"):
         user_prompt += f"\nActive filter — Zone: {filters['cluster']}"
     if filters.get("time_range") and filters["time_range"] != "24h":
@@ -1595,81 +471,166 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
     llm_messages.extend(conversation_history)
     llm_messages.append({"role": "user", "content": user_prompt})
 
-    from app import client as _llm_client, DEPLOYMENT_NAME as _llm_model
-    _LOG.info("AI provider: global client (%s)", _llm_model)
+    _cfg = lambda k, default="": current_app.config.get(k, "") or os.environ.get(k, "") or default
 
+    azure_key        = _cfg("AZURE_OPENAI_API_KEY")
+    azure_endpoint   = _cfg("AZURE_OPENAI_ENDPOINT")
+    azure_deployment = _cfg("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini")
+    azure_version    = _cfg("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
+    gemini_key       = _cfg("GEMINI_API_KEY")
+    gemini_model     = _cfg("OPENAI_MODEL", "gemini-2.0-flash")
+    openai_key       = _cfg("OPENAI_API_KEY")
 
-    # ── Semantic Path: skip LLM if semantic layer produced SQL ─────────────
-    _t1 = time.time()
-    if _used_semantic_path and _semantic_sql:
-        # Build ai_result directly from semantic SQL — bypass LLM entirely
-        _sl_intent = _plan.get("intent", "trend")
-        _sl_chart = "bar" if _sl_intent in ("top_n", "threshold", "comparison") else "composed"
-        _sl_x = "site_id" if _sl_intent in ("top_n", "threshold", "comparison") else "date"
-        ai_result = {
-            "sql": _semantic_sql,
-            "title": prompt[:60],
-            "response": f"Results for: {prompt[:80]}",
-            "chart_type": _sl_chart,
-            "x_axis": _sl_x,
-            "y_axes": ["value"],
-            "chart_config": {},
-            "filter_update": {},
-        }
-        provider = {"provider": "semantic_layer"}
-        _LOG.info("[SEMANTIC] Bypassed LLM SQL gen — using composed SQL directly")
-        print(f"[TIMING] Semantic SQL compose: {time.time()-_t1:.2f}s", flush=True)
-    else:
-        # ── Legacy LLM Call ────────────────────────────────────────────────────
+    _providers = []
+    if azure_key and azure_endpoint:
+        _providers.append(("azure", azure_key, azure_endpoint, azure_deployment, azure_version))
+    if gemini_key:
+        _providers.append(("gemini", gemini_key, gemini_model))
+    if openai_key:
+        _providers.append(("openai", openai_key))
+
+    _LOG.info("AI providers available: %s", [p[0] for p in _providers])
+
+    # ── PRE-LLM INTERCEPTOR ────────────────────────────────────────────────────
+    # Handle certain query patterns with rule-based logic BEFORE calling the LLM.
+    # This ensures follow-ups (site switch, time change, chart type) and
+    # multi-site trend queries are handled correctly and consistently,
+    # regardless of which LLM provider is configured.
+    import re as _re_pre
+
+    def _get_prev_context_for_intercept():
+        """Load the most recent assistant message's content_json from the session."""
+        if not (ai_session and session_id):
+            return None
         try:
-            _llm_resp = _llm_client.chat.completions.create(
-                model=_llm_model,
-                messages=llm_messages,
-                temperature=0.1,
-                max_tokens=2000,
-            )
-            raw_content = _llm_resp.choices[0].message.content
-            if raw_content:
-                ai_result = _parse_ai_result(raw_content)
-                provider = {"provider": _llm_model}
-                _LOG.info("AI query handled by %s", _llm_model)
+            last_asst = (NetworkAiMessage.query
+                         .filter_by(session_id=session_id, role="assistant")
+                         .order_by(NetworkAiMessage.created_at.desc())
+                         .first())
+            return last_asst.content_json if last_asst else None
+        except Exception:
+            return None
+
+    _p_lower = prompt.lower().strip()
+    _prompt_sites = _re_pre.findall(r'[A-Za-z]{2,}[_\-][A-Za-z]{2,}[_\-]\d{3,}', prompt)
+    _prompt_days  = _re_pre.search(r'last\s+(\d+)\s*days?', _p_lower)
+
+    # 1. Follow-up detection — run rule-based BEFORE LLM so context is never lost
+    if _is_followup(_p_lower):
+        _prev_ctx = _get_prev_context_for_intercept()
+        if _prev_ctx:
+            _fu = _handle_followup(prompt, _p_lower, _prev_ctx, time_filter)
+            if _fu:
+                ai_result = _fu
+                provider  = {"provider": "rule-based-followup"}
+                _LOG.info("Follow-up intercepted before LLM: site-switch / chart-change / time-change")
+
+    # 2. Multi-site trend queries — rule-based reliably generates one chart per site
+    #    with ALL requested KPIs, which LLMs often get wrong.
+    if not ai_result and len(_prompt_sites) >= 2:
+        _is_trend_pre = (
+            bool(_prompt_days) or
+            any(w in _p_lower for w in ('trend', 'over time', 'history', 'daily', 'last'))
+        )
+        if _is_trend_pre:
+            ai_result = _rule_based_query(prompt, time_filter, prev_context=None)
+            provider  = {"provider": "rule-based-multisite"}
+            _LOG.info("Multi-site trend intercepted before LLM: %s", _prompt_sites)
+
+    for _prov in _providers:
+        if ai_result:
+            break
+        ptype = _prov[0]
+        try:
+            if ptype == "azure":
+                from openai import AzureOpenAI as _AzureOpenAI
+                az_client = _AzureOpenAI(
+                    api_key=_prov[1], api_version=_prov[4],
+                    azure_endpoint=_prov[2], timeout=25.0,
+                )
+                az_resp = az_client.chat.completions.create(
+                    model=_prov[3],
+                    messages=llm_messages,
+                    temperature=0.1,
+                    max_tokens=2000,
+                    response_format={"type": "json_object"},
+                )
+                raw_content = az_resp.choices[0].message.content
+                if raw_content:
+                    ai_result = _parse_ai_result(raw_content)
+                    provider = {"provider": f"azure-{_prov[3]}"}
+                    _LOG.info("AI query handled by Azure OpenAI (%s)", _prov[3])
+
+            elif ptype == "gemini":
+                from openai import OpenAI as _OpenAI
+                gem_client = _OpenAI(
+                    api_key=_prov[1],
+                    base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+                    timeout=25.0,
+                )
+                gem_resp = gem_client.chat.completions.create(
+                    model=_prov[2],
+                    messages=llm_messages,
+                    temperature=0.1,
+                    max_tokens=2000,
+                )
+                raw_content = gem_resp.choices[0].message.content
+                if raw_content:
+                    ai_result = _parse_ai_result(raw_content)
+                    provider = {"provider": _prov[2]}
+                    _LOG.info("AI query handled by Gemini (%s)", _prov[2])
+
+            elif ptype == "openai":
+                from openai import OpenAI as _OpenAI2
+                oai_client = _OpenAI2(api_key=_prov[1], timeout=25.0)
+                oai_resp = oai_client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=llm_messages,
+                    temperature=0.1,
+                    max_tokens=2000,
+                )
+                raw_content = oai_resp.choices[0].message.content
+                if raw_content:
+                    ai_result = _parse_ai_result(raw_content)
+                    provider = {"provider": "openai-gpt-4o-mini"}
+                    _LOG.info("AI query handled by OpenAI direct")
+
         except json.JSONDecodeError as je:
-            _LOG.warning("LLM returned bad JSON: %s", str(je)[:200])
+            _LOG.warning("%s LLM returned bad JSON, using rule-based fallback: %s", ptype.upper(), str(je)[:100])
+            continue
         except Exception as e:
-            _LOG.warning("LLM call failed: %s", str(e)[:200])
+            err_str = str(e).lower()
+            if "429" in str(e) or "quota" in err_str or "rate" in err_str or "resource_exhausted" in err_str:
+                _LOG.warning("%s quota/rate limit hit — skipping to rule-based", ptype.upper())
+                break
+            _LOG.warning("%s LLM failed (will try next): %s", ptype.upper(), str(e)[:200])
+            continue
 
-        print(f"[TIMING] LLM SQL gen: {time.time()-_t1:.2f}s", flush=True)
-
+    # ── Fallback: rule-based query engine ─────────────────────────────────────
     if not ai_result:
-        _emit_progress(_ws_sid, "complete", "Error")
-        return jsonify({"error": "Could not generate a query. Please try rephrasing your question."}), 400
+        prev_context = None
+        if ai_session and session_id:
+            try:
+                last_asst = (NetworkAiMessage.query
+                             .filter_by(session_id=session_id, role="assistant")
+                             .order_by(NetworkAiMessage.created_at.desc())
+                             .first())
+                if last_asst and last_asst.content_json:
+                    prev_context = last_asst.content_json
+            except Exception:
+                pass
+        ai_result = _rule_based_query(prompt, time_filter, prev_context=prev_context)
+        if not provider:
+            provider = {"provider": "rule-based"}
+        _LOG.info("AI query handled by rule-based fallback")
 
     # ── Helper functions ──────────────────────────────────────────────────────
     def _sql_with_timeout(query, timeout_sec=10):
-        """Execute SQL with timeout and safety validation."""
-        # Validate SQL safety before execution
-        is_safe, result_or_error = _validate_sql(query)
-        if not is_safe:
-            _LOG.warning("[SQL-BLOCKED] %s — SQL: %s", result_or_error, query[:200])
-            raise ValueError(f"SQL validation failed: {result_or_error}")
-        query = _add_safety_limits(result_or_error)  # result_or_error is normalized SQL when safe
-
-        # Check cache first
-        ck = _cache_key(query)
-        cached = _cache_get(ck)
-        if cached is not None:
-            _LOG.info("[CACHE-HIT] Returning cached result for: %s", query[:80])
-            return cached
-
         with db.engine.connect() as conn:
             conn.execute(sa_text(f"SET LOCAL statement_timeout = '{timeout_sec * 1000}'"))
             result = conn.execute(sa_text(query))
             cols = list(result.keys())
-            rows = [dict(zip(cols, row)) for row in result.fetchall()]
-
-        # Cache the result
-        _cache_set(ck, rows)
-        return rows
+            return [dict(zip(cols, row)) for row in result.fetchall()]
 
     def _serial(v):
         if v is None: return None
@@ -1678,83 +639,29 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
         try:    return float(v)
         except: return str(v)
 
-    _emit_progress(_ws_sid, 'executing', 'Running query...')
-    _t2 = time.time()
-
-    # ── MULTI-CHART: execute each chart's SQL in PARALLEL ──────────────────────
+    # ── MULTI-CHART: execute each chart's SQL separately ───────────────────────
     if ai_result.get("multi_chart") and ai_result.get("charts"):
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
-        # Capture the real Flask app object in the request thread —
-        # worker threads need it to create their own app context.
-        _app_obj = current_app._get_current_object()
-
-        def _exec_chart(chart_spec, app):
+        charts_out = []
+        for chart_spec in ai_result["charts"]:
             c_sql = chart_spec.get("sql", "")
+            c_error = None
+            c_rows = []
             try:
-                with app.app_context():
-                    rows = _sql_with_timeout(c_sql, timeout_sec=15)
-                if not rows:
+                c_rows = _sql_with_timeout(c_sql, timeout_sec=15)
+                if not c_rows:
                     _LOG.warning("Multi-chart SQL returned 0 rows — SQL: %s", c_sql[:300])
-                    return chart_spec, rows, "Query returned no data. The site ID or KPI may not exist in the database."
-                return chart_spec, rows, None
+                    c_error = "Query returned no data. The site ID or KPI may not exist in the database."
             except Exception as e:
                 _LOG.warning("Multi-chart SQL failed: %s — SQL: %s", e, c_sql[:300])
-                return chart_spec, [], str(e)
-
-        charts_out = []
-        chart_specs = ai_result["charts"]
-        results_map = {}
-        with ThreadPoolExecutor(max_workers=min(len(chart_specs), 4)) as _pool:
-            futures = {_pool.submit(_exec_chart, spec, _app_obj): i for i, spec in enumerate(chart_specs)}
-            for fut in as_completed(futures):
-                idx = futures[fut]
-                results_map[idx] = fut.result()
-
-        # Rebuild charts in original order
-        for idx, chart_spec in enumerate(chart_specs):
-            chart_spec, c_rows, c_error = results_map.get(idx, (chart_spec, [], "Execution failed"))
-            c_sql = chart_spec.get("sql", "")
+                c_error = str(e)
+                c_rows = []
             c_cols = list(c_rows[0].keys()) if c_rows else []
             c_safe = [{k: _serial(v) for k, v in r.items()} for r in c_rows]
-
-            # Validate y_axes against actual result columns
-            _mc_skip = {
-                "lat", "lng", "latitude", "longitude", "site_id", "cell_id",
-                "cluster", "region", "zone", "technology", "kpi_name", "date", "hour",
-            }
-            _mc_llm_y = chart_spec.get("y_axes", [])
-            _mc_y = [c for c in _mc_llm_y if c in c_cols]
-            if not _mc_y:
-                _mc_y = [
-                    c for c in c_cols
-                    if c not in _mc_skip
-                    and any(isinstance(r.get(c), (int, float)) for r in c_rows[:5])
-                ][:5]
-            if not _mc_y:
-                _mc_y = [c for c in c_cols if c not in _mc_skip][:3]
-
-            # Validate x_axis
-            _mc_llm_x = chart_spec.get("x_axis", "date")
-            _mc_x = _mc_llm_x if _mc_llm_x in c_cols else (c_cols[0] if c_cols else "date")
-
-            # Correct chart type from actual data shape
-            _mc_has_kpi = "kpi_name" in c_cols
-            _mc_has_val = "value" in c_cols
-            _mc_has_date = _mc_x in ("date", "hour") or "date" in str(_mc_x).lower()
-            _mc_chart = chart_spec.get("chart_type", "line")
-            if _mc_has_kpi and _mc_has_val:
-                _mc_chart = "composed"
-            elif _mc_has_date and len(_mc_y) >= 2:
-                _mc_chart = "composed"
-            elif _mc_has_date and len(_mc_y) == 1:
-                _mc_chart = "line"
-
             chart_entry = {
                 "title":      chart_spec.get("title", ""),
-                "chart_type": _mc_chart,
-                "x_axis":     _mc_x,
-                "y_axes":     _mc_y,
+                "chart_type": chart_spec.get("chart_type", "line"),
+                "x_axis":     chart_spec.get("x_axis", c_cols[0] if c_cols else "date"),
+                "y_axes":     chart_spec.get("y_axes", c_cols[1:] if c_cols else []),
                 "data":       c_safe,
                 "columns":    c_cols,
                 "row_count":  len(c_rows),
@@ -1764,12 +671,9 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
                 chart_entry["error"] = c_error
             charts_out.append(chart_entry)
 
-        print(f"[TIMING] DB queries (multi-chart): {time.time()-_t2:.2f}s", flush=True)
-
         resp_text = ai_result.get("response", f"Here are {len(charts_out)} charts.")
         resp_title = ai_result.get("title", prompt[:70])
 
-        _t3 = time.time()
         if ai_session:
             try:
                 if ai_session.title == "New Chat":
@@ -1787,18 +691,7 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
                 db.session.commit()
             except Exception as e:
                 _LOG.error("Failed to persist AI message: %s", e)
-            # ── CHANGE: update session context + maybe summarize ──
-            _all_sqls = " ".join(ch.get("sql", "") for ch in charts_out)
-            _update_session_context(ai_session, _all_sqls, "multi_chart")
-            _maybe_summarize_conversation(ai_session)
 
-        print(f"[TIMING] Session persist + summarize: {time.time()-_t3:.2f}s", flush=True)
-        print(f"[TIMING] TOTAL (analytical): {time.time()-_t_total:.2f}s", flush=True)
-
-        _emit_progress(_ws_sid, 'complete', 'Done')
-        _elapsed = round(time.time() - _query_start, 2)
-        _LOG.info("[COMPLETE] Multi-chart query in %.2fs | %d charts | provider=%s",
-                  _elapsed, len(charts_out), provider.get("provider") if provider else "rule-based")
         return jsonify({
             "response":     resp_text,
             "query_type":   "multi_chart",
@@ -1810,7 +703,6 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
             "row_count":    sum(c["row_count"] for c in charts_out),
             "provider":     provider["provider"] if provider else "rule-based",
             "session_id":   ai_session.id if ai_session else None,
-            "elapsed_seconds": _elapsed,
         })
 
     # ── SINGLE CHART: execute SQL normally ─────────────────────────────────────
@@ -1821,144 +713,32 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
     try:
         rows = _sql_with_timeout(sql, timeout_sec=15)
     except Exception as e:
-        _LOG.warning("AI SQL execution failed (attempt 1): %s — SQL: %s", e, sql[:200])
-        # ── RETRY: feed the error back to the LLM and ask it to fix the SQL ──
-        _retry_sql = None
+        _LOG.warning("AI SQL execution failed: %s — SQL: %s", e, sql[:200])
         try:
-            _retry_msgs = list(llm_messages) + [
-                {"role": "assistant", "content": json.dumps(ai_result)},
-                {"role": "user", "content": (
-                    f"The SQL you generated failed with this PostgreSQL error:\n{str(e)[:400]}\n\n"
-                    f"Failed SQL:\n{sql[:600]}\n\n"
-                    "Fix the SQL. Common fixes:\n"
-                    "- Do NOT reference outer aliases (k., mv.) inside subqueries\n"
-                    "- Use CASE WHEN pivot instead of correlated subqueries\n"
-                    "- Ensure all non-aggregated columns are in GROUP BY\n"
-                    "Return the SAME JSON format with the corrected sql field."
-                )},
-            ]
-            _retry_resp = _llm_client.chat.completions.create(
-                model=_llm_model, messages=_retry_msgs,
-                temperature=0.05, max_tokens=2000,
-            )
-            _retry_raw = _retry_resp.choices[0].message.content
-            if _retry_raw:
-                _retry_result = _parse_ai_result(_retry_raw)
-                _retry_sql = _retry_result.get("sql", "")
-                if _retry_sql and _retry_sql.strip().upper().startswith("SELECT"):
-                    _LOG.info("[RETRY] LLM returned fixed SQL, attempting execution")
-                    rows = _sql_with_timeout(_retry_sql, timeout_sec=15)
-                    # Success — update ai_result with the fixed version
-                    sql = _retry_sql
-                    ai_result = _retry_result
-                    _LOG.info("[RETRY] Fixed SQL succeeded!")
-                else:
-                    raise ValueError("Retry SQL empty or not SELECT")
-        except Exception as e2:
-            _LOG.warning("AI SQL retry also failed: %s", str(e2)[:200])
-            _emit_progress(_ws_sid, "complete", "Error")
-            return jsonify({
-                "error": "SQL execution failed",
-                "reason": str(e)[:300],
-                "sql": sql[:500],
-                "response": f"Query failed: {str(e)[:200]}. Try rephrasing your question.",
-            }), 422
-    print(f"[TIMING] DB query (single-chart): {time.time()-_t2:.2f}s", flush=True)
-
-    # ── 0-rows explanation: if still empty, check KPI ranges and explain why ──
-    # This prevents the chart from silently showing nothing.
-    # If we know the value ranges, we can tell the user their threshold is too tight.
-    if not rows and sql:
-        try:
-            _kpi_ranges = _schema_cache.get("kpi_ranges", {})
-            _threshold_kpis = []
-            import re as _re_0r
-            # Detect HAVING/WHERE conditions in the SQL to find the KPIs + thresholds
-            _having_clauses = _re_0r.findall(
-                r"kpi_name\s*=\s*'([^']+)'[^)]*(?:>|<)\s*([\d.]+)",
-                sql, _re_0r.IGNORECASE
-            )
-            for _kn, _val in _having_clauses:
-                if _kn in _kpi_ranges:
-                    r = _kpi_ranges[_kn]
-                    _threshold_kpis.append(
-                        f"{_kn}: actual range [{r['min_val']} – {r['max_val']}], "
-                        f"avg={r['avg_val']} (your threshold: {_val})"
-                    )
-            if _threshold_kpis:
-                ai_result["response"] = (
-                    "No sites matched the specified thresholds. "
-                    "Based on actual data ranges:\n"
-                    + "\n".join(f"• {t}" for t in _threshold_kpis)
-                    + "\n\nTry relaxing the threshold values."
-                )
-                _LOG.info("[0-ROWS] Threshold explanation injected for %d KPIs", len(_threshold_kpis))
-        except Exception as _e0r:
-            _LOG.debug("[0-ROWS] Explanation injection failed: %s", _e0r)
+            fallback = _rule_based_query(prompt, time_filter)
+            sql2 = fallback.get("sql", "")
+            if sql2 and sql2.strip().upper().startswith("SELECT"):
+                rows = _sql_with_timeout(sql2, timeout_sec=10)
+                ai_result.update(fallback)
+                sql = sql2
+                if not provider:
+                    provider = {"provider": "rule-based-fallback"}
+            else:
+                rows = []
+        except Exception:
+            rows = []
 
     columns = list(rows[0].keys()) if rows else []
     has_geo = any(r.get("lat") or r.get("latitude") for r in rows)
     safe_rows = [{k: _serial(v) for k, v in r.items()} for r in rows]
-
-    # ── Fix 1: Validate y_axes against actual query result columns ──────────
-    # LLM often hallucinates column names that don't exist in the result.
-    # Only keep suggestions that exist; fallback to actual numeric columns.
-    _SKIP_COLS = {
-        "lat", "lng", "latitude", "longitude", "site_id", "cell_id",
-        "cluster", "region", "zone", "technology", "kpi_name",
-        "date", "hour", "color", "status",
-    }
-    _llm_y = ai_result.get("y_axes") or []
-    _validated_y = [c for c in _llm_y if c in columns]
-    if not _validated_y:
-        # Derive from actual result: prefer columns that contain numeric values
-        _validated_y = [
-            c for c in columns
-            if c not in _SKIP_COLS
-            and any(isinstance(r.get(c), (int, float)) for r in rows[:5])
-        ][:5]
-    if not _validated_y:
-        # Last resort: anything not in skip list
-        _validated_y = [c for c in columns if c not in _SKIP_COLS][:3]
-    y_axes = _validated_y
-
-    # ── Fix 5: Validate x_axis against actual columns ────────────────────────
-    _llm_x = ai_result.get("x_axis", "")
-    x_axis_final = _llm_x if _llm_x in columns else (columns[0] if columns else "")
-
-    # ── Fix 2: Correct chart type based on actual data shape ─────────────────
-    def _correct_chart_type(ai_chart, cols, data_rows, x_col, y_cols):
-        if not data_rows:
-            return ai_chart
-        has_date_x = x_col in ("date", "hour") or "date" in str(x_col).lower()
-        has_kpi_col = "kpi_name" in cols
-        has_value_col = "value" in cols
-        n_rows = len(data_rows)
-        n_series = len(y_cols)
-
-        # UNION ALL multi-KPI result — kpi_name + value columns = always composed
-        if has_kpi_col and has_value_col:
-            return "composed"
-        # Time series with 1 series → line
-        if has_date_x and n_series == 1 and n_rows > 5:
-            return "line"
-        # Time series with 2+ series → composed
-        if has_date_x and n_series >= 2:
-            return "composed"
-        # Site/category comparison → bar
-        if x_col in ("site_id", "cell_id", "zone", "cluster", "kpi_name", "category"):
-            return "bar"
-        # Pie only for small distributions
-        if ai_chart == "pie" and n_rows <= 12:
-            return "pie"
-        return ai_chart
+    y_axes = ai_result.get("y_axes") or [
+        c for c in columns[1:5]
+        if c not in ("lat", "lng", "latitude", "longitude", "site_id", "cell_id", "cluster", "region", "technology")
+    ]
 
     resp_text = ai_result.get("response", f"Found {len(rows)} results.")
     resp_title = ai_result.get("title", prompt[:70])
     resp_chart = ai_result.get("chart_type", ai_result.get("query_type", "bar"))
-    resp_chart = _correct_chart_type(resp_chart, columns, rows, x_axis_final, y_axes)
-    _LOG.info("[CHART-CORRECT] final chart_type=%s x_axis=%s y_axes=%s",
-              resp_chart, x_axis_final, y_axes)
 
     if ai_session:
         try:
@@ -1972,7 +752,7 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
                     "title": resp_title,
                     "data": safe_rows,
                     "columns": columns,
-                    "x_axis": x_axis_final,
+                    "x_axis": ai_result.get("x_axis", columns[0] if columns else ""),
                     "y_axes": y_axes,
                     "chart_type": resp_chart,
                     "chart_config": ai_result.get("chart_config", {}),
@@ -1986,24 +766,14 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
             db.session.commit()
         except Exception as e:
             _LOG.error("Failed to persist AI message: %s", e)
-        # ── update session context + maybe summarize ──
-        _update_session_context(ai_session, sql, resp_chart)
-        _maybe_summarize_conversation(ai_session)
 
-    print(f"[TIMING] Session persist + summarize: {time.time()-_t2:.2f}s", flush=True)
-    print(f"[TIMING] TOTAL (analytical): {time.time()-_t_total:.2f}s", flush=True)
-
-    _emit_progress(_ws_sid, 'complete', 'Done')
-    _elapsed = round(time.time() - _query_start, 2)
-    _LOG.info("[COMPLETE] Single-chart query in %.2fs | %d rows | provider=%s | chart=%s",
-              _elapsed, len(rows), provider.get("provider") if provider else "rule-based", resp_chart)
     return jsonify({
         "response":      resp_text,
-        "query_type":    resp_chart,
+        "query_type":    ai_result.get("query_type", "bar"),
         "chart_type":    resp_chart,
         "chart_config":  ai_result.get("chart_config", {}),
         "title":         resp_title,
-        "x_axis":        x_axis_final,
+        "x_axis":        ai_result.get("x_axis", columns[0] if columns else ""),
         "y_axes":        y_axes,
         "data":          safe_rows,
         "columns":       columns,
@@ -2014,135 +784,722 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
         "show_map":      has_geo or ai_result.get("show_map", False),
         "provider":      provider["provider"] if provider else "rule-based",
         "session_id":    ai_session.id if ai_session else None,
-        "elapsed_seconds": _elapsed,
     })
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CHANGE: Session context tracking + conversation summarization
+# Follow-up / Conversation Context Handling
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _extract_session_context(sql_str, chart_type="bar"):
-    """Parse active sites, KPIs, days, chart type from an executed SQL string.
-    Returns a dict suitable for storing in ai_session.session_context."""
+_FU_KPI_WORDS = {
+    'cssr', 'call setup', 'rrc', 'drop', 'cdr', 'erab', 'e-rab', 'e rab',
+    'throughput', 'tput', 'dl throughput', 'speed', 'prb', 'congestion',
+    'availability', 'latency', 'delay', 'volte', 'handover', 'volume',
+    'traffic', 'connected', 'users',
+}
+
+_NEW_QUERY_WORDS = {
+    'top', 'bottom', 'worst', 'best', 'compare zones', 'zone wise',
+    'overall', 'network wide', 'all sites', 'show me', 'give me',
+}
+
+
+def _is_followup(prompt_lower: str) -> bool:
+    """
+    Returns True if this prompt is modifying/extending the previous chart
+    rather than starting a completely new query.
+    """
     import re
-    ctx = {
-        "active_sites": [],
-        "active_kpis": [],
-        "active_days": None,
-        "last_chart_type": chart_type or "bar",
-        "last_sql": (sql_str or "")[:2000],
+    p = prompt_lower.strip()
+    words = p.split()
+
+    has_site     = bool(re.findall(r'[a-z]{2,}[_\-][a-z]{2,}[_\-]\d{3,}', p))
+    has_kpi      = any(kw in p for kw in _FU_KPI_WORDS)
+    has_days     = bool(re.search(r'last\s+\d+\s*days?', p))
+    has_time_ref = has_days or bool(re.search(
+        r'last\s+(year|month|week|quarter|6\s*months?|3\s*months?)'
+        r'|\d+\s*(month|year|week)s?|this\s+(year|month|week)', p
+    ))
+
+    # 1. Truly self-contained: site + explicit time reference → always fresh
+    if has_site and has_time_ref:
+        return False
+
+    # 2. Explicit ranking/network-wide → always fresh
+    if re.search(r'(top|bottom|worst|best)\s+\d+', p):
+        return False
+
+    # 3. Multiple different site IDs → multi-site fresh query
+    #    (handled separately by the pre-LLM interceptor)
+    _all_sites = re.findall(r'[a-z]{2,}[_\-][a-z]{2,}[_\-]\d{3,}', p)
+    if len(_all_sites) >= 2:
+        return False
+
+    # 4. Explicit modification keywords → definitely follow-up
+    #    Covers: "not cssr", "instead of", "only line", "switch to erab", etc.
+    mod_keywords = [
+        ' not ', 'instead', 'rather than', 'in place of',
+        'only line', 'only bar', 'only area', 'just line', 'just bar',
+        'switch to', 'change to', 'show as', 'display as', 'convert to',
+        'the graph', 'the chart', 'this graph', 'this chart', 'that chart',
+        'same', 'previous', 'last one', 'above', 'earlier',
+        'the data', 'the result', 'instead', 'rather', 'in place',
+        'swap', 'replace', 'for this', 'for that',
+        'scale', 'zoom', 'resize', 'bigger', 'smaller',
+        'enlarge', 'expand', 'more days', 'fewer days', 'extend', 'shorten',
+        'add', 'also show', 'overlay', 'combine',
+        'remove', 'hide', 'exclude', 'colour', 'color',
+        'bar chart', 'line chart', 'pie chart', 'area chart',
+        'line graph', 'bar graph',
+        'make it', 'turn it',
+    ]
+    if any(kw in p for kw in mod_keywords):
+        return True
+
+    # 5. Site-only (no KPI, no time) → site-switch follow-up
+    #    e.g. "show me SITE_A" / "i want to see for site id SITE_A"
+    _SITE_SWITCH_BLOCKERS = {'top', 'bottom', 'worst', 'best', 'compare', 'zone', 'all sites', 'network'}
+    if has_site and not has_kpi and not has_time_ref:
+        if not any(nw in p for nw in _SITE_SWITCH_BLOCKERS):
+            return True
+
+    # 6. Very short prompts with no site and no KPI → vague continuation
+    if len(words) <= 5 and not has_kpi and not has_site:
+        return True
+
+    # 7. Polite one-word confirmations
+    if p in ('yes', 'ok', 'sure', 'do it', 'go ahead', 'please do',
+             'please', 'thanks', 'thank you', 'good', 'nice', 'great'):
+        return True
+
+    # 8. KPI-only prompt (no site, no time) → KPI switch on same site
+    if has_kpi and not has_site and not has_time_ref and len(words) <= 10:
+        _NEW_QUERY_BLOCKERS = {'top', 'bottom', 'worst', 'best', 'compare', 'zone', 'all sites', 'network wide', 'overall'}
+        if not any(nw in p for nw in _NEW_QUERY_BLOCKERS):
+            return True
+
+    return False
+
+
+
+def _handle_followup(prompt_orig: str, p: str, prev: dict, time_filter: str) -> dict:
+    import re
+
+    prev_sql    = prev.get("sql", "")
+    prev_title  = prev.get("title", "")
+    prev_chart  = prev.get("chart_type", "bar")
+    prev_y      = prev.get("y_axes", [])
+    prev_x      = prev.get("x_axis", "date")
+    prev_response = prev.get("response", "")
+    prev_cfg    = prev.get("chart_config", {}) or {}
+    prev_charts = prev.get("charts", [])
+
+    if not prev_sql and not prev_charts:
+        return None
+
+    # Extract context from main SQL
+    prev_sites    = re.findall(r"site_id\s*=\s*'([^']+)'", prev_sql)
+    prev_kpi_names = re.findall(r"kpi_name\s*=\s*'([^']+)'", prev_sql)
+    prev_days_m   = re.search(r"INTERVAL\s+'(\d+)\s+days?'", prev_sql)
+    prev_days     = int(prev_days_m.group(1)) if prev_days_m else None
+
+    # ── FIX: When prev was multi_chart, harvest KPIs, sites, and days from ALL sub-charts ──
+    if prev_charts:
+        for ch in prev_charts:
+            ch_sql = ch.get("sql", "")
+            for kpi in re.findall(r"kpi_name\s*=\s*'([^']+)'", ch_sql):
+                if kpi not in prev_kpi_names:
+                    prev_kpi_names.append(kpi)
+            for site in re.findall(r"site_id\s*=\s*'([^']+)'", ch_sql):
+                if site not in prev_sites:
+                    prev_sites.append(site)
+            if not prev_days:
+                m = re.search(r"INTERVAL\s+'(\d+)\s+days?'", ch_sql)
+                if m:
+                    prev_days = int(m.group(1))
+
+    KPI_MAP = {
+        'cssr': ('LTE Call Setup Success Rate', 'cssr'),
+        'call setup': ('LTE Call Setup Success Rate', 'cssr'),
+        'rrc': ('LTE RRC Setup Success Rate', 'rrc_sr'),
+        'erab': ('E-RAB Call Drop Rate_1', 'drop_rate'),
+        'e-rab': ('E-RAB Call Drop Rate_1', 'drop_rate'),
+        'e rab': ('E-RAB Call Drop Rate_1', 'drop_rate'),
+        'drop': ('E-RAB Call Drop Rate_1', 'drop_rate'),
+        'cdr': ('E-RAB Call Drop Rate_1', 'drop_rate'),
+        'throughput': ('LTE DL - Cell Ave Throughput', 'dl_tput'),
+        'tput': ('LTE DL - Cell Ave Throughput', 'dl_tput'),
+        'dl throughput': ('LTE DL - Cell Ave Throughput', 'dl_tput'),
+        'speed': ('LTE DL - Cell Ave Throughput', 'dl_tput'),
+        'prb': ('DL PRB Utilization (1BH)', 'dl_prb'),
+        'congestion': ('DL PRB Utilization (1BH)', 'dl_prb'),
+        'availability': ('Availability', 'availability'),
+        'latency': ('Average Latency Downlink', 'latency'),
+        'delay': ('Average Latency Downlink', 'latency'),
+        'volte': ('VoLTE Traffic Erlang', 'volte_erl'),
+        'handover': ('LTE Intra-Freq HO Success Rate', 'ho_sr'),
+        'volume': ('DL Data Total Volume', 'dl_volume'),
+        'traffic': ('DL Data Total Volume', 'dl_volume'),
+        'connected': ('Ave RRC Connected Ue', 'avg_rrc_ue'),
+        'users': ('Ave RRC Connected Ue', 'avg_rrc_ue'),
     }
-    if not sql_str:
-        return ctx
-    ctx["active_sites"] = list(dict.fromkeys(re.findall(r"site_id\s*=\s*'([^']+)'", sql_str)))
-    ctx["active_kpis"]  = list(dict.fromkeys(re.findall(r"kpi_name\s*=\s*'([^']+)'", sql_str)))
-    days_m = re.search(r"INTERVAL\s+'(\d+)\s+days?'", sql_str)
-    if days_m:
-        ctx["active_days"] = int(days_m.group(1))
-    return ctx
+
+    def _detect_kpi(text):
+        t = text.lower()
+        import re as _re_dk
+        # First, identify KPIs the user wants to EXCLUDE ("not cssr", "instead of cssr")
+        excluded_kpis = set()
+        for kw, (kn, al) in KPI_MAP.items():
+            if (_re_dk.search(r'\bnot\s+' + _re_dk.escape(kw), t) or
+                    _re_dk.search(r'instead\s+of\s+' + _re_dk.escape(kw), t) or
+                    _re_dk.search(r'not\s+this\s+' + _re_dk.escape(kw), t)):
+                excluded_kpis.add(kn)
+        # Return the first KPI that is NOT excluded
+        for kw in sorted(KPI_MAP.keys(), key=len, reverse=True):
+            if kw in t and KPI_MAP[kw][0] not in excluded_kpis:
+                return KPI_MAP[kw]
+        return None
+
+    new_sites  = re.findall(r'[A-Za-z]{2,}[_\-][A-Za-z]{2,}[_\-]\d{3,}', prompt_orig)
+    new_kpi    = _detect_kpi(p)
+    new_days_m = re.search(r'(?:last|past|recent)\s+(\d+)\s*days?', p)
+    new_days   = int(new_days_m.group(1)) if new_days_m else None
+    if not new_days:
+        dm = re.search(r'(\d+)\s*days?', p)
+        if dm and not re.search(r'(top|bottom|worst|best)\s+' + dm.group(1), p):
+            new_days = int(dm.group(1))
+
+    # ── FIX: Site switch — new site mentioned, no new KPI → inherit ALL previous KPIs ──
+    # This handles: "i want to see for site id SITE_A" after a multi-chart response.
+    if new_sites and not new_kpi and prev_kpi_names:
+        site = new_sites[0]
+        days = new_days or prev_days or 14
+        date_clause = f"AND k.date >= CURRENT_DATE - INTERVAL '{days} days' AND k.date <= CURRENT_DATE"
+
+        if len(prev_kpi_names) == 1:
+            kpi_name = prev_kpi_names[0]
+            alias = 'value'
+            for kw, (kn, al) in KPI_MAP.items():
+                if kn == kpi_name:
+                    alias = al
+                    break
+            return {
+                "sql": f"""SELECT k.date::text AS date, AVG(k.value) AS {alias}
+                    FROM kpi_data k
+                    WHERE k.kpi_name = '{kpi_name}' AND k.site_id = '{site}'
+                      AND k.data_level = 'site' AND k.value IS NOT NULL {date_clause}
+                    GROUP BY k.date ORDER BY k.date""",
+                "query_type": "line", "chart_type": "line",
+                "title": f"{kpi_name} — {site} (last {days}d)",
+                "x_axis": "date", "y_axes": [alias],
+                "response": f"Showing {kpi_name} for site {site} over last {days} days.",
+            }
+        else:
+            # Multiple inherited KPIs → composed chart with UNION ALL
+            parts_sql = []
+            for kpi_name in prev_kpi_names[:3]:
+                parts_sql.append(f"""SELECT k.date::text AS date, k.site_id,
+                       AVG(k.value) AS value, '{kpi_name}' AS kpi_name
+                FROM kpi_data k
+                WHERE k.kpi_name = '{kpi_name}' AND k.site_id = '{site}'
+                  AND k.data_level = 'site' AND k.value IS NOT NULL {date_clause}
+                GROUP BY k.date, k.site_id""")
+            kpi_short = " & ".join(
+                k.replace("LTE ", "").replace("E-RAB ", "")[:18]
+                for k in prev_kpi_names[:3]
+            )
+            return {
+                "sql": "\nUNION ALL\n".join(parts_sql) + "\nORDER BY date",
+                "query_type": "composed", "chart_type": "composed",
+                "title": f"{site} — {kpi_short} (last {days}d)",
+                "x_axis": "date", "y_axes": ["value"],
+                "response": f"Showing {', '.join(prev_kpi_names[:3])} for site {site} over last {days} days.",
+            }
+
+    # KPI switch — new KPI, same site
+    if new_kpi and not new_sites and prev_sites:
+        kpi_name, alias = new_kpi
+        days = new_days or prev_days or 14
+        site = prev_sites[0]
+        date_clause = f"AND k.date >= CURRENT_DATE - INTERVAL '{days} days' AND k.date <= CURRENT_DATE"
+        return {
+            "sql": f"""SELECT k.date::text AS date, AVG(k.value) AS {alias}
+                FROM kpi_data k
+                WHERE k.kpi_name = '{kpi_name}' AND k.site_id = '{site}'
+                  AND k.data_level = 'site' AND k.value IS NOT NULL {date_clause}
+                GROUP BY k.date ORDER BY k.date""",
+            "query_type": "line", "chart_type": "line",
+            "title": f"{kpi_name} — {site} (last {days}d)",
+            "x_axis": "date", "y_axes": [alias],
+            "response": f"Switched to {kpi_name} for site {site} over last {days} days.",
+        }
+
+    # Chart type switch
+    new_chart = None
+    if 'bar' in p and ('chart' in p or 'graph' in p or 'as bar' in p):
+        new_chart = 'bar'
+    elif 'line' in p and ('chart' in p or 'graph' in p or 'as line' in p):
+        new_chart = 'line'
+    elif 'pie' in p:
+        new_chart = 'pie'
+    elif 'area' in p and ('chart' in p or 'graph' in p):
+        new_chart = 'area'
+    elif 'table' in p:
+        new_chart = 'bar'
+
+    if new_chart and prev_sql:
+        return {
+            "sql": prev_sql,
+            "query_type": new_chart, "chart_type": new_chart,
+            "title": prev_title, "x_axis": prev_x, "y_axes": prev_y,
+            "response": f"Changed chart to {new_chart} view.",
+        }
+
+    # Time range change
+    if new_days and prev_sql:
+        updated_sql   = re.sub(r"INTERVAL\s+'(\d+)\s+days?'", f"INTERVAL '{new_days} days'", prev_sql)
+        updated_title = re.sub(r'\(last \d+d\)', f'(last {new_days}d)', prev_title)
+        if updated_title == prev_title:
+            updated_title = prev_title + f" (last {new_days}d)"
+
+        if prev_charts:
+            new_charts = []
+            for ch in prev_charts:
+                ch_sql   = re.sub(r"INTERVAL\s+'(\d+)\s+days?'", f"INTERVAL '{new_days} days'", ch.get("sql", ""))
+                ch_title = re.sub(r'\(last \d+d\)', f'(last {new_days}d)', ch.get("title", ""))
+                new_charts.append({**ch, "sql": ch_sql, "title": ch_title})
+            return {
+                "multi_chart": True, "charts": new_charts,
+                "sql": new_charts[0]["sql"],
+                "query_type": "multi_chart", "chart_type": "multi_chart",
+                "title": " & ".join(c["title"] for c in new_charts)[:80],
+                "x_axis": "date", "y_axes": ["value"],
+                "response": f"Updated to last {new_days} days.",
+            }
+        return {
+            "sql": updated_sql,
+            "query_type": prev_chart, "chart_type": prev_chart,
+            "title": updated_title, "x_axis": prev_x, "y_axes": prev_y,
+            "response": f"Updated to show last {new_days} days.",
+        }
+
+    # Y-axis scale change
+    if any(w in p for w in ['scale', 'zoom', 'resize', 'bigger', 'smaller',
+                             'enlarge', 'expand', 'y axis', 'y-axis', 'range',
+                             'difference', 'interval', 'step', 'tick']):
+        scale_num = None
+        sm = re.search(r'(?:to|of|at|interval|difference|step|every)\s*(\d+)', p)
+        if sm:
+            scale_num = int(sm.group(1))
+        elif re.search(r'(\d+)\s*(?:difference|interval|step|tick|unit|gap)', p):
+            scale_num = int(re.search(r'(\d+)\s*(?:difference|interval|step|tick|unit|gap)', p).group(1))
+
+        cfg = dict(prev_cfg)
+        if scale_num:
+            cfg["y_tick_interval"] = scale_num
+            resp_msg = f"Changed Y-axis scale to intervals of {scale_num}."
+        else:
+            cfg.pop("y_tick_interval", None)
+            resp_msg = "Re-rendered chart with auto-scaled axes."
+
+        if prev_charts:
+            for ch in prev_charts:
+                ch_cfg = dict(ch.get("chart_config", {}) or {})
+                if scale_num:
+                    ch_cfg["y_tick_interval"] = scale_num
+                ch["chart_config"] = ch_cfg
+            return {
+                "multi_chart": True, "charts": prev_charts,
+                "sql": prev_charts[0].get("sql", ""),
+                "query_type": "multi_chart", "chart_type": "multi_chart",
+                "title": prev_title, "x_axis": "date", "y_axes": ["value"],
+                "chart_config": cfg, "response": resp_msg,
+            }
+        return {
+            "sql": prev_sql,
+            "query_type": prev_chart, "chart_type": prev_chart,
+            "title": prev_title, "x_axis": prev_x, "y_axes": prev_y,
+            "chart_config": cfg, "response": resp_msg,
+        }
+
+    # Add/overlay a KPI
+    if any(w in p for w in ['add', 'include', 'also show', 'overlay', 'combine']):
+        add_kpi = _detect_kpi(p)
+        if add_kpi and prev_sites and prev_kpi_names:
+            kpi_name, alias = add_kpi
+            site = prev_sites[0]
+            days = prev_days or 14
+            date_clause = f"AND k.date >= CURRENT_DATE - INTERVAL '{days} days' AND k.date <= CURRENT_DATE"
+            prev_alias = prev_y[0] if prev_y else 'value'
+            prev_kpi   = prev_kpi_names[0]
+            new_sql = f"""SELECT k.date::text AS date, k.site_id,
+                       AVG(k.value) AS value, '{prev_kpi}' AS kpi_name
+                FROM kpi_data k
+                WHERE k.kpi_name = '{prev_kpi}' AND k.site_id = '{site}'
+                  AND k.data_level = 'site' AND k.value IS NOT NULL {date_clause}
+                GROUP BY k.date, k.site_id
+            UNION ALL
+            SELECT k.date::text AS date, k.site_id,
+                       AVG(k.value) AS value, '{kpi_name}' AS kpi_name
+                FROM kpi_data k
+                WHERE k.kpi_name = '{kpi_name}' AND k.site_id = '{site}'
+                  AND k.data_level = 'site' AND k.value IS NOT NULL {date_clause}
+                GROUP BY k.date, k.site_id
+            ORDER BY date"""
+            return {
+                "sql": new_sql,
+                "query_type": "composed", "chart_type": "composed",
+                "title": f"{site} — {prev_alias} & {alias} (last {days}d)",
+                "x_axis": "date", "y_axes": ["value"],
+                "response": f"Added {kpi_name} alongside {prev_kpi} for {site}.",
+            }
+
+    # Default: re-show previous result
+    if prev_charts:
+        return {
+            "multi_chart": True, "charts": prev_charts,
+            "sql": prev_charts[0].get("sql", ""),
+            "query_type": "multi_chart", "chart_type": "multi_chart",
+            "title": prev_title, "x_axis": "date", "y_axes": ["value"],
+            "response": prev_response or "Here are the previous results.",
+        }
+    return {
+        "sql": prev_sql,
+        "query_type": prev_chart, "chart_type": prev_chart,
+        "title": prev_title, "x_axis": prev_x, "y_axes": prev_y,
+        "response": prev_response or "Here are the previous results.",
+    }
 
 
-def _update_session_context(ai_session, sql_str, chart_type="bar"):
-    """Update ai_session.session_context from the SQL that was just executed.
-    MERGES new sites/KPIs with existing ones so earlier context isn't lost.
-    Wrapped in try/except so it never breaks the main response."""
-    if not ai_session:
-        return
+# ─────────────────────────────────────────────────────────────────────────────
+# Rule-based NL → SQL fallback engine
+# ─────────────────────────────────────────────────────────────────────────────
+def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict = None) -> dict:
+    import re
+    p = prompt.lower()
+
+    if prev_context and _is_followup(p):
+        result = _handle_followup(prompt, p, prev_context, time_filter)
+        if result:
+            return result
+
+    site_ids = re.findall(r'[A-Za-z]{2,}[_\-][A-Za-z]{2,}[_\-]\d{3,}', prompt)
+    site_ids = list(dict.fromkeys(site_ids))
+
+    KPI_MAP = {
+        'cssr':          ('LTE Call Setup Success Rate', 'cssr'),
+        'call setup':    ('LTE Call Setup Success Rate', 'cssr'),
+        'rrc':           ('LTE RRC Setup Success Rate', 'rrc_sr'),
+        'erab':          ('E-RAB Call Drop Rate_1', 'drop_rate'),
+        'e-rab':         ('E-RAB Call Drop Rate_1', 'drop_rate'),
+        'e rab':         ('E-RAB Call Drop Rate_1', 'drop_rate'),
+        'drop':          ('E-RAB Call Drop Rate_1', 'drop_rate'),
+        'cdr':           ('E-RAB Call Drop Rate_1', 'drop_rate'),
+        'throughput':    ('LTE DL - Cell Ave Throughput', 'dl_tput'),
+        'tput':          ('LTE DL - Cell Ave Throughput', 'dl_tput'),
+        'dl throughput': ('LTE DL - Cell Ave Throughput', 'dl_tput'),
+        'speed':         ('LTE DL - Cell Ave Throughput', 'dl_tput'),
+        'prb':           ('DL PRB Utilization (1BH)', 'dl_prb'),
+        'congestion':    ('DL PRB Utilization (1BH)', 'dl_prb'),
+        'availability':  ('Availability', 'availability'),
+        'availab':       ('Availability', 'availability'),
+        'latency':       ('Average Latency Downlink', 'latency'),
+        'delay':         ('Average Latency Downlink', 'latency'),
+        'volte':         ('VoLTE Traffic Erlang', 'volte_erl'),
+        'handover':      ('LTE Intra-Freq HO Success Rate', 'ho_sr'),
+        'volume':        ('DL Data Total Volume', 'dl_volume'),
+        'traffic':       ('DL Data Total Volume', 'dl_volume'),
+        'connected':     ('Ave RRC Connected Ue', 'avg_rrc_ue'),
+        'users':         ('Ave RRC Connected Ue', 'avg_rrc_ue'),
+    }
+
+    def _detect_kpis(text):
+        found = []
+        seen = set()
+        t = text.lower()
+        for kw in sorted(KPI_MAP.keys(), key=len, reverse=True):
+            if kw in t and KPI_MAP[kw][0] not in seen:
+                found.append(KPI_MAP[kw])
+                seen.add(KPI_MAP[kw][0])
+        return found
+
+    def _extract_days(text):
+        m = re.search(r'last\s+(\d+)\s*days?', text.lower())
+        return int(m.group(1)) if m else None
+
+    # _try_split_compound REMOVED — caused incorrect KPI-site pairing on "and" keyword
+
     try:
-        new_ctx = _extract_session_context(sql_str, chart_type)
-        old_ctx = (getattr(ai_session, 'session_context', None) or {})
+        cnt = _sql("SELECT COUNT(*) AS n FROM kpi_data")
+        USE_KD = int((cnt[0].get("n") or 0) if cnt else 0) > 0
+    except Exception:
+        USE_KD = False
 
-        # ── CHANGE: merge instead of replace — keep last 8 sites/KPIs seen ──
-        merged_sites = list(dict.fromkeys(
-            old_ctx.get("active_sites", []) + new_ctx.get("active_sites", [])
-        ))[-8:]  # keep last 8 unique sites
-        merged_kpis = list(dict.fromkeys(
-            old_ctx.get("active_kpis", []) + new_ctx.get("active_kpis", [])
-        ))[-6:]  # keep last 6 unique KPIs
+    if not USE_KD:
+        return _rule_based_legacy(p, time_filter)
 
-        new_ctx["active_sites"] = merged_sites
-        new_ctx["active_kpis"]  = merged_kpis
-        # Days and chart type always use the latest
-        ai_session.session_context = new_ctx
-        db.session.commit()
-    except Exception as e:
-        _LOG.warning("Failed to update session_context: %s", e)
-        try:
-            db.session.rollback()
-        except Exception:
-            pass
+    GEO_JOIN = "LEFT JOIN telecom_sites ts ON LOWER(k.site_id) = LOWER(ts.site_id)"
 
+    detected_kpis = _detect_kpis(p)
+    days          = _extract_days(p)
+    is_trend      = (bool(days) or 'trend' in p or 'over time' in p or
+                     'history' in p or 'daily' in p or 'last' in p)
 
-def _maybe_summarize_conversation(ai_session):
-    """Generate a rolling summary — first at 8 messages, then every 8 after.
-    This ensures the summary exists BEFORE old messages drop out of the history window.
-    Wrapped in try/except so it never breaks the main response."""
-    if not ai_session:
-        return
-    try:
-        msg_count = NetworkAiMessage.query.filter_by(session_id=ai_session.id).count()
-        # ── CHANGE: trigger at 8 instead of 10, so summary exists before messages drop ──
-        if msg_count < 8 or msg_count % 8 != 0:
-            return
-
-        # Grab last 12 messages for summarization (wider window for better summary)
-        last_10 = (NetworkAiMessage.query
-                   .filter_by(session_id=ai_session.id)
-                   .order_by(NetworkAiMessage.created_at.desc())
-                   .limit(12).all())
-        last_10.reverse()
-        convo_text = "\n".join(
-            f"{m.role}: {m.content[:300]}" for m in last_10
+    # ── FIX: Multiple sites + trend → multi_chart (one chart per site, each with ALL KPIs) ──
+    # Previously this incorrectly paired kpi[i] with site[i].
+    if len(site_ids) >= 2 and is_trend:
+        date_clause = (
+            f"AND k.date >= CURRENT_DATE - INTERVAL '{days} days' AND k.date <= CURRENT_DATE"
+            if days else "AND k.date <= CURRENT_DATE"
         )
+        charts = []
+        for site in site_ids[:4]:
+            if not detected_kpis:
+                # Default KPIs when none specified
+                use_kpis = [
+                    ('E-RAB Call Drop Rate_1', 'drop_rate'),
+                    ('LTE Call Setup Success Rate', 'cssr'),
+                ]
+            else:
+                use_kpis = detected_kpis[:3]
 
-        summary_prompt = (
-            "Summarize this telecom analytics conversation in 3-4 sentences. "
-            "Focus on: which sites were analyzed, which KPIs were discussed, "
-            "what time ranges were used, and what insights were found.\n\n"
-            f"Conversation:\n{convo_text}"
+            if len(use_kpis) == 1:
+                kpi_name, alias = use_kpis[0]
+                charts.append({
+                    "sql": f"""SELECT k.date::text AS date, AVG(k.value) AS {alias}
+                        FROM kpi_data k
+                        WHERE k.kpi_name = '{kpi_name}' AND k.site_id = '{site}'
+                          AND k.data_level = 'site' AND k.value IS NOT NULL {date_clause}
+                        GROUP BY k.date ORDER BY k.date""",
+                    "chart_type": "line",
+                    "title": f"{kpi_name} — {site}" + (f" (last {days}d)" if days else ""),
+                    "x_axis": "date",
+                    "y_axes": [alias],
+                })
+            else:
+                # Multiple KPIs per site → composed chart using UNION ALL
+                parts_sql = []
+                for kpi_name, alias in use_kpis:
+                    parts_sql.append(
+                        f"""SELECT k.date::text AS date, k.site_id,
+                               AVG(k.value) AS value, '{kpi_name}' AS kpi_name
+                        FROM kpi_data k
+                        WHERE k.kpi_name = '{kpi_name}' AND k.site_id = '{site}'
+                          AND k.data_level = 'site' AND k.value IS NOT NULL {date_clause}
+                        GROUP BY k.date, k.site_id"""
+                    )
+                kpi_labels = " & ".join(
+                    kpi[0].replace("LTE ", "").replace("E-RAB ", "")[:18]
+                    for kpi in use_kpis
+                )
+                charts.append({
+                    "sql": "\nUNION ALL\n".join(parts_sql) + "\nORDER BY date",
+                    "chart_type": "composed",
+                    "title": f"{site} — {kpi_labels}" + (f" (last {days}d)" if days else ""),
+                    "x_axis": "date",
+                    "y_axes": ["value"],
+                })
+
+        chart_labels = [c["title"] for c in charts]
+        return {
+            "multi_chart": True,
+            "charts":      charts,
+            "sql":         charts[0]["sql"],
+            "query_type":  "multi_chart",
+            "chart_type":  "multi_chart",
+            "title":       " & ".join(chart_labels)[:80],
+            "x_axis":      "date",
+            "y_axes":      ["value"],
+            "response": (
+                f"Here are {len(charts)} charts as requested: {', '.join(chart_labels)}"
+                + (f" (last {days}d)." if days else ".")
+            ),
+        }
+
+    # compound split removed
+
+    # ── Single site, single KPI ───────────────────────────────────────────────
+    if site_ids and detected_kpis and is_trend:
+        if len(site_ids) == 1 and len(detected_kpis) == 1:
+            kpi_name, alias = detected_kpis[0]
+            site        = site_ids[0]
+            date_clause = (
+                f"AND k.date >= CURRENT_DATE - INTERVAL '{days} days' AND k.date <= CURRENT_DATE"
+                if days else "AND k.date <= CURRENT_DATE"
+            )
+            return {
+                "sql": f"""SELECT k.date::text AS date, AVG(k.value) AS {alias}
+                    FROM kpi_data k
+                    WHERE k.kpi_name = '{kpi_name}' AND k.site_id = '{site}'
+                      AND k.data_level = 'site' AND k.value IS NOT NULL {date_clause}
+                    GROUP BY k.date ORDER BY k.date""",
+                "query_type": "line", "chart_type": "line",
+                "title": f"{kpi_name} — {site}" + (f" (last {days}d)" if days else ""),
+                "x_axis": "date", "y_axes": [alias],
+                "response": f"Trend of {kpi_name} for site {site}" + (f" over last {days} days." if days else "."),
+            }
+
+        # Single site, multiple KPIs
+        if len(site_ids) == 1 and len(detected_kpis) >= 2:
+            site        = site_ids[0]
+            date_clause = (
+                f"AND k.date >= CURRENT_DATE - INTERVAL '{days} days' AND k.date <= CURRENT_DATE"
+                if days else "AND k.date <= CURRENT_DATE"
+            )
+            parts_sql = []
+            for kpi_name, alias in detected_kpis[:3]:
+                parts_sql.append(f"""SELECT k.date::text AS date, k.site_id,
+                       AVG(k.value) AS value, '{kpi_name}' AS kpi_name
+                FROM kpi_data k
+                WHERE k.kpi_name = '{kpi_name}' AND k.site_id = '{site}'
+                  AND k.data_level = 'site' AND k.value IS NOT NULL {date_clause}
+                GROUP BY k.date, k.site_id""")
+            return {
+                "sql": "\nUNION ALL\n".join(parts_sql) + "\nORDER BY date",
+                "query_type": "composed", "chart_type": "composed",
+                "title": f"{site} — " + " & ".join(k[1] for k in detected_kpis[:3]),
+                "x_axis": "date", "y_axes": ["value"],
+                "response": f"Showing {', '.join(k[0] for k in detected_kpis[:3])} for {site}.",
+            }
+
+    if site_ids and detected_kpis and not is_trend:
+        site  = site_ids[0]
+        cases = ", ".join(f"AVG(CASE WHEN k.kpi_name = '{kn}' THEN k.value END) AS {al}" for kn, al in detected_kpis[:5])
+        in_cl = ", ".join(f"'{kn}'" for kn, _ in detected_kpis[:5])
+        return {
+            "sql": f"""SELECT k.site_id, {cases}
+                FROM kpi_data k
+                WHERE k.site_id = '{site}' AND k.data_level = 'site' AND k.value IS NOT NULL
+                  AND k.kpi_name IN ({in_cl})
+                GROUP BY k.site_id""",
+            "query_type": "bar", "chart_type": "bar",
+            "title": f"KPIs for {site}",
+            "x_axis": "site_id", "y_axes": [al for _, al in detected_kpis[:5]],
+            "response": f"Showing requested KPIs for site {site}.",
+        }
+
+    if is_trend and detected_kpis:
+        kpi_name, alias = detected_kpis[0]
+        date_clause = (
+            f"AND k.date >= CURRENT_DATE - INTERVAL '{days} days' AND k.date <= CURRENT_DATE"
+            if days else "AND k.date <= CURRENT_DATE"
         )
-        summary_msgs = [
-            {"role": "system", "content": "You are a concise summarizer."},
-            {"role": "user", "content": summary_prompt},
-        ]
+        return {
+            "sql": f"""SELECT k.date::text AS date, AVG(k.value) AS {alias},
+                       MIN(k.value) AS min_val, MAX(k.value) AS max_val
+                FROM kpi_data k
+                WHERE k.kpi_name = '{kpi_name}' AND k.data_level = 'site'
+                  AND k.value IS NOT NULL {date_clause}
+                GROUP BY k.date ORDER BY k.date LIMIT 60""",
+            "query_type": "line", "chart_type": "line",
+            "title": f"{kpi_name} Daily Trend",
+            "x_axis": "date", "y_axes": [alias, "min_val", "max_val"],
+            "response": f"Daily trend of {kpi_name} across the network.",
+        }
 
-        _cfg = lambda k, default="": current_app.config.get(k, "") or os.environ.get(k, "") or default
-        azure_key   = _cfg("AZURE_OPENAI_API_KEY")
-        azure_ep    = _cfg("AZURE_OPENAI_ENDPOINT")
-        azure_dep   = _cfg("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini")
-        azure_ver   = _cfg("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
-        gemini_key  = _cfg("GEMINI_API_KEY")
-        openai_key  = _cfg("OPENAI_API_KEY")
+    N    = 10
+    nums = re.findall(r'\b(\d+)\b', p)
+    if nums:
+        N = min(int(nums[0]), 100)
 
-        summary_text = None
+    def _kd_site_query(kpi_names_and_aliases, order_col, order_dir="DESC"):
+        case_parts      = []
+        kpi_names_for_in = []
+        for kpi_name, alias in kpi_names_and_aliases:
+            case_parts.append(f"AVG(CASE WHEN k.kpi_name = '{kpi_name}' THEN k.value END) AS {alias}")
+            kpi_names_for_in.append(f"'{kpi_name}'")
+        cases     = ",\n                   ".join(case_parts)
+        in_clause = ", ".join(kpi_names_for_in)
+        return f"""SELECT k.site_id, MAX(ts.zone) AS cluster,
+                       AVG(ts.latitude) AS lat, AVG(ts.longitude) AS lng,
+                       {cases}
+                FROM kpi_data k {GEO_JOIN}
+                WHERE k.data_level = 'site' AND k.value IS NOT NULL
+                  AND k.kpi_name IN ({in_clause})
+                GROUP BY k.site_id
+                ORDER BY {order_col} {order_dir} NULLS LAST LIMIT {N}"""
 
-        if azure_key and azure_ep:
-            from openai import AzureOpenAI as _AzOAI
-            c = _AzOAI(api_key=azure_key, api_version=azure_ver, azure_endpoint=azure_ep, timeout=15.0)
-            r = c.chat.completions.create(model=azure_dep, messages=summary_msgs, temperature=0.3, max_tokens=300)
-            summary_text = r.choices[0].message.content
-        elif gemini_key:
-            from openai import OpenAI as _OAI
-            c = _OAI(api_key=gemini_key, base_url="https://generativelanguage.googleapis.com/v1beta/openai/", timeout=15.0)
-            r = c.chat.completions.create(model=_cfg("OPENAI_MODEL", "gemini-2.0-flash"), messages=summary_msgs, temperature=0.3, max_tokens=300)
-            summary_text = r.choices[0].message.content
-        elif openai_key:
-            from openai import OpenAI as _OAI2
-            c = _OAI2(api_key=openai_key, timeout=15.0)
-            r = c.chat.completions.create(model="gpt-4o-mini", messages=summary_msgs, temperature=0.3, max_tokens=300)
-            summary_text = r.choices[0].message.content
+    if 'rrc' in p or 'accessibility' in p:
+        sql = _kd_site_query([("LTE RRC Setup Success Rate","lte_rrc_setup_sr"),("LTE E-RAB Setup Success Rate","erab_setup_sr"),("LTE Call Setup Success Rate","lte_call_setup_sr"),("DL PRB Utilization (1BH)","dl_prb_util")],"lte_rrc_setup_sr","ASC")
+        return {"sql":sql,"query_type":"bar","title":f"RRC / Accessibility — Bottom {N}","x_axis":"site_id","y_axes":["lte_rrc_setup_sr","erab_setup_sr"],"response":f"Showing {N} sites with lowest RRC Setup Success Rate."}
 
-        if summary_text:
-            ai_session.conversation_summary = summary_text.strip()
-            db.session.commit()
-            _LOG.info("Conversation summary updated for session %d (%d msgs)", ai_session.id, msg_count)
-    except Exception as e:
-        _LOG.warning("Summarization failed (non-fatal): %s", e)
-        try:
-            db.session.rollback()
-        except Exception:
-            pass
+    if 'volte' in p:
+        sql = _kd_site_query([("VoLTE Traffic Erlang","volte_traffic_erl"),("VoLTE Traffic DL","volte_dl"),("VoLTE Traffic UL","volte_ul")],"volte_traffic_erl","DESC")
+        return {"sql":sql,"query_type":"bar","title":f"Top {N} Sites — VoLTE Traffic","x_axis":"site_id","y_axes":["volte_traffic_erl"],"response":f"Showing {N} sites by VoLTE Erlang traffic."}
+
+    if 'handover' in p or ' ho ' in p or 'hsr' in p:
+        sql = _kd_site_query([("LTE Intra-Freq HO Success Rate","intra_freq_ho_sr"),("LTE RRC Setup Success Rate","lte_rrc_setup_sr"),("DL PRB Utilization (1BH)","dl_prb_util")],"intra_freq_ho_sr","ASC")
+        return {"sql":sql,"query_type":"bar","title":f"Bottom {N} — HO Success Rate","x_axis":"site_id","y_axes":["intra_freq_ho_sr"],"response":f"Showing {N} sites with worst Handover Success Rate."}
+
+    if 'drop' in p or 'cdr' in p:
+        sql = _kd_site_query([("E-RAB Call Drop Rate_1","erab_drop_rate"),("DL PRB Utilization (1BH)","dl_prb_util"),("LTE DL - Cell Ave Throughput","dl_cell_tput")],"erab_drop_rate","DESC")
+        return {"sql":sql,"query_type":"bar","title":f"Top {N} Call Drop Offenders","x_axis":"site_id","y_axes":["erab_drop_rate","dl_prb_util"],"response":f"Showing {N} sites with highest E-RAB call drop rate."}
+
+    if 'prb' in p or 'congestion' in p or 'congested' in p or 'overload' in p:
+        sql = _kd_site_query([("DL PRB Utilization (1BH)","dl_prb_util"),("UL PRB Utilization (1BH)","ul_prb_util"),("LTE DL - Cell Ave Throughput","dl_cell_tput"),("Ave RRC Connected Ue","avg_rrc_ue")],"dl_prb_util","DESC")
+        return {"sql":sql,"query_type":"bar","title":f"Top {N} Congested Sites (PRB)","x_axis":"site_id","y_axes":["dl_prb_util","ul_prb_util","dl_cell_tput"],"response":f"Showing top {N} sites by DL PRB Utilization."}
+
+    if 'throughput' in p or 'tput' in p or 'speed' in p or 'mbps' in p:
+        order = "ASC" if any(w in p for w in ['worst','low','bad','poor']) else "DESC"
+        sql = _kd_site_query([("LTE DL - Cell Ave Throughput","dl_cell_tput"),("LTE UL - Cell Ave Throughput","ul_cell_tput"),("DL PRB Utilization (1BH)","dl_prb_util")],"dl_cell_tput",order)
+        return {"sql":sql,"query_type":"bar","title":f"{'Bottom' if order=='ASC' else 'Top'} {N} — DL Throughput","x_axis":"site_id","y_axes":["dl_cell_tput","ul_cell_tput"],"response":f"{'Worst' if order=='ASC' else 'Best'} {N} sites by throughput."}
+
+    if 'cssr' in p or 'call setup' in p or 'setup success' in p:
+        sql = _kd_site_query([("LTE Call Setup Success Rate","lte_cssr"),("LTE E-RAB Setup Success Rate","erab_setup_sr"),("E-RAB Call Drop Rate_1","erab_drop_rate")],"lte_cssr","ASC")
+        return {"sql":sql,"query_type":"bar","title":f"Bottom {N} — Call Setup Success","x_axis":"site_id","y_axes":["lte_cssr","erab_setup_sr"],"response":f"Showing {N} sites with lowest CSSR."}
+
+    if 'zone' in p or 'cluster' in p or 'cbd' in p or 'urban' in p or 'compar' in p:
+        return {"sql":f"""SELECT ts.zone AS cluster, COUNT(DISTINCT k.site_id) AS sites,
+                       AVG(CASE WHEN k.kpi_name='DL PRB Utilization (1BH)' THEN k.value END) AS avg_prb,
+                       AVG(CASE WHEN k.kpi_name='LTE DL - Cell Ave Throughput' THEN k.value END) AS avg_tput,
+                       AVG(CASE WHEN k.kpi_name='E-RAB Call Drop Rate_1' THEN k.value END) AS avg_drop,
+                       AVG(CASE WHEN k.kpi_name='LTE RRC Setup Success Rate' THEN k.value END) AS avg_rrc_sr
+                FROM kpi_data k {GEO_JOIN}
+                WHERE k.data_level='site' AND k.value IS NOT NULL AND ts.zone IS NOT NULL
+                  AND k.kpi_name IN ('DL PRB Utilization (1BH)','LTE DL - Cell Ave Throughput','E-RAB Call Drop Rate_1','LTE RRC Setup Success Rate')
+                GROUP BY ts.zone ORDER BY avg_prb DESC NULLS LAST""",
+                "query_type":"bar","title":"Zone-wise KPI Comparison","x_axis":"cluster","y_axes":["avg_prb","avg_tput","avg_drop"],"response":"Zone-level KPI comparison."}
+
+    if 'availab' in p or 'downtime' in p or 'uptime' in p:
+        sql = _kd_site_query([("Availability","availability"),("DL PRB Utilization (1BH)","dl_prb_util")],"availability","ASC")
+        return {"sql":sql,"query_type":"bar","title":"Sites with Lowest Availability","x_axis":"site_id","y_axes":["availability"],"response":"Sites with lowest availability."}
+
+    if 'latency' in p or 'delay' in p or 'ping' in p:
+        sql = _kd_site_query([("Average Latency Downlink","avg_latency"),("LTE DL - Usr Ave Throughput","dl_usr_tput")],"avg_latency","DESC")
+        return {"sql":sql,"query_type":"bar","title":f"Top {N} High Latency Sites","x_axis":"site_id","y_axes":["avg_latency"],"response":f"Showing {N} sites with highest latency."}
+
+    if 'volume' in p or 'data volume' in p:
+        sql = _kd_site_query([("DL Data Total Volume","dl_volume"),("UL Data Total Volume","ul_volume"),("DL PRB Utilization (1BH)","dl_prb_util")],"dl_volume","DESC")
+        return {"sql":sql,"query_type":"bar","title":f"Top {N} by Data Volume","x_axis":"site_id","y_axes":["dl_volume","ul_volume"],"response":f"Showing {N} sites with highest data volume."}
+
+    if 'user' in p or 'ue' in p or 'connected' in p:
+        sql = _kd_site_query([("Ave RRC Connected Ue","avg_rrc_ue"),("Max RRC Connected Ue","max_rrc_ue"),("DL PRB Utilization (1BH)","dl_prb_util")],"avg_rrc_ue","DESC")
+        return {"sql":sql,"query_type":"bar","title":f"Top {N} by Connected Users","x_axis":"site_id","y_axes":["avg_rrc_ue","max_rrc_ue"],"response":f"Showing {N} sites with most users."}
+
+    sql = _kd_site_query([("DL PRB Utilization (1BH)","dl_prb_util"),("LTE DL - Cell Ave Throughput","dl_cell_tput"),("E-RAB Call Drop Rate_1","erab_drop_rate"),("LTE RRC Setup Success Rate","lte_rrc_setup_sr")],"dl_prb_util","DESC")
+    return {"sql":sql,"query_type":"bar","title":f"Top {N} Sites by PRB Utilization","x_axis":"site_id","y_axes":["dl_prb_util","dl_cell_tput","erab_drop_rate"],"response":f"Top {N} sites by PRB utilization."}
+
+
+def _rule_based_legacy(p: str, time_filter: str) -> dict:
+    """Legacy fallback using network_kpi_timeseries table."""
+    import re
+    N    = 10
+    nums = re.findall(r'\b(\d+)\b', p)
+    if nums:
+        N = min(int(nums[0]), 100)
+    TBL  = "network_kpi_timeseries"
+    base = f"FROM {TBL} WHERE {time_filter}"
+
+    if 'rrc' in p or 'accessibility' in p or 'access' in p:
+        return {"sql": f"SELECT site_id, cluster, AVG(lte_rrc_setup_sr) as lte_rrc_setup_sr, AVG(erab_setup_sr) as erab_setup_sr, AVG(latitude) as lat, AVG(longitude) as lng {base} GROUP BY site_id,cluster ORDER BY lte_rrc_setup_sr ASC NULLS LAST LIMIT {N}", "query_type":"bar","title":f"RRC — Bottom {N} Sites","x_axis":"site_id","y_axes":["lte_rrc_setup_sr","erab_setup_sr"],"response":f"Bottom {N} sites by RRC SR."}
+    if 'volte' in p:
+        return {"sql": f"SELECT site_id, cluster, AVG(volte_traffic_erl) as volte_traffic_erl, AVG(latitude) as lat, AVG(longitude) as lng {base} GROUP BY site_id,cluster ORDER BY volte_traffic_erl DESC NULLS LAST LIMIT {N}", "query_type":"bar","title":f"VoLTE — Top {N}","x_axis":"site_id","y_axes":["volte_traffic_erl"],"response":f"Top {N} sites by VoLTE Erlang."}
+    if 'drop' in p or 'cdr' in p:
+        return {"sql": f"SELECT site_id, cluster, AVG(COALESCE(erab_drop_rate,call_drop_rate,0)) as erab_drop_rate, AVG(COALESCE(dl_prb_util,prb_utilization)) as avg_prb, AVG(latitude) as lat, AVG(longitude) as lng {base} GROUP BY site_id,cluster ORDER BY erab_drop_rate DESC NULLS LAST LIMIT {N}", "query_type":"mixed","title":f"Call Drop — Top {N}","x_axis":"site_id","y_axes":["erab_drop_rate","avg_prb"],"response":f"Top {N} call drop sites."}
+    if 'zone' in p or 'compar' in p or 'cluster' in p:
+        return {"sql": f"SELECT cluster, COUNT(DISTINCT site_id) as sites, AVG(COALESCE(dl_prb_util,prb_utilization)) as avg_prb, AVG(COALESCE(dl_cell_tput,throughput_dl)) as avg_tput {base} GROUP BY cluster ORDER BY avg_prb DESC", "query_type":"bar","title":"Zone Comparison","x_axis":"cluster","y_axes":["avg_prb","avg_tput"],"response":"Zone KPI comparison."}
+    return {"sql": f"SELECT site_id, cluster, AVG(COALESCE(dl_prb_util,prb_utilization)) as avg_prb, AVG(COALESCE(dl_cell_tput,throughput_dl)) as avg_tput, AVG(COALESCE(erab_drop_rate,call_drop_rate,0)) as avg_drop, AVG(latitude) as lat, AVG(longitude) as lng {base} GROUP BY site_id,cluster ORDER BY avg_prb DESC NULLS LAST LIMIT {N}", "query_type":"mixed","title":f"Top {N} Sites by PRB","x_axis":"site_id","y_axes":["avg_prb","avg_tput"],"response":f"Top {N} sites by PRB utilization."}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Network AI Session CRUD endpoints
