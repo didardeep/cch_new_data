@@ -341,8 +341,19 @@ STRICTNESS RULES — FOLLOW THESE EXACTLY:
 4. EXTRACT THE EXACT NUMBER OF DAYS mentioned. "last 18 days" = 18, NOT 7 or 30.
 5. KPI names are CASE-SENSITIVE — copy EXACTLY from the list above.
 6. Site IDs are EXACT — copy every character. NEVER truncate in SQL (only title has 60-char limit).
-7. ALWAYS: WHERE k.data_level='site' AND k.value IS NOT NULL
+7. For kpi_data: add WHERE data_level='site' AND value IS NOT NULL. For mv_daily_site_kpi: do NOT add data_level (MVs don't have it).
 8. JOIN telecom_sites only when you need zone/geo data.
+
+═══════════════════════════════════════════════════════════
+QUERY OPTIMIZATION — ALWAYS APPLY:
+═══════════════════════════════════════════════════════════
+
+1. ALWAYS add LIMIT — max 500 rows. For "top N" queries use the user's N but cap at 500.
+2. ALWAYS include a date filter. If user doesn't specify, default to last 7 days.
+3. For time-series/trend charts: GROUP BY date (not hour) unless user asks for hourly. This reduces row count.
+4. For "top/worst N sites" queries: use a subquery or CTE to first identify the sites, then fetch details. Do NOT scan the entire table.
+5. Prefer mv_daily_site_kpi over kpi_data for site-level daily aggregations — it's pre-aggregated and much faster.
+6. Use AVG/MAX aggregation instead of returning raw rows when the user asks for "average", "peak", etc.
 
 ═══════════════════════════════════════════════════════════
 CHART TYPE — MUST MATCH THE DATA SHAPE:
@@ -385,7 +396,33 @@ RESPONSE FORMAT:
 }}
 
 **Use multi_chart when:** user mentions 2+ site IDs (one chart per site), OR 2 incompatible time ranges.
-**Use single composed chart when:** two KPIs for the SAME site on the same time axis.
+**Use single composed/bar chart when:**
+- Multiple KPIs for the SAME site(s) on the same axis — ALWAYS single chart, NOT multi_chart.
+- User says "combine", "one chart", "together", "all in one", "same chart", "combined".
+- User says "show all KPIs for each site" — use CASE WHEN pivot, single bar chart.
+- "worst N sites where KPI_A > X OR KPI_B < Y" — single bar chart with violations column.
+NEVER split multiple KPIs into separate charts when user asks for them together. Use the MULTI-KPI PIVOT pattern.
+
+**CROSS-TABLE QUERIES (revenue + KPI data):**
+Revenue data is in revenue_data or flexible_kpi_uploads, NOT in kpi_data/mv_daily_site_kpi.
+To combine revenue with KPI data in one chart, use a CTE or subquery:
+```sql
+WITH rev AS (
+  SELECT r.site_id, SUM(r.num_value) AS total_revenue
+  FROM flexible_kpi_uploads r WHERE r.kpi_type='revenue' AND r.column_name ILIKE '%revenue%' AND r.column_type='numeric'
+  GROUP BY r.site_id
+),
+kpi AS (
+  SELECT mv.site_id, AVG(mv.avg_value) AS avg_kpi
+  FROM mv_daily_site_kpi mv WHERE mv.kpi_name='...'
+    AND mv.date >= (SELECT MAX(date) FROM mv_daily_site_kpi) - INTERVAL '7 days'
+  GROUP BY mv.site_id
+)
+SELECT COALESCE(rev.site_id, kpi.site_id) AS site_id, rev.total_revenue, kpi.avg_kpi
+FROM rev FULL JOIN kpi ON rev.site_id = kpi.site_id
+ORDER BY rev.total_revenue DESC NULLS LAST LIMIT 10
+```
+NEVER query revenue columns from kpi_data — they don't exist there.
 
 Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
 
@@ -632,6 +669,64 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
             cols = list(result.keys())
             return [dict(zip(cols, row)) for row in result.fetchall()]
 
+    def _add_safety_limits(sql, max_rows=500):
+        """Cap or add LIMIT to prevent runaway queries."""
+        import re as _re_sl
+        upper = sql.upper().strip()
+        # If there's an existing LIMIT, cap it
+        m = _re_sl.search(r'\bLIMIT\s+(\d+)', upper)
+        if m:
+            existing = int(m.group(1))
+            if existing > max_rows:
+                sql = _re_sl.sub(
+                    r'\bLIMIT\s+\d+',
+                    f'LIMIT {max_rows}',
+                    sql, count=1, flags=_re_sl.IGNORECASE,
+                )
+        elif 'UNION' not in upper:
+            # Add LIMIT only to non-UNION queries
+            sql = sql.rstrip().rstrip(';') + f' LIMIT {max_rows}'
+        return sql
+
+    def _add_date_bounds(sql):
+        """Ensure queries on large tables have date filters to prevent full scans."""
+        import re as _re_db
+        upper = sql.upper()
+        tables_needing_dates = ['KPI_DATA', 'MV_DAILY_SITE_KPI', 'MV_ZONE_DAILY_KPI']
+        has_date_filter = bool(_re_db.search(r'\b(date|created_at)\s*(>=|<=|>|<|BETWEEN)', upper))
+        if has_date_filter:
+            return sql
+        for tbl in tables_needing_dates:
+            if tbl in upper:
+                # Add a 30-day default window
+                date_clause = "date >= (SELECT MAX(date) - INTERVAL '30 days' FROM mv_daily_site_kpi)"
+                if 'WHERE' in upper:
+                    # Insert after the first WHERE
+                    sql = _re_db.sub(
+                        r'\bWHERE\b',
+                        f'WHERE {date_clause} AND',
+                        sql, count=1, flags=_re_db.IGNORECASE,
+                    )
+                else:
+                    sql = sql.rstrip().rstrip(';') + f' WHERE {date_clause}'
+                break
+        return sql
+
+    def _downsample_for_chart(rows, max_points=300):
+        """Evenly sample rows for chart rendering if too many."""
+        if len(rows) <= max_points:
+            return rows
+        step = len(rows) / max_points
+        sampled = []
+        i = 0.0
+        while i < len(rows):
+            sampled.append(rows[int(i)])
+            i += step
+        # Always include the last row
+        if sampled[-1] is not rows[-1]:
+            sampled.append(rows[-1])
+        return sampled
+
     def _serial(v):
         if v is None: return None
         if hasattr(v, "isoformat"): return v.isoformat()
@@ -646,6 +741,11 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
             c_sql = chart_spec.get("sql", "")
             c_error = None
             c_rows = []
+            # Apply safety limits and date bounds
+            if c_sql:
+                c_sql = _add_date_bounds(c_sql)
+                c_sql = _add_safety_limits(c_sql, max_rows=500)
+                chart_spec["sql"] = c_sql
             try:
                 c_rows = _sql_with_timeout(c_sql, timeout_sec=15)
                 if not c_rows:
@@ -655,6 +755,7 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
                 _LOG.warning("Multi-chart SQL failed: %s — SQL: %s", e, c_sql[:300])
                 c_error = str(e)
                 c_rows = []
+            c_rows = _downsample_for_chart(c_rows, max_points=300)
             c_cols = list(c_rows[0].keys()) if c_rows else []
             c_safe = [{k: _serial(v) for k, v in r.items()} for r in c_rows]
             chart_entry = {
@@ -710,6 +811,10 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
     if not sql or not sql.strip().upper().startswith("SELECT"):
         return jsonify({"error": "Could not generate a safe query"}), 400
 
+    # Apply safety limits and date bounds
+    sql = _add_date_bounds(sql)
+    sql = _add_safety_limits(sql, max_rows=500)
+
     try:
         rows = _sql_with_timeout(sql, timeout_sec=15)
     except Exception as e:
@@ -728,6 +833,7 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
         except Exception:
             rows = []
 
+    rows = _downsample_for_chart(rows, max_points=300)
     columns = list(rows[0].keys()) if rows else []
     has_geo = any(r.get("lat") or r.get("latitude") for r in rows)
     safe_rows = [{k: _serial(v) for k, v in r.items()} for r in rows]
@@ -1419,46 +1525,66 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
                 GROUP BY k.site_id
                 ORDER BY {order_col} {order_dir} NULLS LAST LIMIT {N}"""
 
-    if 'rrc' in p or 'accessibility' in p:
-        sql = _kd_site_query([("LTE RRC Setup Success Rate","lte_rrc_setup_sr"),("LTE E-RAB Setup Success Rate","erab_setup_sr"),("LTE Call Setup Success Rate","lte_call_setup_sr"),("DL PRB Utilization (1BH)","dl_prb_util")],"lte_rrc_setup_sr","ASC")
-        return {"sql":sql,"query_type":"bar","title":f"RRC / Accessibility — Bottom {N}","x_axis":"site_id","y_axes":["lte_rrc_setup_sr","erab_setup_sr"],"response":f"Showing {N} sites with lowest RRC Setup Success Rate."}
+    # ── Dynamic KPI chip queries: match user keywords against ACTUAL DB KPIs ──
+    # NO hardcoded KPI names — discover from _schema_cache at runtime.
+    _all_db_kpis = _schema_cache.get("kpi_names_list", [])
 
-    if 'volte' in p:
-        sql = _kd_site_query([("VoLTE Traffic Erlang","volte_traffic_erl"),("VoLTE Traffic DL","volte_dl"),("VoLTE Traffic UL","volte_ul")],"volte_traffic_erl","DESC")
-        return {"sql":sql,"query_type":"bar","title":f"Top {N} Sites — VoLTE Traffic","x_axis":"site_id","y_axes":["volte_traffic_erl"],"response":f"Showing {N} sites by VoLTE Erlang traffic."}
+    def _find_db_kpis(keywords):
+        """Find actual KPI names from DB that match any of the keywords."""
+        matched = []
+        for kn in _all_db_kpis:
+            kn_lower = kn.lower()
+            for kw in keywords:
+                if kw in kn_lower:
+                    alias = re.sub(r'[^a-z0-9]+', '_', kn_lower).strip('_')[:30]
+                    matched.append((kn, alias))
+                    break
+        return matched
 
-    if 'handover' in p or ' ho ' in p or 'hsr' in p:
-        sql = _kd_site_query([("LTE Intra-Freq HO Success Rate","intra_freq_ho_sr"),("LTE RRC Setup Success Rate","lte_rrc_setup_sr"),("DL PRB Utilization (1BH)","dl_prb_util")],"intra_freq_ho_sr","ASC")
-        return {"sql":sql,"query_type":"bar","title":f"Bottom {N} — HO Success Rate","x_axis":"site_id","y_axes":["intra_freq_ho_sr"],"response":f"Showing {N} sites with worst Handover Success Rate."}
+    if ('drop' in p or 'cdr' in p) and not detected_kpis:
+        _kpis = _find_db_kpis(['drop rate', 'drop_rate', 'cdr'])
+        if _kpis:
+            sql = _kd_site_query(_kpis[:3], _kpis[0][1], "DESC")
+            return {"sql":sql,"query_type":"bar","title":f"Top {N} — Drop Rate","x_axis":"site_id","y_axes":[a for _,a in _kpis[:3]],"response":f"Showing {N} sites with highest drop rate."}
 
-    if 'drop' in p or 'cdr' in p:
-        sql = _kd_site_query([("E-RAB Call Drop Rate_1","erab_drop_rate"),("DL PRB Utilization (1BH)","dl_prb_util"),("LTE DL - Cell Ave Throughput","dl_cell_tput")],"erab_drop_rate","DESC")
-        return {"sql":sql,"query_type":"bar","title":f"Top {N} Call Drop Offenders","x_axis":"site_id","y_axes":["erab_drop_rate","dl_prb_util"],"response":f"Showing {N} sites with highest E-RAB call drop rate."}
+    if ('throughput' in p or 'tput' in p or 'speed' in p or 'mbps' in p) and not detected_kpis:
+        _kpis = _find_db_kpis(['throughput', 'tput', 'ave throughput'])
+        if _kpis:
+            order = "ASC" if any(w in p for w in ['worst','low','bad','poor','bottom']) else "DESC"
+            sql = _kd_site_query(_kpis[:3], _kpis[0][1], order)
+            return {"sql":sql,"query_type":"bar","title":f"{'Bottom' if order=='ASC' else 'Top'} {N} — Throughput","x_axis":"site_id","y_axes":[a for _,a in _kpis[:2]],"response":f"{'Worst' if order=='ASC' else 'Best'} {N} sites by throughput."}
 
-    if 'prb' in p or 'congestion' in p or 'congested' in p or 'overload' in p:
-        sql = _kd_site_query([("DL PRB Utilization (1BH)","dl_prb_util"),("UL PRB Utilization (1BH)","ul_prb_util"),("LTE DL - Cell Ave Throughput","dl_cell_tput"),("Ave RRC Connected Ue","avg_rrc_ue")],"dl_prb_util","DESC")
-        return {"sql":sql,"query_type":"bar","title":f"Top {N} Congested Sites (PRB)","x_axis":"site_id","y_axes":["dl_prb_util","ul_prb_util","dl_cell_tput"],"response":f"Showing top {N} sites by DL PRB Utilization."}
+    if ('prb' in p or 'congestion' in p or 'congested' in p) and not detected_kpis:
+        _kpis = _find_db_kpis(['prb util', 'prb_util', 'prb utilization'])
+        if _kpis:
+            sql = _kd_site_query(_kpis[:3], _kpis[0][1], "DESC")
+            return {"sql":sql,"query_type":"bar","title":f"Top {N} Congested Sites","x_axis":"site_id","y_axes":[a for _,a in _kpis[:3]],"response":f"Top {N} sites by PRB Utilization."}
 
-    if 'throughput' in p or 'tput' in p or 'speed' in p or 'mbps' in p:
-        order = "ASC" if any(w in p for w in ['worst','low','bad','poor']) else "DESC"
-        sql = _kd_site_query([("LTE DL - Cell Ave Throughput","dl_cell_tput"),("LTE UL - Cell Ave Throughput","ul_cell_tput"),("DL PRB Utilization (1BH)","dl_prb_util")],"dl_cell_tput",order)
-        return {"sql":sql,"query_type":"bar","title":f"{'Bottom' if order=='ASC' else 'Top'} {N} — DL Throughput","x_axis":"site_id","y_axes":["dl_cell_tput","ul_cell_tput"],"response":f"{'Worst' if order=='ASC' else 'Best'} {N} sites by throughput."}
+    if ('cssr' in p or 'call setup' in p or 'setup success' in p) and not detected_kpis:
+        _kpis = _find_db_kpis(['call setup', 'setup success', 'cssr'])
+        if _kpis:
+            sql = _kd_site_query(_kpis[:3], _kpis[0][1], "ASC")
+            return {"sql":sql,"query_type":"bar","title":f"Bottom {N} — Call Setup","x_axis":"site_id","y_axes":[a for _,a in _kpis[:2]],"response":f"Showing {N} sites with lowest CSSR."}
 
-    if 'cssr' in p or 'call setup' in p or 'setup success' in p:
-        sql = _kd_site_query([("LTE Call Setup Success Rate","lte_cssr"),("LTE E-RAB Setup Success Rate","erab_setup_sr"),("E-RAB Call Drop Rate_1","erab_drop_rate")],"lte_cssr","ASC")
-        return {"sql":sql,"query_type":"bar","title":f"Bottom {N} — Call Setup Success","x_axis":"site_id","y_axes":["lte_cssr","erab_setup_sr"],"response":f"Showing {N} sites with lowest CSSR."}
+    if ('rrc' in p or 'accessibility' in p) and not detected_kpis:
+        _kpis = _find_db_kpis(['rrc', 'accessibility', 'e-rab setup'])
+        if _kpis:
+            sql = _kd_site_query(_kpis[:3], _kpis[0][1], "ASC")
+            return {"sql":sql,"query_type":"bar","title":f"Bottom {N} — Accessibility","x_axis":"site_id","y_axes":[a for _,a in _kpis[:2]],"response":f"Showing {N} sites with lowest accessibility."}
 
-    if 'zone' in p or 'cluster' in p or 'cbd' in p or 'urban' in p or 'compar' in p:
-        return {"sql":f"""SELECT ts.zone AS cluster, COUNT(DISTINCT k.site_id) AS sites,
-                       AVG(CASE WHEN k.kpi_name='DL PRB Utilization (1BH)' THEN k.value END) AS avg_prb,
-                       AVG(CASE WHEN k.kpi_name='LTE DL - Cell Ave Throughput' THEN k.value END) AS avg_tput,
-                       AVG(CASE WHEN k.kpi_name='E-RAB Call Drop Rate_1' THEN k.value END) AS avg_drop,
-                       AVG(CASE WHEN k.kpi_name='LTE RRC Setup Success Rate' THEN k.value END) AS avg_rrc_sr
+    if ('zone' in p or 'cluster' in p or 'compar' in p) and not detected_kpis:
+        # Use first 4 KPIs from DB for zone comparison
+        _kpis = _all_db_kpis[:4] if _all_db_kpis else []
+        if _kpis:
+            _cases = ", ".join(f"AVG(CASE WHEN k.kpi_name='{kn}' THEN k.value END) AS {re.sub(r'[^a-z0-9]+','_',kn.lower()).strip('_')[:25]}" for kn in _kpis)
+            _in_cl = ", ".join(f"'{kn}'" for kn in _kpis)
+            _aliases = [re.sub(r'[^a-z0-9]+','_',kn.lower()).strip('_')[:25] for kn in _kpis]
+            return {"sql":f"""SELECT ts.zone AS cluster, COUNT(DISTINCT k.site_id) AS sites, {_cases}
                 FROM kpi_data k {GEO_JOIN}
                 WHERE k.data_level='site' AND k.value IS NOT NULL AND ts.zone IS NOT NULL
-                  AND k.kpi_name IN ('DL PRB Utilization (1BH)','LTE DL - Cell Ave Throughput','E-RAB Call Drop Rate_1','LTE RRC Setup Success Rate')
-                GROUP BY ts.zone ORDER BY avg_prb DESC NULLS LAST""",
-                "query_type":"bar","title":"Zone-wise KPI Comparison","x_axis":"cluster","y_axes":["avg_prb","avg_tput","avg_drop"],"response":"Zone-level KPI comparison."}
+                  AND k.kpi_name IN ({_in_cl})
+                GROUP BY ts.zone ORDER BY {_aliases[0]} DESC NULLS LAST""",
+                "query_type":"bar","title":"Zone-wise KPI Comparison","x_axis":"cluster","y_axes":_aliases[:3],"response":"Zone-level KPI comparison."}
 
     if 'availab' in p or 'downtime' in p or 'uptime' in p:
         sql = _kd_site_query([("Availability","availability"),("DL PRB Utilization (1BH)","dl_prb_util")],"availability","ASC")
