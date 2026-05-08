@@ -732,17 +732,21 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
                     f'LIMIT {max_rows}',
                     sql, count=1, flags=_re_sl.IGNORECASE,
                 )
-        elif 'UNION' not in upper:
-            # Add LIMIT only to non-UNION queries
+        elif 'UNION' not in upper and not upper.startswith("WITH"):
+            # Add LIMIT only to simple queries (not UNION or CTE)
             sql = sql.rstrip().rstrip(';') + f' LIMIT {max_rows}'
         return sql
 
     def _add_date_bounds(sql):
-        """Ensure queries on large tables have date filters to prevent full scans."""
+        """Ensure queries on large tables have date filters to prevent full scans.
+        Skip CTE/complex queries — they already have targeted date logic from the LLM."""
         import re as _re_db
-        upper = sql.upper()
+        upper = sql.upper().strip()
+        # Don't touch CTEs or multi-table queries — too risky to inject blindly
+        if upper.startswith("WITH") or 'FLEXIBLE_KPI' in upper or upper.count("SELECT") > 2:
+            return sql
         tables_needing_dates = ['KPI_DATA', 'MV_DAILY_SITE_KPI', 'MV_ZONE_DAILY_KPI']
-        has_date_filter = bool(_re_db.search(r'\b(date|created_at)\s*(>=|<=|>|<|BETWEEN)', upper))
+        has_date_filter = bool(_re_db.search(r'\b(date|row_date)\s*(>=|<=|>|<|BETWEEN)', upper))
         if has_date_filter:
             return sql
         for tbl in tables_needing_dates:
@@ -1313,6 +1317,30 @@ def _handle_followup(prompt_orig: str, p: str, prev: dict, time_filter: str) -> 
             "title": prev_title, "x_axis": prev_x, "y_axes": prev_y,
             "chart_config": cfg, "response": resp_msg,
         }
+
+    # Combine / merge multi-chart into single chart
+    _combine_words = ['combine', 'merge', 'single chart', 'one chart', 'same chart', 'together', 'into one', 'in one']
+    if any(w in p for w in _combine_words) and prev_charts and len(prev_charts) >= 2:
+        # Merge all previous chart SQLs into a single UNION ALL query
+        union_parts = []
+        chart_labels = []
+        for ch in prev_charts[:4]:
+            ch_sql = ch.get("sql", "").strip().rstrip(";")
+            ch_title = ch.get("title", "")
+            if ch_sql:
+                # Wrap each chart's SQL to add a label column
+                union_parts.append(f"SELECT sub.*, '{ch_title[:40]}' AS chart_label FROM ({ch_sql}) sub")
+                chart_labels.append(ch_title[:30])
+        if union_parts:
+            combined_sql = "\nUNION ALL\n".join(union_parts)
+            return {
+                "sql": combined_sql,
+                "query_type": "composed", "chart_type": "composed",
+                "title": "Combined: " + " & ".join(chart_labels)[:60],
+                "x_axis": "site_id",
+                "y_axes": prev_charts[0].get("y_axes", ["value"]),
+                "response": f"Combined {len(prev_charts)} charts into a single view.",
+            }
 
     # Add/overlay a KPI
     if any(w in p for w in ['add', 'include', 'also show', 'overlay', 'combine']):
