@@ -528,12 +528,15 @@ export default function NetworkAiChat() {
           s.id===sid&&s.title==='New Chat' ? {...s,title:result.title} : s
         ));
       }
-    }catch{
+    }catch(err){
+      const errMsg = err?.message || 'Could not reach the server. Please try again.';
       setMessages(prev=>[...prev,{
         id:Date.now()+1, role:'assistant',
-        content:'Could not reach the server. Please try again.',
+        content: errMsg,
+        isError: true,
         created_at:new Date().toISOString(),
       }]);
+      console.error('[NetworkAiChat] query failed:', err);
     }
     setLoading(false);
   },[activeSessionId,loading]);

@@ -39,6 +39,38 @@ def invalidate_schema_cache():
     _schema_cache["populated"] = False
 
 
+def _populate_schema_cache():
+    """Discover KPI names and data dates from DB, cache for reuse."""
+    if _schema_cache.get("populated"):
+        return
+    try:
+        # Discover KPI names
+        rows = _sql("SELECT DISTINCT kpi_name FROM kpi_data WHERE kpi_name IS NOT NULL ORDER BY kpi_name")
+        _schema_cache["kpi_names_list"] = [r["kpi_name"] for r in rows] if rows else []
+
+        # Discover max date for date substitution
+        date_rows = _sql("SELECT MAX(date)::text AS max_date FROM kpi_data")
+        if date_rows and date_rows[0].get("max_date"):
+            _schema_cache["kpi_max_date"] = date_rows[0]["max_date"]
+
+        # MV max date
+        try:
+            mv_rows = _sql("SELECT MAX(date)::text AS max_date FROM mv_daily_site_kpi")
+            if mv_rows and mv_rows[0].get("max_date"):
+                _schema_cache["mv_max_date"] = mv_rows[0]["max_date"]
+        except Exception:
+            pass
+
+        _schema_cache["populated"] = True
+        print(f"[AI-DEBUG] Schema cache populated: {len(_schema_cache.get('kpi_names_list', []))} KPIs, max_date={_schema_cache.get('kpi_max_date', 'N/A')}, mv_max_date={_schema_cache.get('mv_max_date', 'N/A')}", flush=True)
+        _LOG.info("Schema cache populated: %d KPI names, max_date=%s",
+                  len(_schema_cache.get("kpi_names_list", [])),
+                  _schema_cache.get("kpi_max_date", "unknown"))
+    except Exception as e:
+        print(f"[AI-DEBUG] Schema cache FAILED to populate: {str(e)[:200]}", flush=True)
+        _LOG.warning("Failed to populate schema cache: %s", e)
+
+
 def refresh_materialized_views():
     """Refresh AI-related materialized views, best-effort.
 
@@ -109,6 +141,7 @@ def ai_query():
         return jsonify({"error": "Forbidden"}), 403
 
     _LOG.info("network_ai version: %s", NETWORK_AI_VERSION)
+    _populate_schema_cache()
     body    = request.get_json(silent=True) or {}
     prompt  = str(body.get("prompt", "")).strip()
     context = body.get("context", {})
@@ -527,6 +560,10 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
         _providers.append(("openai", openai_key))
 
     _LOG.info("AI providers available: %s", [p[0] for p in _providers])
+    print(f"[AI-DEBUG] prompt={prompt[:80]!r}, providers={[p[0] for p in _providers]}, schema_cache_populated={_schema_cache.get('populated')}, kpi_count={len(_schema_cache.get('kpi_names_list', []))}", flush=True)
+
+    if not _providers:
+        print("[AI-DEBUG] WARNING: No LLM providers configured! Check AZURE_OPENAI_API_KEY, GEMINI_API_KEY, OPENAI_API_KEY env vars or app config.", flush=True)
 
     # ── PRE-LLM INTERCEPTOR ────────────────────────────────────────────────────
     # Handle certain query patterns with rule-based logic BEFORE calling the LLM.
@@ -593,9 +630,11 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
                     response_format={"type": "json_object"},
                 )
                 raw_content = az_resp.choices[0].message.content
+                print(f"[AI-DEBUG] Azure raw response ({len(raw_content) if raw_content else 0} chars): {(raw_content or '')[:200]}", flush=True)
                 if raw_content:
                     ai_result = _parse_ai_result(raw_content)
                     provider = {"provider": f"azure-{_prov[3]}"}
+                    print(f"[AI-DEBUG] Azure parsed OK. Has sql={bool(ai_result.get('sql'))}, multi_chart={ai_result.get('multi_chart')}", flush=True)
                     _LOG.info("AI query handled by Azure OpenAI (%s)", _prov[3])
 
             elif ptype == "gemini":
@@ -612,9 +651,11 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
                     max_tokens=2000,
                 )
                 raw_content = gem_resp.choices[0].message.content
+                print(f"[AI-DEBUG] Gemini raw response ({len(raw_content) if raw_content else 0} chars): {(raw_content or '')[:200]}", flush=True)
                 if raw_content:
                     ai_result = _parse_ai_result(raw_content)
                     provider = {"provider": _prov[2]}
+                    print(f"[AI-DEBUG] Gemini parsed OK. Has sql={bool(ai_result.get('sql'))}, multi_chart={ai_result.get('multi_chart')}", flush=True)
                     _LOG.info("AI query handled by Gemini (%s)", _prov[2])
 
             elif ptype == "openai":
@@ -627,16 +668,20 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
                     max_tokens=2000,
                 )
                 raw_content = oai_resp.choices[0].message.content
+                print(f"[AI-DEBUG] OpenAI raw response ({len(raw_content) if raw_content else 0} chars): {(raw_content or '')[:200]}", flush=True)
                 if raw_content:
                     ai_result = _parse_ai_result(raw_content)
                     provider = {"provider": "openai-gpt-4o-mini"}
+                    print(f"[AI-DEBUG] OpenAI parsed OK. Has sql={bool(ai_result.get('sql'))}, multi_chart={ai_result.get('multi_chart')}", flush=True)
                     _LOG.info("AI query handled by OpenAI direct")
 
         except json.JSONDecodeError as je:
+            print(f"[AI-DEBUG] {ptype.upper()} returned bad JSON: {str(je)[:150]}", flush=True)
             _LOG.warning("%s LLM returned bad JSON, using rule-based fallback: %s", ptype.upper(), str(je)[:100])
             continue
         except Exception as e:
             err_str = str(e).lower()
+            print(f"[AI-DEBUG] {ptype.upper()} FAILED: {str(e)[:300]}", flush=True)
             if "429" in str(e) or "quota" in err_str or "rate" in err_str or "resource_exhausted" in err_str:
                 _LOG.warning("%s quota/rate limit hit — skipping to rule-based", ptype.upper())
                 break
@@ -645,6 +690,7 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
 
     # ── Fallback: rule-based query engine ─────────────────────────────────────
     if not ai_result:
+        print(f"[AI-DEBUG] No LLM result — falling back to rule-based engine", flush=True)
         prev_context = None
         if ai_session and session_id:
             try:
@@ -659,7 +705,10 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
         ai_result = _rule_based_query(prompt, time_filter, prev_context=prev_context)
         if not provider:
             provider = {"provider": "rule-based"}
+        print(f"[AI-DEBUG] Rule-based result: has sql={bool(ai_result.get('sql'))}, multi_chart={ai_result.get('multi_chart')}, title={ai_result.get('title', '')[:50]}", flush=True)
         _LOG.info("AI query handled by rule-based fallback")
+    else:
+        print(f"[AI-DEBUG] LLM result obtained via {provider}. has sql={bool(ai_result.get('sql'))}, multi_chart={ai_result.get('multi_chart')}", flush=True)
 
     # ── Helper functions ──────────────────────────────────────────────────────
     def _sql_with_timeout(query, timeout_sec=10):
@@ -736,6 +785,7 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
 
     # ── MULTI-CHART: execute each chart's SQL separately ───────────────────────
     if ai_result.get("multi_chart") and ai_result.get("charts"):
+        print(f"[AI-DEBUG] Processing MULTI-CHART response with {len(ai_result['charts'])} charts", flush=True)
         charts_out = []
         for chart_spec in ai_result["charts"]:
             c_sql = chart_spec.get("sql", "")
@@ -809,15 +859,49 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
     # ── SINGLE CHART: execute SQL normally ─────────────────────────────────────
     sql = ai_result.get("sql", "")
     if not sql or not sql.strip().upper().startswith("SELECT"):
-        return jsonify({"error": "Could not generate a safe query"}), 400
+        # LLM returned a result without valid SQL — fall back to rule-based
+        print(f"[AI-DEBUG] ai_result has NO valid SQL. keys={list(ai_result.keys())}, sql repr={(sql or '(empty)')[:100]!r}. Falling back to rule-based.", flush=True)
+        _LOG.warning("AI result has no valid SQL (keys: %s), falling back to rule-based", list(ai_result.keys()))
+        prev_context = None
+        if ai_session and session_id:
+            try:
+                last_asst = (NetworkAiMessage.query
+                             .filter_by(session_id=session_id, role="assistant")
+                             .order_by(NetworkAiMessage.created_at.desc())
+                             .first())
+                if last_asst and last_asst.content_json:
+                    prev_context = last_asst.content_json
+            except Exception:
+                pass
+        ai_result = _rule_based_query(prompt, time_filter, prev_context=prev_context)
+        provider = {"provider": "rule-based-nosql-fallback"}
+        sql = ai_result.get("sql", "")
+        print(f"[AI-DEBUG] Rule-based fallback result: has sql={bool(sql)}, sql[:100]={(sql or '(empty)')[:100]!r}", flush=True)
+        # If even rule-based can't produce SQL, return a helpful text response
+        if not sql or not sql.strip().upper().startswith("SELECT"):
+            print(f"[AI-DEBUG] Even rule-based produced no SQL. Returning text-only response.", flush=True)
+            return jsonify({
+                "response": ai_result.get("response", "I couldn't generate a query for that. Try asking about a specific KPI like throughput, drop rate, or availability."),
+                "query_type": "text",
+                "chart_type": "text",
+                "title": "",
+                "data": [],
+                "columns": [],
+                "row_count": 0,
+                "provider": "rule-based",
+                "session_id": ai_session.id if ai_session else None,
+            })
 
     # Apply safety limits and date bounds
     sql = _add_date_bounds(sql)
     sql = _add_safety_limits(sql, max_rows=500)
+    print(f"[AI-DEBUG] Final SQL to execute ({len(sql)} chars): {sql[:300]}", flush=True)
 
     try:
         rows = _sql_with_timeout(sql, timeout_sec=15)
+        print(f"[AI-DEBUG] SQL returned {len(rows)} rows", flush=True)
     except Exception as e:
+        print(f"[AI-DEBUG] SQL EXECUTION FAILED: {str(e)[:300]}", flush=True)
         _LOG.warning("AI SQL execution failed: %s — SQL: %s", e, sql[:200])
         try:
             fallback = _rule_based_query(prompt, time_filter)
@@ -828,9 +912,11 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
                 sql = sql2
                 if not provider:
                     provider = {"provider": "rule-based-fallback"}
+                print(f"[AI-DEBUG] Fallback SQL returned {len(rows)} rows", flush=True)
             else:
                 rows = []
-        except Exception:
+        except Exception as e2:
+            print(f"[AI-DEBUG] Fallback SQL also failed: {str(e2)[:200]}", flush=True)
             rows = []
 
     rows = _downsample_for_chart(rows, max_points=300)
