@@ -216,11 +216,23 @@ def ai_query():
     provider = None
     ai_result = None
 
-    SCHEMA_HINT = """
+    # ── Build dynamic schema hint with actual DB state ──────────────────────
+    _kpi_max = _schema_cache.get("kpi_max_date", "unknown")
+    _mv_max  = _schema_cache.get("mv_max_date", _kpi_max)
+    _db_kpis = _schema_cache.get("kpi_names_list", [])
+    # Build a compact list of actual KPI names from the DB for the LLM
+    _db_kpi_block = ""
+    if _db_kpis:
+        _db_kpi_block = "\n   Actual KPI names discovered in this database:\n"
+        for _kn in _db_kpis[:60]:
+            _db_kpi_block += f"   '{_kn}'\n"
+
+    SCHEMA_HINT = f"""
 Tables:
 1. kpi_data(id, site_id, kpi_name, value, date, hour, data_level, cell_id, cell_site_id)
    - data_level = 'site' for site-level, 'cell' for cell-level
    - IMPORTANT: kpi_name values are EXACT strings. Use these EXACTLY as listed below.
+   - Latest date in kpi_data: {_kpi_max}
 
    === RAN KPI Names (EXACT values in kpi_name column) ===
    'LTE RRC Setup Success Rate'        -- RRC success rate, accessibility
@@ -250,14 +262,55 @@ Tables:
    'Average NI of Carrier-'             -- Noise/interference
    'DL PRB Utilization (1BH)'           -- DL PRB utilization %, congestion
    'UL PRB Utilization (1BH)'           -- UL PRB utilization %
+{_db_kpi_block}
+2. mv_daily_site_kpi(site_id, kpi_name, date, avg_value, min_value, max_value, sample_count)
+   - PRE-AGGREGATED materialized view of kpi_data grouped by site+kpi+date.
+   - MUCH faster than kpi_data for site-level daily queries. PREFER this table.
+   - Does NOT have data_level column — do NOT add WHERE data_level=... on this table.
+   - Latest date in mv_daily_site_kpi: {_mv_max}
+   - Use avg_value (not value) for averages, min_value/max_value for extremes.
 
-2. telecom_sites(site_id, cell_id, latitude, longitude, zone)
-   - JOIN: kpi_data k JOIN telecom_sites ts ON k.site_id = ts.site_id
-   - zone column has values like zone names / cluster names
+3. telecom_sites(site_id, cell_id, latitude, longitude, zone, technology, vendor_name, cluster)
+   - JOIN: kpi_data k JOIN telecom_sites ts ON LOWER(k.site_id) = LOWER(ts.site_id)
+   - zone column has zone/area names, cluster has cluster names
+   - technology: '4G', '5G', etc.
 
-3. flexible_kpi_uploads(site_id, kpi_name, kpi_type, column_name, num_value, str_value)
-   - kpi_type = 'core' for core KPIs: Authentication Success Rate, CPU Utilization, Attach Success Rate, PDP Bearer Setup Success Rate
+4. flexible_kpi_uploads(id, site_id, kpi_name, kpi_type, column_name, column_type, num_value, str_value, row_date)
+   - kpi_type = 'core' for core KPIs (Authentication Success Rate, CPU Utilization, Attach Success Rate, etc.)
    - kpi_type = 'revenue' for revenue data
+   - For revenue queries: WHERE kpi_type='revenue' AND column_type='numeric'
+   - Revenue value is in num_value column, metric name is in column_name
+   - Date column is row_date (NOT date)
+   - Example revenue query:
+     SELECT site_id, SUM(num_value) AS total_revenue
+     FROM flexible_kpi_uploads
+     WHERE kpi_type='revenue' AND column_name ILIKE '%revenue%' AND column_type='numeric'
+     GROUP BY site_id
+
+5. revenue_data(site_id, total_revenue, date) — alternative revenue table (may not exist)
+
+=== CROSS-TABLE QUERIES (revenue + KPI data) ===
+Revenue is in flexible_kpi_uploads or revenue_data, NEVER in kpi_data.
+To combine revenue with KPI data, use CTEs:
+  WITH rev AS (
+    SELECT site_id, SUM(num_value) AS total_revenue
+    FROM flexible_kpi_uploads
+    WHERE kpi_type='revenue' AND column_name ILIKE '%revenue%' AND column_type='numeric'
+    GROUP BY site_id
+  ),
+  kpi AS (
+    SELECT site_id, AVG(avg_value) AS avg_kpi
+    FROM mv_daily_site_kpi
+    WHERE kpi_name='DL PRB Utilization (1BH)'
+      AND date >= (SELECT MAX(date) FROM mv_daily_site_kpi) - INTERVAL '7 days'
+    GROUP BY site_id
+  )
+  SELECT COALESCE(rev.site_id, kpi.site_id) AS site_id,
+         rev.total_revenue, kpi.avg_kpi
+  FROM rev FULL JOIN kpi ON LOWER(rev.site_id) = LOWER(kpi.site_id)
+  WHERE rev.total_revenue IS NOT NULL AND kpi.avg_kpi IS NOT NULL
+  ORDER BY rev.total_revenue DESC NULLS LAST, site_id ASC
+  LIMIT 10
 
 === Natural Language → KPI Mapping Guide ===
 User says "call drop" / "drop rate" / "CDR" / "call failure" → 'E-RAB Call Drop Rate_1'
@@ -272,9 +325,16 @@ User says "data volume" / "traffic volume" → 'DL Data Total Volume'
 User says "call setup" / "CSSR" → 'LTE Call Setup Success Rate'
 User says "RRC" / "accessibility" / "access" → 'LTE RRC Setup Success Rate'
 User says "noise" / "interference" → 'Average NI of Carrier-'
-User says "last 7 days" → AND k.date >= CURRENT_DATE - INTERVAL '7 days' AND k.date <= CURRENT_DATE
-User says "last month" → AND k.date >= CURRENT_DATE - INTERVAL '1 month' AND k.date <= CURRENT_DATE
-ALWAYS add AND k.date <= CURRENT_DATE when any date range is used, to exclude future data.
+User says "revenue" / "income" / "earnings" / "ARPU" → flexible_kpi_uploads WHERE kpi_type='revenue'
+
+=== DATE HANDLING — CRITICAL ===
+The latest date with data is {_kpi_max}. CURRENT_DATE may be far ahead of the actual data.
+- If user says "last 7 days", use: date >= '{_kpi_max}'::date - INTERVAL '7 days' AND date <= '{_kpi_max}'::date
+- If user says "last month", use: date >= '{_kpi_max}'::date - INTERVAL '1 month' AND date <= '{_kpi_max}'::date
+- If user doesn't specify a time range, default to last 7 days from {_kpi_max}.
+- For mv_daily_site_kpi, use the same pattern with date column.
+- For flexible_kpi_uploads, use row_date instead of date.
+- NEVER use CURRENT_DATE — always anchor to '{_kpi_max}'::date (the latest actual data date).
 """
 
     LLM_SYSTEM = f"""You are a telecom network analytics SQL generator. Your ONLY job is to convert the user's natural-language query into an EXACT, STRICT SQL query that fetches PRECISELY what was asked — nothing more, nothing less.
@@ -321,7 +381,14 @@ Follow-up patterns and how to handle them:
 5. ADD A KPI — "also show PRB" / "overlay throughput"
    → Extend the previous SQL using UNION ALL or CASE WHEN to include the new KPI.
 
-6. VAGUE / AMBIGUOUS — "yes", "ok", "show more", short prompts with no new site/KPI
+6. COUNT CORRECTION — "I asked for 5 not 4" / "only 4 sites" / "show me 5" / "need more results"
+   → User is unhappy with the number of results. The PREVIOUS SQL logic is correct but LIMIT is wrong.
+   → Take the EXACT previous SQL, ONLY change the LIMIT clause to the desired count.
+   → Do NOT rewrite the query logic, filters, or ordering — keep everything identical.
+   → If the user says "only 4, I asked for 5", change LIMIT 4 → LIMIT 5 (or add LIMIT 5).
+   → The sites/results returned must be a SUPERSET of the previous results, not a different set.
+
+7. VAGUE / AMBIGUOUS — "yes", "ok", "show more", short prompts with no new site/KPI
    → Re-run the previous SQL with the same parameters.
 
 **IMPORTANT RULES for follow-ups:**
@@ -330,6 +397,7 @@ Follow-up patterns and how to handle them:
 - ALWAYS inherit kpi_name(s) from previous SQL if the user doesn't mention a new KPI.
 - If the current prompt is completely self-contained (has site ID + KPI + time range), treat it as a FRESH query.
 - A prompt like "i want to see for site id X" with NO new KPI mentioned = SITE SWITCH → inherit all KPIs.
+- CONSISTENCY: When user asks to correct/adjust results (more rows, different LIMIT), MODIFY the previous SQL minimally — do NOT rewrite from scratch. The corrected results must be consistent with (superset of) the original results.
 
 ═══════════════════════════════════════════════════════════
 CRITICAL RULE #0 — MULTI-PART / COMPOUND QUERIES:
@@ -350,16 +418,16 @@ Example: "show E-RAB drop rate and CSSR last 18 days for SITE_A and SITE_A"
 → TWO CHARTS: Chart 1 = SITE_A (both KPIs), Chart 2 = SITE_A (both KPIs)
 → Each chart: composed chart_type, UNION ALL SQL filtering by that site.
 
-Example SQL for one site with two KPIs:
-SELECT k.date::text AS date, k.site_id, AVG(k.value) AS value, 'E-RAB Call Drop Rate_1' AS kpi_name
-FROM kpi_data k WHERE k.kpi_name = 'E-RAB Call Drop Rate_1' AND k.site_id = 'SITE_A'
-  AND k.data_level='site' AND k.value IS NOT NULL AND k.date >= CURRENT_DATE - INTERVAL '18 days' AND k.date <= CURRENT_DATE
-GROUP BY k.date, k.site_id
+Example SQL for one site with two KPIs (using mv_daily_site_kpi — preferred):
+SELECT mv.date::text AS date, mv.site_id, AVG(mv.avg_value) AS value, 'E-RAB Call Drop Rate_1' AS kpi_name
+FROM mv_daily_site_kpi mv WHERE mv.kpi_name = 'E-RAB Call Drop Rate_1' AND mv.site_id = 'SITE_A'
+  AND mv.avg_value IS NOT NULL AND mv.date >= '{_kpi_max}'::date - INTERVAL '18 days' AND mv.date <= '{_kpi_max}'::date
+GROUP BY mv.date, mv.site_id
 UNION ALL
-SELECT k.date::text AS date, k.site_id, AVG(k.value) AS value, 'LTE Call Setup Success Rate' AS kpi_name
-FROM kpi_data k WHERE k.kpi_name = 'LTE Call Setup Success Rate' AND k.site_id = 'SITE_A'
-  AND k.data_level='site' AND k.value IS NOT NULL AND k.date >= CURRENT_DATE - INTERVAL '18 days' AND k.date <= CURRENT_DATE
-GROUP BY k.date, k.site_id
+SELECT mv.date::text AS date, mv.site_id, AVG(mv.avg_value) AS value, 'LTE Call Setup Success Rate' AS kpi_name
+FROM mv_daily_site_kpi mv WHERE mv.kpi_name = 'LTE Call Setup Success Rate' AND mv.site_id = 'SITE_A'
+  AND mv.avg_value IS NOT NULL AND mv.date >= '{_kpi_max}'::date - INTERVAL '18 days' AND mv.date <= '{_kpi_max}'::date
+GROUP BY mv.date, mv.site_id
 ORDER BY date
 
 **NEVER ignore part of the user's query. If they ask for 2 sites, return charts for BOTH.**
@@ -370,12 +438,17 @@ STRICTNESS RULES — FOLLOW THESE EXACTLY:
 
 1. ONLY query the EXACT KPI(s) the user asked about. Do NOT add extra KPIs.
 2. ONLY filter by what the user specified (site, date range, zone).
-3. TODAY's date is {datetime.now().strftime('%Y-%m-%d')}. ALWAYS cap with AND k.date <= CURRENT_DATE.
+3. The latest date with actual data is '{_kpi_max}'. NEVER use CURRENT_DATE — always anchor dates to '{_kpi_max}'::date.
+   Example: "last 7 days" → date >= '{_kpi_max}'::date - INTERVAL '7 days' AND date <= '{_kpi_max}'::date
 4. EXTRACT THE EXACT NUMBER OF DAYS mentioned. "last 18 days" = 18, NOT 7 or 30.
-5. KPI names are CASE-SENSITIVE — copy EXACTLY from the list above.
+5. KPI names are CASE-SENSITIVE — copy EXACTLY from the list above. If unsure, pick the closest match from the KPI list.
 6. Site IDs are EXACT — copy every character. NEVER truncate in SQL (only title has 60-char limit).
-7. For kpi_data: add WHERE data_level='site' AND value IS NOT NULL. For mv_daily_site_kpi: do NOT add data_level (MVs don't have it).
-8. JOIN telecom_sites only when you need zone/geo data.
+7. PREFER mv_daily_site_kpi over kpi_data for site-level daily queries — it's pre-aggregated, much faster.
+   Use avg_value (not value). Do NOT add data_level filter on MVs.
+   Fall back to kpi_data only if you need hourly data or cell-level data.
+8. For kpi_data: add WHERE data_level='site' AND value IS NOT NULL.
+9. JOIN telecom_sites only when you need zone/geo/technology/vendor data.
+10. For revenue data: query flexible_kpi_uploads with kpi_type='revenue', NOT kpi_data.
 
 ═══════════════════════════════════════════════════════════
 QUERY OPTIMIZATION — ALWAYS APPLY:
@@ -387,6 +460,27 @@ QUERY OPTIMIZATION — ALWAYS APPLY:
 4. For "top/worst N sites" queries: use a subquery or CTE to first identify the sites, then fetch details. Do NOT scan the entire table.
 5. Prefer mv_daily_site_kpi over kpi_data for site-level daily aggregations — it's pre-aggregated and much faster.
 6. Use AVG/MAX aggregation instead of returning raw rows when the user asks for "average", "peak", etc.
+
+═══════════════════════════════════════════════════════════
+DETERMINISTIC RESULTS — CRITICAL FOR CONSISTENCY:
+═══════════════════════════════════════════════════════════
+
+1. EVERY ORDER BY MUST include site_id as a tiebreaker at the end.
+   Example: ORDER BY avg_value DESC NULLS LAST, site_id ASC LIMIT 5
+   Without the tiebreaker, sites with equal values appear in random order on each run.
+
+2. For "top/worst N" by MULTIPLE metrics (e.g. "high revenue AND high utilization"):
+   Compute a combined ranking score so the ordering is unambiguous.
+   Example approach — normalize each metric to a 0-1 scale, sum or average:
+   ```sql
+   ORDER BY (COALESCE(total_revenue,0) / NULLIF(MAX(total_revenue) OVER (), 0)
+           + COALESCE(avg_util,0) / NULLIF(MAX(avg_util) OVER (), 0)) DESC,
+           site_id ASC
+   LIMIT 5
+   ```
+   Do NOT order by just one of the two metrics when the user asked for both.
+
+3. ALWAYS use DESC NULLS LAST for "top" and ASC NULLS LAST for "worst/bottom" to push NULLs to the end.
 
 ═══════════════════════════════════════════════════════════
 CHART TYPE — MUST MATCH THE DATA SHAPE:
@@ -437,25 +531,13 @@ RESPONSE FORMAT:
 NEVER split multiple KPIs into separate charts when user asks for them together. Use the MULTI-KPI PIVOT pattern.
 
 **CROSS-TABLE QUERIES (revenue + KPI data):**
-Revenue data is in revenue_data or flexible_kpi_uploads, NOT in kpi_data/mv_daily_site_kpi.
-To combine revenue with KPI data in one chart, use a CTE or subquery:
-```sql
-WITH rev AS (
-  SELECT r.site_id, SUM(r.num_value) AS total_revenue
-  FROM flexible_kpi_uploads r WHERE r.kpi_type='revenue' AND r.column_name ILIKE '%revenue%' AND r.column_type='numeric'
-  GROUP BY r.site_id
-),
-kpi AS (
-  SELECT mv.site_id, AVG(mv.avg_value) AS avg_kpi
-  FROM mv_daily_site_kpi mv WHERE mv.kpi_name='...'
-    AND mv.date >= (SELECT MAX(date) FROM mv_daily_site_kpi) - INTERVAL '7 days'
-  GROUP BY mv.site_id
-)
-SELECT COALESCE(rev.site_id, kpi.site_id) AS site_id, rev.total_revenue, kpi.avg_kpi
-FROM rev FULL JOIN kpi ON rev.site_id = kpi.site_id
-ORDER BY rev.total_revenue DESC NULLS LAST LIMIT 10
-```
-NEVER query revenue columns from kpi_data — they don't exist there.
+See the CTE example in the schema section above. Key rules:
+- Revenue is in flexible_kpi_uploads (kpi_type='revenue') or revenue_data — NEVER in kpi_data.
+- Use CTE with FULL JOIN or INNER JOIN to combine revenue with KPI data.
+- INNER JOIN is better when you want sites that have BOTH metrics (e.g., "high revenue AND high utilization").
+- FULL JOIN when you want all sites even if one metric is missing.
+- For "top N" across multiple metrics, use a combined score in ORDER BY (see DETERMINISTIC RESULTS rules).
+- Always add WHERE ... IS NOT NULL after the JOIN to filter out sites missing either metric.
 
 Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
 
@@ -547,23 +629,11 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
     azure_endpoint   = _cfg("AZURE_OPENAI_ENDPOINT")
     azure_deployment = _cfg("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini")
     azure_version    = _cfg("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
-    gemini_key       = _cfg("GEMINI_API_KEY")
-    gemini_model     = _cfg("OPENAI_MODEL", "gemini-2.0-flash")
-    openai_key       = _cfg("OPENAI_API_KEY")
+    if not (azure_key and azure_endpoint):
+        _LOG.warning("Azure OpenAI not configured — check AZURE_OPENAI_API_KEY and AZURE_OPENAI_ENDPOINT")
+        print("[AI-DEBUG] WARNING: Azure OpenAI not configured! Check AZURE_OPENAI_API_KEY and AZURE_OPENAI_ENDPOINT env vars or app config.", flush=True)
 
-    _providers = []
-    if azure_key and azure_endpoint:
-        _providers.append(("azure", azure_key, azure_endpoint, azure_deployment, azure_version))
-    if gemini_key:
-        _providers.append(("gemini", gemini_key, gemini_model))
-    if openai_key:
-        _providers.append(("openai", openai_key))
-
-    _LOG.info("AI providers available: %s", [p[0] for p in _providers])
-    print(f"[AI-DEBUG] prompt={prompt[:80]!r}, providers={[p[0] for p in _providers]}, schema_cache_populated={_schema_cache.get('populated')}, kpi_count={len(_schema_cache.get('kpi_names_list', []))}", flush=True)
-
-    if not _providers:
-        print("[AI-DEBUG] WARNING: No LLM providers configured! Check AZURE_OPENAI_API_KEY, GEMINI_API_KEY, OPENAI_API_KEY env vars or app config.", flush=True)
+    print(f"[AI-DEBUG] prompt={prompt[:80]!r}, provider=azure, schema_cache_populated={_schema_cache.get('populated')}, kpi_count={len(_schema_cache.get('kpi_names_list', []))}", flush=True)
 
     # ── PRE-LLM INTERCEPTOR ────────────────────────────────────────────────────
     # Handle certain query patterns with rule-based logic BEFORE calling the LLM.
@@ -611,82 +681,34 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
             provider  = {"provider": "rule-based-multisite"}
             _LOG.info("Multi-site trend intercepted before LLM: %s", _prompt_sites)
 
-    for _prov in _providers:
-        if ai_result:
-            break
-        ptype = _prov[0]
+    # ── Azure OpenAI — sole LLM provider ─────────────────────────────────────
+    if not ai_result and azure_key and azure_endpoint:
         try:
-            if ptype == "azure":
-                from openai import AzureOpenAI as _AzureOpenAI
-                az_client = _AzureOpenAI(
-                    api_key=_prov[1], api_version=_prov[4],
-                    azure_endpoint=_prov[2], timeout=25.0,
-                )
-                az_resp = az_client.chat.completions.create(
-                    model=_prov[3],
-                    messages=llm_messages,
-                    temperature=0.1,
-                    max_tokens=2000,
-                    response_format={"type": "json_object"},
-                )
-                raw_content = az_resp.choices[0].message.content
-                print(f"[AI-DEBUG] Azure raw response ({len(raw_content) if raw_content else 0} chars): {(raw_content or '')[:200]}", flush=True)
-                if raw_content:
-                    ai_result = _parse_ai_result(raw_content)
-                    provider = {"provider": f"azure-{_prov[3]}"}
-                    print(f"[AI-DEBUG] Azure parsed OK. Has sql={bool(ai_result.get('sql'))}, multi_chart={ai_result.get('multi_chart')}", flush=True)
-                    _LOG.info("AI query handled by Azure OpenAI (%s)", _prov[3])
-
-            elif ptype == "gemini":
-                from openai import OpenAI as _OpenAI
-                gem_client = _OpenAI(
-                    api_key=_prov[1],
-                    base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
-                    timeout=25.0,
-                )
-                gem_resp = gem_client.chat.completions.create(
-                    model=_prov[2],
-                    messages=llm_messages,
-                    temperature=0.1,
-                    max_tokens=2000,
-                )
-                raw_content = gem_resp.choices[0].message.content
-                print(f"[AI-DEBUG] Gemini raw response ({len(raw_content) if raw_content else 0} chars): {(raw_content or '')[:200]}", flush=True)
-                if raw_content:
-                    ai_result = _parse_ai_result(raw_content)
-                    provider = {"provider": _prov[2]}
-                    print(f"[AI-DEBUG] Gemini parsed OK. Has sql={bool(ai_result.get('sql'))}, multi_chart={ai_result.get('multi_chart')}", flush=True)
-                    _LOG.info("AI query handled by Gemini (%s)", _prov[2])
-
-            elif ptype == "openai":
-                from openai import OpenAI as _OpenAI2
-                oai_client = _OpenAI2(api_key=_prov[1], timeout=25.0)
-                oai_resp = oai_client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=llm_messages,
-                    temperature=0.1,
-                    max_tokens=2000,
-                )
-                raw_content = oai_resp.choices[0].message.content
-                print(f"[AI-DEBUG] OpenAI raw response ({len(raw_content) if raw_content else 0} chars): {(raw_content or '')[:200]}", flush=True)
-                if raw_content:
-                    ai_result = _parse_ai_result(raw_content)
-                    provider = {"provider": "openai-gpt-4o-mini"}
-                    print(f"[AI-DEBUG] OpenAI parsed OK. Has sql={bool(ai_result.get('sql'))}, multi_chart={ai_result.get('multi_chart')}", flush=True)
-                    _LOG.info("AI query handled by OpenAI direct")
-
+            from openai import AzureOpenAI as _AzureOpenAI
+            az_client = _AzureOpenAI(
+                api_key=azure_key, api_version=azure_version,
+                azure_endpoint=azure_endpoint, timeout=25.0,
+            )
+            az_resp = az_client.chat.completions.create(
+                model=azure_deployment,
+                messages=llm_messages,
+                temperature=0,
+                max_tokens=2000,
+                response_format={"type": "json_object"},
+            )
+            raw_content = az_resp.choices[0].message.content
+            print(f"[AI-DEBUG] Azure raw response ({len(raw_content) if raw_content else 0} chars): {(raw_content or '')[:200]}", flush=True)
+            if raw_content:
+                ai_result = _parse_ai_result(raw_content)
+                provider = {"provider": f"azure-{azure_deployment}"}
+                print(f"[AI-DEBUG] Azure parsed OK. Has sql={bool(ai_result.get('sql'))}, multi_chart={ai_result.get('multi_chart')}", flush=True)
+                _LOG.info("AI query handled by Azure OpenAI (%s)", azure_deployment)
         except json.JSONDecodeError as je:
-            print(f"[AI-DEBUG] {ptype.upper()} returned bad JSON: {str(je)[:150]}", flush=True)
-            _LOG.warning("%s LLM returned bad JSON, using rule-based fallback: %s", ptype.upper(), str(je)[:100])
-            continue
+            print(f"[AI-DEBUG] AZURE returned bad JSON: {str(je)[:150]}", flush=True)
+            _LOG.warning("Azure LLM returned bad JSON, using rule-based fallback: %s", str(je)[:100])
         except Exception as e:
-            err_str = str(e).lower()
-            print(f"[AI-DEBUG] {ptype.upper()} FAILED: {str(e)[:300]}", flush=True)
-            if "429" in str(e) or "quota" in err_str or "rate" in err_str or "resource_exhausted" in err_str:
-                _LOG.warning("%s quota/rate limit hit — skipping to rule-based", ptype.upper())
-                break
-            _LOG.warning("%s LLM failed (will try next): %s", ptype.upper(), str(e)[:200])
-            continue
+            print(f"[AI-DEBUG] AZURE FAILED: {str(e)[:300]}", flush=True)
+            _LOG.warning("Azure LLM failed: %s", str(e)[:200])
 
     # ── Fallback: rule-based query engine ─────────────────────────────────────
     if not ai_result:
@@ -786,6 +808,76 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
         if isinstance(v, float) and math.isnan(v): return None
         try:    return float(v)
         except: return str(v)
+
+    # ── POST-LLM SQL VALIDATION & REPAIR ─────────────────────────────────────
+    def _fix_kpi_names_in_sql(sql):
+        """Find KPI name literals in SQL and fuzzy-match to actual DB KPI names."""
+        import re as _re_kpi
+        if not _db_kpis:
+            return sql
+        # Extract all string literals that look like KPI names (in kpi_name = '...' or kpi_name IN (...))
+        _literals = _re_kpi.findall(r"kpi_name\s*(?:=|ILIKE)\s*'([^']+)'", sql, _re_kpi.IGNORECASE)
+        # Also extract from IN(...) lists
+        _in_matches = _re_kpi.findall(r"kpi_name\s+IN\s*\(([^)]+)\)", sql, _re_kpi.IGNORECASE)
+        for _in_m in _in_matches:
+            _literals.extend(_re_kpi.findall(r"'([^']+)'", _in_m))
+        if not _literals:
+            return sql
+        _db_kpis_lower = {k.lower(): k for k in _db_kpis}
+        for lit in _literals:
+            if lit.lower() in _db_kpis_lower:
+                # Exact match (case-insensitive) — fix casing if needed
+                correct = _db_kpis_lower[lit.lower()]
+                if lit != correct:
+                    sql = sql.replace(f"'{lit}'", f"'{correct}'")
+                continue
+            # Fuzzy match: find best substring match
+            lit_lower = lit.lower()
+            best, best_score = None, 0
+            for db_kpi in _db_kpis:
+                db_lower = db_kpi.lower()
+                # Score: count of matching words
+                lit_words = set(lit_lower.replace('_', ' ').replace('-', ' ').split())
+                db_words  = set(db_lower.replace('_', ' ').replace('-', ' ').split())
+                common = len(lit_words & db_words)
+                # Also check substring containment
+                if lit_lower in db_lower or db_lower in lit_lower:
+                    common += 3
+                if common > best_score:
+                    best_score = common
+                    best = db_kpi
+            if best and best_score >= 2:
+                print(f"[AI-DEBUG] KPI name fix: '{lit}' → '{best}' (score={best_score})", flush=True)
+                sql = sql.replace(f"'{lit}'", f"'{best}'")
+            else:
+                print(f"[AI-DEBUG] KPI name '{lit}' not found in DB (best match: '{best}', score={best_score})", flush=True)
+        return sql
+
+    def _validate_table_refs(sql):
+        """Check that SQL only references known tables."""
+        import re as _re_tbl
+        upper = sql.upper()
+        _KNOWN_TABLES = {
+            'KPI_DATA', 'MV_DAILY_SITE_KPI', 'MV_ZONE_DAILY_KPI',
+            'TELECOM_SITES', 'FLEXIBLE_KPI_UPLOADS', 'REVENUE_DATA',
+            'CORE_COMPONENT_KPI', 'NETWORK_KPI_TIMESERIES', 'TRANSPORT_KPI_DATA',
+        }
+        # Extract FROM/JOIN table references
+        _refs = _re_tbl.findall(r'(?:FROM|JOIN)\s+(\w+)', upper)
+        for ref in _refs:
+            if ref not in _KNOWN_TABLES and ref not in ('SUB', 'REV', 'KPI', 'PER_SKD', 'T', 'K', 'MV', 'TS', 'R', 'S'):
+                print(f"[AI-DEBUG] WARNING: Unknown table '{ref}' in SQL", flush=True)
+        return True  # warn only, don't block
+
+    # Apply KPI name fixing to all SQL in the result
+    if ai_result:
+        if ai_result.get("sql"):
+            ai_result["sql"] = _fix_kpi_names_in_sql(ai_result["sql"])
+            _validate_table_refs(ai_result["sql"])
+        if ai_result.get("charts"):
+            for _ch in ai_result["charts"]:
+                if _ch.get("sql"):
+                    _ch["sql"] = _fix_kpi_names_in_sql(_ch["sql"])
 
     # ── MULTI-CHART: execute each chart's SQL separately ───────────────────────
     if ai_result.get("multi_chart") and ai_result.get("charts"):
@@ -1048,6 +1140,9 @@ def _is_followup(prompt_lower: str) -> bool:
         'bar chart', 'line chart', 'pie chart', 'area chart',
         'line graph', 'bar graph',
         'make it', 'turn it',
+        'only 1', 'only 2', 'only 3', 'only 4', 'only 5', 'only 6', 'only 7', 'only 8', 'only 9',
+        'asked for', 'i need', 'want more', 'show more', 'more results',
+        'not enough', 'missing', 'where are the', 'rest of',
     ]
     if any(kw in p for kw in mod_keywords):
         return True
@@ -1317,6 +1412,72 @@ def _handle_followup(prompt_orig: str, p: str, prev: dict, time_filter: str) -> 
             "title": prev_title, "x_axis": prev_x, "y_axes": prev_y,
             "chart_config": cfg, "response": resp_msg,
         }
+
+    # Count correction — "I asked for 5 not 4" / "only 4, show 5" / "show more results"
+    # Adjusts LIMIT in previous SQL while keeping the query logic identical.
+    _count_words = ['only', 'asked for', 'i need', 'want more', 'show more', 'more results',
+                    'not enough', 'missing', 'where are the', 'rest of', 'should be']
+    if any(w in p for w in _count_words):
+        desired = None
+        # Try to extract the desired count from the prompt
+        _num_m = re.search(r'(?:asked for|need|want|show|top|get)\s+(\d+)', p)
+        if not _num_m:
+            _num_m = re.search(r'(\d+)\s+(?:sites?|results?|rows?|records?|items?)', p)
+        if not _num_m:
+            # "only 4" → user probably wants more; try to find any number
+            _num_m = re.search(r'(?:only|just)\s+(\d+)', p)
+            if _num_m:
+                # "only 4" means they got 4, probably want the original requested count
+                # Check if there's another number that's what they actually want
+                _want_m = re.search(r'(?:asked for|need|want|should be|not)\s+(\d+)', p)
+                if _want_m:
+                    desired = int(_want_m.group(1))
+                else:
+                    # Bump by a few to give them more
+                    desired = int(_num_m.group(1)) + 3
+            else:
+                desired = None
+        else:
+            desired = int(_num_m.group(1))
+
+        if desired and desired > 0 and (prev_sql or prev_charts):
+            _target_sql = prev_sql
+            _target_charts = prev_charts
+
+            if _target_sql:
+                # Update or add LIMIT in the previous SQL
+                if re.search(r'LIMIT\s+\d+', _target_sql, re.IGNORECASE):
+                    new_sql = re.sub(r'LIMIT\s+\d+', f'LIMIT {desired}', _target_sql, flags=re.IGNORECASE)
+                else:
+                    new_sql = _target_sql.rstrip().rstrip(';') + f'\nLIMIT {desired}'
+                return {
+                    "sql": new_sql,
+                    "query_type": prev_chart, "chart_type": prev_chart,
+                    "title": re.sub(r'(?:top|bottom)\s+\d+', f'Top {desired}', prev_title, flags=re.IGNORECASE) if re.search(r'(?:top|bottom)\s+\d+', prev_title, re.IGNORECASE) else prev_title,
+                    "x_axis": prev_x, "y_axes": prev_y,
+                    "chart_config": prev_cfg,
+                    "response": f"Updated to show {desired} results.",
+                }
+            elif _target_charts:
+                # Multi-chart: update LIMIT in each sub-chart SQL
+                updated_charts = []
+                for ch in _target_charts:
+                    ch_sql = ch.get("sql", "")
+                    if re.search(r'LIMIT\s+\d+', ch_sql, re.IGNORECASE):
+                        ch_sql = re.sub(r'LIMIT\s+\d+', f'LIMIT {desired}', ch_sql, flags=re.IGNORECASE)
+                    else:
+                        ch_sql = ch_sql.rstrip().rstrip(';') + f'\nLIMIT {desired}'
+                    updated_ch = dict(ch)
+                    updated_ch["sql"] = ch_sql
+                    updated_ch["title"] = re.sub(r'(?:top|bottom)\s+\d+', f'Top {desired}', ch.get("title", ""), flags=re.IGNORECASE) if re.search(r'(?:top|bottom)\s+\d+', ch.get("title", ""), re.IGNORECASE) else ch.get("title", "")
+                    updated_charts.append(updated_ch)
+                return {
+                    "multi_chart": True, "charts": updated_charts,
+                    "sql": updated_charts[0].get("sql", ""),
+                    "query_type": "multi_chart", "chart_type": "multi_chart",
+                    "title": prev_title, "x_axis": "date", "y_axes": ["value"],
+                    "response": f"Updated to show {desired} results per chart.",
+                }
 
     # Combine / merge multi-chart into single chart
     _combine_words = ['combine', 'merge', 'single chart', 'one chart', 'same chart', 'together', 'into one', 'in one']
