@@ -858,7 +858,7 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
 
     # ── SINGLE CHART: execute SQL normally ─────────────────────────────────────
     sql = ai_result.get("sql", "")
-    if not sql or not sql.strip().upper().startswith("SELECT"):
+    if not sql or not sql.strip().upper().startswith(("SELECT", "WITH")):
         # LLM returned a result without valid SQL — fall back to rule-based
         print(f"[AI-DEBUG] ai_result has NO valid SQL. keys={list(ai_result.keys())}, sql repr={(sql or '(empty)')[:100]!r}. Falling back to rule-based.", flush=True)
         _LOG.warning("AI result has no valid SQL (keys: %s), falling back to rule-based", list(ai_result.keys()))
@@ -878,7 +878,7 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
         sql = ai_result.get("sql", "")
         print(f"[AI-DEBUG] Rule-based fallback result: has sql={bool(sql)}, sql[:100]={(sql or '(empty)')[:100]!r}", flush=True)
         # If even rule-based can't produce SQL, return a helpful text response
-        if not sql or not sql.strip().upper().startswith("SELECT"):
+        if not sql or not sql.strip().upper().startswith(("SELECT", "WITH")):
             print(f"[AI-DEBUG] Even rule-based produced no SQL. Returning text-only response.", flush=True)
             return jsonify({
                 "response": ai_result.get("response", "I couldn't generate a query for that. Try asking about a specific KPI like throughput, drop rate, or availability."),
@@ -906,7 +906,7 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
         try:
             fallback = _rule_based_query(prompt, time_filter)
             sql2 = fallback.get("sql", "")
-            if sql2 and sql2.strip().upper().startswith("SELECT"):
+            if sql2 and sql2.strip().upper().startswith(("SELECT", "WITH")):
                 rows = _sql_with_timeout(sql2, timeout_sec=10)
                 ai_result.update(fallback)
                 sql = sql2
