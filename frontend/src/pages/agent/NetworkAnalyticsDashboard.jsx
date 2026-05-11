@@ -617,6 +617,15 @@ function OverviewPage({T,data,mapSites,filters}) {
   const TipC=(p)=><Tip T={T} {...p}/>;
   const hs=Math.round(d.network_health_score||0);
 
+  // ── DIAGNOSTIC BANNER ──────────────────────────────────────────────────
+  // Shows the raw response counts so we can see WHAT the backend returned
+  // when the dashboard appears empty. Only renders when key fields are
+  // missing/zero — i.e. when something is actually wrong.
+  const _diagShow = !data || (!d.total_sites && (d.avg_prb == null) &&
+                              (!d.zone_performance || d.zone_performance.length === 0));
+  const _diagSummary = !data
+    ? 'overview-stats response is NULL — fetch failed or aborted'
+    : `total_sites=${JSON.stringify(d.total_sites)} | total_cells=${JSON.stringify(d.total_cells)} | avg_prb=${JSON.stringify(d.avg_prb)} | avg_dl_tput=${JSON.stringify(d.avg_dl_tput)} | zone_performance.length=${(d.zone_performance||[]).length} | worst_sites.length=${(d.worst_sites||[]).length} | response_keys=[${Object.keys(d).slice(0,20).join(', ')}]`;
 
   // Pre-scan worst cells (updated every 30 min by backend) — unfiltered, always shows all
   const [preScanCells,setPreScanCells]=useState([]);
@@ -660,6 +669,17 @@ function OverviewPage({T,data,mapSites,filters}) {
 
   return (
     <div style={{animation:'fadeIn .3s ease'}}>
+      {_diagShow && (
+        <div style={{background:'#fef3c7',border:'2px solid #d97706',borderRadius:8,padding:'10px 14px',marginBottom:12,fontFamily:"'IBM Plex Mono',monospace",fontSize:11,color:'#7c2d12',lineHeight:1.6,whiteSpace:'pre-wrap',wordBreak:'break-all'}}>
+          <b style={{fontSize:12,letterSpacing:.5}}>OVERVIEW DIAGNOSTIC — backend response received but data is empty</b><br/>
+          {_diagSummary}<br/>
+          <span style={{fontSize:10,color:'#92400e'}}>
+            If <b>total_sites=0</b>: kpi_data has no rows in the 30-day window.
+            Restart the backend (so the new query loads), then re-run <code>python seed_data.py</code> to populate.
+            If values are non-zero here but cards show "—", the frontend isn't reading them — clear browser cache and Ctrl+Shift+R.
+          </span>
+        </div>
+      )}
       {/* KPI row */}
       <div style={{marginBottom:13}}>
         <SL T={T}>Network Health Overview</SL>
@@ -719,32 +739,38 @@ function OverviewPage({T,data,mapSites,filters}) {
 
       {/* Charts row */}
       <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:10,marginBottom:10}}>
-        <CC T={T} title=" Zone PRB Performance">
-          {zone.length>0?(
-            // FIXED size, NEVER blows out the dashboard grid.
-            // Shows the 5 zones with highest PRB % (the worst offenders);
-            // for full list scroll the Site-Wise page.
-            <div style={{width:'100%',maxWidth:'100%',height:190,overflow:'hidden'}}>
-              <ResponsiveContainer width="100%" height="100%">
-                <BarChart
-                  data={(zone.slice().sort((a,b)=>(b.avg_prb||0)-(a.avg_prb||0))).slice(0,5)}
-                  margin={{top:4,right:6,left:0,bottom:44}}
-                >
-                  <CartesianGrid strokeDasharray="3 3" stroke={T.border} vertical={false}/>
-                  <XAxis dataKey="zone" tick={{fontSize:9,fill:T.muted}} axisLine={false} tickLine={false}
-                         interval={0} angle={-30} textAnchor="end" height={48}
-                         tickFormatter={(v)=>{const s=(v||'').toString();return s.length>10?s.slice(0,9)+'…':s;}}/>
-                  <YAxis tick={{fontSize:9,fill:T.muted}} axisLine={false} tickLine={false} width={26}/>
-                  <Tooltip content={<TipC/>}/>
-                  <Bar dataKey="avg_prb" name="Avg PRB %" radius={[3,3,0,0]}>
-                    {zone.slice().sort((a,b)=>(b.avg_prb||0)-(a.avg_prb||0)).slice(0,5).map((d,i)=>
-                      <Cell key={i} fill={d.avg_prb>75?T.red:d.avg_prb>55?T.amber:T.green}/>
-                    )}
-                  </Bar>
-                </BarChart>
-              </ResponsiveContainer>
-            </div>
-          ):<Empty T={T}/>}
+        <CC T={T} title="⌖ Top 5 Zones — PRB Utilization">
+          {zone.length>0?(()=>{
+            const top5=(zone.slice().sort((a,b)=>(b.avg_prb||0)-(a.avg_prb||0))).slice(0,5);
+            const maxPrb=Math.max(...top5.map(z=>z.avg_prb||0),1);
+            return(
+              <div style={{width:'100%',height:190,display:'flex',flexDirection:'column',justifyContent:'space-between',padding:'8px 4px 2px'}}>
+                {top5.map((z,i)=>{
+                  const pct=Number(z.avg_prb||0);
+                  const barW=Math.round((pct/Math.max(maxPrb,1))*100);
+                  const col=pct>75?'#DC2626':pct>55?'#D97706':'#16a34a';
+                  const rankColors=['#0A2463','#1565C0','#2B4DCC','#5C6BC0','#7986CB'];
+                  return(
+                    <div key={i} style={{display:'flex',alignItems:'center',gap:6,padding:'2px 0'}}>
+                      <span style={{width:17,height:17,borderRadius:'50%',background:rankColors[i]||'#2B4DCC',display:'flex',alignItems:'center',justifyContent:'center',fontSize:9,fontWeight:800,color:'#fff',flexShrink:0}}>{i+1}</span>
+                      <span style={{fontSize:9.5,color:T.text,width:68,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',fontWeight:600,flexShrink:0}} title={z.zone||'Unknown'}>{(z.zone||'Unknown').length>11?(z.zone||'Unknown').slice(0,10)+'…':z.zone||'Unknown'}</span>
+                      <div style={{flex:1,height:13,background:T.border,borderRadius:6,overflow:'hidden',position:'relative'}}>
+                        <div style={{position:'absolute',left:0,top:0,height:'100%',width:`${barW}%`,background:`linear-gradient(90deg,${col}bb,${col})`,borderRadius:6,boxShadow:`0 0 5px ${col}44`}}/>
+                      </div>
+                      <span style={{fontSize:10.5,fontWeight:800,color:col,minWidth:40,textAlign:'right',fontFamily:"'IBM Plex Mono',monospace"}}>{pct.toFixed(1)}%</span>
+                    </div>
+                  );
+                })}
+                <div style={{display:'flex',justifyContent:'flex-end',gap:10,marginTop:3,paddingTop:3,borderTop:`1px solid ${T.border}`}}>
+                  {[['#16a34a','≤55%'],['#D97706','55–75%'],['#DC2626','>75%']].map(([c,l])=>(
+                    <span key={l} style={{display:'flex',alignItems:'center',gap:3,fontSize:8.5,color:T.muted}}>
+                      <span style={{width:7,height:7,borderRadius:'50%',background:c}}/>{l}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            );
+          })():<Empty T={T}/>}
         </CC>
         <CC T={T} title=" DL Throughput Trend">
           {trend.length>0?(
@@ -840,24 +866,28 @@ function OverviewPage({T,data,mapSites,filters}) {
             </ResponsiveContainer>
           ):<Empty T={T}/>}
         </CC>
-        <CC T={T} title=" Low Margin Sites">
+        <CC T={T} title="⚠️ Top 10 Low Margin Sites" action={<span style={{fontSize:9,color:T.muted,fontStyle:'italic'}}>Sorted by Revenue − OPEX ↑</span>}>
           {lowMargin.length>0?(
-            <div style={{maxHeight:Math.max(170, best.length*22+40),overflowY:'auto'}}>
+            <div style={{maxHeight:Math.max(200, best.length*22+40),overflowY:'auto'}}>
               <table style={{width:'100%',borderCollapse:'collapse',fontSize:10.5}}>
                 <thead>
-                  <tr>{['Site','Revenue ($)','OPEX ($)','Rev − OPEX ($)'].map(h=><th key={h} style={{padding:'4px 6px',textAlign:'left',borderBottom:`2px solid ${T.border}`,color:T.muted,fontWeight:700,fontSize:9,textTransform:'uppercase'}}>{h}</th>)}</tr>
+                  <tr>{['#','Site ID','Total Revenue ($)','Total OPEX ($)','Rev − OPEX ($)'].map(h=><th key={h} style={{padding:'4px 6px',textAlign:'left',borderBottom:`2px solid ${T.border}`,color:T.muted,fontWeight:700,fontSize:8.5,textTransform:'uppercase',whiteSpace:'nowrap'}}>{h}</th>)}</tr>
                 </thead>
                 <tbody>
                   {lowMargin.map((s,i)=>{
                     const rev  = parseFloat(s.revenue ?? s.q1_rev ?? 0);
                     const opex = parseFloat(s.opex    ?? s.q1_opex ?? 0);
                     const diff = (s.revenue_minus_opex != null) ? parseFloat(s.revenue_minus_opex) : (rev - opex);
+                    const isNeg = diff < 0;
                     return (
                       <tr key={i} style={{borderBottom:`1px solid ${T.border}`,background:i%2===0?T.surface2:'transparent'}}>
+                        <td style={{padding:'4px 6px',fontSize:9,color:T.muted,fontWeight:700,textAlign:'center',width:22}}>{i+1}</td>
                         <td style={{padding:'4px 6px',fontWeight:700,color:T.kpmgBlue,fontSize:9.5,fontFamily:"'IBM Plex Mono',monospace"}}>{s.site_id}</td>
-                        <td style={{padding:'4px 6px',fontFamily:"'IBM Plex Mono',monospace",fontSize:9.5}}>{f(rev)}</td>
-                        <td style={{padding:'4px 6px',fontFamily:"'IBM Plex Mono',monospace",fontSize:9.5}}>{f(opex)}</td>
-                        <td style={{padding:'4px 6px',fontFamily:"'IBM Plex Mono',monospace",fontSize:9.5,color:diff<0?T.red:T.green,fontWeight:700}}>{diff<0?`(${f(Math.abs(diff))})`:`${f(diff)}`}</td>
+                        <td style={{padding:'4px 6px',fontFamily:"'IBM Plex Mono',monospace",fontSize:9.5,color:T.green}}>${f(rev)}</td>
+                        <td style={{padding:'4px 6px',fontFamily:"'IBM Plex Mono',monospace",fontSize:9.5,color:T.amber}}>${f(opex)}</td>
+                        <td style={{padding:'4px 6px',fontFamily:"'IBM Plex Mono',monospace",fontSize:9.5,color:isNeg?T.red:T.green,fontWeight:800,background:isNeg?`${T.red}10`:'transparent',borderRadius:4}}>
+                          {isNeg?<span>(<span style={{color:T.red}}>-${f(Math.abs(diff))}</span>)</span>:<span>+${f(diff)}</span>}
+                        </td>
                       </tr>
                     );
                   })}
@@ -881,11 +911,34 @@ function RANPage({T,data,mapSites,filters,opts}) {
   const TipC=(p)=><Tip T={T} {...p}/>;
 
   const callDrop=d.call_drop_trend||[];
-  const prbDist=d.prb_distribution||[];
+  const prbTputTrend=d.prb_tput_trend||[];
   const hourlyDL=d.hourly_dl_traffic||[];
   const zonePerf=d.zone_performance||[];
   const topIssues=d.top_issues||[];
   const sites=d.sites||mapSites||[];
+
+  // Normalize zone radar values to 0-100 so all six KPIs share one axis.
+  // Throughput, RRC users and DL volume need scaling; rates/util are already %.
+  const zoneRadar=(zonePerf||[]).map(z=>{
+    const drop=fn(z.drop_rate);
+    const cssr=fn(z.cssr);
+    const usrTput=fn(z.dl_usr_tput);
+    const rrc=fn(z.avg_rrc_ue);
+    const prb=fn(z.dl_prb_util);
+    const vol=fn(z.dl_data_vol);
+    return {
+      zone:z.zone,
+      // Lower drop rate is better → invert. Cap at 5%.
+      'Call Drop':Math.max(0,100-(drop/5)*100),
+      'CSSR':Math.min(100,cssr),
+      'DL Usr Tput':Math.min(100,(usrTput/30)*100),       // 30 Mbps as full-scale
+      'RRC Users':Math.min(100,(rrc/200)*100),            // 200 RRC as full-scale
+      // Lower PRB is better → invert.
+      'PRB Util':Math.max(0,100-prb),
+      'DL Volume':Math.min(100,(vol/500)*100),            // 500 GB as full-scale
+      _raw:{drop,cssr,usrTput,rrc,prb,vol},
+    };
+  });
 
   const fetchSite=useCallback(async(sid)=>{
     setSelectedSite(sid);setSiteData(null);setSiteLoading(true);
@@ -900,14 +953,22 @@ function RANPage({T,data,mapSites,filters,opts}) {
   // Re-fetch selected site when filters change
   useEffect(()=>{if(selectedSite)fetchSite(selectedSite);},[filters]);// eslint-disable-line
 
-  // 6 key RAN KPI cards
+  // 6 key RAN KPI cards — each linked to a single source KPI:
+  //  Call Drop      → E-RAB Call Drop Rate_1
+  //  Call Failure   → 100 − LTE Call Setup Success Rate
+  //  DL Throughput  → LTE DL - Usr Ave Throughput
+  //  RRC Users      → Ave RRC Connected Ue
+  //  DL PRB Util    → DL PRB Utilization (1BH)
+  //  DL Traffic Vol → DL Data Total Volume
+  const cssr=fn(d.lte_call_setup_sr);
+  const callFail=cssr>0?Math.max(0,100-cssr):null;
   const summary6=[
-    {label:'Call Drop Rate',   value:f(d.erab_drop_rate,2),unit:'%',  icon:'', color:fn(d.erab_drop_rate)>2?T.red:T.green,   badge:fn(d.erab_drop_rate)>2?{color:T.red,text:'High'}:null},
-    {label:'Call Failure Rate',value:f(100-fn(d.lte_call_setup_sr),2),unit:'%',icon:'',color:T.red},
-    {label:'DL Throughput',    value:f(d.dl_cell_tput),    unit:'Mbps',icon:'', color:T.teal},
-    {label:'RRC Attached UEs', value:f(d.avg_rrc_ue,0),    icon:'',  color:T.purple},
-    {label:'DL PRB Util',      value:f(d.dl_prb_util ?? d.avg_dl_prb ?? d.avg_prb),     unit:'%',   icon:'', color:fn(d.dl_prb_util ?? d.avg_dl_prb ?? d.avg_prb)>80?T.red:T.amber},
-    {label:'DL Traffic Volume',value:f(d.dl_data_vol),     unit:'GB',  icon:'', color:T.blue3},
+    {label:'Call Drop Rate',   value:f(d.erab_drop_rate,2),unit:'%',  color:fn(d.erab_drop_rate)>2?T.red:T.green, badge:fn(d.erab_drop_rate)>2?{color:T.red,text:'High'}:null},
+    {label:'Call Failure Rate',value:callFail==null?'—':f(callFail,2),unit:'%',color:T.red},
+    {label:'DL Throughput',    value:f(d.dl_usr_tput),     unit:'Mbps',color:T.teal},
+    {label:'RRC Attached UEs', value:f(d.avg_rrc_ue,0),    color:T.purple},
+    {label:'DL PRB Util',      value:f(d.dl_prb_util ?? d.avg_dl_prb ?? d.avg_prb),unit:'%',color:fn(d.dl_prb_util ?? d.avg_dl_prb ?? d.avg_prb)>80?T.red:T.amber},
+    {label:'DL Traffic Volume',value:f(d.dl_data_vol),     unit:'GB',  color:T.blue3},
   ];
 
   return (
@@ -935,95 +996,92 @@ function RANPage({T,data,mapSites,filters,opts}) {
       {viewMode==='network'?(
         <>
           <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:10,marginBottom:10}}>
-            {/* Call Drop Trend */}
+            {/* Call Drop Trend — bar (E-RAB Drop) + line (CSSR) */}
             <CC T={T} title=" Call Drop Rate Trend">
               {callDrop.length>0?(
                 <ResponsiveContainer width="100%" height={185}>
-                  <AreaChart data={callDrop}>
-                    <defs><linearGradient id="cdg" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#E91E8C" stopOpacity={.4}/><stop offset="100%" stopColor="#E91E8C" stopOpacity={.02}/></linearGradient></defs>
+                  <ComposedChart data={callDrop}>
                     <CartesianGrid strokeDasharray="3 3" stroke={T.border} vertical={false}/>
                     <XAxis dataKey="date" tick={{fontSize:9,fill:T.muted}} axisLine={false} tickLine={false} tickFormatter={v=>v?.slice(0,10)}/>
-                    <YAxis tick={{fontSize:9,fill:T.muted}} axisLine={false} tickLine={false} width={35}/>
+                    <YAxis yAxisId="l" tick={{fontSize:9,fill:T.muted}} axisLine={false} tickLine={false} width={32}/>
+                    <YAxis yAxisId="r" orientation="right" tick={{fontSize:9,fill:T.muted}} axisLine={false} tickLine={false} width={32} domain={[80,100]}/>
                     <Tooltip content={<TipC/>}/>
-                    <ReferenceLine y={2} stroke="#0A2463" strokeDasharray="4 2" label={{value:'SLA 2%',fill:'#0A2463',fontSize:9}}/>
-                    <Area type="monotone" dataKey="drop_rate" stroke="#E91E8C" fill="url(#cdg)" strokeWidth={2} dot={false} name="Drop Rate %"/>
-                  </AreaChart>
-                </ResponsiveContainer>
-              ):<Empty T={T}/>}
-            </CC>
-            {/* PRB Distribution */}
-            <CC T={T} title=" PRB Utilization Distribution">
-              {prbDist.length>0?(
-                <ResponsiveContainer width="100%" height={185}>
-                  <BarChart data={prbDist}>
-                    <CartesianGrid strokeDasharray="3 3" stroke={T.border} vertical={false}/>
-                    <XAxis dataKey="range" tick={{fontSize:8.5,fill:T.muted}} axisLine={false} tickLine={false}/>
-                    <YAxis tick={{fontSize:9,fill:T.muted}} axisLine={false} tickLine={false} width={30}/>
-                    <Tooltip content={<TipC/>}/>
-                    <Bar dataKey="count" name="Sites" radius={[4,4,0,0]}>
-                      {prbDist.map((_,i)=><Cell key={i} fill={i<2?'#00BCD4':i<4?'#2B4DCC':'#E91E8C'}/>)}
-                    </Bar>
-                  </BarChart>
-                </ResponsiveContainer>
-              ):<Empty T={T}/>}
-            </CC>
-            {/* Hourly DL Traffic */}
-            <CC T={T} title=" Hourly DL Traffic Volume">
-              {hourlyDL.length>0?(
-                <ResponsiveContainer width="100%" height={185}>
-                  <ComposedChart data={hourlyDL}>
-                    <defs><linearGradient id="dlg" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#2B4DCC" stopOpacity={.4}/><stop offset="100%" stopColor="#2B4DCC" stopOpacity={.02}/></linearGradient></defs>
-                    <CartesianGrid strokeDasharray="3 3" stroke={T.border} vertical={false}/>
-                    <XAxis dataKey="hour" tick={{fontSize:9,fill:T.muted}} axisLine={false} tickLine={false} tickFormatter={v=>v?.slice(11,16)||v?.slice(0,10)}/>
-                    <YAxis tick={{fontSize:9,fill:T.muted}} axisLine={false} tickLine={false} width={35}/>
-                    <Tooltip content={<TipC/>}/>
-                    <Area type="monotone" dataKey="dl_volume" stroke="#2B4DCC" fill="url(#dlg)" strokeWidth={2} dot={false} name="DL Vol (GB)"/>
-                    <Line type="monotone" dataKey="ul_volume" stroke="#7B1FA2" strokeWidth={1.5} dot={false} name="UL Vol (GB)" strokeDasharray="4 2"/>
+                    <ReferenceLine yAxisId="l" y={2} stroke="#0A2463" strokeDasharray="4 2" label={{value:'SLA 2%',fill:'#0A2463',fontSize:9}}/>
+                    <Bar yAxisId="l" dataKey="drop_rate" name="E-RAB Drop %" fill="#E91E8C" opacity={.85} barSize={9} radius={[3,3,0,0]}/>
+                    <Line yAxisId="r" type="monotone" dataKey="cssr" name="Call Setup SR %" stroke="#0A2463" strokeWidth={2} dot={false}/>
                     <Legend iconType="circle" iconSize={7} wrapperStyle={{fontSize:10}}/>
                   </ComposedChart>
                 </ResponsiveContainer>
               ):<Empty T={T}/>}
             </CC>
+            {/* PRB Util & DL Usr Throughput trend */}
+            <CC T={T} title=" PRB Utilization & DL Usr Throughput">
+              {prbTputTrend.length>0?(
+                <ResponsiveContainer width="100%" height={185}>
+                  <ComposedChart data={prbTputTrend}>
+                    <CartesianGrid strokeDasharray="3 3" stroke={T.border} vertical={false}/>
+                    <XAxis dataKey="date" tick={{fontSize:9,fill:T.muted}} axisLine={false} tickLine={false} tickFormatter={v=>v?.slice(0,10)}/>
+                    <YAxis yAxisId="l" tick={{fontSize:9,fill:T.muted}} axisLine={false} tickLine={false} width={32}/>
+                    <YAxis yAxisId="r" orientation="right" tick={{fontSize:9,fill:T.muted}} axisLine={false} tickLine={false} width={32}/>
+                    <Tooltip content={<TipC/>}/>
+                    <Line yAxisId="l" type="monotone" dataKey="dl_prb_util" name="DL PRB Util %" stroke="#2B4DCC" strokeWidth={2} dot={false}/>
+                    <Line yAxisId="r" type="monotone" dataKey="dl_usr_tput" name="DL Usr Tput (Mbps)" stroke="#00BCD4" strokeWidth={2} dot={false} strokeDasharray="4 2"/>
+                    <Legend iconType="circle" iconSize={7} wrapperStyle={{fontSize:10}}/>
+                  </ComposedChart>
+                </ResponsiveContainer>
+              ):<Empty T={T}/>}
+            </CC>
+            {/* Hourly DL Traffic — bar chart of DL Data Total Volume */}
+            <CC T={T} title=" Hourly DL Traffic Volume">
+              {hourlyDL.length>0?(
+                <ResponsiveContainer width="100%" height={185}>
+                  <BarChart data={hourlyDL}>
+                    <CartesianGrid strokeDasharray="3 3" stroke={T.border} vertical={false}/>
+                    <XAxis dataKey="hour" tick={{fontSize:9,fill:T.muted}} axisLine={false} tickLine={false} tickFormatter={v=>v?.slice(11,16)||v?.slice(0,10)}/>
+                    <YAxis tick={{fontSize:9,fill:T.muted}} axisLine={false} tickLine={false} width={35}/>
+                    <Tooltip content={<TipC/>}/>
+                    <Bar dataKey="dl_volume" name="DL Vol (GB)" radius={[3,3,0,0]}>
+                      {hourlyDL.map((_,i)=><Cell key={i} fill={PAL[i%10]}/>)}
+                    </Bar>
+                    <Legend iconType="circle" iconSize={7} wrapperStyle={{fontSize:10}}/>
+                  </BarChart>
+                </ResponsiveContainer>
+              ):<Empty T={T}/>}
+            </CC>
           </div>
-          <div style={{display:'grid',gridTemplateColumns:'1fr 1.4fr 1fr',gap:10}}>
-            {/* Zone Radar */}
+          <div style={{display:'grid',gridTemplateColumns:'1.1fr 1.4fr 1fr',gap:10}}>
+            {/* Zone Performance Radar — 6 KPI axes per zone */}
             <CC T={T} title=" Zone Performance Radar">
               {(() => {
-                // Limit to the 8 worst zones (highest PRB). More than 8 overlap
-                // no matter how big the container — switch to a horizontal bar
-                // list for wider datasets.
-                const sorted = (zonePerf || []).slice().sort((a,b) => (b.avg_prb||0)-(a.avg_prb||0));
-                const top = sorted.slice(0, 8);
-                if (top.length === 0) return <Empty T={T}/>;
-                if (sorted.length <= 8) {
-                  return (
-                    <ResponsiveContainer width="100%" height={280}>
-                      <RadarChart data={top} cx="50%" cy="52%" outerRadius="55%" margin={{top:26,right:44,left:44,bottom:26}}>
-                        <PolarGrid stroke={T.border}/>
-                        <PolarAngleAxis dataKey="zone" tick={{fontSize:8.5,fill:T.muted}}
-                          tickFormatter={(v)=>{const s=(v||'').toString();return s.length>10?s.slice(0,9)+'…':s;}}/>
-                        <Radar name="PRB %" dataKey="avg_prb" stroke="#2B4DCC" fill="#2B4DCC" fillOpacity={.25}/>
-                        <Radar name="Throughput" dataKey="avg_tput" stroke="#00BCD4" fill="#00BCD4" fillOpacity={.2}/>
-                        <Legend iconType="circle" iconSize={7} wrapperStyle={{fontSize:10}}/>
-                        <Tooltip content={<TipC/>}/>
-                      </RadarChart>
-                    </ResponsiveContainer>
-                  );
-                }
-                // Too many zones — fall back to a compact scrollable list so
-                // labels never overlap or get clipped.
+                const top=zoneRadar.slice(0,6);
+                if(top.length===0) return <Empty T={T}/>;
+                const axes=[
+                  {key:'Call Drop',  color:'#E91E8C'},
+                  {key:'CSSR',       color:'#0A2463'},
+                  {key:'DL Usr Tput',color:'#00BCD4'},
+                  {key:'RRC Users',  color:'#7B1FA2'},
+                  {key:'PRB Util',   color:'#2B4DCC'},
+                  {key:'DL Volume',  color:'#F59E0B'},
+                ];
+                // Re-shape: one axis per KPI, one line per zone (up to 6).
+                const data=axes.map(a=>{
+                  const row={kpi:a.key};
+                  top.forEach(z=>{ row[z.zone]=z[a.key]; });
+                  return row;
+                });
                 return (
-                  <div style={{height:280,overflowY:'auto',paddingRight:4}}>
-                    {sorted.map((z,i)=>(
-                      <div key={i} style={{display:'flex',alignItems:'center',gap:8,padding:'5px 4px',borderBottom:`1px solid ${T.border}`}}>
-                        <span style={{flex:1,fontSize:11,color:T.text,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{z.zone}</span>
-                        <span style={{width:56,height:6,background:T.border,borderRadius:3,overflow:'hidden'}}>
-                          <span style={{display:'block',height:'100%',width:`${Math.min(100,z.avg_prb||0)}%`,background:z.avg_prb>75?T.red:z.avg_prb>55?T.amber:T.green}}/>
-                        </span>
-                        <span style={{fontSize:10,color:T.muted,minWidth:38,textAlign:'right',fontFamily:"'IBM Plex Mono',monospace"}}>{Number(z.avg_prb||0).toFixed(1)}%</span>
-                      </div>
-                    ))}
-                  </div>
+                  <ResponsiveContainer width="100%" height={280}>
+                    <RadarChart data={data} cx="50%" cy="52%" outerRadius="62%" margin={{top:18,right:30,left:30,bottom:18}}>
+                      <PolarGrid stroke={T.border}/>
+                      <PolarAngleAxis dataKey="kpi" tick={{fontSize:9,fill:T.muted}}/>
+                      {top.map((z,i)=>(
+                        <Radar key={z.zone} name={z.zone} dataKey={z.zone}
+                          stroke={PAL[i%10]} fill={PAL[i%10]} fillOpacity={.18}/>
+                      ))}
+                      <Legend iconType="circle" iconSize={7} wrapperStyle={{fontSize:9.5}}/>
+                      <Tooltip content={<TipC/>}/>
+                    </RadarChart>
+                  </ResponsiveContainer>
                 );
               })()}
             </CC>
@@ -1038,19 +1096,33 @@ function RANPage({T,data,mapSites,filters,opts}) {
               </div>
               <LeafletMap sites={sites} T={T} height={200}/>
             </CC>
-            {/* Top issues */}
+            {/* Top Issue Sites — sorted by # of breached headline KPIs */}
             <CC T={T} title=" Top Issue Sites">
-              <div style={{maxHeight:210,overflowY:'auto'}}>
-                {topIssues.length===0?<Empty T={T}/>:topIssues.slice(0,10).map((s,i)=>(
-                  <div key={i} style={{display:'flex',alignItems:'center',gap:7,padding:'5px 0',borderBottom:`1px solid ${T.border}`}}>
-                    <span style={{width:18,height:18,borderRadius:'50%',background:i<3?T.red:i<6?T.amber:T.green,display:'flex',alignItems:'center',justifyContent:'center',fontSize:9,fontWeight:800,color:'#fff',flexShrink:0}}>{i+1}</span>
-                    <div style={{flex:1,minWidth:0}}>
-                      <div style={{fontSize:10,fontWeight:700,color:T.text,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{s.site_id}</div>
-                      <div style={{fontSize:9,color:T.muted}}>PRB {f(s.avg_prb)}% · Drop {f(s.drop_rate,2)}%</div>
+              <div style={{maxHeight:240,overflowY:'auto'}}>
+                {topIssues.length===0?<Empty T={T}/>:topIssues.slice(0,10).map((s,i)=>{
+                  const sev=s.issues>=3?T.red:s.issues===2?T.amber:T.green;
+                  const tag=s.issues>=3?'Crit':s.issues===2?'Warn':'Watch';
+                  return (
+                    <div key={i} style={{padding:'6px 0',borderBottom:`1px solid ${T.border}`}}>
+                      <div style={{display:'flex',alignItems:'center',gap:7}}>
+                        <span style={{width:18,height:18,borderRadius:'50%',background:sev,display:'flex',alignItems:'center',justifyContent:'center',fontSize:9,fontWeight:800,color:'#fff',flexShrink:0}}>{i+1}</span>
+                        <div style={{flex:1,minWidth:0}}>
+                          <div style={{fontSize:10.5,fontWeight:700,color:T.text,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{s.site_id}</div>
+                          <div style={{fontSize:9,color:T.muted}}>{s.issue_type}{s.zone?` · ${s.zone}`:''}</div>
+                        </div>
+                        <Bdg color={sev} sm>{tag}</Bdg>
+                      </div>
+                      <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr',gap:3,marginTop:3,fontSize:8.5,color:T.textSub,fontFamily:"'IBM Plex Mono',monospace"}}>
+                        <span>Drop {f(s.drop_rate,2)}%</span>
+                        <span>CSSR {f(s.cssr,1)}%</span>
+                        <span>Tput {f(s.dl_usr_tput,1)}</span>
+                        <span>RRC {f(s.avg_rrc_ue,0)}</span>
+                        <span>PRB {f(s.dl_prb_util,1)}%</span>
+                        <span>Vol {f(s.dl_data_vol,1)}</span>
+                      </div>
                     </div>
-                    <Bdg color={i<3?T.red:i<6?T.amber:T.green} sm>{i<3?'Crit':i<6?'Warn':'Watch'}</Bdg>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             </CC>
           </div>
@@ -1180,7 +1252,7 @@ function RANPage({T,data,mapSites,filters,opts}) {
                 <table style={{width:'100%',borderCollapse:'collapse',fontSize:10}}>
                   <thead>
                     <tr style={{background:T.surface2}}>
-                      {['Site ID','Zone','Call Drop %','DL Tput (Mbps)','RRC Users','PRB %','DL Traffic (GB)','Status'].map(h=>(
+                      {['Site ID','Zone','Call Drop %','DL Tput (Mbps)','RRC Users','PRB %','VoLTE DL Traffic','Status'].map(h=>(
                         <th key={h} style={{padding:'6px 8px',textAlign:'center',borderBottom:`2px solid ${T.border}`,color:T.muted,fontWeight:700,fontSize:9,textTransform:'uppercase',whiteSpace:'nowrap'}}>{h}</th>
                       ))}
                     </tr>
@@ -1199,7 +1271,7 @@ function RANPage({T,data,mapSites,filters,opts}) {
                           <td style={{padding:'5px 8px',textAlign:'center',fontFamily:"'IBM Plex Mono',monospace"}}>{f(s.dl_cell_tput||s.throughput)}</td>
                           <td style={{padding:'5px 8px',textAlign:'center',fontFamily:"'IBM Plex Mono',monospace"}}>{f(s.avg_rrc_ue,0)}</td>
                           <td style={{padding:'5px 8px',textAlign:'center',color:prb>80?T.red:T.amber,fontWeight:700,fontFamily:"'IBM Plex Mono',monospace"}}>{f(prb)}%</td>
-                          <td style={{padding:'5px 8px',textAlign:'center',fontFamily:"'IBM Plex Mono',monospace"}}>{f(s.dl_data_vol)}</td>
+                          <td style={{padding:'5px 8px',textAlign:'center',fontFamily:"'IBM Plex Mono',monospace"}}>{f(s.volte_traffic_dl,2)}</td>
                           <td style={{padding:'5px 8px',textAlign:'center'}}><Bdg color={sc} sm>{st}</Bdg></td>
                         </tr>
                       );
@@ -2769,10 +2841,10 @@ export default function NetworkAnalyticsDashboard() {
       {/* ── MAIN CONTENT ── */}
       <div style={{padding:'13px 18px 32px',position:'relative'}}>
         {/* Filter context banner — shown whenever non-default filters are active */}
-        {(filters.cluster||filters.technology||filters.region||filters.country||filters.state||filters.city||filters.time_range!=='24h')&&(
+        {(filters.cluster||filters.technology||filters.region||filters.country||filters.state||filters.city||filters.time_range!=='7d')&&(
           <div style={{display:'flex',alignItems:'center',gap:8,padding:'6px 12px',marginBottom:12,borderRadius:9,background:`${T.kpmgBlue}0c`,border:`1px solid ${T.kpmgBlue}22`,flexWrap:'wrap'}}>
             <span style={{fontSize:9.5,fontWeight:700,color:T.kpmgBlue,textTransform:'uppercase',letterSpacing:'0.05em'}}> Filtered View</span>
-            {filters.time_range!=='24h'&&<Bdg color={T.kpmgBlue}> {filters.time_range.toUpperCase()}</Bdg>}
+            {filters.time_range!=='7d'&&<Bdg color={T.kpmgBlue}> {filters.time_range.toUpperCase()}</Bdg>}
             {filters.cluster&&<Bdg color={T.kpmgBlue}> Zone: {filters.cluster}</Bdg>}
             {filters.technology&&<Bdg color={T.teal}> Tech: {filters.technology}</Bdg>}
             {filters.country&&<Bdg color={T.green}> {filters.country}</Bdg>}

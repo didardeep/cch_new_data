@@ -75,9 +75,18 @@ CORE_CRITICAL_KPIS = {
 }
 
 def clear_analytics_cache():
-    """Clear all cached analytics data. Call after data upload/delete."""
+    """Clear all cached analytics data. Call after data upload/delete.
+
+    Resets every module-level cache so the next request hits the DB. This
+    is critical after a DROP/CREATE database cycle: stale schema/columns/
+    KPI-name caches must not survive into the new DB session."""
     _CACHE.clear()
     _KPI_COUNTS_CACHE.clear()
+    _KPI_NAMES_CACHE.clear()
+    global _KPI_MAX_DATE, _KPI_MAX_DATE_TS, _TS_COLS_CACHE
+    _KPI_MAX_DATE = None
+    _KPI_MAX_DATE_TS = None
+    _TS_COLS_CACHE = None
 
 
 # Process-level memo for site/cell counts derived from kpi_data — these
@@ -88,24 +97,33 @@ _KPI_COUNTS_TTL = 3600  # seconds
 _KPI_NAMES_CACHE: dict = {}
 def _distinct_kpi_names_cached() -> list:
     """Distinct kpi_name values from kpi_data — cached for an hour. The DB
-    query takes 5-20s on 37M rows; KPI names rarely change between uploads."""
+    query takes 5-20s on 37M rows; KPI names rarely change between uploads.
+
+    NEVER caches an empty list: if the query fails or the table is empty
+    (transiently, e.g. the DB was just dropped/recreated), we want the next
+    request to re-query rather than serve "[]" for an hour."""
     now_ts = datetime.utcnow().timestamp()
     cached = _KPI_NAMES_CACHE.get("v")
-    if cached and (now_ts - cached["ts"] < _KPI_COUNTS_TTL):
+    if cached and cached.get("data") and (now_ts - cached["ts"] < _KPI_COUNTS_TTL):
         return cached["data"]
     names = []
     try:
         names = [r["kpi_name"] for r in _sql("SELECT DISTINCT kpi_name FROM kpi_data WHERE kpi_name IS NOT NULL")]
-    except Exception:
-        pass
-    _KPI_NAMES_CACHE["v"] = {"data": names, "ts": now_ts}
+    except Exception as e:
+        _LOG.warning("_distinct_kpi_names_cached query failed: %s", e)
+    if names:
+        _KPI_NAMES_CACHE["v"] = {"data": names, "ts": now_ts}
     return names
 
 
 def _kpi_data_counts_cached() -> dict:
+    """Distinct site/cell counts from kpi_data — cached for an hour.
+    Only caches when sites > 0 so a transient empty result doesn't poison
+    the cache for an hour."""
     now_ts = datetime.utcnow().timestamp()
     cached = _KPI_COUNTS_CACHE.get("v")
-    if cached and (now_ts - cached["ts"] < _KPI_COUNTS_TTL):
+    if cached and cached.get("data", {}).get("sites", 0) > 0 \
+            and (now_ts - cached["ts"] < _KPI_COUNTS_TTL):
         return cached["data"]
     sites = cells = 0
     try:
@@ -113,8 +131,8 @@ def _kpi_data_counts_cached() -> dict:
         # index-only scan instead of seq-scanning the value column.
         r = _sql("SELECT COUNT(*) AS n FROM (SELECT DISTINCT site_id FROM kpi_data) sub")
         sites = int((r or [{"n": 0}])[0].get("n") or 0)
-    except Exception:
-        pass
+    except Exception as e:
+        _LOG.warning("_kpi_data_counts_cached site query failed: %s", e)
     try:
         # Distinct (site_id, cell_id) — only cell-level rows have cell_id.
         r = _sql("""
@@ -124,10 +142,11 @@ def _kpi_data_counts_cached() -> dict:
             ) sub
         """)
         cells = int((r or [{"n": 0}])[0].get("n") or 0)
-    except Exception:
-        pass
+    except Exception as e:
+        _LOG.warning("_kpi_data_counts_cached cell query failed: %s", e)
     data = {"sites": sites, "cells": cells}
-    _KPI_COUNTS_CACHE["v"] = {"data": data, "ts": now_ts}
+    if sites > 0:
+        _KPI_COUNTS_CACHE["v"] = {"data": data, "ts": now_ts}
     return data
 
 _FLEX_TABLES_ENSURED = False  # run DDL only once per process
@@ -336,11 +355,13 @@ def _kpi_filter_clause(filters: dict, k_alias: str = "k", ts_alias: str = "ts"):
         parts.append(f"LOWER({k_alias}.site_id) = LOWER(:_fs)")
         params["_fs"] = site
     if tr and tr != "all":
-        days_map = {"1h": 1, "6h": 1, "24h": 7, "7d": 7, "30d": 30}
+        # days_map: "24h" was previously mapped to 7 (bug) — corrected to 1.
+        days_map = {"1h": 1, "6h": 1, "24h": 1, "7d": 7, "30d": 30}
         days = days_map.get(tr, 30)
-        # Use precomputed max date as reference (not CURRENT_DATE) so queries
-        # work even when uploaded KPI data dates are older than today.
-        # Falls back to CURRENT_DATE if max date not available.
+        # Anchor the window to MAX(kpi_data.date) so uploads whose dates are
+        # older than today (real telecom data is usually a few days behind)
+        # still surface in the 30d/7d views. Falls back to CURRENT_DATE only
+        # when the table is empty.
         max_date = _get_kpi_max_date()
         if max_date:
             from datetime import timedelta as _td
@@ -350,7 +371,6 @@ def _kpi_filter_clause(filters: dict, k_alias: str = "k", ts_alias: str = "ts"):
             params["_fdate_start"] = start_date
             params["_fdate_end"] = max_date
         else:
-            # Fallback: no data in kpi_data yet, use CURRENT_DATE
             parts.append(f"{k_alias}.date >= CURRENT_DATE - INTERVAL '{days} days'")
             parts.append(f"{k_alias}.date <= CURRENT_DATE")
 
@@ -537,24 +557,24 @@ def _kpi_col(name: str):
 
 def _kpi_date_range(filters: dict):
     """
-    Return date range from kpi_data, respecting time_range filter.
-    Uses CURRENT_DATE as reference (not max_date) to avoid showing future data.
+    Return (from_date, to_date) for kpi_data WHERE clauses, respecting time_range.
+    Anchors to MAX(kpi_data.date) so uploaded data whose dates lag behind today
+    still falls inside the 30d/7d window. Falls back to CURRENT_DATE only when
+    the table is empty.
     """
     try:
-        rows = _sql("SELECT MIN(date) AS mn, LEAST(MAX(date), CURRENT_DATE) AS mx FROM kpi_data_merged WHERE data_level = 'site'")
-        if not rows or rows[0]["mx"] is None:
-            return None, None
-        max_date = rows[0]["mx"]  # capped at today
-        min_date = rows[0]["mn"]
-        # Apply time_range filter — cutoff from today, not from max_date
         tr = (filters or {}).get("time_range", "all")
         days_map = {"1h": 1, "6h": 1, "24h": 1, "7d": 7, "30d": 30, "all": None}
         days = days_map.get(tr)
-        if days is not None:
-            cutoff = max_date - timedelta(days=days) if hasattr(max_date, '__sub__') else None
-            if cutoff and cutoff > min_date:
-                min_date = cutoff
-        return min_date, max_date
+        if days is None:
+            return None, None
+        max_date = _get_kpi_max_date()
+        if max_date:
+            from_date = max_date - timedelta(days=days)
+            return from_date, max_date
+        from datetime import date as _date
+        today = _date.today()
+        return today - timedelta(days=days), today
     except Exception as e:
         _LOG.warning("_kpi_date_range: %s", e)
         return None, None
@@ -2201,218 +2221,421 @@ def network_map():
     return jsonify(result)
 
 
-@network_bp.route("/api/network/ran-analytics", methods=["GET"])
+@network_bp.route("/api/network/ran-debug", methods=["GET"])
 @jwt_required()
-def ran_analytics():
+def ran_debug():
     """
-    RAN analytics: KPI averages, call drop trend, PRB distribution,
-    DL traffic trend, zone performance, top issues, site list.
-    Source: kpi_data (data_level='site') — fast CASE WHEN queries.
+    Diagnostic endpoint — call from the browser to see exactly what's in
+    kpi_data. Returns row count, distinct sites, distinct KPI names, the
+    actual date span of uploaded data, and a sample of values for the six
+    headline RAN KPIs. If this returns counts > 0 but ran_analytics still
+    shows blank cards, the bug is in the query/filter logic, not the DB.
+    If counts are 0, the upload didn't land in kpi_data.
     """
-    filters = _get_filters()
-    fresh = request.args.get("fresh") == "1"
-    ck = _cache_key("ran_v14_full_kpidata", filters)
-    if not fresh:
-        cached = _from_cache(ck)
-        if cached:
-            return jsonify(cached)
-
-    # KPI names — resolved against actual kpi_data values so naming drift
-    # (e.g. "DL PRB Util" vs "DL PRB Utilization (1BH)") doesn't zero out cards.
-    def _ran_resolve(default, patterns):
-        names = _distinct_kpi_names_cached()
-        if default in names:
-            return default
-        for pat in patterns:
-            pl = pat.lower()
-            for n in names:
-                if n and pl in n.lower():
-                    return n
-        return default
-
-    _DROP   = _ran_resolve("E-RAB Call Drop Rate_1",       ["e-rab call drop", "call drop rate", "erab drop", "drop rate"])
-    _PRB    = _ran_resolve("DL PRB Utilization (1BH)",     ["dl prb util", "dl_prb", "dl prb"])
-    _TPUT   = _ran_resolve("LTE DL - Cell Ave Throughput", ["dl cell ave", "cell ave throughput", "dl cell"])
-    _ULTPUT = _ran_resolve("LTE UL - Cell Ave Throughput", ["ul cell ave", "ul cell"])
-    _RRC    = _ran_resolve("Ave RRC Connected Ue",         ["ave rrc", "rrc connected"])
-    _RRC_SR = _ran_resolve("LTE RRC Setup Success Rate",   ["rrc setup success"])
-    _CALL_SR= _ran_resolve("LTE Call Setup Success Rate",  ["call setup success", "cssr"])
-    _ERAB_SR= _ran_resolve("LTE E-RAB Setup Success Rate", ["e-rab setup success", "erab setup"])
-    _AVAIL  = _ran_resolve("Availability",                 ["availability", "avail"])
-    _DL_VOL = _ran_resolve("DL Data Total Volume",         ["dl data total", "dl total volume", "dl volume"])
-    _UL_VOL = _ran_resolve("UL Data Total Volume",         ["ul data total", "ul total volume", "ul volume"])
-    _USR_TPUT = _ran_resolve("LTE DL - Usr Ave Throughput",["dl usr ave", "usr ave throughput", "user throughput"])
-
-    # Build filter clause from all active filters (zone, tech, region).
-    # Headline KPI cards use the last 30 days of data anchored to CURRENT_DATE
-    # so KPIs whose uploads ended weeks ago still surface real values, while
-    # the query stays index-bounded (avoids the 15s+ full table scan).
-    _ran_filters_no_time = dict(filters or {})
-    _ran_filters_no_time.pop("time_range", None)
-    _rfw_geo, _rfp, _r_needs_ts = _kpi_filter_clause(_ran_filters_no_time, "k", "ts")
-    _rfp = dict(_rfp)
-    _rfp["_overall_start"] = (datetime.utcnow().date() - timedelta(days=30))
-    _rfw = _rfw_geo + " AND k.date >= :_overall_start"
-
-    base_where = "k.value IS NOT NULL AND k.data_level = 'site'"
-    base_params: dict = dict(_rfp)  # include filter params
-    zone_join = ""  # per-site query already has LEFT JOIN telecom_sites ts
-    zone_cond = _rfw  # includes zone/tech/city/state/time filters
-    # For aggregate query (no ts join), add one if geo filters are active
-    _agg_ts_join = "LEFT JOIN telecom_sites ts ON LOWER(k.site_id) = LOWER(ts.site_id)" if _r_needs_ts else ""
-
-    # ── 1. Network-wide KPI averages — read directly from kpi_data with
-    # per-site/per-date pre-aggregation so cell-level rows are first averaged
-    # per (site, kpi, date). No view dependency, no data_level filter,
-    # ILIKE substring matching for KPI-name casing variants.
-    agg = {}
+    diag = {"db_connected": False}
     try:
-        r = _sql(f"""
-            WITH per_skd AS (
-                SELECT k.site_id, k.kpi_name, k.date, AVG(k.value) AS v
-                FROM kpi_data k {_agg_ts_join}
-                WHERE k.value IS NOT NULL {zone_cond}
-                GROUP BY k.site_id, k.kpi_name, k.date
-            )
-            SELECT
-                AVG(CASE WHEN kpi_name ILIKE '%e-rab%call%drop%' OR kpi_name ILIKE '%call%drop%rate%' THEN v END) AS erab_drop_rate,
-                AVG(CASE WHEN kpi_name ILIKE '%dl%prb%util%' THEN v END) AS dl_prb_util,
-                AVG(CASE WHEN kpi_name ILIKE '%ul%prb%util%' THEN v END) AS ul_prb_util,
-                AVG(CASE WHEN kpi_name ILIKE '%dl%cell%ave%throughput%' OR kpi_name ILIKE '%dl%cell%tput%' THEN v END) AS dl_cell_tput,
-                AVG(CASE WHEN kpi_name ILIKE '%ul%cell%ave%throughput%' OR kpi_name ILIKE '%ul%cell%tput%' THEN v END) AS ul_cell_tput,
-                AVG(CASE WHEN kpi_name ILIKE '%dl%usr%ave%throughput%' OR kpi_name ILIKE '%dl%user%ave%throughput%' OR kpi_name ILIKE '%user%throughput%' THEN v END) AS dl_usr_tput,
-                AVG(CASE WHEN kpi_name ILIKE '%rrc%connected%' OR kpi_name ILIKE '%ave%rrc%' THEN v END) AS avg_rrc_ue,
-                AVG(CASE WHEN kpi_name ILIKE '%rrc%setup%success%' THEN v END) AS lte_rrc_setup_sr,
-                AVG(CASE WHEN kpi_name ILIKE '%call%setup%success%' OR kpi_name ILIKE '%cssr%' THEN v END) AS lte_call_setup_sr,
-                AVG(CASE WHEN kpi_name ILIKE '%e-rab%setup%success%' OR kpi_name ILIKE '%erab%setup%' THEN v END) AS erab_setup_sr,
-                AVG(CASE WHEN kpi_name ILIKE '%availability%' THEN v END) AS availability,
-                AVG(CASE WHEN kpi_name ILIKE '%dl%data%total%volume%' OR kpi_name ILIKE '%dl%volume%' THEN v END) AS dl_data_vol
-            FROM per_skd
-        """, base_params)
+        r = _sql("SELECT COUNT(*) AS rows, COUNT(DISTINCT site_id) AS sites, "
+                 "COUNT(DISTINCT kpi_name) AS kpis, MIN(date) AS min_date, "
+                 "MAX(date) AS max_date, CURRENT_DATE AS db_today FROM kpi_data")
         if r:
-            agg = {k: _f(v, 3) if v is not None else None for k, v in r[0].items()}
+            d = r[0]
+            diag["db_connected"] = True
+            diag["rows"]      = int(d.get("rows") or 0)
+            diag["sites"]     = int(d.get("sites") or 0)
+            diag["kpis"]      = int(d.get("kpis") or 0)
+            diag["min_date"]  = str(d.get("min_date")) if d.get("min_date") else None
+            diag["max_date"]  = str(d.get("max_date")) if d.get("max_date") else None
+            diag["db_today"]  = str(d.get("db_today")) if d.get("db_today") else None
     except Exception as e:
-        _LOG.error("ran_analytics agg: %s", e)
+        diag["error"] = f"count query failed: {e}"
+        return jsonify(diag), 500
 
-    # ── 2. Per-site pivot — read kpi_data directly with per-site/per-date
-    # pre-aggregation. No view dependency, no data_level filter (cell-level
-    # rows for a (site,kpi,date) are first averaged into a single value, then
-    # collapsed across dates per site). ILIKE matching tolerates KPI-name
-    # casing variants. No fallback defaults — missing metrics surface as NULL.
-    site_kpis = []
-    site_rows = []
     try:
-        site_rows = _sql(f"""
-            WITH per_skd AS (
-                SELECT k.site_id, k.kpi_name, k.date, AVG(k.value) AS v
-                FROM kpi_data k
-                LEFT JOIN telecom_sites ts ON LOWER(k.site_id) = LOWER(ts.site_id)
-                {zone_join}
-                WHERE k.value IS NOT NULL {zone_cond}
-                GROUP BY k.site_id, k.kpi_name, k.date
-            )
-            SELECT psk.site_id,
+        names = [n["kpi_name"] for n in _sql(
+            "SELECT DISTINCT kpi_name FROM kpi_data WHERE kpi_name IS NOT NULL "
+            "ORDER BY kpi_name LIMIT 200"
+        )]
+        diag["distinct_kpi_names"] = names
+    except Exception as e:
+        diag["distinct_kpi_names_error"] = str(e)
+
+    try:
+        sample = _sql("""
+            SELECT
+                AVG(CASE WHEN kpi_name ILIKE '%e-rab%call%drop%' OR kpi_name ILIKE '%call%drop%rate%' THEN value END) AS erab_drop_rate,
+                AVG(CASE WHEN kpi_name ILIKE '%dl%prb%util%' THEN value END) AS dl_prb_util,
+                AVG(CASE WHEN kpi_name ILIKE '%dl%usr%ave%throughput%' OR kpi_name ILIKE '%dl%usr%throughput%' THEN value END) AS dl_usr_tput,
+                AVG(CASE WHEN kpi_name ILIKE '%rrc%connected%' OR kpi_name ILIKE '%ave%rrc%' THEN value END) AS avg_rrc_ue,
+                AVG(CASE WHEN kpi_name ILIKE '%call%setup%success%' THEN value END) AS lte_call_setup_sr,
+                AVG(CASE WHEN kpi_name ILIKE '%dl%data%total%volume%' THEN value END) AS dl_data_vol
+            FROM kpi_data WHERE value IS NOT NULL
+        """)
+        if sample:
+            diag["headline_kpis_no_filter"] = {
+                k: (round(float(v), 3) if v is not None else None)
+                for k, v in sample[0].items()
+            }
+    except Exception as e:
+        diag["headline_kpis_error"] = str(e)
+
+    return jsonify(diag)
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# RAN ANALYTICS — SELF-CONTAINED REWRITE (does not share date filter logic
+# with overview_stats so a bug in one cannot blank the other)
+# ────────────────────────────────────────────────────────────────────────────
+
+def _ran_resolve_dates(time_range: str):
+    """Return (from_date, to_date) for the RAN endpoint.
+
+    Anchors to MIN(MAX(kpi_data.date), today) — never returns a future end
+    date, but slides backwards if uploads are older than today. Returns
+    (None, None) if no data has been uploaded.
+    """
+    try:
+        r = _sql("SELECT MAX(date) AS mx FROM kpi_data")
+        max_date = r[0]["mx"] if r and r[0].get("mx") else None
+    except Exception:
+        max_date = None
+    if not max_date:
+        return None, None
+    from datetime import date as _date, timedelta as _td
+    today = _date.today()
+    end = max_date if max_date <= today else today
+    days_map = {"1h": 1, "6h": 1, "24h": 1, "7d": 7, "30d": 30, "all": None}
+    days = days_map.get((time_range or "30d").strip().lower(), 30)
+    start = (end - _td(days=days)) if days is not None else None
+    return start, end
+
+
+def _ran_geo_clause(filters: dict):
+    """Build a geo-only WHERE fragment + params for kpi_data queries.
+    Excludes time_range — that is handled separately by ran_analytics so the
+    no-data-window fallback can drop it without rebuilding the geo filter.
+    """
+    parts = []
+    params = {}
+    needs_ts = False
+    if not filters:
+        return "", params, False
+
+    zone = (filters.get("cluster") or filters.get("zone") or "").strip()
+    if zone:
+        items = [v.strip() for v in zone.split(",") if v.strip()]
+        if len(items) == 1:
+            params["_rz"] = items[0]
+            parts.append("LOWER(ts.zone) = LOWER(:_rz)")
+        else:
+            phs = []
+            for i, v in enumerate(items):
+                params[f"_rz_{i}"] = v
+                phs.append(f"LOWER(:_rz_{i})")
+            parts.append(f"LOWER(ts.zone) IN ({','.join(phs)})")
+        needs_ts = True
+
+    geo_cols = []  # subquery against telecom_sites
+    for fk, col, prefix in [("technology", "technology", "_rtech"),
+                            ("vendor",     "vendor_name", "_rvend"),
+                            ("country",    "country",    "_rcty"),
+                            ("state",      "state",      "_rst"),
+                            ("city",       "city",       "_rci")]:
+        val = (filters.get(fk) or "").strip()
+        if not val:
+            continue
+        items = [v.strip() for v in val.split(",") if v.strip()]
+        if len(items) == 1:
+            params[prefix] = items[0]
+            geo_cols.append(f"LOWER({col}) = LOWER(:{prefix})")
+        else:
+            phs = []
+            for i, v in enumerate(items):
+                key = f"{prefix}_{i}"
+                params[key] = v
+                phs.append(f"LOWER(:{key})")
+            geo_cols.append(f"LOWER({col}) IN ({','.join(phs)})")
+    if geo_cols:
+        parts.append(f"k.site_id IN (SELECT site_id FROM telecom_sites WHERE {' AND '.join(geo_cols)})")
+
+    site = (filters.get("site") or "").strip()
+    if site:
+        params["_rsite"] = site
+        parts.append("LOWER(k.site_id) = LOWER(:_rsite)")
+
+    where = (" AND " + " AND ".join(parts)) if parts else ""
+    return where, params, needs_ts
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RAN Layer Helpers — pure Python data-retrieval logic (ISOLATED from _ovw_*).
+#
+# Separation guarantee: NO _ran_* helper calls any _ovw_* helper, and the
+# overview function does not call any _ran_* helper. They share only the
+# read-only utilities `_sql`, `_kpi_filter_clause`, `_distinct_kpi_names_cached`,
+# `_get_kpi_max_date`, `_telecom_sites_cell_col`, and `_f`. A bug or slow path
+# on the overview side cannot affect the RAN endpoint and vice versa — they
+# don't share request state, they don't share caches, they don't share buckets.
+#
+# SQL is used only for the cheap heavy-lift (WHERE filter + GROUP BY on
+# indexed columns). Every business decision — KPI-name resolution, network
+# averages, per-site shaping, status classification, zone aggregation,
+# top-issues ranking, PRB-bucket distribution, trend assembly — happens in
+# pure Python so each step is easy to read, change, and debug. Each helper
+# logs its result count to backend.log so any blank chart is one log line
+# away from a root cause.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _ran_resolve_kpi_names():
+    """Resolve canonical RAN KPI names from kpi_data (cached 1h).
+    Returns a dict: short_key -> kpi_name (or None if not present).
+    Using exact `kpi_name IN (...)` lets Postgres hit the index — much
+    faster than `ILIKE '%...%'` over millions of rows."""
+    name_idx = {(n or "").lower(): n for n in _distinct_kpi_names_cached()}
+
+    def _r(default, *substrings):
+        if default.lower() in name_idx:
+            return name_idx[default.lower()]
+        for s in substrings:
+            for low, full in name_idx.items():
+                if s.lower() in low:
+                    return full
+        return None
+
+    return {
+        "drop":     _r("E-RAB Call Drop Rate_1",      "e-rab call drop", "call drop rate"),
+        "prb_dl":   _r("DL PRB Utilization (1BH)",    "dl prb util"),
+        "prb_ul":   _r("UL PRB Utilization (1BH)",    "ul prb util"),
+        "tput_dl":  _r("LTE DL - Cell Ave Throughput","dl - cell ave", "dl cell ave"),
+        "tput_ul":  _r("LTE UL - Cell Ave Throughput","ul - cell ave", "ul cell ave"),
+        "usr_dl":   _r("LTE DL - Usr Ave Throughput", "dl - usr", "dl usr"),
+        "rrc":      _r("Ave RRC Connected Ue",        "rrc connected", "ave rrc"),
+        "rrc_sr":   _r("LTE RRC Setup Success Rate",  "rrc setup success"),
+        "cssr":     _r("LTE Call Setup Success Rate", "call setup success", "cssr"),
+        "erab_sr":  _r("LTE E-RAB Setup Success Rate","e-rab setup success", "erab setup"),
+        "avail":    _r("Availability",                "availability"),
+        "dl_vol":   _r("DL Data Total Volume",        "dl data total volume", "dl volume"),
+        "ul_vol":   _r("UL Data Total Volume",        "ul data total volume", "ul volume"),
+        "volte_dl": _r("VoLTE Traffic DL",            "volte traffic dl"),
+    }
+
+
+def _ran_mean(values):
+    """Mean of an iterable, ignoring None. Returns None on empty."""
+    xs = [float(v) for v in values if v is not None]
+    return sum(xs) / len(xs) if xs else None
+
+
+def _ran_pull_per_site(filters, kpi_names, start, end):
+    """Step 1A: fetch per-(site, kpi) averages for the chosen KPIs and window.
+    SQL does WHERE + GROUP BY (uses kpi_name + date indexes). Python receives
+    one row per (site, kpi) — usually a few thousand rows total."""
+    if not kpi_names:
+        return []
+    geo_where, geo_params, _needs = _ran_geo_clause(filters)
+    params = dict(geo_params)
+    placeholders = []
+    for i, n in enumerate(kpi_names):
+        key = f"_rkn{i}"
+        params[key] = n
+        placeholders.append(f":{key}")
+    in_clause = ",".join(placeholders)
+    date_cond = ""
+    if start and end:
+        params["_r_start"] = start
+        params["_r_end"]   = end
+        date_cond = " AND k.date >= :_r_start AND k.date <= :_r_end"
+    rows = _sql(f"""
+        SELECT k.site_id, k.kpi_name,
+               AVG(k.value)      AS v,
+               MAX(ts.zone)      AS zone,
+               AVG(ts.latitude)  AS lat,
+               AVG(ts.longitude) AS lng
+        FROM kpi_data k
+        LEFT JOIN telecom_sites ts ON LOWER(k.site_id) = LOWER(ts.site_id)
+        WHERE k.value IS NOT NULL
+          AND k.kpi_name IN ({in_clause})
+          {geo_where}
+          {date_cond}
+        GROUP BY k.site_id, k.kpi_name
+    """, params)
+    _LOG.info("_ran_pull_per_site: %d rows window=%s→%s", len(rows), start, end)
+    if not rows and date_cond:
+        # Fallback: no date window
+        np = {k: v for k, v in params.items() if k not in ("_r_start", "_r_end")}
+        rows = _sql(f"""
+            SELECT k.site_id, k.kpi_name,
+                   AVG(k.value)      AS v,
                    MAX(ts.zone)      AS zone,
                    AVG(ts.latitude)  AS lat,
-                   AVG(ts.longitude) AS lng,
-                   AVG(CASE WHEN psk.kpi_name ILIKE '%e-rab%call%drop%' OR psk.kpi_name ILIKE '%call%drop%rate%' THEN psk.v END) AS erab_drop_rate,
-                   AVG(CASE WHEN psk.kpi_name ILIKE '%dl%prb%util%' THEN psk.v END) AS dl_prb_util,
-                   AVG(CASE WHEN psk.kpi_name ILIKE '%ul%prb%util%' THEN psk.v END) AS ul_prb_util,
-                   AVG(CASE WHEN psk.kpi_name ILIKE '%dl%cell%ave%throughput%' OR psk.kpi_name ILIKE '%dl%cell%tput%' THEN psk.v END) AS dl_cell_tput,
-                   AVG(CASE WHEN psk.kpi_name ILIKE '%dl%usr%ave%throughput%' OR psk.kpi_name ILIKE '%dl%user%ave%throughput%' OR psk.kpi_name ILIKE '%user%throughput%' THEN psk.v END) AS dl_usr_tput,
-                   AVG(CASE WHEN psk.kpi_name ILIKE '%rrc%connected%ue%' OR psk.kpi_name ILIKE '%ave%rrc%' THEN psk.v END) AS avg_rrc_ue,
-                   AVG(CASE WHEN psk.kpi_name ILIKE '%rrc%setup%success%' THEN psk.v END) AS lte_rrc_setup_sr,
-                   AVG(CASE WHEN psk.kpi_name ILIKE '%call%setup%success%' OR psk.kpi_name ILIKE '%cssr%' THEN psk.v END) AS lte_call_setup_sr,
-                   AVG(CASE WHEN psk.kpi_name ILIKE '%availability%' THEN psk.v END) AS availability,
-                   AVG(CASE WHEN psk.kpi_name ILIKE '%dl%data%total%volume%' OR psk.kpi_name ILIKE '%dl%volume%' THEN psk.v END) AS dl_data_vol
-            FROM per_skd psk
-            LEFT JOIN telecom_sites ts ON LOWER(psk.site_id) = LOWER(ts.site_id)
-            GROUP BY psk.site_id
-            ORDER BY AVG(CASE WHEN psk.kpi_name ILIKE '%dl%prb%util%' THEN psk.v END) DESC NULLS LAST
-            LIMIT 500
-        """, base_params)
-    except Exception as e:
-        _LOG.error("ran_analytics site pivot: %s", e)
-    try:
+                   AVG(ts.longitude) AS lng
+            FROM kpi_data k
+            LEFT JOIN telecom_sites ts ON LOWER(k.site_id) = LOWER(ts.site_id)
+            WHERE k.value IS NOT NULL
+              AND k.kpi_name IN ({in_clause})
+              {geo_where}
+            GROUP BY k.site_id, k.kpi_name
+        """, np)
+        _LOG.info("_ran_pull_per_site (no-date fallback): %d rows", len(rows))
+    return rows
 
-        # 4-factor site health: PRB > 70%, Drop > 1.5%, CSSR < 98.5%, Usr Tput < 8 Mbps
-        def _site_health_ran(prb, drop, cssr, usr_tput):
-            bad = 0
-            if drop > 1.5:    bad += 1
-            if cssr < 98.5:   bad += 1
-            if usr_tput < 8:  bad += 1
-            if prb > 70:      bad += 1
-            score  = max(0, min(25, 25 * (1 - (drop - 0.5) / 3.0)))
-            score += max(0, min(25, 25 * (cssr - 95) / 5.0))
-            score += max(0, min(25, 25 * min(usr_tput, 20) / 20.0))
-            score += max(0, min(25, 25 * (1 - max(prb - 30, 0) / 70.0)))
-            score = round(score, 1)
-            if bad >= 3:   return "critical", "#DC2626", score
-            elif bad == 2: return "degraded", "#F97316", score
-            elif bad == 1: return "warning",  "#EAB308", score
-            else:          return "healthy",  "#22c55e", score
 
-        site_kpis = []
-        for r in site_rows:
-            dl_prb = float(r.get("dl_prb_util") or 0)
-            ul_prb = float(r.get("ul_prb_util") or 0)
-            # Headline PRB = average of DL and UL when both are present, else
-            # whichever one we have. Some uploads only carry one of the two.
-            if dl_prb and ul_prb:
-                prb_combined = (dl_prb + ul_prb) / 2.0
-            else:
-                prb_combined = dl_prb or ul_prb
-            drop = float(r.get("erab_drop_rate") or 0)
-            cssr = float(r.get("lte_call_setup_sr") or 100)
-            usr_tput = float(r.get("dl_usr_tput") or 0)
-            status, color, health_score = _site_health_ran(prb_combined, drop, cssr, usr_tput)
-            site_kpis.append({
-                "site_id": r["site_id"], "zone": r.get("zone") or "",
-                "cluster": r.get("zone") or "",
-                "lat": r.get("lat"), "lng": r.get("lng"),
-                "erab_drop_rate":    _f(r.get("erab_drop_rate"), 2),
-                "dl_prb_util":       _f(dl_prb or prb_combined, 1),
-                "ul_prb_util":       _f(ul_prb, 1),
-                "prb_utilization":   _f(prb_combined, 1),
-                "avg_prb":           _f(prb_combined, 1),
-                "dl_cell_tput":      _f(r.get("dl_cell_tput"), 1),
-                "dl_usr_tput":       _f(usr_tput, 1),
-                "throughput":        _f(r.get("dl_cell_tput"), 1),
-                "avg_rrc_ue":        _f(r.get("avg_rrc_ue"), 1),
-                "lte_rrc_setup_sr":  _f(r.get("lte_rrc_setup_sr"), 1),
-                "lte_call_setup_sr": _f(cssr, 1),
-                "lte_cssr":          _f(cssr, 1),
-                "availability":      _f(r.get("availability"), 1),
-                "dl_data_vol":       _f(r.get("dl_data_vol"), 2),
-                "status":            status,
-                "color":             color,
-                "health_score":      health_score,
-            })
-    except Exception as e:
-        _LOG.error("ran_analytics site_kpis: %s", e)
+def _ran_pull_per_date(filters, kpi_names, start, end):
+    """Step 1B: fetch per-(kpi, date) averages — feeds the trend charts."""
+    if not kpi_names:
+        return []
+    geo_where, geo_params, _needs = _ran_geo_clause(filters)
+    params = dict(geo_params)
+    placeholders = []
+    for i, n in enumerate(kpi_names):
+        key = f"_rdkn{i}"
+        params[key] = n
+        placeholders.append(f":{key}")
+    in_clause = ",".join(placeholders)
+    date_cond = ""
+    if start and end:
+        params["_r_start"] = start
+        params["_r_end"]   = end
+        date_cond = " AND k.date >= :_r_start AND k.date <= :_r_end"
+    rows = _sql(f"""
+        SELECT k.kpi_name, k.date::text AS date, AVG(k.value) AS v
+        FROM kpi_data k
+        LEFT JOIN telecom_sites ts ON LOWER(k.site_id) = LOWER(ts.site_id)
+        WHERE k.value IS NOT NULL
+          AND k.kpi_name IN ({in_clause})
+          {geo_where}
+          {date_cond}
+        GROUP BY k.kpi_name, k.date
+        ORDER BY k.date
+    """, params)
+    _LOG.info("_ran_pull_per_date: %d rows window=%s→%s", len(rows), start, end)
+    if not rows and date_cond:
+        np = {k: v for k, v in params.items() if k not in ("_r_start", "_r_end")}
+        rows = _sql(f"""
+            SELECT k.kpi_name, k.date::text AS date, AVG(k.value) AS v
+            FROM kpi_data k
+            LEFT JOIN telecom_sites ts ON LOWER(k.site_id) = LOWER(ts.site_id)
+            WHERE k.value IS NOT NULL
+              AND k.kpi_name IN ({in_clause})
+              {geo_where}
+            GROUP BY k.kpi_name, k.date
+            ORDER BY k.date
+        """, np)
+        _LOG.info("_ran_pull_per_date (no-date fallback): %d rows", len(rows))
+    return rows
 
-    # ── 3. Call drop daily trend — kpi_data direct, ILIKE matching ───────────
-    call_drop = []
-    try:
-        drop_rows = _sql(f"""
-            WITH per_skd AS (
-                SELECT k.site_id, k.date, AVG(k.value) AS v
-                FROM kpi_data k {_agg_ts_join}
-                WHERE k.value IS NOT NULL
-                  AND (k.kpi_name ILIKE '%e-rab%call%drop%' OR k.kpi_name ILIKE '%call%drop%rate%')
-                  {zone_cond}
-                GROUP BY k.site_id, k.date
-            )
-            SELECT date::text AS date, AVG(v) AS val
-            FROM per_skd
-            GROUP BY date ORDER BY date
-        """, base_params)
-        call_drop = [{"date": r["date"], "drop_rate": _f(r["val"], 2)} for r in drop_rows]
-    except Exception as e:
-        _LOG.error("ran_analytics call_drop: %s", e)
 
-    # ── 4. PRB distribution from site_kpis ────────────────────────────────────
-    buckets = {"0-20%": 0, "20-40%": 0, "40-60%": 0, "60-80%": 0, "80-85%": 0, ">85% (Critical)": 0}
+def _ran_card_avgs(per_site_rows, kpi_map):
+    """Step 2: network-wide KPI card averages (mean of per-site averages)."""
+    from collections import defaultdict
+    buckets = defaultdict(list)
+    for r in per_site_rows:
+        v = r.get("v")
+        if v is None:
+            continue
+        buckets[r["kpi_name"]].append(float(v))
+    def _avg(short_key):
+        kn = kpi_map.get(short_key)
+        if not kn or kn not in buckets:
+            return None
+        vs = buckets[kn]
+        return (sum(vs) / len(vs)) if vs else None
+    return {
+        "erab_drop_rate":    _avg("drop"),
+        "dl_prb_util":       _avg("prb_dl"),
+        "ul_prb_util":       _avg("prb_ul"),
+        "dl_cell_tput":      _avg("tput_dl"),
+        "ul_cell_tput":      _avg("tput_ul"),
+        "dl_usr_tput":       _avg("usr_dl"),
+        "avg_rrc_ue":        _avg("rrc"),
+        "lte_rrc_setup_sr":  _avg("rrc_sr"),
+        "lte_call_setup_sr": _avg("cssr"),
+        "erab_setup_sr":     _avg("erab_sr"),
+        "availability":      _avg("avail"),
+        "dl_data_vol":       _avg("dl_vol"),
+    }
+
+
+def _ran_site_health(prb, drop, cssr, usr_tput):
+    """Status / colour / score for a single site. Pure Python rules."""
+    bad = 0
+    if drop > 1.5:   bad += 1
+    if cssr < 98.5:  bad += 1
+    if usr_tput < 8: bad += 1
+    if prb > 70:     bad += 1
+    score  = max(0, min(25, 25 * (1 - (drop - 0.5) / 3.0)))
+    score += max(0, min(25, 25 * (cssr - 95) / 5.0))
+    score += max(0, min(25, 25 * min(usr_tput, 20) / 20.0))
+    score += max(0, min(25, 25 * (1 - max(prb - 30, 0) / 70.0)))
+    score = round(score, 1)
+    if bad >= 3:   return "critical", "#DC2626", score
+    elif bad == 2: return "degraded", "#F97316", score
+    elif bad == 1: return "warning",  "#EAB308", score
+    else:          return "healthy",  "#22c55e", score
+
+
+def _ran_site_list(per_site_rows, kpi_map):
+    """Step 3: build the full per-site list with every RAN KPI + status colour.
+    Pure Python pivot of (site, kpi) rows into one record per site."""
+    from collections import defaultdict
+    site_data = defaultdict(lambda: {"kpis": {}, "zone": "", "lat": None, "lng": None})
+    for r in per_site_rows:
+        sd = site_data[r["site_id"]]
+        sd["kpis"][r["kpi_name"]] = float(r["v"]) if r.get("v") is not None else None
+        if r.get("zone") and not sd["zone"]:
+            sd["zone"] = r["zone"]
+        if r.get("lat") is not None: sd["lat"] = r["lat"]
+        if r.get("lng") is not None: sd["lng"] = r["lng"]
+
+    out = []
+    K_PRB_DL  = kpi_map.get("prb_dl")
+    K_PRB_UL  = kpi_map.get("prb_ul")
+    K_DROP    = kpi_map.get("drop")
+    K_CSSR    = kpi_map.get("cssr")
+    K_USR_DL  = kpi_map.get("usr_dl")
+    K_TPUT_DL = kpi_map.get("tput_dl")
+    K_RRC     = kpi_map.get("rrc")
+    K_RRC_SR  = kpi_map.get("rrc_sr")
+    K_AVAIL   = kpi_map.get("avail")
+    K_DL_VOL  = kpi_map.get("dl_vol")
+    K_VOLTE   = kpi_map.get("volte_dl")
+
+    for sid, sd in site_data.items():
+        kp = sd["kpis"]
+        dl_prb = kp.get(K_PRB_DL) or 0
+        ul_prb = kp.get(K_PRB_UL) or 0
+        prb_combined = (dl_prb + ul_prb) / 2.0 if (dl_prb and ul_prb) else (dl_prb or ul_prb)
+        drop     = kp.get(K_DROP)   or 0
+        cssr     = kp.get(K_CSSR)   if kp.get(K_CSSR) is not None else 100
+        usr_tput = kp.get(K_USR_DL) or 0
+        status, color, health = _ran_site_health(prb_combined, drop, cssr, usr_tput)
+        out.append({
+            "site_id": sid, "zone": sd["zone"], "cluster": sd["zone"],
+            "lat": sd["lat"], "lng": sd["lng"],
+            "erab_drop_rate":    _f(drop, 2),
+            "dl_prb_util":       _f(dl_prb or prb_combined, 1),
+            "ul_prb_util":       _f(ul_prb, 1),
+            "prb_utilization":   _f(prb_combined, 1),
+            "avg_prb":           _f(prb_combined, 1),
+            "dl_cell_tput":      _f(kp.get(K_TPUT_DL), 1),
+            "dl_usr_tput":       _f(usr_tput, 1),
+            "throughput":        _f(kp.get(K_TPUT_DL), 1),
+            "avg_rrc_ue":        _f(kp.get(K_RRC), 1),
+            "lte_rrc_setup_sr":  _f(kp.get(K_RRC_SR), 1),
+            "lte_call_setup_sr": _f(cssr, 1),
+            "lte_cssr":          _f(cssr, 1),
+            "availability":      _f(kp.get(K_AVAIL), 1),
+            "dl_data_vol":       _f(kp.get(K_DL_VOL), 2),
+            "volte_traffic_dl":  _f(kp.get(K_VOLTE), 2),
+            "status": status, "color": color, "health_score": health,
+        })
+    out.sort(key=lambda s: -float(s.get("dl_prb_util") or 0))
+    return out[:500]
+
+
+def _ran_prb_distribution(site_kpis):
+    """PRB% bucket distribution across sites — pure Python counter."""
+    buckets = {"0-20%": 0, "20-40%": 0, "40-60%": 0,
+               "60-80%": 0, "80-85%": 0, ">85% (Critical)": 0}
     for s in site_kpis:
         prb = float(s.get("dl_prb_util") or 0)
         if prb < 20:    buckets["0-20%"] += 1
@@ -2421,62 +2644,179 @@ def ran_analytics():
         elif prb < 80:  buckets["60-80%"] += 1
         elif prb <= 85: buckets["80-85%"] += 1
         else:           buckets[">85% (Critical)"] += 1
-    prb_dist = [{"range": k, "count": v} for k, v in buckets.items() if v > 0]
+    return [{"range": k, "count": v} for k, v in buckets.items() if v > 0]
 
-    # ── 5. DL/UL traffic daily trend — kpi_data direct, ILIKE matching ──────
-    hourly_dl = []
-    try:
-        dl_rows = _sql(f"""
-            WITH per_skd AS (
-                SELECT k.site_id, k.kpi_name, k.date, AVG(k.value) AS v
-                FROM kpi_data k {_agg_ts_join}
-                WHERE k.value IS NOT NULL
-                  AND (k.kpi_name ILIKE '%dl%data%total%volume%' OR k.kpi_name ILIKE '%dl%volume%'
-                    OR k.kpi_name ILIKE '%ul%data%total%volume%' OR k.kpi_name ILIKE '%ul%volume%')
-                  {zone_cond}
-                GROUP BY k.site_id, k.kpi_name, k.date
-            )
-            SELECT date::text AS date,
-                   AVG(CASE WHEN kpi_name ILIKE '%dl%data%total%volume%' OR kpi_name ILIKE '%dl%volume%' THEN v END) AS dl_volume,
-                   AVG(CASE WHEN kpi_name ILIKE '%ul%data%total%volume%' OR kpi_name ILIKE '%ul%volume%' THEN v END) AS ul_volume
-            FROM per_skd
-            GROUP BY date ORDER BY date
-        """, base_params)
-        hourly_dl = [{"hour": r["date"],
-                      "dl_volume": _f(r.get("dl_volume"), 2),
-                      "ul_volume": _f(r.get("ul_volume"), 2)} for r in dl_rows]
-    except Exception as e:
-        _LOG.error("ran_analytics dl_trend: %s", e)
 
-    # ── 6. Zone performance ───────────────────────────────────────────────────
-    zone_map: dict = {}
+def _ran_zone_perf(site_kpis):
+    """Per-zone aggregate of every headline RAN KPI. Pure Python bucketing."""
+    zone_map = {}
     for s in site_kpis:
         z = s.get("zone") or "Unknown"
-        zone_map.setdefault(z, {"prbs": [], "tputs": [], "n": 0})
-        zone_map[z]["prbs"].append(float(s.get("dl_prb_util") or 0))
-        zone_map[z]["tputs"].append(float(s.get("dl_cell_tput") or 0))
-        zone_map[z]["n"] += 1
-    zone_perf = [
-        {"zone": z,
-         "avg_prb":  _f(sum(d["prbs"])  / max(len(d["prbs"]),  1)),
-         "avg_tput": _f(sum(d["tputs"]) / max(len(d["tputs"]), 1)),
-         "sites": d["n"]}
-        for z, d in sorted(zone_map.items(), key=lambda x: -(sum(x[1]["prbs"])/max(len(x[1]["prbs"]),1)))
+        zd = zone_map.setdefault(z, {"drop": [], "cssr": [], "usr_tput": [],
+                                     "rrc": [], "prb": [], "vol": [],
+                                     "tputs": [], "n": 0})
+        zd["drop"].append(float(s.get("erab_drop_rate")    or 0))
+        zd["cssr"].append(float(s.get("lte_call_setup_sr") or 0))
+        zd["usr_tput"].append(float(s.get("dl_usr_tput")   or 0))
+        zd["rrc"].append(float(s.get("avg_rrc_ue")         or 0))
+        zd["prb"].append(float(s.get("dl_prb_util")        or 0))
+        zd["vol"].append(float(s.get("dl_data_vol")        or 0))
+        zd["tputs"].append(float(s.get("dl_cell_tput")     or 0))
+        zd["n"] += 1
+    def _avg(xs): return sum(xs) / max(len(xs), 1)
+    return [
+        {"zone":         z,
+         "drop_rate":    _f(_avg(d["drop"]),     2),
+         "cssr":         _f(_avg(d["cssr"]),     2),
+         "dl_usr_tput":  _f(_avg(d["usr_tput"]), 2),
+         "avg_rrc_ue":   _f(_avg(d["rrc"]),      1),
+         "dl_prb_util":  _f(_avg(d["prb"]),      1),
+         "dl_data_vol":  _f(_avg(d["vol"]),      2),
+         "avg_prb":      _f(_avg(d["prb"]),      1),
+         "avg_tput":     _f(_avg(d["tputs"]),    1),
+         "sites":        d["n"]}
+        for z, d in sorted(zone_map.items(), key=lambda x: -_avg(x[1]["prb"]))
     ]
 
-    # ── 7. Top issue sites ────────────────────────────────────────────────────
-    top_issues = sorted(
-        [{"site_id": s["site_id"], "cluster": s.get("zone", ""),
-          "avg_prb":   float(s.get("dl_prb_util")    or 0),
-          "drop_rate": float(s.get("erab_drop_rate") or 0),
-          "avg_tput":  float(s.get("dl_cell_tput")   or 0),
-          "lat": s.get("lat"), "lng": s.get("lng"),
-          "issue_type": ("High PRB"  if float(s.get("dl_prb_util")    or 0) > 80
-                    else "Call Drop" if float(s.get("erab_drop_rate") or 0) > 1
-                    else "Low Tput")}
-         for s in site_kpis],
-        key=lambda x: x["avg_prb"], reverse=True
+
+def _ran_top_issues(site_kpis):
+    """Top 20 sites with the most KPI breaches. Pure Python ranker."""
+    def _issues(s):
+        bad = 0
+        if float(s.get("erab_drop_rate")    or 0) > 2:    bad += 1
+        if float(s.get("lte_call_setup_sr") or 100) < 98: bad += 1
+        if float(s.get("dl_usr_tput")       or 0) < 8:    bad += 1
+        if float(s.get("dl_prb_util")       or 0) > 80:   bad += 1
+        return bad
+
+    def _label(s):
+        if float(s.get("erab_drop_rate")    or 0) > 2:    return "High Drop"
+        if float(s.get("lte_call_setup_sr") or 100) < 98: return "Low CSSR"
+        if float(s.get("dl_prb_util")       or 0) > 80:   return "High PRB"
+        if float(s.get("dl_usr_tput")       or 0) < 8:    return "Low Tput"
+        return "Watch"
+
+    return sorted(
+        [{
+            "site_id":     s["site_id"],
+            "cluster":     s.get("zone", ""),
+            "zone":        s.get("zone", ""),
+            "drop_rate":   float(s.get("erab_drop_rate")    or 0),
+            "cssr":        float(s.get("lte_call_setup_sr") or 0),
+            "dl_usr_tput": float(s.get("dl_usr_tput")       or 0),
+            "avg_rrc_ue":  float(s.get("avg_rrc_ue")        or 0),
+            "dl_prb_util": float(s.get("dl_prb_util")       or 0),
+            "avg_prb":     float(s.get("dl_prb_util")       or 0),
+            "dl_data_vol": float(s.get("dl_data_vol")       or 0),
+            "avg_tput":    float(s.get("dl_cell_tput")      or 0),
+            "lat":         s.get("lat"),
+            "lng":         s.get("lng"),
+            "issues":      _issues(s),
+            "issue_type":  _label(s),
+        } for s in site_kpis],
+        key=lambda x: (x["issues"], x["drop_rate"], x["avg_prb"]),
+        reverse=True,
     )[:20]
+
+
+def _ran_trends(per_date_rows, kpi_map):
+    """Build the three trend chart datasets from per-(kpi, date) rows."""
+    by_date = {}
+    for r in per_date_rows:
+        if r.get("v") is None: continue
+        by_date.setdefault(r["date"], {})[r["kpi_name"]] = float(r["v"])
+
+    K_DROP   = kpi_map.get("drop")
+    K_CSSR   = kpi_map.get("cssr")
+    K_PRB_DL = kpi_map.get("prb_dl")
+    K_USR_DL = kpi_map.get("usr_dl")
+    K_DL_VOL = kpi_map.get("dl_vol")
+    K_UL_VOL = kpi_map.get("ul_vol")
+
+    sorted_dates = sorted(by_date.keys())
+    call_drop = [{
+        "date": d,
+        "drop_rate": _f(by_date[d].get(K_DROP), 2),
+        "cssr":      _f(by_date[d].get(K_CSSR), 2),
+    } for d in sorted_dates
+       if (by_date[d].get(K_DROP) is not None or by_date[d].get(K_CSSR) is not None)]
+
+    prb_tput_trend = [{
+        "date":        d,
+        "dl_prb_util": _f(by_date[d].get(K_PRB_DL), 2),
+        "dl_usr_tput": _f(by_date[d].get(K_USR_DL), 2),
+    } for d in sorted_dates
+       if (by_date[d].get(K_PRB_DL) is not None or by_date[d].get(K_USR_DL) is not None)]
+
+    hourly_dl = [{
+        "hour":      d,
+        "dl_volume": _f(by_date[d].get(K_DL_VOL), 2),
+        "ul_volume": _f(by_date[d].get(K_UL_VOL), 2),
+    } for d in sorted_dates
+       if (by_date[d].get(K_DL_VOL) is not None or by_date[d].get(K_UL_VOL) is not None)]
+
+    return call_drop, prb_tput_trend, hourly_dl
+
+
+@network_bp.route("/api/network/ran-analytics", methods=["GET"])
+@jwt_required()
+def ran_analytics():
+    """RAN analytics — Python orchestration over isolated _ran_* helpers.
+
+    Each card / chart / table is computed by its own helper above; this
+    function just wires them together and assembles the response. RAN
+    helpers do NOT call any _ovw_* helper, so a slow or broken overview
+    can never affect this endpoint (and vice versa)."""
+    filters = _get_filters()
+    _LOG.info("ran-analytics: start filters=%s", {k: v for k, v in filters.items() if v})
+
+    # Step 1: resolve actual KPI names from kpi_data so we can use exact
+    # `IN (...)` matches (hits the (kpi_name, date) index).
+    kpi_map = _ran_resolve_kpi_names()
+    kpi_names = [v for v in kpi_map.values() if v]
+    _LOG.info("ran-analytics: %d KPIs resolved out of %d expected",
+              len(kpi_names), len(kpi_map))
+
+    # Empty KPI list — return well-shaped zeros so the frontend renders.
+    if not kpi_names:
+        return jsonify({
+            "lte_rrc_setup_sr": 0, "lte_call_setup_sr": 0, "erab_setup_sr": 0,
+            "erab_drop_rate": 0, "dl_cell_tput": 0, "ul_cell_tput": 0,
+            "dl_usr_tput": 0, "dl_data_vol": 0, "avg_rrc_ue": 0,
+            "availability": 0, "dl_prb_util": 0, "avg_prb": 0, "avg_sinr": 0,
+            "call_drop_trend": [], "prb_distribution": [], "prb_tput_trend": [],
+            "hourly_dl_traffic": [], "zone_performance": [], "top_issues": [],
+            "sites": [],
+        })
+
+    # Step 2: resolve the date window (RAN-specific).
+    start, end = _ran_resolve_dates(filters.get("time_range") or "30d")
+
+    # Step 3: pull both raw datasets in parallel-friendly Python helpers.
+    try:
+        per_site_rows = _ran_pull_per_site(filters, kpi_names, start, end)
+    except Exception as e:
+        _LOG.error("ran-analytics per-site: %s", e); per_site_rows = []
+    try:
+        per_date_rows = _ran_pull_per_date(filters, kpi_names, start, end)
+    except Exception as e:
+        _LOG.error("ran-analytics per-date: %s", e); per_date_rows = []
+
+    # Step 4: shape each dashboard piece in pure Python helpers.
+    try: agg = _ran_card_avgs(per_site_rows, kpi_map)
+    except Exception as e: _LOG.error("ran cards: %s", e); agg = {}
+    try: site_kpis = _ran_site_list(per_site_rows, kpi_map)
+    except Exception as e: _LOG.error("ran site_list: %s", e); site_kpis = []
+    try: prb_dist = _ran_prb_distribution(site_kpis)
+    except Exception as e: _LOG.error("ran prb_dist: %s", e); prb_dist = []
+    try: zone_perf = _ran_zone_perf(site_kpis)
+    except Exception as e: _LOG.error("ran zone_perf: %s", e); zone_perf = []
+    try: top_issues = _ran_top_issues(site_kpis)
+    except Exception as e: _LOG.error("ran top_issues: %s", e); top_issues = []
+    try: call_drop, prb_tput_trend, hourly_dl = _ran_trends(per_date_rows, kpi_map)
+    except Exception as e:
+        _LOG.error("ran trends: %s", e)
+        call_drop = prb_tput_trend = hourly_dl = []
 
     def _p(v): return _f(v, 1) if v is not None else 0
 
@@ -2487,6 +2827,7 @@ def ran_analytics():
         "erab_drop_rate":    _f(agg.get("erab_drop_rate"), 2),
         "dl_cell_tput":      _f(agg.get("dl_cell_tput")),
         "ul_cell_tput":      _f(agg.get("ul_cell_tput")),
+        "dl_usr_tput":       _f(agg.get("dl_usr_tput")),
         "dl_data_vol":       _f(agg.get("dl_data_vol")),
         "avg_rrc_ue":        _f(agg.get("avg_rrc_ue")),
         "availability":      _p(agg.get("availability")),
@@ -2495,12 +2836,15 @@ def ran_analytics():
         "avg_sinr":          0,
         "call_drop_trend":   call_drop,
         "prb_distribution":  prb_dist,
+        "prb_tput_trend":    prb_tput_trend,
         "hourly_dl_traffic": hourly_dl,
         "zone_performance":  zone_perf,
         "top_issues":        top_issues,
         "sites":             site_kpis,
     }
-    _to_cache(ck, result)
+    _LOG.info("ran-analytics: done sites=%d zones=%d top_issues=%d trends=(%d,%d,%d)",
+              len(site_kpis), len(zone_perf), len(top_issues),
+              len(call_drop), len(prb_tput_trend), len(hourly_dl))
     return jsonify(result)
 
 
@@ -2530,12 +2874,11 @@ def core_analytics():
         if cached:
             return jsonify(cached)
 
-    # Time filter
+    # Time filter — anchored to CURRENT_DATE.
     _days = {"1h": 1, "6h": 1, "24h": 1, "7d": 7, "30d": 30}.get(time_range, 9999)
     _time_sql = ""
     if _days < 9999:
-        # Use CURRENT_DATE as anchor so today's intraday data is included
-        _time_sql = f"AND date >= CURRENT_DATE - INTERVAL '{_days} days'"
+        _time_sql = f"AND date >= CURRENT_DATE - INTERVAL '{_days} days' AND date <= CURRENT_DATE"
 
     _ct_sql = f"AND component_type = '{comp_type}'" if comp_type else ""
     _ci_sql = f"AND component_id = :comp_id" if comp_id else ""
@@ -2694,7 +3037,7 @@ def core_daily_curves():
     if dates_str:
         date_list = [d.strip() for d in dates_str.split(",") if d.strip()]
     else:
-        # Default: today (based on CURRENT_DATE) + last 7 days
+        # Default: last 7 days anchored to CURRENT_DATE
         date_rows = _sql(f"""
             SELECT DISTINCT date FROM core_component_kpi
             WHERE kpi_name = :kn {_ct_sql} {_ci_sql}
@@ -3655,7 +3998,7 @@ def network_kpi_filter():
                 WHERE k.data_level = 'site' AND k.value IS NOT NULL
                   AND k.kpi_name IN (:tput, :prb, :drop)
                   AND k.site_id IN ({sid_placeholders})
-                  AND k.date <= CURRENT_DATE
+                  AND k.date <= (SELECT MAX(date) FROM kpi_data)
                 GROUP BY k.date ORDER BY k.date
                 LIMIT 30
             """, {**sid_params, "tput": _TPUT_T, "prb": _PRB_T, "drop": _DROP_T})
@@ -3936,10 +4279,27 @@ def delete_network_data():
         with db.engine.connect() as conn:
             conn.execute(sa_text("DELETE FROM network_kpi_timeseries"))
             conn.commit()
-        _CACHE.clear()
+        clear_analytics_cache()
         return jsonify({"success": True, "deleted": count})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@network_bp.route("/api/admin/clear-cache", methods=["POST"])
+@jwt_required()
+def admin_clear_cache():
+    """Manually flush every analytics cache. Useful after a manual DB reset
+    (DROP/CREATE) or when the dashboard appears to show stale data."""
+    uid = get_jwt_identity()
+    user = db.session.get(User, int(uid))
+    if not user or user.role not in ("admin", "manager"):
+        return jsonify({"error": "Forbidden"}), 403
+    clear_analytics_cache()
+    return jsonify({
+        "success": True,
+        "cleared": ["_CACHE", "_KPI_NAMES_CACHE", "_KPI_COUNTS_CACHE",
+                    "_KPI_MAX_DATE", "_TS_COLS_CACHE"],
+    })
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -5171,6 +5531,7 @@ def site_core_detail():
                 FROM core_kpi_data
                 WHERE LOWER(site_id) = LOWER(:sid)
                   AND date >= CURRENT_DATE - INTERVAL '{_max_days} days'
+                  AND date <= CURRENT_DATE
                 ORDER BY date
             """, {"sid": site_id})
             trend = [
@@ -5315,746 +5676,710 @@ def site_transport_detail():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# GET /api/network/overview-stats
-# Pulls data from ALL tables (RAN + Core + Transport + Revenue) for Overview page
+# Overview Page Helpers — pure Python data-retrieval logic.
+#
+# SQL is used only for the cheap heavy-lift (WHERE filters + GROUP BY on
+# indexed columns, which Postgres does in milliseconds). Every business
+# decision — bucketing KPI names into metrics, computing means, ranking
+# best/worst, classifying violations, shaping zone aggregates — happens
+# in pure Python so it's easy to read, easy to change, and easy to debug
+# (each step logs to backend.log).
+#
+# This file is concatenated into network_analytics.py at build time; do not
+# import it directly. Helpers all live under the _ovw_* prefix.
 # ─────────────────────────────────────────────────────────────────────────────
-@network_bp.route("/api/network/overview-stats", methods=["GET"])
-@jwt_required()
-def overview_stats():
-    """
-    Unified overview page data pulling from ALL tables:
-      RAN     → kpi_data + telecom_sites  (27 KPIs)
-      Core    → flexible_kpi_uploads (type='core') or core_kpi_data
-      Transport → transport_kpi_data
-      Revenue → flexible_kpi_uploads (type='revenue') or revenue_data
-    Optimised: uses targeted CASE WHEN SQL — never loads all 40K rows into Python.
-    """
-    filters = _get_filters()
-    fresh = request.args.get("fresh") == "1"
-    # Include today's date in cache key so worst cells update daily
-    from datetime import date as _date_type
-    ck = _cache_key(f"overview_v23_health_safe_{_date_type.today().isoformat()}", filters)
-    if not fresh:
-        cached = _from_cache(ck)
-        if cached:
-            return jsonify(cached)
 
-    # Resolve canonical KPI names against whatever is actually in kpi_data.
-    # Some uploads use slightly different wording — pick the closest match
-    # from distinct kpi_name values so queries below always hit data.
-    def _resolve_kpi(default, patterns):
-        names = _distinct_kpi_names_cached()
-        if default in names:
-            return default
-        for pat in patterns:
-            pl = pat.lower()
-            for n in names:
-                if n and pl in n.lower():
-                    return n
-        return default
+# Substring patterns that classify a kpi_name into a metric bucket. Match
+# semantics: case-insensitive, ALL words in any one inner list must appear.
+# Uploads with custom KPI names just need one matching pattern here to feed
+# the dashboard — no schema change required.
 
-    _PRB      = _resolve_kpi("DL PRB Utilization (1BH)",     ["dl prb util", "dl_prb", "dl prb"])
-    _UL_PRB   = _resolve_kpi("UL PRB Utilization (1BH)",     ["ul prb util", "ul_prb", "ul prb"])
-    _TPUT     = _resolve_kpi("LTE DL - Cell Ave Throughput", ["dl cell ave", "cell ave throughput", "dl cell"])
-    _DROP     = _resolve_kpi("E-RAB Call Drop Rate_1",       ["e-rab call drop", "call drop rate", "erab drop", "drop rate"])
-    _RRC      = _resolve_kpi("Ave RRC Connected Ue",         ["ave rrc", "rrc connected", "rrc conn"])
-    _AVAIL    = _resolve_kpi("Availability",                 ["availability", "avail"])
-    _CSSR     = _resolve_kpi("LTE Call Setup Success Rate",  ["call setup success", "cssr", "setup success"])
-    _USR_TPUT = _resolve_kpi("LTE DL - Usr Ave Throughput",  ["dl usr ave", "usr ave throughput", "user throughput"])
-    _DL_VOL   = _resolve_kpi("DL Data Total Volume",         ["dl data total", "dl total volume", "dl volume"])
+_OVW_METRIC_PATTERNS = {
+    "dl_prb":    [["dl", "prb", "util"]],
+    "ul_prb":    [["ul", "prb", "util"]],
+    "usr_tput":  [["dl", "usr", "ave", "throughput"],
+                  ["dl", "user", "ave", "throughput"]],
+    "cell_tput": [["dl", "cell", "ave", "throughput"],
+                  ["dl", "cell", "tput"]],
+    "drop":      [["e-rab", "call", "drop"],
+                  ["call", "drop", "rate"],
+                  ["drop", "rate"]],
+    "rrc":       [["rrc", "connected"], ["ave", "rrc"], ["rrc", "ue"]],
+    "avail":     [["availability"], ["avail"]],
+    "dl_vol":    [["dl", "data", "total", "volume"],
+                  ["dl", "data", "volume"], ["dl", "volume"]],
+    "cssr":      [["call", "setup", "success"], ["cssr"],
+                  ["setup", "success", "rate"]],
+}
 
-    # ── Build filter clause for all queries ────────────────────────────────────
-    # Headline KPI cards = "overall network average" (per dashboard spec).
-    # Use the last 30 days of data anchored to CURRENT_DATE — fast (uses the
-    # date index) and captures all KPIs whose uploads land in that window.
-    # We avoid the full-scan / "all" path because it burns the request budget
-    # (15s+ per query × 6 aggregates).
-    _filters_overall = dict(filters or {})
-    _filters_overall.pop("time_range", None)  # we'll add our own date bounds
-    _fw_geo, _fp, _needs_ts = _kpi_filter_clause(_filters_overall, "k", "ts")
-    _fp = dict(_fp)
-    _fp["_overall_start"] = (datetime.utcnow().date() - timedelta(days=30))
-    _fw = _fw_geo + " AND k.date >= :_overall_start"
-    _TS_JOIN = "JOIN telecom_sites ts ON k.site_id = ts.site_id" if _needs_ts else ""
 
-    # ── 1. Site & cell counts ──────────────────────────────────────────────
-    # Total Sites  = unique sites (Site ID + ABS Site ID columns from upload).
-    # Active Cells = unique cell names across the network.
-    # Source priority: telecom_sites (master list) → fall back to kpi_data when
-    # the master list is empty (KPI uploads alone are enough to count).
+def _ovw_classify_kpi(kpi_name):
+    """Return the metric bucket (e.g. 'dl_prb') for a kpi_name, or None."""
+    n = (kpi_name or "").lower()
+    if not n:
+        return None
+    for metric, patterns in _OVW_METRIC_PATTERNS.items():
+        for words in patterns:
+            if all(w in n for w in words):
+                return metric
+    return None
+
+
+def _ovw_mean(values):
+    """Arithmetic mean of an iterable, ignoring None. Returns None on empty."""
+    xs = [float(v) for v in values if v is not None]
+    return sum(xs) / len(xs) if xs else None
+
+
+def _ovw_site_counts(filters):
+    """Total sites + total cells respecting the geo filter.
+    Tries telecom_sites first; falls back to distinct site_id from kpi_data
+    when the master list is empty. Returns (n_sites, n_cells)."""
     n_sites = n_cells = 0
+    parts, params = [], {}
+    zone   = filters.get("cluster") or filters.get("zone") or ""
+    city_f = filters.get("city") or ""
+    state  = filters.get("state") or ""
+    if zone:
+        items = [v.strip() for v in zone.split(",") if v.strip()]
+        if len(items) == 1:
+            parts.append("LOWER(zone) = LOWER(:_tz)"); params["_tz"] = items[0]
+        else:
+            for i, v in enumerate(items): params[f"_tz{i}"] = v
+            phs = ",".join(f"LOWER(:_tz{i})" for i in range(len(items)))
+            parts.append(f"LOWER(zone) IN ({phs})")
+    if city_f:
+        items = [v.strip() for v in city_f.split(",") if v.strip()]
+        if len(items) == 1:
+            parts.append("LOWER(city) = LOWER(:_tc)"); params["_tc"] = items[0]
+        else:
+            for i, v in enumerate(items): params[f"_tc{i}"] = v
+            phs = ",".join(f"LOWER(:_tc{i})" for i in range(len(items)))
+            parts.append(f"LOWER(city) IN ({phs})")
+    if state:
+        parts.append("LOWER(state) = LOWER(:_tst)"); params["_tst"] = state
+    where = (" AND " + " AND ".join(parts)) if parts else ""
+    cell_col = _telecom_sites_cell_col()
+    cell_expr = "NULL" if not cell_col else f"NULLIF(COALESCE({cell_col}, ''), '')"
     try:
-        _cell_col = _telecom_sites_cell_col()
-        _cell_expr = "NULL" if not _cell_col else f"NULLIF(COALESCE({_cell_col}, ''), '')"
-        # Build a lightweight filter for telecom_sites only (zone/city/state)
-        _ts_parts, _ts_params = [], {}
-        _zone = (filters or {}).get("cluster") or (filters or {}).get("zone") or ""
-        _city_f = (filters or {}).get("city") or ""
-        _state_f = (filters or {}).get("state") or ""
-        if _zone:
-            items = [v.strip() for v in _zone.split(",") if v.strip()]
-            if len(items) == 1:
-                _ts_parts.append("LOWER(zone) = LOWER(:_tz)")
-                _ts_params["_tz"] = items[0]
-            else:
-                phs = []
-                for i, v in enumerate(items):
-                    _ts_params[f"_tz{i}"] = v
-                    phs.append(f"LOWER(:_tz{i})")
-                _ts_parts.append(f"LOWER(zone) IN ({','.join(phs)})")
-        if _city_f:
-            city_items = [v.strip() for v in _city_f.split(",") if v.strip()]
-            if len(city_items) == 1:
-                _ts_parts.append("LOWER(city) = LOWER(:_tc)")
-                _ts_params["_tc"] = city_items[0]
-            else:
-                city_phs = []
-                for i, v in enumerate(city_items):
-                    _ts_params[f"_tc{i}"] = v
-                    city_phs.append(f"LOWER(:_tc{i})")
-                _ts_parts.append(f"LOWER(city) IN ({','.join(city_phs)})")
-        if _state_f:
-            _ts_parts.append("LOWER(state) = LOWER(:_tst)")
-            _ts_params["_tst"] = _state_f
-        _ts_where = (" AND " + " AND ".join(_ts_parts)) if _ts_parts else ""
-        r = _sql(f"""
+        rows = _sql(f"""
             SELECT
                 COUNT(DISTINCT COALESCE(NULLIF(site_id,''), NULLIF(site_abs_id,''))) AS s,
-                COUNT(DISTINCT {_cell_expr}) AS c_by_cell,
+                COUNT(DISTINCT {cell_expr}) AS c_by_cell,
                 COUNT(*) AS c_total
-            FROM telecom_sites WHERE 1=1 {_ts_where}
-        """, _ts_params)[0]
-        n_sites = int(r.get("s") or 0)
-        n_cells = int(r.get("c_by_cell") or 0) or int(r.get("c_total") or 0)
+            FROM telecom_sites WHERE 1=1 {where}
+        """, params)
+        if rows:
+            r = rows[0]
+            n_sites = int(r.get("s") or 0)
+            n_cells = int(r.get("c_by_cell") or 0) or int(r.get("c_total") or 0)
     except Exception as e:
-        _LOG.error("overview n_sites (telecom_sites): %s", e)
-
-    # Fallback: derive counts from kpi_data when the master list hasn't been
-    # uploaded yet. COUNT(DISTINCT) over 37M rows takes 20s+, so we use a
-    # process-level memo that refreshes hourly. Uses index-only scans on the
-    # smallest possible row sets.
-    if (not n_sites or not n_cells) and not _needs_ts:
+        _LOG.error("_ovw_site_counts: %s", e)
+    if (not n_sites or not n_cells) and not parts:
         cached = _kpi_data_counts_cached()
-        if not n_sites: n_sites = cached["sites"]
-        if not n_cells: n_cells = cached["cells"]
+        if not n_sites: n_sites = cached.get("sites", 0)
+        if not n_cells: n_cells = cached.get("cells", 0)
+    return n_sites, n_cells
 
-    # ── 2. KPI averages — ONE query that returns per-site averages for every
-    # KPI in the 30-day window. From that single result we derive:
-    #   • the headline network-wide averages (mean across sites)
-    #   • the congested-sites count (sites where avg DL PRB > 85%)
-    #   • the best/worst sites lists
-    #   • the cssr / usr-tput inputs to the health score
-    # This collapses what used to be 6 separate scans into one — turning a
-    # ~90s page load into a few seconds. Uses idx_kpi_level_name_date_val
-    # for an index-only scan.
-    avg_prb = avg_tput = avg_drop = avg_rrc = avg_avail = avg_dl_vol = None
-    avg_dl_prb = avg_ul_prb = avg_cell_tput = None
-    per_site_kpis: dict = {}   # site_id -> { metric: value, ... }
 
-    def _match_kpi(name, *substrings):
-        nl = (name or "").lower()
-        return any(s in nl for s in substrings)
-
-    try:
-        _join = "JOIN telecom_sites ts ON LOWER(k.site_id) = LOWER(ts.site_id)" if _needs_ts else ""
-        site_kpi_rows = _sql(f"""
+def _ovw_per_site_kpis(filters, anchor_date):
+    """Per-site averages for the 30-day window.
+    Step 1 (SQL): pull pre-aggregated (site, kpi_name) rows from kpi_data.
+    Step 2 (Python): classify each kpi_name into a metric, store under site.
+    Returns: dict[site_id] -> dict[metric] -> float."""
+    fw_geo, fp, needs_ts = _kpi_filter_clause(
+        {**(filters or {}), "time_range": "all"}, "k", "ts")
+    fp = dict(fp)
+    fp["_o_start"] = anchor_date - timedelta(days=30)
+    fp["_o_end"]   = anchor_date
+    join = "JOIN telecom_sites ts ON LOWER(k.site_id) = LOWER(ts.site_id)" if needs_ts else ""
+    rows = _sql(f"""
+        SELECT k.site_id, k.kpi_name, AVG(k.value) AS v
+        FROM kpi_data k {join}
+        WHERE k.value IS NOT NULL
+          AND k.date >= :_o_start AND k.date <= :_o_end
+          {fw_geo}
+        GROUP BY k.site_id, k.kpi_name
+    """, fp)
+    _LOG.info("_ovw_per_site_kpis step1: %d rows in window %s→%s",
+              len(rows), fp["_o_start"], fp["_o_end"])
+    if not rows:
+        fp_nd = {k: v for k, v in fp.items() if k not in ("_o_start", "_o_end")}
+        rows = _sql(f"""
             SELECT k.site_id, k.kpi_name, AVG(k.value) AS v
-            FROM kpi_data k {_join}
-            WHERE k.value IS NOT NULL AND k.data_level = 'site' {_fw}
+            FROM kpi_data k {join}
+            WHERE k.value IS NOT NULL {fw_geo}
             GROUP BY k.site_id, k.kpi_name
-        """, _fp)
-        # Bucket each row into the metric it represents.
-        for kr in site_kpi_rows:
-            sid, n, v = kr.get("site_id"), kr.get("kpi_name") or "", kr.get("v")
-            if v is None or not sid: continue
-            d = per_site_kpis.setdefault(sid, {})
-            if _match_kpi(n, "dl prb util", "dl_prb"):                      d["dl_prb"]    = v
-            elif _match_kpi(n, "ul prb util", "ul_prb"):                    d["ul_prb"]    = v
-            elif _match_kpi(n, "dl - usr ave throughput", "dl - user ave throughput"):
-                                                                            d["usr_tput"]  = v
-            elif _match_kpi(n, "dl - cell ave throughput", "dl - cell tput"): d["cell_tput"] = v
-            elif _match_kpi(n, "e-rab call drop", "call drop rate"):        d["drop"]      = v
-            elif _match_kpi(n, "rrc connected", "ave rrc"):                 d["rrc"]       = v
-            elif _match_kpi(n, "availability"):                             d["avail"]     = v
-            elif _match_kpi(n, "dl data total volume", "dl volume"):        d["dl_vol"]    = v
-            elif _match_kpi(n, "call setup success", "cssr"):               d["cssr"]      = v
+        """, fp_nd)
+        _LOG.info("_ovw_per_site_kpis step1-retry (no date): %d rows", len(rows))
 
-        # Compute network-wide means from per-site values.
-        def _mean(vals):
-            xs = [x for x in vals if x is not None]
-            return sum(xs) / len(xs) if xs else None
-        rows = [{
-            "avg_dl_prb":    _mean(d.get("dl_prb")    for d in per_site_kpis.values()),
-            "avg_ul_prb":    _mean(d.get("ul_prb")    for d in per_site_kpis.values()),
-            "avg_usr_tput":  _mean(d.get("usr_tput")  for d in per_site_kpis.values()),
-            "avg_cell_tput": _mean(d.get("cell_tput") for d in per_site_kpis.values()),
-            "avg_drop":      _mean(d.get("drop")      for d in per_site_kpis.values()),
-            "avg_rrc":       _mean(d.get("rrc")       for d in per_site_kpis.values()),
-            "avg_avail":     _mean(d.get("avail")     for d in per_site_kpis.values()),
-            "avg_dl_vol":    _mean(d.get("dl_vol")    for d in per_site_kpis.values()),
-        }]
-        kpi_rows = []   # downstream code reuses this; we no longer need it
-        r = rows[0] if rows else {}
-        avg_dl_prb = _f(r.get("avg_dl_prb")) if r.get("avg_dl_prb") is not None else None
-        avg_ul_prb = _f(r.get("avg_ul_prb")) if r.get("avg_ul_prb") is not None else None
-        if avg_dl_prb is not None and avg_ul_prb is not None:
-            avg_prb = _f((avg_dl_prb + avg_ul_prb) / 2.0)
-        elif avg_dl_prb is not None:
-            avg_prb = avg_dl_prb
-        elif avg_ul_prb is not None:
-            avg_prb = avg_ul_prb
-        # Headline DL Throughput card = LTE DL Usr Ave Throughput (user spec).
-        # Fall back to cell-level if user-level is missing in some uploads.
-        usr_t  = r.get("avg_usr_tput")
-        cell_t = r.get("avg_cell_tput")
-        avg_cell_tput = _f(cell_t) if cell_t is not None else None
-        avg_tput = _f(usr_t) if usr_t is not None else avg_cell_tput
-        avg_drop   = _f(r.get("avg_drop"),2) if r.get("avg_drop")   is not None else None
-        avg_rrc    = _f(r.get("avg_rrc"),0)  if r.get("avg_rrc")    is not None else None
-        avg_avail  = _f(r.get("avg_avail"))  if r.get("avg_avail")  is not None else None
-        avg_dl_vol = _f(r.get("avg_dl_vol"),1) if r.get("avg_dl_vol") is not None else None
+    per_site = {}
+    unmatched = set()
+    for r in rows:
+        sid = r.get("site_id")
+        if not sid: continue
+        metric = _ovw_classify_kpi(r.get("kpi_name"))
+        if not metric:
+            if len(unmatched) < 30:
+                unmatched.add(r.get("kpi_name") or "")
+            continue
+        try: v = float(r.get("v"))
+        except (TypeError, ValueError): continue
+        per_site.setdefault(sid, {})[metric] = v
+    _LOG.info("_ovw_per_site_kpis step2: %d sites bucketed; %d unmatched kpi_names",
+              len(per_site), len(unmatched))
+    if unmatched:
+        _LOG.info("_ovw_per_site_kpis sample unmatched: %s",
+                  sorted(unmatched)[:10])
+    return per_site
+
+
+def _ovw_zone_perf(per_site_kpis):
+    """Group per-site KPIs by zone (read from telecom_sites). Pure Python."""
+    if not per_site_kpis:
+        return []
+    site_ids = list(per_site_kpis.keys())
+    site_zone = {}
+    try:
+        CHUNK = 5000
+        for i in range(0, len(site_ids), CHUNK):
+            chunk = site_ids[i:i+CHUNK]
+            params = {f"sz_{j}": s for j, s in enumerate(chunk)}
+            phs = ",".join(f":sz_{j}" for j in range(len(chunk)))
+            rows = _sql(f"""
+                SELECT DISTINCT ON (LOWER(site_id)) LOWER(site_id) AS sid,
+                       COALESCE(NULLIF(zone,''), NULLIF(province,''),
+                                NULLIF(city,''), 'Unzoned') AS zone
+                FROM telecom_sites
+                WHERE LOWER(site_id) IN ({phs})
+            """, params)
+            for r in rows:
+                site_zone[r["sid"]] = r["zone"]
     except Exception as e:
-        _LOG.error("overview kpi agg: %s", e)
+        _LOG.error("_ovw_zone_perf zone lookup: %s", e)
 
-    # ── 3. Congested sites — count sites whose 30-day avg DL PRB > 85% (spec).
-    congested = sum(1 for d in per_site_kpis.values()
-                    if d.get("dl_prb") is not None and d["dl_prb"] > 85)
+    buckets = {}
+    for sid, d in per_site_kpis.items():
+        zname = site_zone.get((sid or "").lower(), "Unzoned")
+        b = buckets.setdefault(zname, {"sites": 0, "dl_prb": [], "ul_prb": [],
+                                       "tput": [], "drop": []})
+        b["sites"] += 1
+        if d.get("dl_prb")  is not None: b["dl_prb"].append(float(d["dl_prb"]))
+        if d.get("ul_prb")  is not None: b["ul_prb"].append(float(d["ul_prb"]))
+        t = d.get("usr_tput") if d.get("usr_tput") is not None else d.get("cell_tput")
+        if t is not None:                b["tput"].append(float(t))
+        if d.get("drop")    is not None: b["drop"].append(float(d["drop"]))
 
-    # ── Health score (4-factor model) ─────────────────────────────────────────
-    # Fetch CSSR and User Throughput from kpi_data directly. Health is computed
-    # only from real values — when a metric is missing we drop it from the
-    # weighted average rather than substituting a hard-coded fallback.
-    # Health-score inputs — derive from per-site values we already have.
-    def _avg(vals):
-        xs = [x for x in vals if x is not None]
-        return sum(xs) / len(xs) if xs else None
-    avg_cssr     = _avg(d.get("cssr")     for d in per_site_kpis.values())
-    avg_usr_tput = _avg(d.get("usr_tput") for d in per_site_kpis.values())
+    out = []
+    for zname, b in buckets.items():
+        z_dl = _ovw_mean(b["dl_prb"]); z_ul = _ovw_mean(b["ul_prb"])
+        z_t  = _ovw_mean(b["tput"]);   z_d  = _ovw_mean(b["drop"])
+        if z_dl is not None and z_ul is not None: z_combined = (z_dl + z_ul) / 2.0
+        else: z_combined = z_dl if z_dl is not None else z_ul
+        out.append({
+            "zone": zname, "province": zname, "sites": b["sites"],
+            "avg_prb":    _f(z_combined, 1) if z_combined is not None else None,
+            "avg_dl_prb": _f(z_dl, 1)       if z_dl       is not None else None,
+            "avg_ul_prb": _f(z_ul, 1)       if z_ul       is not None else None,
+            "avg_tput":   _f(z_t, 1)        if z_t        is not None else None,
+            "avg_drop":   _f(z_d, 2)        if z_d        is not None else None,
+        })
+    out.sort(key=lambda x: x.get("avg_dl_prb") or -1, reverse=True)
+    return out
 
-    # 4-factor health (PRB, Drop, CSSR, Tput). Each contributes 25% only when
-    # its underlying metric is available — missing metrics drop out and the
-    # remaining weights renormalise so the score reflects real data only.
+
+def _ovw_violations_query(filters, anchor_date, group_by_cell=False):
+    """Internal: pull 7-day per-site (or per-cell) KPI averages for violation logic."""
+    fw_geo, fp, needs_ts = _kpi_filter_clause(
+        {**(filters or {}), "time_range": "all"}, "k", "ts")
+    fp = dict(fp)
+    fp["_w_start"] = anchor_date - timedelta(days=7)
+    fp["_w_end"]   = anchor_date
+    join = "JOIN telecom_sites ts ON LOWER(k.site_id) = LOWER(ts.site_id)" if needs_ts else ""
+    if group_by_cell:
+        return _sql(f"""
+            SELECT k.site_id, k.cell_id, k.kpi_name, AVG(k.value) AS v
+            FROM kpi_data k {join}
+            WHERE k.value IS NOT NULL
+              AND k.cell_id IS NOT NULL AND k.cell_id <> ''
+              AND k.date >= :_w_start AND k.date <= :_w_end
+              {fw_geo}
+            GROUP BY k.site_id, k.cell_id, k.kpi_name
+        """, fp)
+    return _sql(f"""
+        SELECT k.site_id, k.kpi_name, AVG(k.value) AS v
+        FROM kpi_data k {join}
+        WHERE k.value IS NOT NULL
+          AND k.date >= :_w_start AND k.date <= :_w_end
+          {fw_geo}
+        GROUP BY k.site_id, k.kpi_name
+    """, fp)
+
+
+def _ovw_count_violations(metrics):
+    """Count how many of {drop, cssr, tput} breach SLA thresholds."""
+    drop = metrics.get("drop")
+    cssr = metrics.get("cssr")
+    tput = metrics.get("usr_tput") if metrics.get("usr_tput") is not None else metrics.get("cell_tput")
+    return drop, cssr, tput, sum([
+        1 if drop is not None and drop > 1.5 else 0,
+        1 if cssr is not None and cssr < 98.5 else 0,
+        1 if tput is not None and tput < 8 else 0,
+    ])
+
+
+def _ovw_lookup_site_info(site_ids):
+    """Fetch zone/lat/lng for a list of site_ids. Returns dict keyed by site_id."""
+    if not site_ids:
+        return {}
+    info = {}
+    try:
+        ids_ph = ",".join(f":si_{i}" for i in range(len(site_ids)))
+        params = {f"si_{i}": s for i, s in enumerate(site_ids)}
+        for r in _sql(f"""
+            SELECT site_id, zone, latitude, longitude
+            FROM telecom_sites WHERE site_id IN ({ids_ph})
+        """, params):
+            info[r["site_id"]] = r
+    except Exception:
+        pass
+    return info
+
+
+def _ovw_worst_sites(filters, anchor_date):
+    """Top 10 worst sites by violation count (drop>1.5, cssr<98.5, tput<8)."""
+    try:
+        rows = _ovw_violations_query(filters, anchor_date, group_by_cell=False)
+    except Exception as e:
+        _LOG.error("_ovw_worst_sites query: %s", e)
+        return []
+    per_site = {}
+    for r in rows:
+        sid = r.get("site_id")
+        metric = _ovw_classify_kpi(r.get("kpi_name"))
+        if not sid or metric not in ("drop", "cssr", "usr_tput", "cell_tput"):
+            continue
+        try: v = float(r.get("v"))
+        except (TypeError, ValueError): continue
+        per_site.setdefault(sid, {})[metric] = v
+    scored = []
+    for sid, m in per_site.items():
+        drop, cssr, tput, vc = _ovw_count_violations(m)
+        if vc == 0: continue
+        scored.append((sid, vc, drop, cssr, tput))
+    scored.sort(key=lambda x: (-x[1], -(x[2] or 0)))
+    top = scored[:10]
+    info = _ovw_lookup_site_info([s for (s, *_x) in top])
+    return [{
+        "site_id": sid,
+        "cluster": (info.get(sid) or {}).get("zone") or "",
+        "call_drop_rate": _f(drop, 2) if drop is not None else None,
+        "lte_cssr":       _f(cssr, 2) if cssr is not None else None,
+        "dl_usr_tput":    _f(tput, 2) if tput is not None else None,
+        "violations":     vc,
+        "lat": (info.get(sid) or {}).get("latitude"),
+        "lng": (info.get(sid) or {}).get("longitude"),
+    } for (sid, vc, drop, cssr, tput) in top]
+
+
+def _ovw_worst_cells(filters, anchor_date):
+    """Top 10 worst cells by violation count."""
+    try:
+        rows = _ovw_violations_query(filters, anchor_date, group_by_cell=True)
+    except Exception as e:
+        _LOG.error("_ovw_worst_cells query: %s", e)
+        return []
+    per_cell = {}
+    for r in rows:
+        sid = r.get("site_id"); cid = r.get("cell_id")
+        metric = _ovw_classify_kpi(r.get("kpi_name"))
+        if not sid or not cid or metric not in ("drop", "cssr", "usr_tput", "cell_tput"):
+            continue
+        try: v = float(r.get("v"))
+        except (TypeError, ValueError): continue
+        per_cell.setdefault((sid, cid), {})[metric] = v
+    scored = []
+    for (sid, cid), m in per_cell.items():
+        drop, cssr, tput, vc = _ovw_count_violations(m)
+        if vc == 0: continue
+        scored.append((sid, cid, vc, drop, cssr, tput))
+    scored.sort(key=lambda x: (-x[2], -(x[3] or 0)))
+    top = scored[:10]
+    info = _ovw_lookup_site_info(list({s for (s, _c, *_x) in top}))
+    return [{
+        "site_id": sid, "cell_id": cid,
+        "cluster": (info.get(sid) or {}).get("zone") or "",
+        "call_drop_rate": _f(drop, 2) if drop is not None else None,
+        "lte_cssr":       _f(cssr, 2) if cssr is not None else None,
+        "dl_usr_tput":    _f(tput, 2) if tput is not None else None,
+        "violations":     vc,
+        "lat": (info.get(sid) or {}).get("latitude"),
+        "lng": (info.get(sid) or {}).get("longitude"),
+    } for (sid, cid, vc, drop, cssr, tput) in top]
+
+
+def _ovw_best_sites(per_site_kpis):
+    """Top 10 sites by user throughput. Pure Python from per_site_kpis dict."""
+    ranked = []
+    for sid, d in per_site_kpis.items():
+        tput = d.get("usr_tput") if d.get("usr_tput") is not None else d.get("cell_tput")
+        if tput is None: continue
+        ranked.append((sid, float(tput), d.get("dl_prb")))
+    ranked.sort(key=lambda x: x[1], reverse=True)
+    top = ranked[:10]
+    info = _ovw_lookup_site_info([s for (s, _t, _p) in top])
+    return [{
+        "site_id": sid,
+        "cluster": (info.get(sid) or {}).get("zone") or "",
+        "dl_tput": _f(tput),
+        "dl_prb_util": _f(prb) if prb is not None else None,
+        "lat": (info.get(sid) or {}).get("latitude"),
+        "lng": (info.get(sid) or {}).get("longitude"),
+    } for (sid, tput, prb) in top]
+
+
+def _ovw_tput_trend(filters, anchor_date):
+    """DL throughput per date for the last 30 days."""
+    fw_geo, fp, needs_ts = _kpi_filter_clause(
+        {**(filters or {}), "time_range": "all"}, "k", "ts")
+    fp = dict(fp)
+    fp["_t_start"] = anchor_date - timedelta(days=30)
+    fp["_t_end"]   = anchor_date
+    join = "LEFT JOIN telecom_sites ts ON LOWER(k.site_id) = LOWER(ts.site_id)" if needs_ts else ""
+    try:
+        rows = _sql(f"""
+            SELECT k.date::text AS d, k.kpi_name, AVG(k.value) AS v
+            FROM kpi_data k {join}
+            WHERE k.value IS NOT NULL
+              AND k.date >= :_t_start AND k.date <= :_t_end
+              {fw_geo}
+            GROUP BY k.date, k.kpi_name
+        """, fp)
+    except Exception as e:
+        _LOG.error("_ovw_tput_trend: %s", e)
+        return []
+    by_date = {}
+    for r in rows:
+        d = r.get("d")
+        if not d: continue
+        metric = _ovw_classify_kpi(r.get("kpi_name"))
+        if metric not in ("usr_tput", "cell_tput", "dl_prb"): continue
+        try: v = float(r.get("v"))
+        except (TypeError, ValueError): continue
+        by_date.setdefault(d, {})[metric] = v
+    trend = []
+    for d in sorted(by_date.keys()):
+        m = by_date[d]
+        tput = m.get("usr_tput") if m.get("usr_tput") is not None else m.get("cell_tput")
+        trend.append({
+            "time": d,
+            "avg_tput": _f(tput) if tput is not None else None,
+            "avg_prb":  _f(m.get("dl_prb")) if m.get("dl_prb") is not None else None,
+        })
+    return trend
+
+
+def _ovw_core_kpis(filters):
+    """Auth / CPU / Attach / PDP averages, source-priority ordered."""
+    out = {"avg_auth": 0, "avg_cpu": 0, "avg_attach": 0, "avg_pdp": 0}
+    # Source 1: flexible_kpi_uploads
+    try:
+        rows = _sql("""
+            SELECT kpi_name, column_name, AVG(num_value) AS v
+            FROM flexible_kpi_uploads
+            WHERE kpi_type='core' AND column_type='numeric' AND num_value IS NOT NULL
+            GROUP BY kpi_name, column_name
+        """)
+        if rows:
+            buckets = {"auth": [], "cpu": [], "attach": [], "pdp": []}
+            for r in rows:
+                combined = ((r.get("kpi_name") or "") + " " +
+                            (r.get("column_name") or "")).lower()
+                v = r.get("v")
+                if v is None: continue
+                v = float(v)
+                if "auth" in combined: buckets["auth"].append(v)
+                if "cpu" in combined:  buckets["cpu"].append(v)
+                if "attach" in combined: buckets["attach"].append(v)
+                if "pdp" in combined or "bearer" in combined: buckets["pdp"].append(v)
+            for k in ("auth", "cpu", "attach", "pdp"):
+                if buckets[k]:
+                    out[f"avg_{k}"] = sum(buckets[k]) / len(buckets[k])
+            if not any(buckets.values()):
+                # Component-style upload — use overall average across all rows
+                all_vals = [float(r["v"]) for r in rows if r.get("v") is not None]
+                if all_vals:
+                    avg = sum(all_vals) / len(all_vals)
+                    for k in ("auth", "cpu", "attach", "pdp"):
+                        out[f"avg_{k}"] = avg
+            if any(out.values()):
+                return out
+    except Exception:
+        pass
+    # Source 2: legacy core_kpi_data
+    try:
+        r = _sql("""
+            SELECT AVG(auth_sr) AS a, AVG(cpu_util) AS c,
+                   AVG(attach_sr) AS at, AVG(pdp_sr) AS p
+            FROM core_kpi_data
+        """)
+        if r:
+            out["avg_auth"]   = float(r[0].get("a") or 0)
+            out["avg_cpu"]    = float(r[0].get("c") or 0)
+            out["avg_attach"] = float(r[0].get("at") or 0)
+            out["avg_pdp"]    = float(r[0].get("p") or 0)
+            if any(out.values()):
+                return out
+    except Exception:
+        pass
+    # Source 3: core_component_kpi
+    try:
+        rows = _sql("""
+            SELECT kpi_name, AVG(value) AS v
+            FROM core_component_kpi WHERE value IS NOT NULL
+            GROUP BY kpi_name
+        """)
+        for r in rows:
+            n = (r.get("kpi_name") or "").lower(); v = r.get("v")
+            if v is None: continue
+            v = float(v)
+            if "auth"   in n and not out["avg_auth"]:   out["avg_auth"]   = v
+            if "cpu"    in n and not out["avg_cpu"]:    out["avg_cpu"]    = v
+            if "attach" in n and not out["avg_attach"]: out["avg_attach"] = v
+            if ("pdp" in n or "bearer" in n) and not out["avg_pdp"]:
+                out["avg_pdp"] = v
+    except Exception:
+        pass
+    return out
+
+
+def _ovw_transport_kpis(filters):
+    """Link util / latency / packet loss / availability averages."""
+    try:
+        r = _sql("""
+            SELECT AVG(avg_util) AS u, AVG(avg_latency) AS l,
+                   AVG(packet_loss) AS p, AVG(availability) AS a
+            FROM transport_kpi_data
+        """)
+        if r:
+            return {
+                "avg_link_util":   float(r[0].get("u") or 0),
+                "avg_tr_latency":  float(r[0].get("l") or 0),
+                "avg_tr_pkt_loss": float(r[0].get("p") or 0),
+                "avg_tr_avail":    float(r[0].get("a") or 0),
+            }
+    except Exception:
+        pass
+    return {"avg_link_util": 0, "avg_tr_latency": 0,
+            "avg_tr_pkt_loss": 0, "avg_tr_avail": 0}
+
+
+def _ovw_revenue(filters):
+    """Total revenue, total OPEX, and bottom 10 sites by margin.
+    All bucketing done in Python — no regex CASE WHEN."""
+    try:
+        rows = _sql("""
+            SELECT site_id, column_name, num_value
+            FROM flexible_kpi_uploads
+            WHERE kpi_type='revenue' AND column_type='numeric' AND num_value IS NOT NULL
+        """)
+    except Exception:
+        rows = []
+    months = {"jan", "feb", "mar", "apr", "may", "jun",
+              "jul", "aug", "sep", "oct", "nov", "dec"}
+    per_site = {}
+    for r in rows:
+        sid = r.get("site_id")
+        col = (r.get("column_name") or "").lower()
+        if not sid or not col: continue
+        try: val = float(r.get("num_value"))
+        except (TypeError, ValueError): continue
+        b = per_site.setdefault(sid, {
+            "rev_total": None, "rev_monthly": 0.0,
+            "opex_total": None, "opex_plain": None, "opex_monthly": 0.0,
+        })
+        is_opex  = "opex" in col
+        is_total = "total" in col
+        is_month = any(m in col for m in months)
+        if is_opex:
+            if is_total:                           b["opex_total"] = val
+            elif col == "opex" or (not is_month):  b["opex_plain"] = val
+            elif is_month:                         b["opex_monthly"] += val
+        else:
+            if is_total and "revenue" in col: b["rev_total"] = val
+            elif is_month:                    b["rev_monthly"] += val
+
+    site_totals = []
+    for sid, b in per_site.items():
+        rev = b["rev_total"] if b["rev_total"] is not None else b["rev_monthly"]
+        opex = (b["opex_total"] if b["opex_total"] is not None else
+                b["opex_plain"] if b["opex_plain"] is not None else
+                b["opex_monthly"])
+        site_totals.append({
+            "site_id": sid, "revenue": rev or 0.0, "opex": opex or 0.0,
+            "diff": (rev or 0.0) - (opex or 0.0),
+        })
+    total_rev  = sum(s["revenue"] for s in site_totals)
+    total_opex = sum(s["opex"]    for s in site_totals)
+    eligible = [s for s in site_totals if s["revenue"] > 0 and s["opex"] > 0]
+    eligible.sort(key=lambda x: x["diff"])
+    low_margin = [{
+        "site_id":            s["site_id"],
+        "zone":               "",
+        "revenue":            _f(s["revenue"]),
+        "opex":               _f(s["opex"]),
+        "revenue_minus_opex": _f(s["diff"]),
+        "q1_rev":             _f(s["revenue"]),
+        "q1_opex":            _f(s["opex"]),
+    } for s in eligible[:10]]
+    return total_rev, total_opex, low_margin
+
+
+def _ovw_health(avg_prb, avg_drop, avg_cssr, avg_usr_tput):
+    """4-factor health score — missing metrics drop out, weights renormalise."""
     components = []
     if avg_prb is not None:
         components.append(max(0, min(1, 1 - max(float(avg_prb) - 30, 0) / 70.0)))
     if avg_drop is not None:
         components.append(max(0, min(1, 1 - (float(avg_drop) - 0.5) / 3.0)))
     if avg_cssr is not None:
-        components.append(max(0, min(1, (avg_cssr - 95) / 5.0)))
+        components.append(max(0, min(1, (float(avg_cssr) - 95) / 5.0)))
     if avg_usr_tput is not None:
-        components.append(max(0, min(1, min(avg_usr_tput, 20) / 20.0)))
-    health = round((sum(components) / len(components)) * 100, 1) if components else None
+        components.append(max(0, min(1, min(float(avg_usr_tput), 20) / 20.0)))
+    if not components:
+        return None, None
+    score = round((sum(components) / len(components)) * 100, 1)
+    if score >= 80:   label = "Good"
+    elif score >= 60: label = "Fair"
+    else:             label = "Poor"
+    return score, label
 
-    # ── 2. Zone performance — group sites by zone (province/city as fallback).
-    # When telecom_sites is empty we synthesise a single "All Sites" zone
-    # so the chart still has data to render instead of going blank.
-    # Zone performance — fast path: when telecom_sites is empty (no zone master
-    # uploaded), synthesise a single "All Sites" row from the headline averages
-    # we already computed. Otherwise run the per-site/per-zone aggregation.
-    zone_perf = []
-    try:
-        ts_count = int((_sql("SELECT COUNT(*) AS n FROM telecom_sites") or [{"n":0}])[0].get("n") or 0)
-    except Exception:
-        ts_count = 0
-    if ts_count == 0:
-        # Single bucket — just echo the network-wide averages.
-        if any(v is not None for v in (avg_prb, avg_dl_prb, avg_ul_prb, avg_tput, avg_drop)):
-            zone_perf.append({
-                "zone": "All Sites", "province": "All Sites",
-                "sites": n_sites,
-                "avg_prb":    avg_prb,
-                "avg_dl_prb": avg_dl_prb,
-                "avg_ul_prb": avg_ul_prb,
-                "avg_tput":   avg_tput,
-                "avg_drop":   avg_drop,
-            })
-        zrows = []
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /api/network/overview-stats
+# Each card on the overview page is computed by a Python helper above.
+# This function is now just orchestration: call helpers, assemble response.
+# ─────────────────────────────────────────────────────────────────────────────
+@network_bp.route("/api/network/overview-stats", methods=["GET"])
+@jwt_required()
+def overview_stats():
+    filters = _get_filters()
+    fresh = request.args.get("fresh") == "1"
+    from datetime import date as _date_type
+    ck = _cache_key(f"overview_python_{_date_type.today().isoformat()}", filters)
+    if not fresh:
+        cached = _from_cache(ck)
+        if cached:
+            return jsonify(cached)
+
+    anchor_date = _get_kpi_max_date() or datetime.utcnow().date()
+    _LOG.info("overview-stats: start anchor_date=%s filters=%s", anchor_date,
+              {k: v for k, v in filters.items() if v})
+
+    # Each section is its own Python helper — if one fails the others still
+    # render so the dashboard never blanks because of one bad table.
+    try: n_sites, n_cells = _ovw_site_counts(filters)
+    except Exception as e: _LOG.error("site_counts: %s", e); n_sites = n_cells = 0
+    try: per_site_kpis = _ovw_per_site_kpis(filters, anchor_date)
+    except Exception as e: _LOG.error("per_site_kpis: %s", e); per_site_kpis = {}
+
+    # Network-wide means in plain Python from the per-site dict
+    avg_dl_prb    = _ovw_mean(d.get("dl_prb")    for d in per_site_kpis.values())
+    avg_ul_prb    = _ovw_mean(d.get("ul_prb")    for d in per_site_kpis.values())
+    avg_usr_tput  = _ovw_mean(d.get("usr_tput")  for d in per_site_kpis.values())
+    avg_cell_tput = _ovw_mean(d.get("cell_tput") for d in per_site_kpis.values())
+    avg_drop      = _ovw_mean(d.get("drop")      for d in per_site_kpis.values())
+    avg_rrc       = _ovw_mean(d.get("rrc")       for d in per_site_kpis.values())
+    avg_avail     = _ovw_mean(d.get("avail")     for d in per_site_kpis.values())
+    avg_dl_vol    = _ovw_mean(d.get("dl_vol")    for d in per_site_kpis.values())
+    avg_cssr      = _ovw_mean(d.get("cssr")      for d in per_site_kpis.values())
+    if avg_dl_prb is not None and avg_ul_prb is not None:
+        avg_prb = (avg_dl_prb + avg_ul_prb) / 2.0
     else:
-        try:
-            zrows = _sql(f"""
-                WITH per_site AS (
-                    SELECT k.site_id,
-                           AVG(CASE WHEN k.kpi_name ILIKE '%dl%prb%util%' THEN k.value END) AS dl_prb,
-                           AVG(CASE WHEN k.kpi_name ILIKE '%ul%prb%util%' THEN k.value END) AS ul_prb,
-                           AVG(CASE WHEN k.kpi_name ILIKE '%dl%usr%ave%throughput%' OR k.kpi_name ILIKE '%dl%user%ave%throughput%' THEN k.value END) AS usr_tput,
-                           AVG(CASE WHEN k.kpi_name ILIKE '%dl%cell%ave%throughput%' OR k.kpi_name ILIKE '%dl%cell%tput%' THEN k.value END) AS cell_tput,
-                           AVG(CASE WHEN k.kpi_name ILIKE '%e-rab%call%drop%' OR k.kpi_name ILIKE '%call%drop%rate%' THEN k.value END) AS drop_rate
-                    FROM kpi_data k
-                    WHERE k.value IS NOT NULL AND k.data_level = 'site' {_fw}
-                    GROUP BY k.site_id
-                ),
-                site_zone AS (
-                    SELECT DISTINCT ON (LOWER(ts.site_id)) LOWER(ts.site_id) AS sid,
-                           COALESCE(NULLIF(ts.zone,''), NULLIF(ts.province,''), NULLIF(ts.city,''), 'Unknown') AS zone
-                    FROM telecom_sites ts
-                )
-                SELECT COALESCE(sz.zone, 'Unzoned') AS zone,
-                       COUNT(DISTINCT ps.site_id) AS sites,
-                       AVG(ps.dl_prb)    AS avg_dl_prb,
-                       AVG(ps.ul_prb)    AS avg_ul_prb,
-                       AVG(COALESCE(ps.usr_tput, ps.cell_tput)) AS avg_tput,
-                       AVG(ps.drop_rate) AS avg_drop
-                FROM per_site ps
-                LEFT JOIN site_zone sz ON sz.sid = LOWER(ps.site_id)
-                GROUP BY COALESCE(sz.zone, 'Unzoned')
-                ORDER BY avg_dl_prb DESC NULLS LAST
-            """, _fp)
-        except Exception as e:
-            _LOG.error("overview zone_perf: %s", e)
-            zrows = []
-    for r in zrows:
-        dl_p = r.get("avg_dl_prb")
-        ul_p = r.get("avg_ul_prb")
-        if dl_p is not None and ul_p is not None:
-            combined = (float(dl_p) + float(ul_p)) / 2.0
-        elif dl_p is not None:
-            combined = float(dl_p)
-        elif ul_p is not None:
-            combined = float(ul_p)
-        else:
-            combined = None
-        zone_perf.append({
-            "zone": r["zone"] or "Unknown",
-            "province": r["zone"] or "Unknown",
-            "sites": int(r["sites"] or 0),
-            "avg_prb":    _f(combined, 1) if combined is not None else None,
-            "avg_dl_prb": _f(dl_p, 1) if dl_p is not None else None,
-            "avg_ul_prb": _f(ul_p, 1) if ul_p is not None else None,
-            "avg_tput":   _f(r["avg_tput"], 1) if r.get("avg_tput") is not None else None,
-            "avg_drop":   _f(r["avg_drop"], 2) if r.get("avg_drop") is not None else None,
-        })
+        avg_prb = avg_dl_prb if avg_dl_prb is not None else avg_ul_prb
+    avg_dl_tput = avg_usr_tput if avg_usr_tput is not None else avg_cell_tput
 
-    # ── 3. Worst sites — ALWAYS last 7 days from CURRENT_DATE ────────────────
-    #   AVG of last 7 days: Drop Rate > 1.5% | CSSR < 98.5% | Usr Tput < 8 Mbps
-    #   Updates daily. Time dropdown does NOT affect this — always 7-day window.
-    #   Only geo filters (zone/city/tech) apply.
-    _geo_only = dict(filters or {})
-    _geo_only["time_range"] = "all"  # remove time filter for worst cells
-    _wfw, _wfp, _w_needs_ts = _kpi_filter_clause(_geo_only, "k", "ts")
-    worst_sites = []
-    _max_d = _get_kpi_max_date()
-    from datetime import timedelta as _td
-    _worst_end = _max_d if _max_d else _date_type.today()
-    _worst_start = _worst_end - _td(days=7)
-    _worst_params = {**_wfp, "_worst_start": _worst_start, "_worst_end": _worst_end}
-    # ILIKE patterns — used in HAVING / ORDER BY too so casing variants don't
-    # cause the worst-sites HAVING filter to silently exclude breaching sites.
-    _DROP_PAT = "(k.kpi_name ILIKE '%e-rab%call%drop%' OR k.kpi_name ILIKE '%call%drop%rate%')"
-    _CSSR_PAT = "(k.kpi_name ILIKE '%call%setup%success%' OR k.kpi_name ILIKE '%cssr%')"
-    _UTPUT_PAT = "(k.kpi_name ILIKE '%dl%usr%ave%throughput%' OR k.kpi_name ILIKE '%dl%user%ave%throughput%' OR k.kpi_name ILIKE '%user%throughput%')"
-    # Worst sites — kpi_data direct, per-site/per-date pre-aggregation,
-    # ILIKE matching, no view dependency.
-    try:
-        wrows = _sql(f"""
-            WITH per_skd AS (
-                SELECT k.site_id, k.kpi_name, k.date, AVG(k.value) AS v
-                FROM kpi_data k
-                WHERE k.value IS NOT NULL
-                  AND k.date >= :_worst_start AND k.date <= :_worst_end {_wfw}
-                GROUP BY k.site_id, k.kpi_name, k.date
-            ),
-            per_site AS (
-                SELECT site_id,
-                       AVG(CASE WHEN {_DROP_PAT.replace("k.kpi_name","kpi_name")}  THEN v END) AS erab_drop_rate,
-                       AVG(CASE WHEN {_CSSR_PAT.replace("k.kpi_name","kpi_name")}  THEN v END) AS lte_cssr,
-                       AVG(CASE WHEN {_UTPUT_PAT.replace("k.kpi_name","kpi_name")} THEN v END) AS dl_usr_tput
-                FROM per_skd
-                GROUP BY site_id
-            )
-            SELECT ps.site_id, ts.zone,
-                   ps.erab_drop_rate, ps.lte_cssr, ps.dl_usr_tput,
-                   ts.latitude AS lat, ts.longitude AS lng
-            FROM per_site ps
-            LEFT JOIN telecom_sites ts ON LOWER(ps.site_id) = LOWER(ts.site_id)
-            WHERE ps.erab_drop_rate > 1.5
-               OR ps.lte_cssr < 98.5
-               OR ps.dl_usr_tput < 8
-            ORDER BY (
-                CASE WHEN ps.erab_drop_rate > 1.5  THEN 1 ELSE 0 END +
-                CASE WHEN ps.lte_cssr < 98.5      THEN 1 ELSE 0 END +
-                CASE WHEN ps.dl_usr_tput < 8      THEN 1 ELSE 0 END
-            ) DESC, ps.erab_drop_rate DESC NULLS LAST
-            LIMIT 10
-        """, _worst_params)
-        worst_sites = [{"site_id": r["site_id"], "cluster": r.get("zone") or "",
-                        "call_drop_rate": _f(r["erab_drop_rate"], 2) if r.get("erab_drop_rate") is not None else None,
-                        "lte_cssr": _f(r["lte_cssr"], 2) if r.get("lte_cssr") is not None else None,
-                        "dl_usr_tput": _f(r["dl_usr_tput"], 2) if r.get("dl_usr_tput") is not None else None,
-                        "violations": sum([
-                            1 if (r.get("erab_drop_rate") or 0) > 1.5 else 0,
-                            1 if (r.get("lte_cssr") or 100) < 98.5 else 0,
-                            1 if (r.get("dl_usr_tput") or 999) < 8 else 0,
-                        ]),
-                        "lat": r.get("lat"), "lng": r.get("lng")} for r in wrows]
-    except Exception as e:
-        _LOG.error("overview worst_sites: %s", e)
+    congested = sum(1 for d in per_site_kpis.values()
+                    if d.get("dl_prb") is not None and float(d["dl_prb"]) > 85)
+    health, h_label = _ovw_health(avg_prb, avg_drop, avg_cssr, avg_usr_tput)
 
-    # ── 3b. Worst cells — same logic but cell-level rows kept individually
-    # (we still need the data_level='cell' filter here so each cell becomes its
-    # own row for the table). Reads kpi_data directly.
-    worst_cells = []
-    try:
-        wcrows = _sql(f"""
-            WITH per_cell AS (
-                SELECT k.site_id, k.cell_id,
-                       AVG(CASE WHEN {_DROP_PAT}  THEN k.value END) AS erab_drop_rate,
-                       AVG(CASE WHEN {_CSSR_PAT}  THEN k.value END) AS lte_cssr,
-                       AVG(CASE WHEN {_UTPUT_PAT} THEN k.value END) AS dl_usr_tput
-                FROM kpi_data k
-                WHERE k.value IS NOT NULL AND k.data_level = 'cell'
-                  AND k.date >= :_worst_start AND k.date <= :_worst_end {_wfw}
-                GROUP BY k.site_id, k.cell_id
-            )
-            SELECT pc.site_id, pc.cell_id, ts.zone,
-                   pc.erab_drop_rate, pc.lte_cssr, pc.dl_usr_tput,
-                   ts.latitude AS lat, ts.longitude AS lng
-            FROM per_cell pc
-            LEFT JOIN telecom_sites ts ON LOWER(pc.site_id) = LOWER(ts.site_id)
-            WHERE pc.erab_drop_rate > 1.5
-               OR pc.lte_cssr < 98.5
-               OR pc.dl_usr_tput < 8
-            ORDER BY (
-                CASE WHEN pc.erab_drop_rate > 1.5  THEN 1 ELSE 0 END +
-                CASE WHEN pc.lte_cssr < 98.5      THEN 1 ELSE 0 END +
-                CASE WHEN pc.dl_usr_tput < 8      THEN 1 ELSE 0 END
-            ) DESC, pc.erab_drop_rate DESC NULLS LAST
-            LIMIT 10
-        """, _worst_params)
-        worst_cells = [{"site_id": r["site_id"], "cell_id": r["cell_id"], "cluster": r.get("zone") or "",
-                        "call_drop_rate": _f(r["erab_drop_rate"], 2) if r.get("erab_drop_rate") is not None else None,
-                        "lte_cssr": _f(r["lte_cssr"], 2) if r.get("lte_cssr") is not None else None,
-                        "dl_usr_tput": _f(r["dl_usr_tput"], 2) if r.get("dl_usr_tput") is not None else None,
-                        "violations": sum([
-                            1 if (r.get("erab_drop_rate") or 0) > 1.5 else 0,
-                            1 if (r.get("lte_cssr") or 100) < 98.5 else 0,
-                            1 if (r.get("dl_usr_tput") or 999) < 8 else 0,
-                        ]),
-                        "lat": r.get("lat"), "lng": r.get("lng")} for r in wcrows]
-    except Exception as e:
-        _LOG.error("overview worst_cells: %s", e)
+    try: zone_perf = _ovw_zone_perf(per_site_kpis)
+    except Exception as e: _LOG.error("zone_perf: %s", e); zone_perf = []
+    try: worst_sites = _ovw_worst_sites(filters, anchor_date)
+    except Exception as e: _LOG.error("worst_sites: %s", e); worst_sites = []
+    try: worst_cells = _ovw_worst_cells(filters, anchor_date)
+    except Exception as e: _LOG.error("worst_cells: %s", e); worst_cells = []
+    try: best_sites = _ovw_best_sites(per_site_kpis)
+    except Exception as e: _LOG.error("best_sites: %s", e); best_sites = []
+    try: tput_trend = _ovw_tput_trend(filters, anchor_date)
+    except Exception as e: _LOG.error("tput_trend: %s", e); tput_trend = []
+    try: core = _ovw_core_kpis(filters)
+    except Exception as e: _LOG.error("core: %s", e); core = {"avg_auth":0,"avg_cpu":0,"avg_attach":0,"avg_pdp":0}
+    try: transport = _ovw_transport_kpis(filters)
+    except Exception as e: _LOG.error("transport: %s", e); transport = {"avg_link_util":0,"avg_tr_latency":0,"avg_tr_pkt_loss":0,"avg_tr_avail":0}
+    try: total_rev, total_opex, low_margin_sites = _ovw_revenue(filters)
+    except Exception as e: _LOG.error("revenue: %s", e); total_rev = total_opex = 0; low_margin_sites = []
 
-    # ── 4. Best 10 sites by LTE DL Usr Ave Throughput (user spec). All data
-    # already in per_site_kpis — just rank.
-    best_sites = []
-    try:
-        ranked = []
-        for sid, d in per_site_kpis.items():
-            tput = d.get("usr_tput") if d.get("usr_tput") is not None else d.get("cell_tput")
-            if tput is None: continue
-            ranked.append((sid, tput, d.get("dl_prb")))
-        ranked.sort(key=lambda x: x[1], reverse=True)
-        top = ranked[:10]
-        # Look up zone/lat/lng (best-effort; works without telecom_sites).
-        zone_lookup = {}
-        if top:
-            ids = ",".join([f":bz_{i}" for i in range(len(top))])
-            zparams = {f"bz_{i}": s for i, (s, _, _) in enumerate(top)}
-            try:
-                for r in _sql(f"""
-                    SELECT site_id, zone, latitude, longitude
-                    FROM telecom_sites WHERE site_id IN ({ids})
-                """, zparams):
-                    zone_lookup[r["site_id"]] = r
-            except Exception:
-                pass
-        for sid, tput, prb in top:
-            z = zone_lookup.get(sid, {})
-            best_sites.append({
-                "site_id": sid, "cluster": z.get("zone") or "",
-                "dl_tput": _f(tput),
-                "dl_prb_util": _f(prb) if prb is not None else None,
-                "lat": z.get("latitude"), "lng": z.get("longitude"),
-            })
-    except Exception as e:
-        _LOG.error("overview best_sites: %s", e)
-
-    # ── 5. DL Throughput Trend by date — kpi_data direct ─────────────────────
-    tput_trend = []
-    try:
-        _trend_filters = dict(filters or {})
-        tr = _trend_filters.get("time_range", "24h")
-        days_map = {"1h": 1, "6h": 1, "24h": 1, "7d": 7, "30d": 30, "all": 9999}
-        if days_map.get(tr, 30) < 14:
-            _trend_filters["time_range"] = "30d"
-        _tfw, _tfp, _t_needs_ts = _kpi_filter_clause(_trend_filters, "k", "ts")
-        _t_join = "LEFT JOIN telecom_sites ts ON LOWER(k.site_id) = LOWER(ts.site_id)" if _t_needs_ts else ""
-        trows = _sql(f"""
-            WITH per_skd AS (
-                SELECT k.site_id, k.kpi_name, k.date, AVG(k.value) AS v
-                FROM kpi_data k {_t_join}
-                WHERE k.value IS NOT NULL AND k.date <= CURRENT_DATE {_tfw}
-                GROUP BY k.site_id, k.kpi_name, k.date
-            )
-            SELECT date::text AS date,
-                   AVG(CASE
-                         WHEN kpi_name ILIKE '%dl%usr%ave%throughput%' OR kpi_name ILIKE '%dl%user%ave%throughput%'
-                         THEN v END) AS avg_usr_tput,
-                   AVG(CASE
-                         WHEN kpi_name ILIKE '%dl%cell%ave%throughput%' OR kpi_name ILIKE '%dl%cell%tput%'
-                         THEN v END) AS avg_cell_tput,
-                   AVG(CASE WHEN kpi_name ILIKE '%dl%prb%util%' THEN v END) AS avg_prb
-            FROM per_skd
-            GROUP BY date ORDER BY date
-        """, _tfp)
-        tput_trend = [{"time": r["date"],
-                       "avg_tput": _f(r["avg_usr_tput"] if r.get("avg_usr_tput") is not None else r.get("avg_cell_tput"))
-                                   if (r.get("avg_usr_tput") is not None or r.get("avg_cell_tput") is not None) else None,
-                       "avg_prb":  _f(r["avg_prb"])  if r.get("avg_prb")  is not None else None} for r in trows]
-    except Exception as e:
-        _LOG.error("overview tput_trend: %s", e)
-
-    # ── Core from flexible_kpi_uploads (type='core') ─────────────────────────
-    # Multi-sheet upload: each sheet name is stored as kpi_name.
-    # Sheet names are matched to metrics via keyword lookup.
-    avg_auth = avg_cpu = avg_attach = avg_pdp = 0
-    # Build site filter for flexible_kpi/core/transport (filter by site_ids matching geo filters)
-    _site_filter_sub = ""
-    if _needs_ts:
-        _sub_conds = []
-        if (filters or {}).get("cluster") or (filters or {}).get("zone"):
-            _v = (filters or {}).get("cluster") or (filters or {}).get("zone")
-            if "," in _v:
-                _vals = ",".join([f"'{x.strip().lower()}'" for x in _v.split(",") if x.strip()])
-                _sub_conds.append(f"LOWER(zone) IN ({_vals})")
-            else:
-                _sub_conds.append(f"LOWER(zone) = '{_v.lower()}'")
-        if (filters or {}).get("technology"):
-            _v = (filters or {}).get("technology")
-            if "," in _v:
-                _vals = ",".join([f"'{x.strip().lower()}'" for x in _v.split(",") if x.strip()])
-                _sub_conds.append(f"LOWER(technology) IN ({_vals})")
-            else:
-                _sub_conds.append(f"LOWER(technology) = '{_v.lower()}'")
-        if (filters or {}).get("city"):
-            _v = (filters or {}).get("city")
-            if "," in _v:
-                _vals = ",".join([f"'{x.strip().lower()}'" for x in _v.split(",") if x.strip()])
-                _sub_conds.append(f"LOWER(city) IN ({_vals})")
-            else:
-                _sub_conds.append(f"LOWER(city) = '{_v.lower()}'")
-        if (filters or {}).get("state"):
-            _sub_conds.append(f"LOWER(state) = '{(filters or {}).get('state','').lower()}'")
-        if (filters or {}).get("country"):
-            _sub_conds.append(f"LOWER(country) = '{(filters or {}).get('country','').lower()}'")
-        if _sub_conds:
-            _site_filter_sub = f"AND LOWER(site_id) IN (SELECT LOWER(site_id) FROM telecom_sites WHERE {' AND '.join(_sub_conds)})"
-    # Time filter for flexible_kpi_uploads (column_name contains date strings like '2026_02_20_000000')
-    _time_sub = ""
-    _tr = (filters or {}).get("time_range", "all")
-    if _tr and _tr != "all":
-        _days = {"1h": 7, "6h": 7, "24h": 7, "7d": 7, "30d": 30}.get(_tr, 30)
-        try:
-            _mx = _sql("SELECT MAX(column_name) AS mx FROM flexible_kpi_uploads WHERE kpi_type='core' AND column_type='numeric'")
-            if _mx and _mx[0]["mx"]:
-                _mx_str = _mx[0]["mx"][:10]
-                _mx_dt = datetime.strptime(_mx_str, "%Y_%m_%d")
-                _cutoff_str = (_mx_dt - timedelta(days=_days)).strftime("%Y_%m_%d")
-                _time_sub = f"AND column_name >= '{_cutoff_str}'"
-        except Exception:
-            pass
-    try:
-        core_rows = _sql(f"""
-            SELECT kpi_name, AVG(num_value) AS avg_val
-            FROM flexible_kpi_uploads
-            WHERE kpi_type='core' AND column_type='numeric' AND num_value IS NOT NULL {_site_filter_sub} {_time_sub}
-            GROUP BY kpi_name
-        """)
-        def _pick_core(rows, *keys):
-            for row in rows:
-                name = (row.get("kpi_name") or "").lower()
-                if any(k.lower() in name for k in keys):
-                    return _f(row.get("avg_val"))
-            return 0
-        avg_auth   = _pick_core(core_rows, "auth")
-        avg_cpu    = _pick_core(core_rows, "cpu")
-        avg_attach = _pick_core(core_rows, "attach")
-        avg_pdp    = _pick_core(core_rows, "pdp", "bearer")
-        # Fallback: if all 4 are still 0 but there is data, use overall avg
-        if not any([avg_auth, avg_cpu, avg_attach, avg_pdp]) and core_rows:
-            overall = _f(_sql(f"""
-                SELECT AVG(num_value) AS avg_val
-                FROM flexible_kpi_uploads
-                WHERE kpi_type='core' AND column_type='numeric' AND num_value IS NOT NULL {_site_filter_sub} {_time_sub}
-            """)[0].get("avg_val"))
-            avg_auth = avg_cpu = avg_attach = avg_pdp = overall
-    except Exception:
-        pass
-    # Fallback: core_kpi_data table
-    if not avg_auth:
-        try:
-            r = _sql(f"SELECT AVG(auth_sr) AS a, AVG(cpu_util) AS c, AVG(attach_sr) AS at, AVG(pdp_sr) AS p FROM core_kpi_data WHERE 1=1 {_site_filter_sub}")[0]
-            avg_auth=_f(r.get("a")); avg_cpu=_f(r.get("c")); avg_attach=_f(r.get("at")); avg_pdp=_f(r.get("p"))
-        except Exception:
-            pass
-
-    # ── Transport from transport_kpi_data (filtered) ─────────────────────────
-    avg_link_util=avg_tr_lat=avg_tr_pkt=avg_tr_avail=0
-    try:
-        tr = _sql(f"SELECT AVG(avg_util) AS u, AVG(avg_latency) AS l, AVG(packet_loss) AS p, AVG(availability) AS a FROM transport_kpi_data WHERE 1=1 {_site_filter_sub}")[0]
-        avg_link_util=_f(tr.get("u")); avg_tr_lat=_f(tr.get("l")); avg_tr_pkt=_f(tr.get("p"),3); avg_tr_avail=_f(tr.get("a"))
-    except Exception:
-        pass
-
-    # ── Revenue from flexible_kpi_uploads (type='revenue') ───────────────────
-    # Revenue data is in USD. Total revenue = SUM of "Total Revenue" column
-    # (or SUM of monthly Feb Avg/Mar Avg/... if that column is absent).
-    # Total opex = SUM of "OPEX" column (any case).
-    total_rev = total_opex = 0
-    low_margin_sites = []
-    try:
-        # Revenue: filter by zone/city via telecom_sites JOIN
-        _rev_zone_join = ""
-        _rev_zone_cond = ""
-        _rev_params = {}
-        _zone_f = (filters or {}).get("cluster") or (filters or {}).get("zone") or ""
-        _city_f = (filters or {}).get("city") or ""
-        if _zone_f or _city_f:
-            _rev_zone_join = "LEFT JOIN telecom_sites _rts ON LOWER(f.site_id) = LOWER(_rts.site_id)"
-            if _zone_f:
-                if "," in _zone_f:
-                    _items = [v.strip() for v in _zone_f.split(",") if v.strip()]
-                    _ph = ",".join([f":_rz{i}" for i in range(len(_items))])
-                    _rev_zone_cond += f" AND LOWER(_rts.zone) IN ({_ph})"
-                    for i, v in enumerate(_items): _rev_params[f"_rz{i}"] = v
-                else:
-                    _rev_zone_cond += " AND LOWER(_rts.zone) = LOWER(:_rz)"
-                    _rev_params["_rz"] = _zone_f
-            if _city_f:
-                if "," in _city_f:
-                    _items = [v.strip() for v in _city_f.split(",") if v.strip()]
-                    _ph = ",".join([f":_rc{i}" for i in range(len(_items))])
-                    _rev_zone_cond += f" AND LOWER(_rts.city) IN ({_ph})"
-                    for i, v in enumerate(_items): _rev_params[f"_rc{i}"] = v
-                else:
-                    _rev_zone_cond += " AND LOWER(_rts.city) = LOWER(:_rc)"
-                    _rev_params["_rc"] = _city_f
-        # Per-site revenue/opex aggregation. Each site picks its own value:
-        #   Revenue per site = "Total Revenue" column when present, else SUM
-        #                      of monthly revenue columns (jan/feb/.../dec).
-        #   OPEX per site    = "OPEX total" column when present, else SUM of
-        #                      monthly opex_* columns.
-        # Picking the "total" column when available avoids double-counting
-        # (totalcol + monthly cols) and matches what the user sees in Excel.
-        ID_EXCL = "(site_id|abs_id|absid|pcid|bandwidth|latitude|longitude|" \
-                  "antenna|rf_power|eirp|tilt|azimuth|crs|gain|subscriber)"
-        rev_rows = _sql(f"""
-            WITH flat AS (
-                SELECT f.site_id,
-                       LOWER(f.column_name) AS cl,
-                       f.num_value
-                FROM flexible_kpi_uploads f
-                {_rev_zone_join}
-                WHERE f.kpi_type='revenue'
-                  AND f.column_type='numeric'
-                  AND f.num_value IS NOT NULL
-                  {_rev_zone_cond}
-            ),
-            per_site AS (
-                SELECT site_id,
-                    MAX(CASE WHEN cl ~ 'total' AND cl ~ 'revenue' THEN num_value END) AS total_rev,
-                    SUM(CASE
-                        WHEN cl !~ 'opex' AND cl !~ 'util' AND cl !~ '{ID_EXCL}'
-                         AND cl !~ 'total'
-                         AND cl ~ '(^|[^a-z])(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)([^a-z]|$)'
-                        THEN num_value ELSE 0 END) AS monthly_rev,
-                    MAX(CASE WHEN cl ~ 'opex' AND cl ~ 'total' THEN num_value END) AS total_opex_col,
-                    SUM(CASE
-                        WHEN cl ~ 'opex' AND cl !~ 'total'
-                         AND cl ~ '(^|[^a-z])(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)([^a-z]|$)'
-                        THEN num_value ELSE 0 END) AS monthly_opex
-                FROM flat
-                GROUP BY site_id
-            )
-            SELECT ps.site_id,
-                   COALESCE(NULLIF(ps.total_rev, 0), NULLIF(ps.monthly_rev, 0)) AS q1_rev,
-                   COALESCE(NULLIF(ps.total_opex_col, 0), NULLIF(ps.monthly_opex, 0)) AS q1_opex,
-                   '' AS zone
-            FROM per_site ps
-        """, _rev_params)
-
-        # Hero totals = SUM of per-site revenue/opex (which already pick the
-        # right "total" column or the monthly fallback per site). This is the
-        # only sum that doesn't double-count.
-        total_rev  = _f(sum(float(r.get("q1_rev")  or 0) for r in rev_rows))
-        total_opex = _f(sum(float(r.get("q1_opex") or 0) for r in rev_rows))
-        _LOG.info("Hero SUMs (per-site, no double count): rev=%.2f opex=%.2f", total_rev, total_opex)
-
-        for r in rev_rows:
-            rev  = float(r.get("q1_rev")  or 0)
-            opex = float(r.get("q1_opex") or 0)
-            # Per user spec: only show sites that have BOTH revenue and opex
-            if rev <= 0 or opex <= 0:
-                continue
-            diff = rev - opex
-            low_margin_sites.append({
-                "site_id":      r["site_id"],
-                "zone":         r.get("zone") or "",
-                "revenue":      _f(rev),
-                "opex":         _f(opex),
-                "revenue_minus_opex": _f(diff),
-                # Legacy keys for backwards compatibility with older UI code paths
-                "q1_rev":       _f(rev),
-                "q1_opex":      _f(opex),
-            })
-        # Sort by revenue_minus_opex ascending (worst margin first — negatives first)
-        low_margin_sites = sorted(low_margin_sites, key=lambda x: x["revenue_minus_opex"])[:10]
-    except Exception as e:
-        _LOG.error("overview revenue: %s", e)
-        # Final fallback: revenue_data table
-        try:
-            r2 = _sql("SELECT SUM(COALESCE(rev_jan,0)+COALESCE(rev_feb,0)+COALESCE(rev_mar,0)) AS rev, SUM(COALESCE(opex_jan,0)+COALESCE(opex_feb,0)+COALESCE(opex_mar,0)) AS opex FROM revenue_data")[0]
-            total_rev=_f(r2.get("rev")); total_opex=_f(r2.get("opex"))
-        except Exception:
-            pass
-
-    # Guard health-label computation against None (when no KPIs are available
-    # the health score is None — `None >= 80` would otherwise raise TypeError
-    # and crash the whole response, leaving the dashboard blank).
-    if health is None:
-        _h_label = None
-    elif health >= 80:
-        _h_label = "Good"
-    elif health >= 60:
-        _h_label = "Fair"
-    else:
-        _h_label = "Poor"
-
-    def _none_or(val):
-        # Helper: pass through None unchanged so the frontend renders "—",
-        # otherwise apply _f formatting consistently.
-        return None if val is None else _f(val)
+    # Synthesise a single-row zone perf when telecom_sites was empty so the
+    # chart never goes blank — values are still DB-derived (network averages).
+    if not zone_perf and any(v is not None for v in (avg_prb, avg_dl_tput, avg_drop)):
+        zone_perf = [{
+            "zone": "All Sites", "province": "All Sites",
+            "sites": n_sites,
+            "avg_prb":    _f(avg_prb, 1)    if avg_prb    is not None else None,
+            "avg_dl_prb": _f(avg_dl_prb, 1) if avg_dl_prb is not None else None,
+            "avg_ul_prb": _f(avg_ul_prb, 1) if avg_ul_prb is not None else None,
+            "avg_tput":   _f(avg_dl_tput, 1) if avg_dl_tput is not None else None,
+            "avg_drop":   _f(avg_drop, 2)   if avg_drop   is not None else None,
+        }]
 
     result = {
         "network_health_score": health,
-        "health_label": _h_label,
-        "total_sites":    n_sites, "total_cells": n_cells,
-        "congested_sites": congested,
-        "avg_prb": avg_prb,
-        "avg_dl_prb": _none_or(avg_dl_prb),
-        "avg_ul_prb": _none_or(avg_ul_prb),
-        "avg_dl_tput": avg_tput,
-        "avg_drop_rate": avg_drop, "avg_rrc_ue": avg_rrc,
-        "avg_dl_vol": avg_dl_vol,
-        "avg_sinr": 0, "avg_packet_loss": avg_tr_pkt, "avg_availability": avg_avail,
-        "avg_auth_sr": _f(avg_auth), "avg_cpu_util": _f(avg_cpu),
-        "avg_attach_sr": _f(avg_attach), "avg_pdp_sr": _f(avg_pdp),
-        "avg_link_util": avg_link_util, "avg_tr_latency": avg_tr_lat,
-        "avg_tr_pkt_loss": avg_tr_pkt, "avg_tr_avail": avg_tr_avail,
-        # Revenue card — all USD, no EBITDA
-        "total_revenue": _f(total_rev), "total_opex": _f(total_opex),
-        # Legacy keys (kept for backwards compatibility with old UI code)
-        "total_q1_revenue": _f(total_rev), "total_q1_opex": _f(total_opex),
-        "worst_sites":      worst_sites,
-        "worst_cells":      worst_cells,
-        "best_sites":       best_sites,
-        "low_margin_sites": low_margin_sites,
-        "zone_performance": zone_perf,
-        "tput_trend":       tput_trend,
+        "health_label":         h_label,
+        "total_sites":          n_sites,
+        "total_cells":          n_cells,
+        "congested_sites":      congested,
+        "avg_prb":              _f(avg_prb)        if avg_prb       is not None else None,
+        "avg_dl_prb":           _f(avg_dl_prb)     if avg_dl_prb    is not None else None,
+        "avg_ul_prb":           _f(avg_ul_prb)     if avg_ul_prb    is not None else None,
+        "avg_dl_tput":          _f(avg_dl_tput)    if avg_dl_tput   is not None else None,
+        "avg_drop_rate":        _f(avg_drop, 2)    if avg_drop      is not None else None,
+        "avg_rrc_ue":           _f(avg_rrc, 0)     if avg_rrc       is not None else None,
+        "avg_dl_vol":           _f(avg_dl_vol, 1)  if avg_dl_vol    is not None else None,
+        "avg_sinr":             0,
+        "avg_packet_loss":      _f(transport["avg_tr_pkt_loss"], 3),
+        "avg_availability":     _f(avg_avail)      if avg_avail     is not None else None,
+        "avg_auth_sr":          _f(core["avg_auth"]),
+        "avg_cpu_util":         _f(core["avg_cpu"]),
+        "avg_attach_sr":        _f(core["avg_attach"]),
+        "avg_pdp_sr":           _f(core["avg_pdp"]),
+        "avg_link_util":        _f(transport["avg_link_util"]),
+        "avg_tr_latency":       _f(transport["avg_tr_latency"]),
+        "avg_tr_pkt_loss":      _f(transport["avg_tr_pkt_loss"], 3),
+        "avg_tr_avail":         _f(transport["avg_tr_avail"]),
+        "total_revenue":        _f(total_rev),
+        "total_opex":           _f(total_opex),
+        "total_q1_revenue":     _f(total_rev),
+        "total_q1_opex":        _f(total_opex),
+        "worst_sites":          worst_sites,
+        "worst_cells":          worst_cells,
+        "best_sites":           best_sites,
+        "low_margin_sites":     low_margin_sites,
+        "zone_performance":     zone_perf,
+        "tput_trend":           tput_trend,
     }
+    _LOG.info("overview-stats: done sites=%d cells=%d congested=%d health=%s zones=%d worst=%d tput_trend=%d",
+              n_sites, n_cells, congested, health, len(zone_perf),
+              len(worst_sites), len(tput_trend))
     _to_cache(ck, result)
     return jsonify(result)
 
-# Run index creation once when the module loads (non-blocking, best-effort)
+
+# Run index creation + cache warm-up once when the module loads.
+# Both run in the background so server start isn't blocked. Warming the
+# kpi_data max-date / counts / distinct-kpi-names caches at startup means
+# the first dashboard hit doesn't pay for those (each takes seconds on a
+# multi-million-row table).
 import threading as _threading
 def _bg_ensure_indexes():
     try:
@@ -6062,6 +6387,14 @@ def _bg_ensure_indexes():
         _time.sleep(3)          # wait for app to finish starting
         _ensure_kpi_indexes()
         _LOG.info("kpi_data indexes ensured")
+        # Warm the lightweight caches the overview endpoint reads first.
+        try:
+            md = _get_kpi_max_date()
+            counts = _kpi_data_counts_cached()
+            _LOG.info("Analytics cache warmed: max_date=%s sites=%s cells=%s",
+                      md, counts.get("sites"), counts.get("cells"))
+        except Exception as ce:
+            _LOG.warning("Cache warm-up skipped: %s", ce)
     except Exception as e:
         _LOG.warning("Index creation skipped: %s", e)
 _threading.Thread(target=_bg_ensure_indexes, daemon=True).start()

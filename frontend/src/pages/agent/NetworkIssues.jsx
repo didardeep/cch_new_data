@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { apiGet, apiCall } from '../../api';
 import CRFormModal from './CRFormModal';
+import CoreTickets from './CoreTickets';
 
 /* ── Icons ──────────────────────────────────────────────────────────────────── */
 const IC = {
@@ -1111,8 +1112,15 @@ export default function NetworkIssues() {
           color:issueTab==='overutilized'?'#E65100':'#94a3b8',borderBottom:issueTab==='overutilized'?'3px solid #E65100':'3px solid transparent',marginBottom:-2}}>
           Overutilized Sites ({myOuTickets.length})
         </button>
+        <button onClick={()=>setIssueTab('core')} style={{padding:'10px 24px',fontSize:13,fontWeight:700,cursor:'pointer',border:'none',background:'transparent',
+          color:issueTab==='core'?'#7C3AED':'#94a3b8',borderBottom:issueTab==='core'?'3px solid #7C3AED':'3px solid transparent',marginBottom:-2}}>
+          Core Tickets
+        </button>
       </div>
 
+      {issueTab === 'core' && <CoreTickets />}
+
+      {issueTab !== 'core' && <>
       {/* Header */}
       <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:16}}>
         <div>
@@ -1331,6 +1339,8 @@ export default function NetworkIssues() {
           </div>
         );
       })}
+
+      </>}
 
       </>}
 

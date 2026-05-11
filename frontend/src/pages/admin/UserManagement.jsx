@@ -81,14 +81,18 @@ function StaffTab() {
   const handleEdit = (u) => {
     setEditingId(u.id);
     setEditData({ name: u.name, email: u.email, role: u.role, password: '',
-      domain: u.domain || '', location: u.location || '', expertise: u.expertise || '', specialization: u.specialization || '' });
+      domain: u.domain || '', location: u.location || '', expertise: u.expertise || '',
+      specialization: u.specialization || '',
+      bandwidth_capacity: u.bandwidth_capacity ?? 10 });
     setEditError('');
   };
 
   const handleUpdate = async (id) => {
     setEditError('');
     const payload = { name: editData.name, email: editData.email, role: editData.role,
-      domain: editData.domain, location: editData.location, expertise: editData.expertise, specialization: editData.specialization };
+      domain: editData.domain, location: editData.location, expertise: editData.expertise,
+      specialization: editData.specialization,
+      bandwidth_capacity: editData.bandwidth_capacity };
     if (editData.password) {
       const pwErr = validatePassword(editData.password);
       if (pwErr) { setEditError(pwErr); return; }
@@ -305,15 +309,33 @@ function StaffTab() {
                         {editData.role === 'human_agent' && (
                           <>
                             <select className="filter-select" value={editData.domain || ''} style={{padding:'4px 6px',fontSize:10,width:90}}
-                              onChange={e => setEditData(d => ({ ...d, domain: e.target.value }))}>
+                              onChange={e => setEditData(d => {
+                                const newDomain = e.target.value;
+                                // Reset expertise when switching domain so the user explicitly picks a valid one
+                                return { ...d, domain: newDomain, expertise: '' };
+                              })}>
                               <option value="">Domain</option>
-                              {['mobile','broadband','dth','landline','enterprise','fiber'].map(v=><option key={v} value={v}>{v}</option>)}
+                              {['mobile','broadband','dth','landline','enterprise','fiber','core'].map(v=><option key={v} value={v}>{v}</option>)}
                             </select>
-                            <select className="filter-select" value={editData.expertise || ''} style={{padding:'4px 6px',fontSize:10,width:110}}
-                              onChange={e => setEditData(d => ({ ...d, expertise: e.target.value }))}>
-                              <option value="">Expertise</option>
-                              {['NETWORK_RF','NETWORK_OPTIMIZATION','LTE','5G','CORE','TRANSPORT','VoLTE','GENERAL'].map(v=><option key={v} value={v}>{v}</option>)}
-                            </select>
+                            {editData.domain === 'core' ? (
+                              <select className="filter-select" value={editData.expertise || ''} style={{padding:'4px 6px',fontSize:10,width:110}}
+                                onChange={e => setEditData(d => ({ ...d, expertise: e.target.value }))}>
+                                <option value="">Expertise</option>
+                                {['MME','SGW','PGW','HSS','PCRF'].map(v=><option key={v} value={v}>{v}</option>)}
+                              </select>
+                            ) : (
+                              <select className="filter-select" value={editData.expertise || ''} style={{padding:'4px 6px',fontSize:10,width:110}}
+                                onChange={e => setEditData(d => ({ ...d, expertise: e.target.value }))}>
+                                <option value="">Expertise</option>
+                                {['NETWORK_RF','NETWORK_OPTIMIZATION','LTE','5G','CORE','TRANSPORT','VoLTE','GENERAL'].map(v=><option key={v} value={v}>{v}</option>)}
+                              </select>
+                            )}
+                            <input type="number" className="form-input" placeholder="Bandwidth"
+                              title="Max concurrent open tickets this agent can hold"
+                              style={{padding:'4px 6px',fontSize:10,width:90}}
+                              value={editData.bandwidth_capacity ?? ''}
+                              min={1} max={100}
+                              onChange={e => setEditData(d => ({ ...d, bandwidth_capacity: e.target.value === '' ? '' : Number(e.target.value) }))} />
                             <input type="text" className="form-input" placeholder="Location"
                               style={{padding:'4px 6px',fontSize:10,width:110}}
                               value={editData.location || ''}

@@ -10,7 +10,7 @@ import time
 from geopy.geocoders import Nominatim
 from geopy.exc import GeocoderTimedOut, GeocoderServiceError
 
-DB = "postgresql://postgres:ROOT@localhost:5432/telecom_cch"
+DB = "postgresql://postgres:root@localhost:5432/telecom_cch"
 
 geolocator = Nominatim(user_agent="telecom_cch_geo_populator", timeout=10)
 

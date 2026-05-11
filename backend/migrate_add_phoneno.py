@@ -5,7 +5,7 @@ Migration script to add phone_number column to users table
 import psycopg2
 
 # Your database connection
-DATABASE_URL = "postgresql://postgres:ROOT@localhost:5432/telecom_cch"
+DATABASE_URL = "postgresql://postgres:root@localhost:5432/telecom_cch"
 
 try:
     conn = psycopg2.connect(DATABASE_URL)

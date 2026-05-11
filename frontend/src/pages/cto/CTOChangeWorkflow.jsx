@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { apiGet, apiPut } from '../../api';
 import { useTheme } from '../../ThemeContext';
+import CoreParameterChangePanel from '../../components/CoreParameterChangePanel';
 
 /* ── Constants ─────────────────────────────────────────────────────────────── */
 const TYPE_STYLE = {
@@ -336,8 +337,20 @@ export default function CTOChangeWorkflow() {
         }}>
           Overutilized ({overutilizedCRs.length})
         </button>
+        <button onClick={() => { setSection('core'); setFilter(''); }} style={{
+          padding: '10px 24px', fontSize: 13, fontWeight: 700, cursor: 'pointer', border: 'none',
+          borderLeft: `1px solid ${isDark ? '#334155' : '#e2e8f0'}`,
+          background: section === 'core' ? '#0EA5E9' : (isDark ? '#1e293b' : '#f8fafc'),
+          color: section === 'core' ? '#fff' : (isDark ? '#94a3b8' : '#64748b'),
+          display: 'flex', alignItems: 'center', gap: 8,
+        }}>
+          Core Change Parameter
+        </button>
       </div>
 
+      {section === 'core' && <div style={{ marginTop: 8 }}><CoreParameterChangePanel /></div>}
+
+      {section !== 'core' && <>
       {/* Section Header */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
         <div style={{ width: 4, height: 16, borderRadius: 2, background: sectionColor }} />
@@ -460,6 +473,8 @@ export default function CTOChangeWorkflow() {
           );
         })
       )}
+
+      </>}
 
       {/* Modals */}
       {reviewCR && <ReviewModal cr={reviewCR} onClose={() => setReviewCR(null)} onDone={fetchCRs} isDark={isDark} />}

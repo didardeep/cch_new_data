@@ -36,11 +36,14 @@ ZONES         = [("CBD", 500), ("Urban", 600), ("Edge", 400)]  # zone, count
 LAT_MIN, LAT_MAX = 28.3699, 28.5470
 LON_MIN, LON_MAX = 76.9272, 77.1282
 
-# Date ranges
-SITE_DATE_START = date(2026, 1, 20)
-SITE_DATE_END   = date(2026, 4, 23)   # 94 days
-CELL_DATE_START = date(2026, 1, 20)
-CELL_DATE_END   = date(2026, 4, 22)   # 93 days
+# Date ranges — anchored to today so 7d/30d filters always have data in
+# range no matter when the seed is run. End date = today, start date =
+# today - 93/94 days to give ~3 months of history.
+_TODAY = date.today()
+SITE_DATE_END   = _TODAY
+SITE_DATE_START = _TODAY - timedelta(days=93)
+CELL_DATE_END   = _TODAY
+CELL_DATE_START = _TODAY - timedelta(days=93)
 
 BATCH_SIZE = 5000  # rows per INSERT
 

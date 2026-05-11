@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { apiGet, apiPut } from '../../api';
 import { useTheme } from '../../ThemeContext';
+import CoreParameterChangePanel from '../../components/CoreParameterChangePanel';
 
 /* ── Constants ─────────────────────────────────────────────────────────────── */
 const TYPE_STYLE = {
@@ -348,8 +349,20 @@ export default function ChangeWorkflow() {
         }}>
           Overutilized ({overutilizedCRs.length})
         </button>
+        <button onClick={() => { setSection('core'); setFilter(''); }} style={{
+          padding: '10px 24px', fontSize: 13, fontWeight: 700, cursor: 'pointer', border: 'none',
+          borderLeft: `1px solid ${isDark ? '#334155' : '#e2e8f0'}`,
+          background: section === 'core' ? '#0EA5E9' : (isDark ? '#1e293b' : '#f8fafc'),
+          color: section === 'core' ? '#fff' : (isDark ? '#94a3b8' : '#64748b'),
+          display: 'flex', alignItems: 'center', gap: 8,
+        }}>
+          Core Change Parameter
+        </button>
       </div>
 
+      {section === 'core' && <div style={{ marginTop: 8 }}><CoreParameterChangePanel /></div>}
+
+      {section !== 'core' && <>
       {/* Stats */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 12, marginBottom: 20 }}>
         {[
@@ -507,6 +520,8 @@ export default function ChangeWorkflow() {
           );
         })
       )}
+
+      </>}
 
       {/* Action Modal */}
       {actionCR && actionType && (
