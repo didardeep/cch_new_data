@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { apiGet } from '../../api';
+import { useTheme } from '../../ThemeContext';
 
 export default function AgentIssues() {
   const [tickets, setTickets] = useState([]);
@@ -11,6 +12,7 @@ export default function AgentIssues() {
   const [agentFilter, setAgentFilter] = useState('');
   const [search, setSearch] = useState('');
   const [dismissedAlerts, setDismissedAlerts] = useState([]);
+  const { isDark } = useTheme();
 
   const loadTickets = () => {
     const params = new URLSearchParams();
@@ -44,9 +46,9 @@ export default function AgentIssues() {
   const visibleAlerts = alerts.filter((_, i) => !dismissedAlerts.includes(i));
 
   const severityConfig = {
-    critical: { bg: '#fef2f2', border: '#fca5a5', color: '#991b1b', dot: '#dc2626', label: 'CRITICAL' },
-    high:     { bg: '#fff7ed', border: '#fdba74', color: '#9a3412', dot: '#ea580c', label: 'HIGH' },
-    warning:  { bg: '#fffbeb', border: '#fcd34d', color: '#92400e', dot: '#f59e0b', label: 'WARNING' },
+    critical: { bg: isDark ? 'rgba(248,113,113,0.12)' : '#fef2f2', border: isDark ? 'rgba(248,113,113,0.3)' : '#fca5a5', color: isDark ? '#f87171' : '#991b1b', dot: '#dc2626', label: 'CRITICAL' },
+    high:     { bg: isDark ? 'rgba(251,191,36,0.12)' : '#fff7ed', border: isDark ? 'rgba(251,191,36,0.3)' : '#fdba74', color: isDark ? '#fbbf24' : '#9a3412', dot: '#ea580c', label: 'HIGH' },
+    warning:  { bg: isDark ? 'rgba(251,191,36,0.08)' : '#fffbeb', border: isDark ? 'rgba(251,191,36,0.2)' : '#fcd34d', color: isDark ? '#fbbf24' : '#92400e', dot: '#f59e0b', label: 'WARNING' },
   };
 
   const typeLabels = {
@@ -67,7 +69,7 @@ export default function AgentIssues() {
 
       {/* Notification Center */}
       <div style={{
-        background: '#fff', border: '1px solid #e2e8f0', borderRadius: 12,
+        background: isDark ? '#1e293b' : '#fff', border: `1px solid ${isDark ? '#334155' : '#e2e8f0'}`, borderRadius: 12,
         marginBottom: 20, overflow: 'hidden',
       }}>
         <div
@@ -75,14 +77,14 @@ export default function AgentIssues() {
           style={{
             display: 'flex', alignItems: 'center', justifyContent: 'space-between',
             padding: '14px 20px', cursor: 'pointer', userSelect: 'none',
-            background: visibleAlerts.length > 0 ? '#fefce8' : '#f8fafc',
-            borderBottom: alertsOpen ? '1px solid #e2e8f0' : 'none',
+            background: visibleAlerts.length > 0 ? (isDark ? 'rgba(251,191,36,0.08)' : '#fefce8') : (isDark ? '#0f172a' : '#f8fafc'),
+            borderBottom: alertsOpen ? `1px solid ${isDark ? '#334155' : '#e2e8f0'}` : 'none',
           }}
         >
           <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
             <div style={{
               width: 32, height: 32, borderRadius: 8,
-              background: visibleAlerts.length > 0 ? '#fef3c7' : '#e2e8f0',
+              background: visibleAlerts.length > 0 ? (isDark ? 'rgba(251,191,36,0.15)' : '#fef3c7') : (isDark ? '#334155' : '#e2e8f0'),
               display: 'flex', alignItems: 'center', justifyContent: 'center',
               fontSize: 16,
             }}>
@@ -91,7 +93,7 @@ export default function AgentIssues() {
                 <path d="M13.73 21a2 2 0 0 1-3.46 0"/>
               </svg>
             </div>
-            <span style={{ fontWeight: 700, fontSize: 14, color: '#1e293b' }}>
+            <span style={{ fontWeight: 700, fontSize: 14, color: isDark ? '#e2e8f0' : '#1e293b' }}>
               Notification Center
             </span>
             {visibleAlerts.length > 0 && (
@@ -112,7 +114,7 @@ export default function AgentIssues() {
         {alertsOpen && (
           <div style={{ maxHeight: 320, overflowY: 'auto' }}>
             {visibleAlerts.length === 0 ? (
-              <div style={{ padding: '24px 20px', textAlign: 'center', color: '#94a3b8', fontSize: 13 }}>
+              <div style={{ padding: '24px 20px', textAlign: 'center', color: isDark ? '#64748b' : '#94a3b8', fontSize: 13 }}>
                 No active alerts. All clear.
               </div>
             ) : (
@@ -122,7 +124,7 @@ export default function AgentIssues() {
                 return (
                   <div key={originalIdx} style={{
                     display: 'flex', alignItems: 'flex-start', gap: 12,
-                    padding: '12px 20px', borderBottom: '1px solid #f1f5f9',
+                    padding: '12px 20px', borderBottom: `1px solid ${isDark ? '#334155' : '#f1f5f9'}`,
                     background: cfg.bg, transition: 'background 0.2s',
                   }}>
                     {/* Severity dot */}
@@ -145,10 +147,10 @@ export default function AgentIssues() {
                           {alert.time ? new Date(alert.time).toLocaleString() : ''}
                         </span>
                       </div>
-                      <div style={{ fontSize: 13, fontWeight: 600, color: '#1e293b', marginBottom: 2 }}>
+                      <div style={{ fontSize: 13, fontWeight: 600, color: isDark ? '#e2e8f0' : '#1e293b', marginBottom: 2 }}>
                         {alert.title}
                       </div>
-                      <div style={{ fontSize: 12, color: '#64748b', lineHeight: 1.4 }}>
+                      <div style={{ fontSize: 12, color: isDark ? '#94a3b8' : '#64748b', lineHeight: 1.4 }}>
                         {alert.message}
                       </div>
                     </div>
@@ -229,7 +231,7 @@ export default function AgentIssues() {
                 {tickets.map(t => (
                   <tr key={t.id}>
                     <td>
-                      <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12, color: '#00338D', fontWeight: 600 }}>
+                      <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12, color: isDark ? '#4da3ff' : '#00338D', fontWeight: 600 }}>
                         {t.reference_number}
                       </span>
                     </td>
@@ -242,13 +244,13 @@ export default function AgentIssues() {
                     <td>
                       <span style={{
                         display: 'inline-flex', alignItems: 'center', gap: 6,
-                        fontSize: 13, fontWeight: 500, color: '#483698',
+                        fontSize: 13, fontWeight: 500, color: isDark ? '#a78bfa' : '#483698',
                       }}>
                         <span style={{
                           width: 28, height: 28, borderRadius: '50%',
                           background: 'rgba(72,54,152,0.10)', display: 'inline-flex',
                           alignItems: 'center', justifyContent: 'center',
-                          fontSize: 12, fontWeight: 700, color: '#483698', flexShrink: 0,
+                          fontSize: 12, fontWeight: 700, color: isDark ? '#a78bfa' : '#483698', flexShrink: 0,
                         }}>
                           {(t.assignee_name || 'U').charAt(0).toUpperCase()}
                         </span>

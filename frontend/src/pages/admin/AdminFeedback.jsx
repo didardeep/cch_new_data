@@ -1,9 +1,11 @@
 ﻿import { useState, useEffect } from 'react';
 import { apiGet } from '../../api';
+import { useTheme } from '../../ThemeContext';
 
 export default function AdminFeedback() {
   const [feedbacks, setFeedbacks] = useState([]);
   const [loading, setLoading] = useState(true);
+  const { isDark } = useTheme();
 
   useEffect(() => {
     apiGet('/api/admin/feedback').then(d => {
@@ -50,11 +52,11 @@ export default function AdminFeedback() {
               <tbody>
                 {feedbacks.map(f => (
                   <tr key={f.id}>
-                    <td style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12, color: '#64748b' }}>#{f.id}</td>
+                    <td style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12, color: isDark ? '#94a3b8' : '#64748b' }}>#{f.id}</td>
                     <td style={{ fontWeight: 500, fontSize: 13 }}>{f.user_name}</td>
                     <td>
                       {f.chat_session_id ? (
-                        <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12, color: '#00338D', fontWeight: 600 }}>
+                        <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12, color: isDark ? '#4da3ff' : '#00338D', fontWeight: 600 }}>
                           #{f.chat_session_id}
                         </span>
                       ) : 'â€”'}

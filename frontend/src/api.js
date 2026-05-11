@@ -2,17 +2,22 @@
 // Production: set REACT_APP_API_URL=https://your-backend.com in your .env
 export const API_BASE = process.env.REACT_APP_API_URL || '';
 
+// ─── Session-per-tab storage ────────────────────────────────────────────────
+// Uses sessionStorage so each browser tab keeps its OWN independent token.
+// This lets you login as agent, manager, and CTO in separate tabs without
+// any tab overwriting another's token (unlike localStorage which is shared).
+
 export function getToken() {
-  return localStorage.getItem('token');
+  return sessionStorage.getItem('token');
 }
 
 export function setToken(token) {
-  localStorage.setItem('token', token);
+  sessionStorage.setItem('token', token);
 }
 
 export function clearToken() {
-  localStorage.removeItem('token');
-  localStorage.removeItem('user');
+  sessionStorage.removeItem('token');
+  sessionStorage.removeItem('user');
 }
 
 export async function apiCall(endpoint, options = {}) {

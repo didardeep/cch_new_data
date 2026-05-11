@@ -563,7 +563,7 @@ function PremiumTable({ cols, rows, emptyText = 'No data' }) {
           <tr
             key={i}
             style={{ borderTop: '1px solid var(--border)', transition: 'background 0.15s' }}
-            onMouseEnter={e => { e.currentTarget.style.background = 'rgba(99,102,241,0.05)'; }}
+            onMouseEnter={e => { e.currentTarget.style.background = 'rgba(0,51,141,0.05)'; }}
             onMouseLeave={e => { e.currentTarget.style.background = 'transparent'; }}
           >
             {cols.map((c) => (

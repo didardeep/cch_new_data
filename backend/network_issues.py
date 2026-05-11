@@ -575,6 +575,23 @@ def run_daily_network_issue_job():
                 existing.zone = data["zone"]
                 existing.location = location
                 existing.updated_at = today_08
+                # If ticket is unassigned, try to assign an agent now
+                if not existing.assigned_agent:
+                    try:
+                        from app import _find_best_expert, _open_ticket_count
+                        network_agents = User.query.filter(
+                            User.role == "human_agent",
+                            User.expertise.in_(["NETWORK_RF", "NETWORK_OPTIMIZATION", "LTE", "5G"])
+                        ).all()
+                        if network_agents:
+                            same_zone = [a for a in network_agents if (a.location or "").lower() in (data["zone"] or "").lower() or (data["city"] or "").lower() in (a.location or "").lower()]
+                            pool = same_zone if same_zone else network_agents
+                            under_cap = [a for a in pool if _open_ticket_count(a.id) < (a.bandwidth_capacity or 10)]
+                            ag = min(under_cap or pool, key=lambda a: _open_ticket_count(a.id))
+                            existing.assigned_agent = ag.id
+                            print(f"  [ASSIGN] {site_id}: was unassigned, now assigned to {ag.name}")
+                    except Exception as e:
+                        print(f"  [ASSIGN] {site_id}: reassignment failed: {e}")
                 updated += 1
                 _ag_name = "unassigned"
                 try:
@@ -1371,6 +1388,107 @@ def network_issue_stats():
     except:
         total = open_c = ip = res = crit = sev = 0
     return jsonify({"total": total, "open": open_c, "in_progress": ip, "resolved": res, "critical": crit, "severe_worst": sev})
+
+
+@network_issues_bp.route("/api/network-issues/logs", methods=["GET"])
+@jwt_required()
+def network_issue_logs():
+    """Return full pipeline logs: data source, scheduler status, ticket history."""
+    logs = []
+
+    # ── 1. Data Source (single query instead of 4 separate COUNT scans) ─
+    logs.append({"type": "header", "text": "Data Source"})
+    try:
+        stats = db.session.execute(sa_text("""
+            SELECT
+                COUNT(*) AS total,
+                COUNT(*) FILTER (WHERE data_level='cell' AND value IS NOT NULL) AS cell_rows,
+                COUNT(*) FILTER (WHERE data_level='site' AND value IS NOT NULL) AS site_rows,
+                MIN(date) FILTER (WHERE data_level='cell') AS min_date,
+                MAX(date) FILTER (WHERE data_level='cell') AS max_date
+            FROM kpi_data
+        """)).fetchone()
+        kpi_total = stats[0] or 0
+        cell_rows = stats[1] or 0
+        site_rows = stats[2] or 0
+        min_d = stats[3].isoformat() if stats[3] else "N/A"
+        max_d = stats[4].isoformat() if stats[4] else "N/A"
+        logs.append({"type": "info", "text": f"Source table: kpi_data ({kpi_total:,} total rows)"})
+        logs.append({"type": "info", "text": f"Cell-level rows: {cell_rows:,} | Site-level rows: {site_rows:,}"})
+        logs.append({"type": "info", "text": f"Date range: {min_d} to {max_d}"})
+    except Exception as e:
+        logs.append({"type": "error", "text": f"Failed to read kpi_data: {e}"})
+
+    # KPI names used for worst-cell detection
+    logs.append({"type": "info", "text": f"Detection KPIs: {_DROP_KPI}, {_CSSR_KPI}, {_TPUT_KPI}"})
+    logs.append({"type": "info", "text": "Thresholds: Drop Rate > 1.5% AND CSSR < 98.5% AND Throughput < 8 Mbps"})
+
+    # Upload source — admin uploads to kpi_data via /api/admin/upload-kpi-cell-level
+    logs.append({"type": "info", "text": "Upload path: Admin → Data Upload → Cell-Level KPI Excel → kpi_data table"})
+
+    # ── 2. Worst Cell Scan ──────────────────────────────────────────────
+    logs.append({"type": "header", "text": "Worst Cell Detection"})
+    today = _date.today()
+    scan_start = today - timedelta(days=7)
+    logs.append({"type": "info", "text": f"Scan window: {scan_start} to {today} (last 7 days)"})
+    logs.append({"type": "info", "text": f"Last scan time: {_LATEST_SCAN_TIME.strftime('%Y-%m-%d %H:%M') if _LATEST_SCAN_TIME else 'Never'}"})
+    logs.append({"type": "info", "text": f"Worst sites found: {len(_LATEST_WORST_CELLS)}"})
+    for sid, d in _LATEST_WORST_CELLS.items():
+        logs.append({"type": "detail", "text": f"  {sid}: {len(d['cells'])} cells — Drop={d['avg_drop']}%, CSSR={d['avg_cssr']}%, Tput={d['avg_tput']}Mbps"})
+
+    # ── 3. Scheduler Status ─────────────────────────────────────────────
+    logs.append({"type": "header", "text": "Scheduler"})
+    logs.append({"type": "info", "text": "Schedule: Pre-scan at 07:30 IST, Ticket job at 08:00 IST daily"})
+    logs.append({"type": "info", "text": f"Last job date (in-memory): {_LAST_JOB_DATE or 'Not run since restart'}"})
+    ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
+    logs.append({"type": "info", "text": f"Current IST: {ist.strftime('%Y-%m-%d %H:%M:%S')}"})
+
+    # ── 4. Agent Routing (single query for all ticket counts) ───────────
+    logs.append({"type": "header", "text": "Agent Routing"})
+    network_agents = User.query.filter(
+        User.role == "human_agent",
+        User.expertise.in_(["NETWORK_RF", "NETWORK_OPTIMIZATION", "LTE", "5G"])
+    ).all()
+    if network_agents:
+        agent_ids = [ag.id for ag in network_agents]
+        placeholders = ",".join(str(int(aid)) for aid in agent_ids)
+        ticket_counts_rows = db.session.execute(sa_text(
+            f"SELECT assigned_agent, COUNT(*) FROM network_issue_tickets "
+            f"WHERE assigned_agent IN ({placeholders}) AND status IN ('open','in_progress') "
+            f"GROUP BY assigned_agent"
+        )).fetchall() if agent_ids else []
+        ticket_counts = {row[0]: row[1] for row in ticket_counts_rows}
+        for ag in network_agents:
+            assigned = ticket_counts.get(ag.id, 0)
+            logs.append({"type": "info", "text": f"  {ag.name} (id={ag.id}, expertise={ag.expertise}, location={ag.location or 'N/A'}) — {assigned} open tickets"})
+    else:
+        logs.append({"type": "warn", "text": "No agents with NETWORK_RF/NETWORK_OPTIMIZATION/LTE/5G expertise found"})
+    logs.append({"type": "info", "text": "Routing: zone match → capacity check → least loaded agent"})
+
+    # ── 5. Ticket History (batch-fetch agent names) ─────────────────────
+    logs.append({"type": "header", "text": "Ticket History"})
+    tickets = NetworkIssueTicket.query.order_by(NetworkIssueTicket.created_at.desc()).limit(20).all()
+    # Batch-fetch all assigned agents in one query instead of N separate queries
+    _ticket_agent_ids = list({t.assigned_agent for t in tickets if t.assigned_agent})
+    if _ticket_agent_ids:
+        _ticket_agents = {u.id: u.name for u in User.query.filter(User.id.in_(_ticket_agent_ids)).all()}
+    else:
+        _ticket_agents = {}
+    for t in tickets:
+        agent_name = _ticket_agents.get(t.assigned_agent, "Unassigned") if t.assigned_agent else "Unassigned"
+        logs.append({
+            "type": "ticket",
+            "text": f"#{t.id} | {t.site_id} | {t.priority} | {t.status} | Agent: {agent_name} | Created: {t.created_at.strftime('%Y-%m-%d %H:%M') if t.created_at else 'N/A'}",
+        })
+
+    # ── 6. Priority Scoring ─────────────────────────────────────────────
+    logs.append({"type": "header", "text": "Priority Scoring Logic"})
+    logs.append({"type": "info", "text": "Score = Severity(1-3) + Revenue(1-3) + AvgRRC(1-3) + MaxRRC(1-3)"})
+    logs.append({"type": "info", "text": "Critical: ≥10 (SLA 2h) | High: ≥7 (SLA 4h) | Medium: ≥4 (SLA 8h) | Low: <4 (SLA 16h)"})
+    logs.append({"type": "info", "text": "Revenue from: flexible_kpi_uploads (kpi_type='revenue')"})
+    logs.append({"type": "info", "text": "RRC data from: kpi_data (Ave/Max RRC Connected Ue, last 60 days)"})
+
+    return jsonify({"logs": logs})
 
 
 # ─────────────────────────────────────────────────────────────────────────────

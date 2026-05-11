@@ -120,7 +120,7 @@ export default function CustomerDashboard() {
                     </td>
                     <td>
                       <span className={`badge badge-${s.status}`}>{s.status}</span>
-                      <span style={{ fontSize: 11, color: '#3b82f6', marginLeft: 6 }}>
+                      <span style={{ fontSize: 11, color: 'var(--primary)', marginLeft: 6 }}>
                         {s.status === 'active' ? 'Resume' : 'Open'}
                       </span>
                     </td>

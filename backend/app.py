@@ -28,9 +28,11 @@ import urllib.request
 import urllib.parse
 import urllib.error
 
+import threading
 from sqlalchemy import case as sql_case, text
 from sqlalchemy.orm import joinedload
 from models import db, bcrypt, User, ChatSession, ChatMessage, Ticket, Feedback, SystemSetting, SlaAlert, TelecomSite, KpiData, ParameterChange, ChangeRequest, FlexibleKpiUpload, CoreComponentKpi
+from auth_utils import token_required, role_required
 # Add this import after other imports
 from whatsapp_integration import send_whatsapp_message, format_chat_summary_for_whatsapp, format_ticket_alert_for_whatsapp
 import network_prompts
@@ -2068,11 +2070,13 @@ def add_chat_message(session_id):
     session.last_message_at = datetime.now(timezone.utc)  # ← keeps session timestamp fresh
 
     db.session.commit()
-    return jsonify({"message": msg.to_dict()})
-# ═══════════════════════════════════════════════════════════════════
-# ADD THIS NEW ROUTE to app.py
-# Place it right after the add_chat_message route
-# ═══════════════════════════════════════════════════════════════════
+
+    # Push to WebSocket so the agent sees customer messages in real-time
+    msg_dict = msg.to_dict()
+    msg_dict["session_id"] = session_id
+    socketio.emit("new_message", msg_dict, room=f"session_{session_id}")
+
+    return jsonify({"message": msg_dict})
 
 @app.route("/api/chat/session/<int:session_id>/location", methods=["POST"])
 @jwt_required()
@@ -3303,6 +3307,37 @@ def _cache_clear(*keys):
         return
     for k in keys:
         _cto_cache.pop(k, None)
+
+
+def _warm_cto_cache():
+    """Best-effort startup warmup for the expensive CTO dashboard endpoints."""
+    try:
+        with app.app_context():
+            user = User.query.filter(User.role.in_(("cto", "admin"))).first()
+            if not user:
+                print(">>> CTO KPI cache warm skipped: no CTO/admin user found")
+                return
+
+            token = create_access_token(identity=str(user.id))
+            endpoints = (
+                ("/api/cto/technical-kpi", cto_technical_kpi),
+                ("/api/cto/business-kpi", cto_business_kpi),
+            )
+
+            warmed = []
+            for path, view_func in endpoints:
+                with app.test_request_context(path, headers={"Authorization": f"Bearer {token}"}):
+                    response = view_func()
+                    status_code = response[1] if isinstance(response, tuple) else getattr(response, "status_code", 200)
+                    if status_code and int(status_code) >= 400:
+                        print(f">>> CTO KPI cache warm failed for {path}: HTTP {status_code}")
+                        continue
+                    warmed.append(path)
+
+        if warmed:
+            print(f">>> CTO KPI cache warm complete: {', '.join(warmed)}")
+    except Exception as e:
+        print(f">>> CTO KPI cache warm skipped: {e}")
 
 
 def _latest_site_values_for_kpi(kpi_name):
@@ -9610,6 +9645,13 @@ def agent_resolve_ticket(ticket_id):
 
     db.session.commit()
 
+    # Push session_updated via WebSocket so customer UI updates instantly
+    if chat_session:
+        socketio.emit("session_updated", {
+            "session_id": ticket.chat_session_id,
+            "status": "resolved",
+        }, room=f"session_{ticket.chat_session_id}")
+
     # ── Notify customer via Email ──
     customer_user = User.query.get(ticket.user_id)
     if customer_user and customer_user.email:
@@ -10060,7 +10102,13 @@ def agent_send_message(session_id):
         assigned_ticket.first_response_at = datetime.now(timezone.utc)
 
     db.session.commit()
-    return jsonify({"message": msg.to_dict()}), 201
+
+    # Push to WebSocket so the customer sees agent messages in real-time
+    msg_dict = msg.to_dict()
+    msg_dict["session_id"] = session_id
+    socketio.emit("new_message", msg_dict, room=f"session_{session_id}")
+
+    return jsonify({"message": msg_dict}), 201
 
 
 # ── SLA Alert Helper ────────────────────────────────────────────────────────────
@@ -10586,8 +10634,124 @@ from network_analytics import network_bp, clear_analytics_cache
 app.register_blueprint(network_bp)
 
 # ─── Register Network AI Blueprint ───────────────────────────────────────────
-from network_ai import network_ai_bp
+from network_ai import network_ai_bp, ensure_db_optimizations
 app.register_blueprint(network_ai_bp)
+
+# ─── Startup schema warm-up for network AI ────────────────────────────────────
+# Pre-populate _schema_cache (KPI ranges, date freshness, column discovery)
+# so the first AI query is as fast as subsequent ones.
+def _warm_network_ai_schema():
+    """Run schema discovery once at startup so first AI query has full context."""
+    import threading, time as _t
+    def _do_warm():
+        _t.sleep(5)  # let DB settle
+        try:
+            with app.app_context():
+                from network_ai import _schema_cache, _sql
+                if _schema_cache.get("populated"):
+                    print("[AI-SCHEMA] Already populated — skipping warm-up")
+                    return
+                # Populate KPI ranges
+                try:
+                    _kpi_r = _sql("""
+                        SELECT kpi_name,
+                               ROUND(MIN(value)::numeric,2) AS min_val,
+                               ROUND(AVG(value)::numeric,2) AS avg_val,
+                               ROUND(MAX(value)::numeric,2) AS max_val,
+                               ROUND(PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY value)::numeric,2) AS p25,
+                               ROUND(PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY value)::numeric,2) AS p75,
+                               COUNT(DISTINCT site_id) AS site_count
+                        FROM kpi_data WHERE data_level='site' AND value IS NOT NULL
+                        GROUP BY kpi_name ORDER BY kpi_name
+                    """)
+                    _schema_cache["kpi_ranges"] = {r["kpi_name"]: r for r in _kpi_r}
+                    print(f"[AI-SCHEMA] KPI ranges warm-up: {len(_kpi_r)} KPIs loaded")
+                except Exception as e:
+                    print(f"[AI-SCHEMA] KPI ranges warm-up failed: {e}")
+                # Populate max date
+                try:
+                    _d = _sql("SELECT MAX(date)::text AS max_date FROM kpi_data WHERE data_level='site'")
+                    if _d and _d[0].get("max_date"):
+                        _schema_cache["kpi_max_date"] = _d[0]["max_date"]
+                        _schema_cache["kpi_max_date_recent"] = _d[0]["max_date"]
+                        print(f"[AI-SCHEMA] Data freshness: latest date = {_d[0]['max_date']}")
+                except Exception as e:
+                    print(f"[AI-SCHEMA] Date warm-up failed: {e}")
+                _schema_cache["populated"] = True
+                print("[AI-SCHEMA] Warm-up complete")
+        except Exception as e:
+            print(f"[AI-SCHEMA] Warm-up error: {e}")
+    threading.Thread(target=_do_warm, daemon=True, name="ai-schema-warm").start()
+
+_warm_network_ai_schema()
+
+# ─── Database optimizations (indexes, materialized views) ────────────────────
+with app.app_context():
+    try:
+        ensure_db_optimizations()
+    except Exception as _db_opt_err:
+        print(f"[WARN] DB optimization skipped: {_db_opt_err}")
+
+# ─── ML Pipeline endpoints ───────────────────────────────────────────────────
+from ml_pipeline import run_ml_pipeline, run_ml_pipeline_async, get_pipeline_status
+
+@app.route("/api/ml/run-pipeline", methods=["POST"])
+@jwt_required()
+def api_run_ml_pipeline():
+    """Trigger the ML categorization pipeline (background).
+    Only managers and CTOs can trigger this."""
+    uid = get_jwt_identity()
+    user = db.session.get(User, int(uid))
+    if not user or user.role not in ('manager', 'cto'):
+        return jsonify({"error": "Only managers/CTOs can trigger the ML pipeline"}), 403
+    result = run_ml_pipeline_async(app)
+    return jsonify(result)
+
+@app.route("/api/ml/run-pipeline-sync", methods=["POST"])
+@jwt_required()
+def api_run_ml_pipeline_sync():
+    """Trigger the ML pipeline synchronously (blocks until done).
+    Use for smaller datasets or when you need the result immediately."""
+    uid = get_jwt_identity()
+    user = db.session.get(User, int(uid))
+    if not user or user.role not in ('manager', 'cto'):
+        return jsonify({"error": "Only managers/CTOs can trigger the ML pipeline"}), 403
+    result = run_ml_pipeline(app)
+    return jsonify(result)
+
+@app.route("/api/ml/status", methods=["GET"])
+@jwt_required()
+def api_ml_pipeline_status():
+    """Get current ML pipeline status."""
+    return jsonify(get_pipeline_status())
+
+# Create site_kpi_summary table
+with app.app_context():
+    try:
+        from models import SiteKpiSummary
+        SiteKpiSummary.__table__.create(db.engine, checkfirst=True)
+        print("[ML] site_kpi_summary table ready")
+    except Exception as _sks_err:
+        print(f"[WARN] site_kpi_summary table creation skipped: {_sks_err}")
+
+# Auto-run ML pipeline after startup if summary table is empty.
+# Uses a delayed thread so the app is fully initialized before running.
+def _auto_ml_on_startup():
+    """Check site_kpi_summary after a short delay and run ML if empty."""
+    import time as _t
+    _t.sleep(3)  # wait for app to fully start
+    try:
+        with app.app_context():
+            _count = db.session.execute(text("SELECT COUNT(*) FROM site_kpi_summary")).scalar()
+            if _count == 0:
+                print("[ML] site_kpi_summary is empty — auto-running ML pipeline in background...")
+                run_ml_pipeline_async(app)
+            else:
+                print(f"[ML] site_kpi_summary has {_count} rows — ML pipeline not needed")
+    except Exception as e:
+        print(f"[ML] Auto-ML check skipped: {e}")
+
+threading.Thread(target=_auto_ml_on_startup, daemon=True, name="ml-auto-check").start()
 
 # ─── Register Network Issues Blueprint ─────────────────────────────────────
 from network_issues import network_issues_bp, NetworkIssueTicket, OverutilizedTicket, schedule_daily_job, run_overutilized_job
@@ -10693,10 +10857,6 @@ with app.app_context():
                 except Exception:
                     _conn.rollback()
 
-    # Build the merged KPI read view so analytics queries transparently
-    # see cell-only sites.
-    _ensure_kpi_merged_view()
-
 
 def _check_kpi_data_populated():
     """Print a friendly notice at startup when kpi_data is empty so the user
@@ -10730,4 +10890,5 @@ def _check_kpi_data_populated():
 if __name__ == "__main__":
     _check_kpi_data_populated()
     run_sla_checks()
+    _warm_cto_cache()
     socketio.run(app, debug=True, host="0.0.0.0", port=5500, use_reloader=False)

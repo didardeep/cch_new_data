@@ -5,8 +5,8 @@ import { useAuth } from '../../AuthContext';
 import { useTheme } from '../../ThemeContext';
 
 const ESCALATION_BANNER_STYLE = {
-  background: '#fdf4ff',
-  border: '1px solid #e9d5ff',
+  background: 'rgba(168,85,247,0.08)',
+  border: '1px solid rgba(168,85,247,0.25)',
   borderRadius: 12,
   padding: '16px 20px',
   marginBottom: 24,
@@ -17,17 +17,17 @@ const ESCALATION_BANNER_STYLE = {
 };
 
 const LEVEL_STYLE = {
-  '625': { label: '62.5%', bg: '#fffbeb', border: '#fde68a', text: '#92400e', badge: '#f59e0b' },
-  '750': { label: '75%',   bg: '#fff7ed', border: '#fed7aa', text: '#9a3412', badge: '#f97316' },
-  '875': { label: '87.5%', bg: '#fef2f2', border: '#fecaca', text: '#991b1b', badge: '#ef4444' },
-  breach: { label: 'BREACH', bg: '#fef2f2', border: '#fca5a5', text: '#7f1d1d', badge: '#dc2626' },
+  '625': { label: '62.5%', bg: 'rgba(245,158,11,0.1)', border: 'rgba(245,158,11,0.3)', text: '#f59e0b', badge: '#f59e0b' },
+  '750': { label: '75%',   bg: 'rgba(249,115,22,0.1)', border: 'rgba(249,115,22,0.3)', text: '#f97316', badge: '#f97316' },
+  '875': { label: '87.5%', bg: 'rgba(239,68,68,0.1)', border: 'rgba(239,68,68,0.3)', text: '#ef4444', badge: '#ef4444' },
+  breach: { label: 'BREACH', bg: 'rgba(220,38,38,0.12)', border: 'rgba(220,38,38,0.35)', text: '#dc2626', badge: '#dc2626' },
 };
 
 const PRIORITY_BADGE = {
-  critical: { bg: '#fef2f2', color: '#dc2626', border: '#fecaca' },
-  high:     { bg: '#fff7ed', color: '#ea580c', border: '#fed7aa' },
-  medium:   { bg: '#fffbeb', color: '#d97706', border: '#fde68a' },
-  low:      { bg: '#f0fdf4', color: '#16a34a', border: '#bbf7d0' },
+  critical: { bg: 'rgba(220,38,38,0.1)', color: '#dc2626', border: 'rgba(220,38,38,0.3)' },
+  high:     { bg: 'rgba(234,88,12,0.1)', color: '#ea580c', border: 'rgba(234,88,12,0.3)' },
+  medium:   { bg: 'rgba(217,119,6,0.1)', color: '#d97706', border: 'rgba(217,119,6,0.3)' },
+  low:      { bg: 'rgba(22,163,106,0.1)', color: '#16a34a', border: 'rgba(22,163,106,0.3)' },
 };
 
 export default function ManagerDashboard() {

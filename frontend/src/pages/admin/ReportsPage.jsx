@@ -376,7 +376,7 @@ export default function ReportsPage() {
   const currentData = data[`${tab}_${range}`];
 
   const handleExportCSV = async () => {
-    const token = localStorage.getItem('token');
+    const token = sessionStorage.getItem('token');
     const resp = await fetch(`${API_BASE}/api/reports/export?format=csv&section=${tab}&range=${range}`, {
       headers: { Authorization: `Bearer ${token}` }
     });

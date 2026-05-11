@@ -15,14 +15,14 @@ import { apiGet } from '../../api';
    DESIGN TOKENS
    ═══════════════════════════════════════════════════════════ */
 const CFG = {
-  accessibility:       { colors: ['#10b981', '#06b6d4'], icon: ShieldCheck,     max: 100, unit: '%', label: 'Higher = better' },
-  retainability:       { colors: ['#6366f1', '#8b5cf6'], icon: RefreshCw,       max: 100, unit: '%', label: 'Network retain rate' },
-  downlink_throughput: { colors: ['#06b6d4', '#3b82f6'], icon: ArrowDownToLine, max: 100, unit: '',  label: 'DL cell average' },
-  prb_utilization:     { colors: ['#f59e0b', '#f97316'], icon: Cpu,             max: 100, unit: '%', label: 'Radio resource load' },
-  downlink_volume:     { colors: ['#6366f1', '#7c3aed'], icon: Database,        max: null,unit: '',  label: 'DL data volume' },
-  uplink_volume:       { colors: ['#0d9488', '#06b6d4'], icon: ArrowUpFromLine, max: null,unit: '',  label: 'UL data volume' },
+  accessibility:       { colors: ['#00338D', '#4F46E5'], icon: ShieldCheck,     max: 100, unit: '%', label: 'Higher = better' },
+  retainability:       { colors: ['#4F46E5', '#8B5CF6'], icon: RefreshCw,       max: 100, unit: '%', label: 'Network retain rate' },
+  downlink_throughput: { colors: ['#06B6D4', '#00338D'], icon: ArrowDownToLine, max: 100, unit: '',  label: 'DL cell average' },
+  prb_utilization:     { colors: ['#0d9488', '#06B6D4'], icon: Cpu,             max: 100, unit: '%', label: 'Radio resource load' },
+  downlink_volume:     { colors: ['#00338D', '#8B5CF6'], icon: Database,        max: null,unit: '',  label: 'DL data volume' },
+  uplink_volume:       { colors: ['#4F46E5', '#06B6D4'], icon: ArrowUpFromLine, max: null,unit: '',  label: 'UL data volume' },
 };
-const FALLBACK = { colors: ['#6366f1', '#8b5cf6'], icon: ShieldCheck, max: 100, unit: '', label: '' };
+const FALLBACK = { colors: ['#00338D', '#4F46E5'], icon: ShieldCheck, max: 100, unit: '', label: '' };
 
 const lin = ([c1, c2], deg = 135) => `linear-gradient(${deg}deg, ${c1}, ${c2})`;
 
@@ -489,7 +489,7 @@ export default function TechnicalKPI() {
               <p style={{ margin: '3px 0 0', fontSize: 11, color: 'var(--text-muted)' }}>LTE Call Setup Success Rate trend — last 30 data points</p>
             </div>
             <div style={{ display: 'flex', gap: 16 }}>
-              {[['#10b981', 'Current'], ['var(--text-muted)', 'Baseline']].map(([c, l]) => (
+              {[['#00338D', 'Current'], ['var(--text-muted)', 'Baseline']].map(([c, l]) => (
                 <div key={l} style={{ display: 'flex', alignItems: 'center', gap: 5, fontSize: 10, color: 'var(--text-muted)', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
                   <span style={{ width: 8, height: 8, borderRadius: '50%', background: c }} />
                   {l}
@@ -514,7 +514,7 @@ export default function TechnicalKPI() {
                   label={{ value: `Threshold ${THRESHOLDS.accessibility.value}%`, position: 'right', fill: '#ef4444', fontSize: 9, fontWeight: 700 }} />
                 <Area type="monotoneX" dataKey="value" stroke="#10b981" strokeWidth={3}
                   fill="url(#trendGrad)" name={acc.label} dot={false}
-                  activeDot={{ r: 5, fill: '#10b981', stroke: '#06b6d4', strokeWidth: 2 }} />
+                  activeDot={{ r: 5, fill: '#00338D', stroke: '#4F46E5', strokeWidth: 2 }} />
               </AreaChart>
             </ResponsiveContainer>
           </div>
@@ -532,7 +532,7 @@ export default function TechnicalKPI() {
 
         {/* ── KPI Forecast Panel ─────────────────────────────── */}
         <motion.div {...FADE(0.40)} style={{ ...glass, overflow: 'hidden' }}>
-          <div style={{ height: 3, background: 'linear-gradient(90deg, #6366f1, #10b981)' }} />
+          <div style={{ height: 3, background: 'linear-gradient(90deg, #00338D, #06B6D4)' }} />
           <div style={{ padding: '18px 20px 14px', borderBottom: '1px solid var(--border)' }}>
             <h3 style={{ margin: 0, fontSize: 14, fontWeight: 700, color: 'var(--text)' }}>KPI Forecast <span style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-muted)' }}>(7 Days)</span></h3>
           </div>
@@ -1438,7 +1438,7 @@ function LegacyCoreTab({ data }) {
               </div>
               <div style={{ height: 48, display: 'flex', alignItems: 'flex-end', gap: 3, opacity: 0.5 }}>
                 {authSparkline.map((v, i) => (
-                  <div key={i} title={`${trend.slice(-8)[i]?.date || ''}: ${v}`} style={{ flex: 1, background: '#fff', borderRadius: '2px 2px 0 0', height: `${Math.max(15, (v / maxAuthSpark) * 100)}%`, cursor: 'pointer' }} />
+                  <div key={i} title={`${trend.slice(-8)[i]?.date || ''}: ${v}`} style={{ flex: 1, background: 'rgba(255,255,255,0.7)', borderRadius: '2px 2px 0 0', height: `${Math.max(15, (v / maxAuthSpark) * 100)}%`, cursor: 'pointer' }} />
                 ))}
               </div>
             </div>
