@@ -5633,6 +5633,119 @@ def generate_employee_id(role):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# SEMANTIC LAYER ADMIN ROUTES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.route("/api/admin/semantic/catalog", methods=["GET"])
+@jwt_required()
+def semantic_catalog_list():
+    """List all metric concepts and their physical mappings."""
+    user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
+    if user.role != "admin":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    from semantic_layer import _sql as sl_sql
+    concepts = sl_sql("""
+        SELECT mc.id, mc.concept_name, mc.display_name, mc.unit, mc.description,
+               mc.created_at
+        FROM metric_catalog mc ORDER BY mc.concept_name
+    """)
+    # Attach mappings to each concept
+    for c in concepts:
+        c["mappings"] = sl_sql("""
+            SELECT id, table_name, column_expr, filter_expr, device_type, priority
+            FROM metric_physical_mapping WHERE concept_id = :cid
+            ORDER BY priority DESC
+        """, {"cid": c["id"]})
+        if c.get("created_at"):
+            c["created_at"] = str(c["created_at"])
+
+    return jsonify({"concepts": concepts, "count": len(concepts)})
+
+
+@app.route("/api/admin/semantic/catalog", methods=["POST"])
+@jwt_required()
+def semantic_catalog_upsert():
+    """Add or update a metric concept with its physical mappings."""
+    user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
+    if user.role != "admin":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    data = request.get_json()
+    if not data or not data.get("concept_name") or not data.get("display_name"):
+        return jsonify({"error": "concept_name and display_name required"}), 400
+
+    from semantic_layer import _sql as sl_sql, _sql_exec as sl_exec
+
+    cname = data["concept_name"].strip()
+    dname = data["display_name"].strip()
+    unit = data.get("unit")
+    desc = data.get("description")
+
+    # Upsert concept
+    existing = sl_sql("SELECT id FROM metric_catalog WHERE concept_name = :cn", {"cn": cname})
+    if existing:
+        concept_id = existing[0]["id"]
+        sl_exec("""
+            UPDATE metric_catalog SET display_name = :dn, unit = :unit, description = :desc
+            WHERE id = :cid
+        """, {"dn": dname, "unit": unit, "desc": desc, "cid": concept_id})
+    else:
+        sl_exec("""
+            INSERT INTO metric_catalog (concept_name, display_name, unit, description)
+            VALUES (:cn, :dn, :unit, :desc)
+        """, {"cn": cname, "dn": dname, "unit": unit, "desc": desc})
+        new_row = sl_sql("SELECT id FROM metric_catalog WHERE concept_name = :cn", {"cn": cname})
+        concept_id = new_row[0]["id"]
+
+    # Replace mappings if provided
+    mappings = data.get("mappings", [])
+    if mappings:
+        sl_exec("DELETE FROM metric_physical_mapping WHERE concept_id = :cid", {"cid": concept_id})
+        for m in mappings:
+            sl_exec("""
+                INSERT INTO metric_physical_mapping (concept_id, table_name, column_expr, filter_expr, device_type, priority)
+                VALUES (:cid, :tbl, :col, :filt, :dev, :pri)
+            """, {
+                "cid": concept_id, "tbl": m.get("table_name", ""),
+                "col": m.get("column_expr", "value"), "filt": m.get("filter_expr"),
+                "dev": m.get("device_type", "generic"), "pri": m.get("priority", 0),
+            })
+
+    return jsonify({"message": "Concept saved", "concept_id": concept_id})
+
+
+@app.route("/api/admin/semantic/seed", methods=["POST"])
+@jwt_required()
+def semantic_seed():
+    """Trigger auto-discovery: cluster existing KPIs into semantic concepts."""
+    user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
+    if user.role != "admin":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    from semantic_layer import seed_catalog_from_existing_data
+    result = seed_catalog_from_existing_data()
+    return jsonify(result)
+
+
+@app.route("/api/admin/semantic/embed", methods=["POST"])
+@jwt_required()
+def semantic_embed():
+    """Trigger embedding generation for all schema objects."""
+    user_id = int(get_jwt_identity())
+    user = User.query.get(user_id)
+    if user.role != "admin":
+        return jsonify({"error": "Unauthorized"}), 403
+
+    from semantic_layer import embed_schema_objects
+    result = embed_schema_objects()
+    return jsonify(result)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # ADMIN ROUTES
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -6504,6 +6617,7 @@ def admin_upload_sites():
         print(f">>> Geo auto-populate failed (non-fatal): {e}")
 
     clear_analytics_cache()
+    _invalidate_ai_schema()
     return jsonify({
         "created": created, "skipped": skipped, "total": created,
         "detected_columns": list(col_map.keys()),
@@ -6567,6 +6681,7 @@ def admin_populate_geo():
         return jsonify({"error": "Unauthorized"}), 403
     _auto_populate_geo()
     clear_analytics_cache()
+    _invalidate_ai_schema()
     count = TelecomSite.query.filter(TelecomSite.city.isnot(None), TelecomSite.city != '').count()
     total = TelecomSite.query.count()
     return jsonify({"message": f"Geo populated: {count}/{total} sites have city data"})
@@ -6677,6 +6792,9 @@ def admin_upload_kpi_site_level():
         wb.close()
 
     clear_analytics_cache()
+    upsert_kpi_data_stats()
+    # Schema cache invalidation happens INSIDE refresh_all_matviews after MVs are refreshed
+    threading.Thread(target=refresh_all_matviews, daemon=True).start()
     return jsonify({
         "inserted": total_inserted,
         "kpis_processed": len(kpi_summary),
@@ -6943,6 +7061,9 @@ def admin_upload_kpi_cell_level():
         wb.close()
 
     clear_analytics_cache()
+    upsert_kpi_data_stats()
+    # Schema cache invalidation happens INSIDE refresh_all_matviews after MVs are refreshed
+    threading.Thread(target=refresh_all_matviews, daemon=True).start()
     return jsonify({
         "inserted": total_inserted,
         "kpis_processed": len(kpi_summary),
@@ -7428,6 +7549,7 @@ def admin_upload_core_component_kpi():
         wb.close()
 
     clear_analytics_cache()
+    _invalidate_ai_schema()
     return jsonify({
         "inserted": total_inserted,
         "kpis_processed": len(kpi_summary),
@@ -7494,6 +7616,7 @@ def admin_delete_core_component_kpi():
     except Exception:
         deleted = 0
     clear_analytics_cache()
+    _invalidate_ai_schema()
     return jsonify({"deleted": deleted, "component_type": comp_type or "ALL"})
 
 
@@ -7535,6 +7658,7 @@ def admin_delete_sites():
     TelecomSite.query.delete()
     db.session.commit()
     clear_analytics_cache()
+    _invalidate_ai_schema()
     return jsonify({"deleted": count})
 
 
@@ -7549,6 +7673,9 @@ def admin_delete_kpi_site_level():
     KpiData.query.filter_by(data_level="site").delete()
     db.session.commit()
     clear_analytics_cache()
+    upsert_kpi_data_stats()
+    # Schema cache invalidation happens INSIDE refresh_all_matviews after MVs are refreshed
+    threading.Thread(target=refresh_all_matviews, daemon=True).start()
     return jsonify({"deleted": count})
 
 
@@ -7563,6 +7690,9 @@ def admin_delete_kpi_cell_level():
     KpiData.query.filter_by(data_level="cell").delete()
     db.session.commit()
     clear_analytics_cache()
+    upsert_kpi_data_stats()
+    # Schema cache invalidation happens INSIDE refresh_all_matviews after MVs are refreshed
+    threading.Thread(target=refresh_all_matviews, daemon=True).start()
     return jsonify({"deleted": count})
 
 
@@ -7783,6 +7913,7 @@ def admin_upload_flexible_kpi():
                 db.session.commit()
                 _cache_clear("business_kpi", "technical_kpi")
                 clear_analytics_cache()
+                _invalidate_ai_schema()
                 return jsonify({
                     "rows_in_file": total_inserted,
                     "records_inserted": total_inserted,
@@ -7954,6 +8085,7 @@ def admin_upload_flexible_kpi():
     # picks up the freshly uploaded rows.
     _cache_clear("business_kpi", "technical_kpi")
     clear_analytics_cache()
+    _invalidate_ai_schema()
 
     # Invalidate priority/urgency bracket caches so new uploads are reflected immediately
     try:
@@ -8051,6 +8183,7 @@ def admin_delete_flexible_kpi():
     db.session.commit()
     _cache_clear("business_kpi", "technical_kpi")
     clear_analytics_cache()
+    _invalidate_ai_schema()
     return jsonify({"deleted": deleted, "kpi_type": kpi_type})
 
 
@@ -10362,19 +10495,32 @@ def run_sla_checks():
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _ensure_kpi_merged_view():
-    """Create/refresh the kpi_data_merged VIEW.
+    """Create the kpi_data_merged MATERIALIZED VIEW (first-time only).
 
-    This view presents every (site_id, kpi_name, date) ONCE:
-      - If site-level rows exist, they pass through as-is.
-      - For sites with NO site-level data for a given (kpi, date), the cell-level
-        rows are averaged across all cells of that site and surfaced with
-        data_level='site' so existing analytics queries pick them up transparently.
-    All read-heavy dashboards (network_analytics, CTO dashboards) should read
-    from this view instead of the raw kpi_data table.
+    This materialized view persists query results physically so every dashboard
+    query hits a pre-built snapshot instead of re-executing the 30 M-row UNION.
+
+    Upgrade path: drops the legacy regular VIEW if it exists so the first
+    deployment converts it transparently.
+
+    Indexes created:
+      • UNIQUE on id          — enables REFRESH CONCURRENTLY (non-blocking)
+      • (site_id, kpi_name, date)     — main analytics filter
+      • (kpi_name, date) WHERE value IS NOT NULL  — trends queries
+      • (data_level, kpi_name, date)  — level-filtered scans
     """
     from sqlalchemy import text as _t
+    with db.engine.connect() as conn:
+        # Drop the old regular VIEW so we can replace it with a MATERIALIZED VIEW.
+        # CASCADE removes any dependent objects; re-created below.
+        try:
+            conn.execute(_t("DROP VIEW IF EXISTS kpi_data_merged CASCADE"))
+            conn.commit()
+        except Exception:
+            pass
+
     ddl = """
-        CREATE OR REPLACE VIEW kpi_data_merged AS
+        CREATE MATERIALIZED VIEW IF NOT EXISTS kpi_data_merged AS
         SELECT id, site_id, site_abs_id, kpi_name, date, hour, value,
                data_level, cell_id, cell_site_id
         FROM kpi_data
@@ -10401,14 +10547,56 @@ def _ensure_kpi_merged_view():
                 AND s.data_level = 'site'
           )
         GROUP BY k.site_id, k.kpi_name, k.date
+        WITH DATA
     """
+    idx_ddls = [
+        # Required for REFRESH CONCURRENTLY (non-blocking refresh).
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_kdm_id ON kpi_data_merged (id)",
+        # Main analytics filter.
+        "CREATE INDEX IF NOT EXISTS idx_kdm_site_kpi_date ON kpi_data_merged (site_id, kpi_name, date)",
+        # Trends queries scan by kpi_name + date.
+        "CREATE INDEX IF NOT EXISTS idx_kdm_kpi_date ON kpi_data_merged (kpi_name, date) WHERE value IS NOT NULL",
+        # Level-filtered scans.
+        "CREATE INDEX IF NOT EXISTS idx_kdm_level_kpi_date ON kpi_data_merged (data_level, kpi_name, date)",
+    ]
     try:
         with db.engine.connect() as conn:
             conn.execute(_t(ddl))
             conn.commit()
-        print(">>> kpi_data_merged view ready (site-level preferred, cell-level fallback)")
+            for idx in idx_ddls:
+                try:
+                    conn.execute(_t(idx))
+                    conn.commit()
+                except Exception:
+                    pass
+        print(">>> kpi_data_merged materialized view ready")
     except Exception as e:
-        print(f">>> kpi_data_merged view create failed (non-fatal): {e}")
+        print(f">>> kpi_data_merged materialized view create failed (non-fatal): {e}")
+
+
+def refresh_all_matviews():
+    """Refresh all KPI materialized views. Call after upload/delete.
+
+    Order matters: kpi_data_merged first (no deps), then mv_daily_site_kpi
+    (sourced from kpi_data), then mv_zone_daily_kpi (sourced from mv_daily_site_kpi).
+    Each refresh is attempted CONCURRENTLY first; falls back to plain REFRESH on error.
+    Invalidates AI schema cache AFTER all refreshes complete (not before).
+    """
+    from sqlalchemy import text as _t
+    for _mv in ["kpi_data_merged", "mv_daily_site_kpi", "mv_zone_kpi_summary", "mv_zone_daily_kpi"]:
+        try:
+            with db.engine.connect() as conn:
+                conn.execute(_t(f"REFRESH MATERIALIZED VIEW CONCURRENTLY {_mv}"))
+                conn.commit()
+        except Exception:
+            try:
+                with db.engine.connect() as conn:
+                    conn.execute(_t(f"REFRESH MATERIALIZED VIEW {_mv}"))
+                    conn.commit()
+            except Exception as _e:
+                print(f"refresh {_mv} failed (non-fatal): {_e}")
+    # Invalidate AI schema cache AFTER refresh so next query rebuilds from fresh MVs
+    _invalidate_ai_schema()
 
 
 with app.app_context():
@@ -10481,6 +10669,8 @@ with app.app_context():
                 conn.execute(sa_text("ALTER TABLE kpi_data ADD COLUMN site_abs_id VARCHAR(100)"))
                 conn.commit()
                 print(">>> Added site_abs_id column to kpi_data")
+
+    _ensure_kpi_merged_view()
 
     # Auto-populate geo data for sites missing city/state/country
     try:
@@ -10630,11 +10820,11 @@ with app.app_context():
 
 
 # ─── Register Network Analytics Blueprint ─────────────────────────────────────
-from network_analytics import network_bp, clear_analytics_cache
+from network_analytics import network_bp, clear_analytics_cache, refresh_kpi_data_merged, upsert_kpi_data_stats
 app.register_blueprint(network_bp)
 
 # ─── Register Network AI Blueprint ───────────────────────────────────────────
-from network_ai import network_ai_bp, ensure_db_optimizations
+from network_ai import network_ai_bp, ensure_db_optimizations, refresh_materialized_views as _refresh_ai_mvs, invalidate_schema_cache as _invalidate_ai_schema
 app.register_blueprint(network_ai_bp)
 
 # ─── Startup schema warm-up for network AI ────────────────────────────────────

@@ -808,6 +808,13 @@ def list_network_issues():
     except Exception:
         pass
 
+    # Bulk pre-fetch assigned agents — avoids N+1 per-ticket db.session.get calls.
+    agent_ids = {t.assigned_agent for t in tickets if t.assigned_agent}
+    agent_map = {}
+    if agent_ids:
+        for ag in User.query.filter(User.id.in_(agent_ids)).all():
+            agent_map[ag.id] = ag
+
     result = []
     for t in tickets:
         sla_remaining = sla_pct = 0
@@ -817,7 +824,7 @@ def list_network_issues():
             sla_pct = round(min((t.sla_hours - max(rem, 0)) / max(t.sla_hours, 1) * 100, 100), 1)
         agent_name = agent_eid = ""
         if t.assigned_agent:
-            ag = db.session.get(User, t.assigned_agent)
+            ag = agent_map.get(t.assigned_agent)
             if ag: agent_name = ag.name; agent_eid = ag.employee_id or ""
 
         site_meta = abs_map.get(t.site_id, {})
@@ -861,10 +868,30 @@ def todays_routing():
         )
     ).order_by(NetworkIssueTicket.updated_at.desc()).all()
 
+    # Overutilized tickets created/updated today
+    ou_tickets = []
+    try:
+        ou_tickets = OverutilizedTicket.query.filter(
+            db.or_(
+                db.and_(OverutilizedTicket.created_at >= today_start, OverutilizedTicket.created_at < tomorrow_start),
+                db.and_(OverutilizedTicket.updated_at >= today_start, OverutilizedTicket.updated_at < tomorrow_start),
+            )
+        ).order_by(OverutilizedTicket.updated_at.desc()).all()
+    except Exception as e:
+        _LOG.warning("Overutilized routing fetch failed: %s", e)
+
+    # Bulk pre-fetch assigned agents for ALL tickets in one query — avoids N+1.
+    all_tickets_for_agents = list(wc_tickets) + list(ou_tickets)
+    agent_ids = {t.assigned_agent for t in all_tickets_for_agents if t.assigned_agent}
+    agent_map = {}
+    if agent_ids:
+        for ag in User.query.filter(User.id.in_(agent_ids)).all():
+            agent_map[ag.id] = ag
+
     for t in wc_tickets:
         agent_name = agent_email = ""
         if t.assigned_agent:
-            ag = db.session.get(User, t.assigned_agent)
+            ag = agent_map.get(t.assigned_agent)
             if ag: agent_name = ag.name or ""; agent_email = ag.email or ""
         created_today = t.created_at and t.created_at.date() == today
         routing.append({
@@ -879,19 +906,11 @@ def todays_routing():
             "type": "created" if created_today else "updated",
         })
 
-    # Overutilized tickets created/updated today
     try:
-        ou_tickets = OverutilizedTicket.query.filter(
-            db.or_(
-                db.and_(OverutilizedTicket.created_at >= today_start, OverutilizedTicket.created_at < tomorrow_start),
-                db.and_(OverutilizedTicket.updated_at >= today_start, OverutilizedTicket.updated_at < tomorrow_start),
-            )
-        ).order_by(OverutilizedTicket.updated_at.desc()).all()
-
         for t in ou_tickets:
             agent_name = agent_email = ""
             if t.assigned_agent:
-                ag = db.session.get(User, t.assigned_agent)
+                ag = agent_map.get(t.assigned_agent)
                 if ag: agent_name = ag.name or ""; agent_email = ag.email or ""
             created_today = t.created_at and t.created_at.date() == today
             routing.append({
@@ -1081,39 +1100,50 @@ def network_issue_trends(ticket_id):
         params["cid"] = target
 
     kpis = ['E-RAB Call Drop Rate_1', 'LTE Call Setup Success Rate', 'LTE DL - Usr Ave Throughput']
-    result = {}
-    for kpi in kpis:
-        try:
-            if period == "month":
-                group_key = "TO_CHAR(k.date, 'YYYY-MM')"
-            elif period == "week":
-                group_key = "TO_CHAR(k.date, 'IYYY-\"W\"IW')"
-            elif period == "hour":
-                # Last 7 days for hourly (zoomed in)
-                group_key = "TO_CHAR(k.date, 'MM/DD')"
-                rows = _sql(f"""
-                    SELECT {group_key} AS label, AVG(k.value) AS avg, MIN(k.value) AS min, MAX(k.value) AS max
-                    FROM kpi_data k WHERE k.site_id=:sid AND k.kpi_name=:kpi
-                      AND k.data_level=:dl AND k.value IS NOT NULL {cell_filter}
-                      AND k.date >= CURRENT_DATE - INTERVAL '7 days' AND k.date <= CURRENT_DATE
-                    GROUP BY {group_key} ORDER BY {group_key}
-                """, {**params, "kpi": kpi, "dl": data_level})
-                result[kpi] = [{"label": r["label"], "avg": _f(r["avg"], 4), "min": _f(r["min"], 4), "max": _f(r["max"], 4)} for r in rows]
-                continue
-            else:
-                group_key = "k.date::text"
+    result = {kpi: [] for kpi in kpis}
 
-            rows = _sql(f"""
-                SELECT {group_key} AS label, AVG(k.value) AS avg, MIN(k.value) AS min, MAX(k.value) AS max
-                FROM kpi_data k WHERE k.site_id=:sid AND k.kpi_name=:kpi
-                  AND k.data_level=:dl AND k.value IS NOT NULL {cell_filter}
-                  AND k.date <= CURRENT_DATE
-                GROUP BY {group_key} ORDER BY {group_key}
-            """, {**params, "kpi": kpi, "dl": data_level})
-            result[kpi] = [{"label": r["label"], "avg": _f(r["avg"], 4), "min": _f(r["min"], 4), "max": _f(r["max"], 4)} for r in rows]
-        except Exception as e:
-            _LOG.error("Trend query failed for %s/%s: %s", kpi, target, e)
-            result[kpi] = []
+    try:
+        if period == "hour":
+            # Hourly view: last 7 days, grouped by day label
+            group_key = "TO_CHAR(k.date, 'MM/DD')"
+            lower_clause = "AND k.date >= CURRENT_DATE - INTERVAL '7 days'"
+        elif period == "week":
+            group_key = "TO_CHAR(k.date, 'IYYY-\"W\"IW')"
+            lower_clause = "AND k.date >= CURRENT_DATE - INTERVAL '90 days'"
+        elif period == "month":
+            group_key = "TO_CHAR(k.date, 'YYYY-MM')"
+            lower_clause = "AND k.date >= CURRENT_DATE - INTERVAL '90 days'"
+        else:  # day
+            group_key = "k.date::text"
+            lower_clause = "AND k.date >= CURRENT_DATE - INTERVAL '90 days'"
+
+        # Single query for all KPIs — avoids 3 separate round-trips per request.
+        rows = _sql(f"""
+            SELECT k.kpi_name, {group_key} AS label,
+                   AVG(k.value) AS avg, MIN(k.value) AS min, MAX(k.value) AS max
+            FROM kpi_data k
+            WHERE k.site_id = :sid
+              AND k.kpi_name = ANY(:kpis)
+              AND k.data_level = :dl
+              AND k.value IS NOT NULL
+              {cell_filter}
+              {lower_clause}
+              AND k.date <= CURRENT_DATE
+            GROUP BY k.kpi_name, {group_key}
+            ORDER BY k.kpi_name, {group_key}
+        """, {**params, "kpis": kpis, "dl": data_level})
+
+        for r in rows:
+            kpi_name = r["kpi_name"]
+            if kpi_name in result:
+                result[kpi_name].append({
+                    "label": r["label"],
+                    "avg"  : _f(r["avg"], 4),
+                    "min"  : _f(r["min"], 4),
+                    "max"  : _f(r["max"], 4),
+                })
+    except Exception as e:
+        _LOG.error("Trend query failed for %s: %s", target, e)
 
     return jsonify({"site_id": t.site_id, "target": target, "period": period, "data_level": data_level, "trends": result})
 

@@ -55,6 +55,47 @@ CREATE_TABLES = [
         )
         """,
     ),
+    (
+        "metric_catalog",
+        """
+        CREATE TABLE metric_catalog (
+            id              SERIAL PRIMARY KEY,
+            concept_name    TEXT UNIQUE NOT NULL,
+            display_name    TEXT NOT NULL,
+            unit            TEXT,
+            description     TEXT,
+            created_at      TIMESTAMP DEFAULT NOW()
+        )
+        """,
+    ),
+    (
+        "metric_physical_mapping",
+        """
+        CREATE TABLE metric_physical_mapping (
+            id              SERIAL PRIMARY KEY,
+            concept_id      INTEGER REFERENCES metric_catalog(id) ON DELETE CASCADE,
+            table_name      TEXT NOT NULL,
+            column_expr     TEXT NOT NULL,
+            filter_expr     TEXT,
+            device_type     TEXT,
+            priority        INTEGER DEFAULT 0,
+            UNIQUE(concept_id, table_name, device_type)
+        )
+        """,
+    ),
+    (
+        "schema_embeddings",
+        """
+        CREATE TABLE schema_embeddings (
+            id              SERIAL PRIMARY KEY,
+            object_type     TEXT NOT NULL,
+            object_name     TEXT NOT NULL,
+            source_table    TEXT,
+            embedding       JSONB,
+            created_at      TIMESTAMP DEFAULT NOW()
+        )
+        """,
+    ),
 ]
 
 
