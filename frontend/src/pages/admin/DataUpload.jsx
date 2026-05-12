@@ -53,6 +53,76 @@ export default function DataUpload() {
   const [coreCompStatus, setCoreCompStatus] = useState(null);
   const [coreCompStatusByType, setCoreCompStatusByType] = useState(null);
 
+  // ── Core Parameter upload (single workbook with one sheet per component)
+  const [coreParamFile, setCoreParamFile] = useState(null);
+  const [uploadingCoreParam, setUploadingCoreParam] = useState(false);
+  const [coreParamResult, setCoreParamResult] = useState(null);
+  const [coreParamStatus, setCoreParamStatus] = useState(null);
+
+  // ── Core KPI Threshold upload (single workbook with one sheet per component)
+  const [coreThrFile, setCoreThrFile] = useState(null);
+  const [uploadingCoreThr, setUploadingCoreThr] = useState(false);
+  const [coreThrResult, setCoreThrResult] = useState(null);
+  const [coreThrStatus, setCoreThrStatus] = useState(null);
+
+  const fetchCoreThrStatus = useCallback(async () => {
+    try {
+      const resp = await fetch(`${API_BASE}/api/admin/core-thresholds/status`, { headers: { Authorization: `Bearer ${getToken()}` } });
+      if (resp.ok) setCoreThrStatus(await resp.json());
+    } catch {}
+  }, []);
+
+  useEffect(() => { fetchCoreThrStatus(); }, [fetchCoreThrStatus]);
+
+  const uploadCoreThresholds = async () => {
+    if (!coreThrFile) return;
+    setUploadingCoreThr(true); setError(''); setSuccess('');
+    try {
+      const fd = new FormData();
+      fd.append('file', coreThrFile);
+      const resp = await fetch(`${API_BASE}/api/admin/upload-core-thresholds`, {
+        method: 'POST', body: fd, headers: { Authorization: `Bearer ${getToken()}` },
+      });
+      const d = await resp.json();
+      if (!resp.ok) { setError(d.error || 'Upload failed'); }
+      else {
+        setCoreThrResult(d);
+        setSuccess(`Uploaded ${d.total_inserted} threshold rows.`);
+        fetchCoreThrStatus();
+      }
+    } catch (e) { setError(String(e)); }
+    setUploadingCoreThr(false);
+  };
+
+  const fetchCoreParamStatus = useCallback(async () => {
+    try {
+      const resp = await fetch(`${API_BASE}/api/admin/core-parameters/status`, { headers: { Authorization: `Bearer ${getToken()}` } });
+      if (resp.ok) setCoreParamStatus(await resp.json());
+    } catch {}
+  }, []);
+
+  useEffect(() => { fetchCoreParamStatus(); }, [fetchCoreParamStatus]);
+
+  const uploadCoreParameters = async () => {
+    if (!coreParamFile) return;
+    setUploadingCoreParam(true); setError(''); setSuccess('');
+    try {
+      const fd = new FormData();
+      fd.append('file', coreParamFile);
+      const resp = await fetch(`${API_BASE}/api/admin/upload-core-parameters`, {
+        method: 'POST', body: fd, headers: { Authorization: `Bearer ${getToken()}` },
+      });
+      const d = await resp.json();
+      if (!resp.ok) { setError(d.error || 'Upload failed'); }
+      else {
+        setCoreParamResult(d);
+        setSuccess(`Uploaded ${d.total_inserted} parameter rows.`);
+        fetchCoreParamStatus();
+      }
+    } catch (e) { setError(String(e)); }
+    setUploadingCoreParam(false);
+  };
+
   const fetchCoreCompStatusByType = useCallback(async () => {
     try {
       const resp = await fetch(`${API_BASE}/api/admin/core-component-status-by-type`, { headers: { Authorization: `Bearer ${getToken()}` } });
@@ -1101,6 +1171,100 @@ export default function DataUpload() {
             </div>
           )}
         </div>
+      </div>
+
+      {/* ─── Core KPI Threshold Upload ─── */}
+      <div style={{ background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 12, padding: 20, marginBottom: 24 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
+          <span style={{ width: 4, height: 22, background: '#16a34a', borderRadius: 2 }} />
+          <h3 style={{ margin: 0, fontSize: 16, fontWeight: 700, color: 'var(--text)' }}>Core KPI Threshold Upload</h3>
+          <span style={{ fontSize: 11, color: '#16a34a', background: '#16a34a18', padding: '2px 8px', borderRadius: 10, fontWeight: 700 }}>NEW</span>
+        </div>
+        <p style={{ margin: '4px 0 14px', fontSize: 12, color: 'var(--text-muted)' }}>
+          Upload a single Excel file with one <b>sheet per component type</b> (MME / HSS / PGW / SGW / PCRF).
+          Required columns: <code>kpi_name</code>, <code>Normal (Industry Std)</code>, <code>Degradation / Action</code>, <code>Critical Threshold</code>, <code>Unit</code>.
+          Free-form text like <code>≥ 99.90%</code>, <code>99.50–99.80%</code>, <code>&lt; 99.50%</code>, <code>&gt; 80% sustained</code> is parsed automatically.
+          These overrides drive ticket creation immediately on save.
+        </p>
+        <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+          <input type="file" accept=".xlsx,.xlsm" onChange={e => setCoreThrFile(e.target.files[0] || null)} style={{ fontSize: 13 }} />
+          <button className="btn btn-primary btn-sm" onClick={uploadCoreThresholds} disabled={!coreThrFile || uploadingCoreThr}>
+            {uploadingCoreThr ? 'Uploading…' : 'Upload Thresholds'}
+          </button>
+        </div>
+        {coreThrStatus?.by_component && Object.keys(coreThrStatus.by_component).length > 0 && (
+          <div style={{ marginTop: 14 }}>
+            <div style={{ fontSize: 12, fontWeight: 700, color: 'var(--text)', marginBottom: 8 }}>
+              Active Overrides ({coreThrStatus.total} rows)
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: 10 }}>
+              {Object.entries(coreThrStatus.by_component).map(([ct, kpis]) => (
+                <div key={ct} style={{ background: '#fff', border: '1px solid #e2e8f0', borderLeft: '4px solid #16a34a', borderRadius: 8, padding: '10px 14px' }}>
+                  <div style={{ fontSize: 13, fontWeight: 700, color: '#0f172a' }}>{ct}</div>
+                  <div style={{ fontSize: 11, color: '#64748b', marginTop: 4 }}>{kpis.length} KPI threshold(s)</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+        {coreThrResult && (
+          <div style={{ marginTop: 14, background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: 8, padding: 12, fontSize: 13 }}>
+            <strong style={{ color: '#16a34a' }}>Upload Successful — {coreThrResult.total_inserted} threshold rows inserted</strong>
+            <div style={{ marginTop: 8, fontSize: 11, color: '#475569' }}>
+              {Object.entries(coreThrResult.by_component || {}).map(([k, v]) => (
+                <div key={k}>
+                  · <b>{k}</b>: sheet "{v.sheet}" — {v.rows ?? 0} rows
+                  {v.skipped ? ` (skipped: ${v.skipped})` : ''}
+                  {v.unmatched_kpis?.length ? <span style={{ color: '#92400e' }}> · unmatched: {v.unmatched_kpis.join(', ')}</span> : ''}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* ─── Core Parameter Upload (MME / SGW / PGW / HSS / PCRF) ─── */}
+      <div style={{ background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 12, padding: 20, marginBottom: 24 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
+          <span style={{ width: 4, height: 22, background: '#7c3aed', borderRadius: 2 }} />
+          <h3 style={{ margin: 0, fontSize: 16, fontWeight: 700, color: 'var(--text)' }}>Core Parameter Upload</h3>
+          <span style={{ fontSize: 11, color: '#7c3aed', background: '#7c3aed18', padding: '2px 8px', borderRadius: 10, fontWeight: 700 }}>NEW</span>
+        </div>
+        <p style={{ margin: '4px 0 14px', fontSize: 12, color: 'var(--text-muted)' }}>
+          Upload a single Excel file. Each <b>sheet name</b> must equal the component type — <b>MME / SGW / PGW / HSS / PCRF</b>.
+          Required columns: <code>kpi_name</code>, <code>parameter_group</code>, <code>parameter_name</code>, <code>unit</code>.
+          Component-id columns (e.g. MME1, MME2, MME3) hold the current parameter value for each instance.
+          OpenAI uses these rows when recommending parameter changes for Core tickets.
+        </p>
+
+        <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+          <input type="file" accept=".xlsx,.xlsm" onChange={e => setCoreParamFile(e.target.files[0] || null)} style={{ fontSize: 13 }} />
+          <button className="btn btn-primary btn-sm" onClick={uploadCoreParameters} disabled={!coreParamFile || uploadingCoreParam}>
+            {uploadingCoreParam ? 'Uploading…' : 'Upload Core Parameters'}
+          </button>
+        </div>
+
+        {coreParamStatus && (coreParamStatus.summary?.length > 0) && (
+          <div style={{ marginTop: 14, display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(180px, 1fr))', gap: 10 }}>
+            {coreParamStatus.summary.map(s => (
+              <div key={s.component_type} style={{ background: '#fff', border: '1px solid #e2e8f0', borderLeft: '4px solid #7c3aed', borderRadius: 8, padding: '10px 14px' }}>
+                <div style={{ fontSize: 13, fontWeight: 700, color: '#0f172a' }}>{s.component_type}</div>
+                <div style={{ fontSize: 11, color: '#64748b', marginTop: 4 }}>{s.total_rows} rows · {s.component_ids} component(s) · {s.unique_parameters} parameter(s)</div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {coreParamResult && (
+          <div style={{ marginTop: 14, background: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: 8, padding: 12, fontSize: 13 }}>
+            <strong style={{ color: '#16a34a' }}>Upload Successful — {coreParamResult.total_inserted} rows inserted</strong>
+            <div style={{ marginTop: 8, fontSize: 11, color: '#475569' }}>
+              {Object.entries(coreParamResult.by_component || {}).map(([k, v]) => (
+                <div key={k}>· <b>{k}</b>: sheet "{v.sheet}", {v.rows ?? 0} rows{v.skipped ? ` (skipped: ${v.skipped})` : ''}</div>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
 
     </div>

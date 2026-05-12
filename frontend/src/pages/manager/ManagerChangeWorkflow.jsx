@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { apiGet, apiPut } from '../../api';
 import { useTheme } from '../../ThemeContext';
+import CoreParameterChangePanel from '../../components/CoreParameterChangePanel';
 
 /* ── Constants ─────────────────────────────────────────────────────────────── */
 const PRIORITY_STYLE = {
@@ -964,8 +965,20 @@ export default function ManagerChangeWorkflow() {
         }}>
           Overutilized ({overutilizedCRs.length})
         </button>
+        <button onClick={() => { setSection('core'); setFilter(''); }} style={{
+          padding: '10px 24px', fontSize: 13, fontWeight: 700, cursor: 'pointer', border: 'none',
+          borderLeft: `1px solid ${isDark ? '#334155' : '#e2e8f0'}`,
+          background: section === 'core' ? '#0EA5E9' : (isDark ? '#1e293b' : '#f8fafc'),
+          color: section === 'core' ? '#fff' : (isDark ? '#94a3b8' : '#64748b'),
+          display: 'flex', alignItems: 'center', gap: 8,
+        }}>
+          Core Change Parameter
+        </button>
       </div>
 
+      {section === 'core' && <div style={{ marginTop: 8 }}><CoreParameterChangePanel /></div>}
+
+      {section !== 'core' && <>
       {/* Stats row */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 14, marginBottom: 24 }}>
         {STAT_CARDS.map(s => (
@@ -1065,6 +1078,7 @@ export default function ManagerChangeWorkflow() {
       <div style={{ marginTop: 14, fontSize: 12, color: isDark ? '#64748b' : '#94a3b8', textAlign: 'right' }}>
         {activeCRs.length} change request{activeCRs.length !== 1 ? 's' : ''} · Auto-refreshes every 30s
       </div>
+      </>}
 
       {/* Remarks Modal */}
       {remarksCR && (

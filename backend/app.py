@@ -68,7 +68,7 @@ app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", os.urandom(24).hex())
 app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get(
     "DATABASE_URL",
-    "postgresql://postgres:ROOT@localhost:5432/telecom_cch"
+    "postgresql://postgres:root@localhost:5432/telecom_cch"
 )
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 # Raise DB connection pool limits — default SQLAlchemy 5+10 is far too small
@@ -130,6 +130,13 @@ def _jwt_needs_fresh(jwt_header, jwt_payload):
 @jwt.revoked_token_loader
 def _jwt_revoked(jwt_header, jwt_payload):
     return jsonify({"error": "token_revoked", "msg": "Token has been revoked."}), 401
+
+
+# Quietly answer the browser's automatic /favicon.ico request so it doesn't
+# spam the dev terminal with 404s. Returning 204 (no content) is enough.
+@app.route("/favicon.ico")
+def _favicon():
+    return ("", 204)
 
 mail = Mail(app)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
@@ -1790,22 +1797,13 @@ def login():
 @app.route("/api/auth/me", methods=["GET"])
 @jwt_required()
 def get_me():
+    # GET only — never read request.json here. The frontend calls this on every
+    # page load with no body; touching request.json on a body-less GET makes
+    # Flask return 400 and the dashboard's auth check fails. Profile updates
+    # go through PUT /api/user/settings instead.
     user = db.session.get(User, int(get_jwt_identity()))
     if not user:
         return jsonify({"error": "User not found"}), 404
-    data = request.json or {}
-    if 'name' in data and data['name'].strip():
-        user.name = data['name'].strip()
-    if 'phone_number' in data:
-        user.phone_number = (data['phone_number'] or '').strip() or None
-    if 'email' in data and data['email'].strip():
-        new_email = data['email'].strip().lower()
-        if new_email != user.email:
-            existing = User.query.filter_by(email=new_email).first()
-            if existing:
-                return jsonify({"error": "Email already in use"}), 409
-            user.email = new_email
-    db.session.commit()
     return jsonify({"user": user.to_dict()})
 
 
@@ -6034,6 +6032,14 @@ def admin_update_user(uid):
         target.expertise = (data["expertise"] or "").strip()
     if "specialization" in data and target.role == "human_agent":
         target.specialization = (data["specialization"] or "").strip()
+    if "bandwidth_capacity" in data and target.role == "human_agent":
+        try:
+            cap = int(data["bandwidth_capacity"])
+            if cap < 1 or cap > 100:
+                return jsonify({"error": "bandwidth_capacity must be 1–100"}), 400
+            target.bandwidth_capacity = cap
+        except (TypeError, ValueError):
+            return jsonify({"error": "bandwidth_capacity must be an integer"}), 400
 
     db.session.commit()
     return jsonify({"user": target.to_dict()})
@@ -10959,56 +10965,32 @@ with app.app_context():
     except Exception as _oe:
         print(f">>> Overutilized migration: {_oe}")
 
-# ── One-time cleanup: purge legacy GUR_LTE_* seeded rows + nuke ALL existing
-# AI tickets (operator wants a clean slate after migrating between machines).
-# Guarded by a marker row in a tiny `_one_time_migrations` table — runs once
-# per database, never again.
-with app.app_context():
-    try:
-        with db.engine.connect() as _c:
-            # Marker table
-            _c.execute(sa_text(
-                "CREATE TABLE IF NOT EXISTS _one_time_migrations ("
-                "  id SERIAL PRIMARY KEY, "
-                "  name VARCHAR(120) UNIQUE NOT NULL, "
-                "  applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"))
-            _c.commit()
-
-            MIGRATION_NAME = "purge_seed_and_existing_ai_tickets_2026_04_15"
-            already = _c.execute(
-                sa_text("SELECT 1 FROM _one_time_migrations WHERE name = :n"),
-                {"n": MIGRATION_NAME}
-            ).fetchone()
-
-            if not already:
-                # 1. Purge legacy seed rows
-                _c.execute(sa_text(
-                    "DELETE FROM overutilized_tickets WHERE site_id LIKE 'GUR\\_LTE\\_%' ESCAPE '\\' "
-                    "OR sites_list LIKE '%GUR\\_LTE\\_%' ESCAPE '\\'"))
-                _c.execute(sa_text(
-                    "DELETE FROM network_issue_tickets WHERE site_id LIKE 'GUR\\_LTE\\_%' ESCAPE '\\'"))
-                _c.execute(sa_text(
-                    "DELETE FROM telecom_sites WHERE site_id LIKE 'GUR\\_LTE\\_%' ESCAPE '\\'"))
-
-                # 2. Wipe ALL existing AI tickets so the next 08:00 daily job
-                #    rebuilds them fresh from the operator's uploaded data.
-                _c.execute(sa_text("DELETE FROM overutilized_tickets"))
-                _c.execute(sa_text("DELETE FROM network_issue_tickets"))
-
-                # 3. Mark migration as applied (won't run again)
-                _c.execute(
-                    sa_text("INSERT INTO _one_time_migrations (name) VALUES (:n)"),
-                    {"n": MIGRATION_NAME}
-                )
-                _c.commit()
-                print(">>> One-time migration applied: purged GUR_LTE seed + cleared all AI tickets")
-            else:
-                print(">>> One-time AI-ticket purge already applied; skipping")
-    except Exception as _e:
-        print(f">>> One-time migration skipped: {_e}")
+# NOTE: A previous "one-time migration" lived here that deleted every
+# telecom_sites row whose site_id matched 'GUR_LTE_%' — the exact pattern
+# seed_data.py uses. On a freshly-seeded database the marker table didn't
+# exist yet, so the migration ran on first startup and purged the seed.
+# That blanked the dashboard the moment the server restarted. The block has
+# been removed; if a future deployment really needs a one-time cleanup, do
+# it via a standalone migrate_*.py script the operator runs explicitly.
 
 # Schedule daily 07:30/08:00 AM IST jobs for worst cell + overutilized detection
 schedule_daily_job(app)
+
+# ─── Register Core Tickets Blueprint (MME/SGW/PGW/HSS/PCRF predictive) ─────
+try:
+    from core_tickets import (
+        core_tickets_bp, init_llm as _core_init_llm,
+        ensure_tables as _core_ensure_tables, schedule_core_hourly_job,
+    )
+    _core_init_llm(client, DEPLOYMENT_NAME)
+    app.register_blueprint(core_tickets_bp)
+    _core_ensure_tables(app)
+    schedule_core_hourly_job(app)
+    print(">>> Core Tickets module loaded (hourly job runs at MM:55 with startup catch-up)")
+except Exception as _ce:
+    print(f">>> Core Tickets module FAILED to load: {_ce}")
+    import traceback as _tb
+    _tb.print_exc()
 
 # ─── Register Change Workflow Blueprint ───────────────────────────────────
 try:
@@ -11066,7 +11048,37 @@ with app.app_context():
                     _conn.rollback()
 
 
+def _check_kpi_data_populated():
+    """Print a friendly notice at startup when kpi_data is empty so the user
+    knows to seed before opening the dashboard. Auto-seeding 26M rows here
+    would block startup for several minutes — better to tell the user how."""
+    try:
+        with app.app_context():
+            with db.engine.connect() as conn:
+                from sqlalchemy import text as _t
+                row = conn.execute(_t("SELECT COUNT(*) AS n FROM kpi_data")).mappings().first()
+                rows = int(row["n"]) if row else 0
+                site_row = conn.execute(_t("SELECT COUNT(*) AS n FROM telecom_sites")).mappings().first()
+                sites = int(site_row["n"]) if site_row else 0
+        if rows == 0 or sites == 0:
+            print("=" * 78)
+            print(" >>> NETWORK ANALYTICS DATA IS EMPTY")
+            print(f" >>>   kpi_data rows = {rows}, telecom_sites rows = {sites}")
+            print(" >>> The dashboard will show 'No data' until you seed the database.")
+            print(" >>> To populate ~3 months of realistic sample data, run ONCE:")
+            print("")
+            print("     python seed_data.py")
+            print("")
+            print(" >>> (takes 5-10 minutes; produces 1500 sites x 27 KPIs x 90 days).")
+            print("=" * 78)
+        else:
+            print(f">>> kpi_data has {rows:,} rows across {sites:,} sites — dashboard ready.")
+    except Exception as e:
+        print(f">>> kpi_data populated check failed: {e}")
+
+
 if __name__ == "__main__":
+    _check_kpi_data_populated()
     run_sla_checks()
     _warm_cto_cache()
     socketio.run(app, debug=True, host="0.0.0.0", port=5500, use_reloader=False)
