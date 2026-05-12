@@ -59,7 +59,7 @@ except ImportError:
 network_bp = Blueprint("network", __name__)
 
 _CACHE: dict = {}
-CACHE_TTL = 300  # 5 minutes — analytics data changes only on upload
+CACHE_TTL = 1800  # 30 minutes — analytics data changes only on upload
 
 # Revenue currency conversion: if uploaded data is in INR, convert to USD
 # Set to 1.0 if data is already in USD. Adjust rate as needed.
@@ -166,6 +166,9 @@ def _ensure_kpi_indexes():
                 "CREATE INDEX IF NOT EXISTS idx_ts_zone ON telecom_sites (zone)",
                 "CREATE INDEX IF NOT EXISTS idx_ts_province ON telecom_sites (province)",
                 "CREATE INDEX IF NOT EXISTS idx_kpi_site_abs ON kpi_data (site_abs_id)",
+                "CREATE INDEX IF NOT EXISTS idx_kpi_site_level_lookup ON kpi_data (kpi_name, site_id, date) WHERE data_level = 'site' AND value IS NOT NULL",
+                "CREATE INDEX IF NOT EXISTS idx_nkts_technology ON network_kpi_timeseries (technology)",
+                "CREATE INDEX IF NOT EXISTS idx_core_kpi_name ON core_component_kpi (kpi_name, date)",
             ]:
                 try:
                     conn.execute(sa_text(stmt))
@@ -918,8 +921,10 @@ def _flex_kpi_trend(kpi_type: str, column_name: str) -> list[dict]:
         return []
 
 
-def _sql(query: str, params: dict = None) -> list[dict]:
+def _sql(query: str, params: dict = None, timeout_ms: int = 0) -> list[dict]:
     with db.engine.connect() as conn:
+        if timeout_ms > 0:
+            conn.execute(sa_text(f"SET LOCAL statement_timeout = '{timeout_ms}'"))
         result = conn.execute(sa_text(query), params or {})
         cols = list(result.keys())
         return [dict(zip(cols, row)) for row in result.fetchall()]
@@ -2457,7 +2462,7 @@ def _ran_pull_per_site(filters, kpi_names, start, end):
           {geo_where}
           {date_cond}
         GROUP BY k.site_id, k.kpi_name
-    """, params)
+    """, params, timeout_ms=10000)
     _LOG.info("_ran_pull_per_site: %d rows window=%s→%s", len(rows), start, end)
     if not rows and date_cond:
         # Fallback: no date window
@@ -2506,7 +2511,7 @@ def _ran_pull_per_date(filters, kpi_names, start, end):
           {date_cond}
         GROUP BY k.kpi_name, k.date
         ORDER BY k.date
-    """, params)
+    """, params, timeout_ms=10000)
     _LOG.info("_ran_pull_per_date: %d rows window=%s→%s", len(rows), start, end)
     if not rows and date_cond:
         np = {k: v for k, v in params.items() if k not in ("_r_start", "_r_end")}
@@ -2931,42 +2936,43 @@ def core_analytics():
             "samples": r["sample_count"],
         }
 
-    # 3. Trend data per KPI — aggregated by scale
+    # 3. Trend data per KPI — single aggregated query (replaces N+1 loop)
     kpi_trends = {}
-    distinct_kpis = _sql(f"""
-        SELECT DISTINCT kpi_name FROM core_component_kpi
-        WHERE value IS NOT NULL {_ct_sql} {_ci_sql} {_time_sql}
-    """, _params)
+    if scale == "15min":
+        _all_trends = _sql(f"""
+            SELECT kpi_name,
+                   date::text || ' ' || LPAD(hour::text, 2, '0') || CHR(58) || LPAD(minute::text, 2, '0') AS ts,
+                   AVG(value) AS val
+            FROM core_component_kpi
+            WHERE value IS NOT NULL {_ct_sql} {_ci_sql} {_time_sql}
+            GROUP BY kpi_name, date, hour, minute
+            ORDER BY kpi_name, date, hour, minute
+        """, _params)
+    elif scale == "daily":
+        _all_trends = _sql(f"""
+            SELECT kpi_name, date::text AS ts, AVG(value) AS val
+            FROM core_component_kpi
+            WHERE value IS NOT NULL {_ct_sql} {_ci_sql} {_time_sql}
+            GROUP BY kpi_name, date
+            ORDER BY kpi_name, date
+        """, _params)
+    else:  # hourly (default)
+        _all_trends = _sql(f"""
+            SELECT kpi_name,
+                   date::text || ' ' || LPAD(hour::text, 2, '0') || CHR(58) || '00' AS ts,
+                   AVG(value) AS val
+            FROM core_component_kpi
+            WHERE value IS NOT NULL {_ct_sql} {_ci_sql} {_time_sql}
+            GROUP BY kpi_name, date, hour
+            ORDER BY kpi_name, date, hour
+        """, _params)
 
-    for kpi_row in distinct_kpis:
-        kn = kpi_row["kpi_name"]
-        if scale == "15min":
-            trend_rows = _sql(f"""
-                SELECT date::text || ' ' || LPAD(hour::text, 2, '0') || CHR(58) || LPAD(minute::text, 2, '0') AS ts,
-                       AVG(value) AS val
-                FROM core_component_kpi
-                WHERE kpi_name = :kn AND value IS NOT NULL {_ct_sql} {_ci_sql} {_time_sql}
-                GROUP BY date, hour, minute
-                ORDER BY date, hour, minute
-                LIMIT 500
-            """, {**_params, "kn": kn})
-        elif scale == "daily":
-            trend_rows = _sql(f"""
-                SELECT date::text AS ts, AVG(value) AS val
-                FROM core_component_kpi
-                WHERE kpi_name = :kn AND value IS NOT NULL {_ct_sql} {_ci_sql} {_time_sql}
-                GROUP BY date ORDER BY date LIMIT 120
-            """, {**_params, "kn": kn})
-        else:  # hourly (default)
-            trend_rows = _sql(f"""
-                SELECT date::text || ' ' || LPAD(hour::text, 2, '0') || CHR(58) || '00' AS ts,
-                       AVG(value) AS val
-                FROM core_component_kpi
-                WHERE kpi_name = :kn AND value IS NOT NULL {_ct_sql} {_ci_sql} {_time_sql}
-                GROUP BY date, hour ORDER BY date, hour LIMIT 500
-            """, {**_params, "kn": kn})
-
-        kpi_trends[kn] = [{"ts": r["ts"], "value": _f(r["val"], 2)} for r in trend_rows]
+    # Partition results by kpi_name in Python
+    for r in _all_trends:
+        kn = r["kpi_name"]
+        if kn not in kpi_trends:
+            kpi_trends[kn] = []
+        kpi_trends[kn].append({"ts": r["ts"], "value": _f(r["val"], 2)})
 
     # 4. Component-level summary table (one row per component instance)
     comp_summary = []
@@ -4039,12 +4045,21 @@ def network_filters():
     techs_set = set()
     vendors_set = set()
 
-    # telecom_sites — has zone and site_id
+    # telecom_sites — combined into 1 round-trip instead of 4
     try:
-        for r in _sql("SELECT DISTINCT zone FROM telecom_sites WHERE zone IS NOT NULL AND zone != '' ORDER BY zone LIMIT 200"):
-            zones_set.add(r["zone"])
-        for r in _sql("SELECT DISTINCT site_id FROM telecom_sites ORDER BY site_id LIMIT 1000"):
-            sites_set.add(r["site_id"])
+        _ts_combined = _sql("""
+            SELECT
+                (SELECT COALESCE(array_agg(DISTINCT zone ORDER BY zone), '{}') FROM telecom_sites WHERE zone IS NOT NULL AND zone != '') AS zones,
+                (SELECT COALESCE(array_agg(DISTINCT technology ORDER BY technology), '{}') FROM telecom_sites WHERE technology IS NOT NULL AND technology != '') AS techs,
+                (SELECT COALESCE(array_agg(DISTINCT vendor_name ORDER BY vendor_name), '{}') FROM telecom_sites WHERE vendor_name IS NOT NULL AND vendor_name != '') AS vendors,
+                (SELECT COALESCE(array_agg(DISTINCT site_id ORDER BY site_id), '{}') FROM (SELECT DISTINCT site_id FROM telecom_sites ORDER BY site_id LIMIT 1000) s) AS sites
+        """)
+        if _ts_combined:
+            _r0 = _ts_combined[0]
+            for z in (_r0.get("zones") or []):    zones_set.add(z)
+            for t in (_r0.get("techs") or []):    techs_set.add(t)
+            for v in (_r0.get("vendors") or []):  vendors_set.add(v)
+            for s in (_r0.get("sites") or []):    sites_set.add(s)
     except Exception:
         pass
 
@@ -4055,26 +4070,19 @@ def network_filters():
     except Exception:
         pass
 
-    # network_kpi_timeseries — has cluster/zone, technology, site_id
+    # network_kpi_timeseries — combined into 1 round-trip instead of 3
     try:
-        for r in _sql("SELECT DISTINCT cluster FROM network_kpi_timeseries WHERE cluster IS NOT NULL ORDER BY cluster LIMIT 200"):
-            if r["cluster"]: zones_set.add(r["cluster"])
-        for r in _sql("SELECT DISTINCT technology FROM network_kpi_timeseries WHERE technology IS NOT NULL ORDER BY technology"):
-            if r["technology"]: techs_set.add(r["technology"])
-        for r in _sql("SELECT DISTINCT site_id FROM network_kpi_timeseries ORDER BY site_id LIMIT 1000"):
-            sites_set.add(r["site_id"])
-    except Exception:
-        pass
-
-    # Also pull technology + vendor from telecom_sites
-    try:
-        for r in _sql("SELECT DISTINCT technology FROM telecom_sites WHERE technology IS NOT NULL AND technology != '' ORDER BY technology"):
-            techs_set.add(r["technology"])
-    except Exception:
-        pass
-    try:
-        for r in _sql("SELECT DISTINCT vendor_name FROM telecom_sites WHERE vendor_name IS NOT NULL AND vendor_name != '' ORDER BY vendor_name"):
-            vendors_set.add(r["vendor_name"])
+        _nkt_combined = _sql("""
+            SELECT
+                (SELECT COALESCE(array_agg(DISTINCT cluster ORDER BY cluster), '{}') FROM network_kpi_timeseries WHERE cluster IS NOT NULL) AS clusters,
+                (SELECT COALESCE(array_agg(DISTINCT technology ORDER BY technology), '{}') FROM network_kpi_timeseries WHERE technology IS NOT NULL) AS techs,
+                (SELECT COALESCE(array_agg(DISTINCT site_id ORDER BY site_id), '{}') FROM (SELECT DISTINCT site_id FROM network_kpi_timeseries ORDER BY site_id LIMIT 1000) s) AS sites
+        """)
+        if _nkt_combined:
+            _r0 = _nkt_combined[0]
+            for c in (_r0.get("clusters") or []): zones_set.add(c)
+            for t in (_r0.get("techs") or []):    techs_set.add(t)
+            for s in (_r0.get("sites") or []):    sites_set.add(s)
     except Exception:
         pass
 
@@ -5800,7 +5808,7 @@ def _ovw_per_site_kpis(filters, anchor_date):
           AND k.date >= :_o_start AND k.date <= :_o_end
           {fw_geo}
         GROUP BY k.site_id, k.kpi_name
-    """, fp)
+    """, fp, timeout_ms=10000)
     _LOG.info("_ovw_per_site_kpis step1: %d rows in window %s→%s",
               len(rows), fp["_o_start"], fp["_o_end"])
     if not rows:
