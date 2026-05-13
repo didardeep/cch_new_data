@@ -179,6 +179,136 @@ def _ensure_kpi_indexes():
         pass
 
 
+def _ensure_kpi_data_merged_view():
+    """Create the kpi_data_merged materialized view if it does not exist.
+
+    app.py also creates this during startup. Keeping this helper here lets
+    network_ai and upload hooks refresh the view without importing app.py and
+    creating a circular dependency.
+    """
+    ddl = """
+        CREATE MATERIALIZED VIEW IF NOT EXISTS kpi_data_merged AS
+        SELECT id, site_id, site_abs_id, kpi_name, date, hour, value,
+               data_level, cell_id, cell_site_id
+        FROM kpi_data
+        WHERE data_level = 'site'
+        UNION ALL
+        SELECT
+            MIN(k.id)            AS id,
+            k.site_id,
+            MAX(k.site_abs_id)   AS site_abs_id,
+            k.kpi_name,
+            k.date,
+            0                    AS hour,
+            AVG(k.value)         AS value,
+            'site'               AS data_level,
+            NULL::varchar        AS cell_id,
+            NULL::varchar        AS cell_site_id
+        FROM kpi_data k
+        WHERE k.data_level = 'cell' AND k.value IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM kpi_data s
+              WHERE s.site_id    = k.site_id
+                AND s.kpi_name   = k.kpi_name
+                AND s.date       = k.date
+                AND s.data_level = 'site'
+          )
+        GROUP BY k.site_id, k.kpi_name, k.date
+        WITH DATA
+    """
+    idx_ddls = [
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_kdm_id ON kpi_data_merged (id)",
+        "CREATE INDEX IF NOT EXISTS idx_kdm_site_kpi_date ON kpi_data_merged (site_id, kpi_name, date)",
+        "CREATE INDEX IF NOT EXISTS idx_kdm_kpi_date ON kpi_data_merged (kpi_name, date) WHERE value IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS idx_kdm_level_kpi_date ON kpi_data_merged (data_level, kpi_name, date)",
+    ]
+    try:
+        with db.engine.connect() as conn:
+            conn.execute(sa_text(ddl))
+            conn.commit()
+            for idx in idx_ddls:
+                try:
+                    conn.execute(sa_text(idx))
+                    conn.commit()
+                except Exception as exc:
+                    _LOG.warning("kpi_data_merged index setup skipped: %s", exc)
+    except Exception as exc:
+        _LOG.warning("kpi_data_merged materialized view setup skipped: %s", exc)
+
+
+def refresh_kpi_data_merged():
+    """Refresh the merged KPI materialized view, best-effort."""
+    _ensure_kpi_data_merged_view()
+    try:
+        with db.engine.connect() as conn:
+            conn.execute(sa_text("REFRESH MATERIALIZED VIEW CONCURRENTLY kpi_data_merged"))
+            conn.commit()
+    except Exception:
+        try:
+            with db.engine.connect() as conn:
+                conn.execute(sa_text("REFRESH MATERIALIZED VIEW kpi_data_merged"))
+                conn.commit()
+        except Exception as exc:
+            _LOG.warning("kpi_data_merged refresh skipped: %s", exc)
+    clear_analytics_cache()
+
+
+def _ensure_kpi_data_stats_table():
+    """Create a compact KPI inventory table used by startup/upload hooks."""
+    ddl = """
+        CREATE TABLE IF NOT EXISTS kpi_data_stats (
+            data_level   VARCHAR(10) NOT NULL,
+            kpi_name     VARCHAR(100) NOT NULL,
+            row_count    BIGINT NOT NULL DEFAULT 0,
+            site_count   BIGINT NOT NULL DEFAULT 0,
+            cell_count   BIGINT NOT NULL DEFAULT 0,
+            date_from    DATE,
+            date_to      DATE,
+            updated_at   TIMESTAMP NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (data_level, kpi_name)
+        )
+    """
+    try:
+        with db.engine.connect() as conn:
+            conn.execute(sa_text(ddl))
+            conn.commit()
+    except Exception as exc:
+        _LOG.warning("kpi_data_stats table setup skipped: %s", exc)
+
+
+def upsert_kpi_data_stats():
+    """Refresh KPI inventory stats after KPI upload/delete operations."""
+    _ensure_kpi_data_stats_table()
+    try:
+        with db.engine.connect() as conn:
+            conn.execute(sa_text("TRUNCATE TABLE kpi_data_stats"))
+            conn.execute(sa_text("""
+                INSERT INTO kpi_data_stats (
+                    data_level, kpi_name, row_count, site_count, cell_count,
+                    date_from, date_to, updated_at
+                )
+                SELECT
+                    COALESCE(data_level, 'site') AS data_level,
+                    kpi_name,
+                    COUNT(*) AS row_count,
+                    COUNT(DISTINCT site_id) AS site_count,
+                    COUNT(DISTINCT CASE
+                        WHEN data_level = 'cell' AND cell_id IS NOT NULL AND cell_id <> ''
+                        THEN site_id || ':' || cell_id
+                    END) AS cell_count,
+                    MIN(date) AS date_from,
+                    MAX(date) AS date_to,
+                    NOW() AS updated_at
+                FROM kpi_data
+                WHERE kpi_name IS NOT NULL
+                GROUP BY COALESCE(data_level, 'site'), kpi_name
+            """))
+            conn.commit()
+    except Exception as exc:
+        _LOG.warning("kpi_data_stats refresh skipped: %s", exc)
+    clear_analytics_cache()
+
+
 def _cache_key(prefix: str, params: dict) -> str:
     raw = json.dumps(params, sort_keys=True)
     return f"{prefix}:{hashlib.md5(raw.encode()).hexdigest()}"
