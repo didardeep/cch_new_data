@@ -204,7 +204,7 @@ def _ensure_kpi_data_merged_view():
             'site'               AS data_level,
             NULL::varchar        AS cell_id,
             NULL::varchar        AS cell_site_id
-        FROM kpi_data k
+        FROM kpi_data_merged k
         WHERE k.data_level = 'cell' AND k.value IS NOT NULL
           AND NOT EXISTS (
               SELECT 1 FROM kpi_data s
@@ -2585,7 +2585,7 @@ def _ran_pull_per_site(filters, kpi_names, start, end):
                MAX(ts.zone)      AS zone,
                AVG(ts.latitude)  AS lat,
                AVG(ts.longitude) AS lng
-        FROM kpi_data k
+        FROM kpi_data_merged k
         LEFT JOIN telecom_sites ts ON LOWER(k.site_id) = LOWER(ts.site_id)
         WHERE k.value IS NOT NULL
           AND k.kpi_name IN ({in_clause})
@@ -2594,23 +2594,60 @@ def _ran_pull_per_site(filters, kpi_names, start, end):
         GROUP BY k.site_id, k.kpi_name
     """, params, timeout_ms=10000)
     _LOG.info("_ran_pull_per_site: %d rows window=%s→%s", len(rows), start, end)
-    if not rows and date_cond:
-        # Fallback: no date window
-        np = {k: v for k, v in params.items() if k not in ("_r_start", "_r_end")}
-        rows = _sql(f"""
-            SELECT k.site_id, k.kpi_name,
-                   AVG(k.value)      AS v,
-                   MAX(ts.zone)      AS zone,
-                   AVG(ts.latitude)  AS lat,
-                   AVG(ts.longitude) AS lng
-            FROM kpi_data k
-            LEFT JOIN telecom_sites ts ON LOWER(k.site_id) = LOWER(ts.site_id)
-            WHERE k.value IS NOT NULL
-              AND k.kpi_name IN ({in_clause})
-              {geo_where}
-            GROUP BY k.site_id, k.kpi_name
-        """, np)
-        _LOG.info("_ran_pull_per_site (no-date fallback): %d rows", len(rows))
+    if date_cond:
+        present = {r.get("kpi_name") for r in rows}
+        missing = [n for n in kpi_names if n not in present]
+        if rows and missing:
+            fp = dict(geo_params)
+            fph = []
+            for i, n in enumerate(missing):
+                key = f"_rfkn{i}"
+                fp[key] = n
+                fph.append(f":{key}")
+            fp["_rf_days"] = max(1, int((end - start).days))
+            fin = ",".join(fph)
+            fallback_rows = _sql(f"""
+                WITH latest AS (
+                    SELECT kpi_name, MAX(date) AS mx
+                    FROM kpi_data_merged
+                    WHERE kpi_name IN ({fin}) AND value IS NOT NULL
+                    GROUP BY kpi_name
+                )
+                SELECT k.site_id, k.kpi_name,
+                       AVG(k.value)      AS v,
+                       MAX(ts.zone)      AS zone,
+                       AVG(ts.latitude)  AS lat,
+                       AVG(ts.longitude) AS lng
+                FROM kpi_data_merged k
+                JOIN latest l ON l.kpi_name = k.kpi_name
+                LEFT JOIN telecom_sites ts ON LOWER(k.site_id) = LOWER(ts.site_id)
+                WHERE k.value IS NOT NULL
+                  AND k.kpi_name IN ({fin})
+                  AND k.date >= l.mx - (:_rf_days * INTERVAL '1 day')
+                  AND k.date <= l.mx
+                  {geo_where}
+                GROUP BY k.site_id, k.kpi_name
+            """, fp, timeout_ms=10000)
+            rows.extend(fallback_rows)
+            _LOG.info("_ran_pull_per_site (per-kpi fallback): %d rows for %d missing KPIs",
+                      len(fallback_rows), len(missing))
+        elif not rows:
+            # Fallback: no date window
+            np = {k: v for k, v in params.items() if k not in ("_r_start", "_r_end")}
+            rows = _sql(f"""
+                SELECT k.site_id, k.kpi_name,
+                       AVG(k.value)      AS v,
+                       MAX(ts.zone)      AS zone,
+                       AVG(ts.latitude)  AS lat,
+                       AVG(ts.longitude) AS lng
+                FROM kpi_data_merged k
+                LEFT JOIN telecom_sites ts ON LOWER(k.site_id) = LOWER(ts.site_id)
+                WHERE k.value IS NOT NULL
+                  AND k.kpi_name IN ({in_clause})
+                  {geo_where}
+                GROUP BY k.site_id, k.kpi_name
+            """, np)
+            _LOG.info("_ran_pull_per_site (no-date fallback): %d rows", len(rows))
     return rows
 
 
@@ -2633,7 +2670,7 @@ def _ran_pull_per_date(filters, kpi_names, start, end):
         date_cond = " AND k.date >= :_r_start AND k.date <= :_r_end"
     rows = _sql(f"""
         SELECT k.kpi_name, k.date::text AS date, AVG(k.value) AS v
-        FROM kpi_data k
+        FROM kpi_data_merged k
         LEFT JOIN telecom_sites ts ON LOWER(k.site_id) = LOWER(ts.site_id)
         WHERE k.value IS NOT NULL
           AND k.kpi_name IN ({in_clause})
@@ -2643,19 +2680,54 @@ def _ran_pull_per_date(filters, kpi_names, start, end):
         ORDER BY k.date
     """, params, timeout_ms=10000)
     _LOG.info("_ran_pull_per_date: %d rows window=%s→%s", len(rows), start, end)
-    if not rows and date_cond:
-        np = {k: v for k, v in params.items() if k not in ("_r_start", "_r_end")}
-        rows = _sql(f"""
-            SELECT k.kpi_name, k.date::text AS date, AVG(k.value) AS v
-            FROM kpi_data k
-            LEFT JOIN telecom_sites ts ON LOWER(k.site_id) = LOWER(ts.site_id)
-            WHERE k.value IS NOT NULL
-              AND k.kpi_name IN ({in_clause})
-              {geo_where}
-            GROUP BY k.kpi_name, k.date
-            ORDER BY k.date
-        """, np)
-        _LOG.info("_ran_pull_per_date (no-date fallback): %d rows", len(rows))
+    if date_cond:
+        present = {r.get("kpi_name") for r in rows}
+        missing = [n for n in kpi_names if n not in present]
+        if rows and missing:
+            fp = dict(geo_params)
+            fph = []
+            for i, n in enumerate(missing):
+                key = f"_rdfkn{i}"
+                fp[key] = n
+                fph.append(f":{key}")
+            fp["_rdf_days"] = max(1, int((end - start).days))
+            fin = ",".join(fph)
+            fallback_rows = _sql(f"""
+                WITH latest AS (
+                    SELECT kpi_name, MAX(date) AS mx
+                    FROM kpi_data_merged
+                    WHERE kpi_name IN ({fin}) AND value IS NOT NULL
+                    GROUP BY kpi_name
+                )
+                SELECT k.kpi_name, k.date::text AS date, AVG(k.value) AS v
+                FROM kpi_data_merged k
+                JOIN latest l ON l.kpi_name = k.kpi_name
+                LEFT JOIN telecom_sites ts ON LOWER(k.site_id) = LOWER(ts.site_id)
+                WHERE k.value IS NOT NULL
+                  AND k.kpi_name IN ({fin})
+                  AND k.date >= l.mx - (:_rdf_days * INTERVAL '1 day')
+                  AND k.date <= l.mx
+                  {geo_where}
+                GROUP BY k.kpi_name, k.date
+                ORDER BY k.date
+            """, fp, timeout_ms=10000)
+            rows.extend(fallback_rows)
+            rows.sort(key=lambda r: r.get("date") or "")
+            _LOG.info("_ran_pull_per_date (per-kpi fallback): %d rows for %d missing KPIs",
+                      len(fallback_rows), len(missing))
+        elif not rows:
+            np = {k: v for k, v in params.items() if k not in ("_r_start", "_r_end")}
+            rows = _sql(f"""
+                SELECT k.kpi_name, k.date::text AS date, AVG(k.value) AS v
+                FROM kpi_data_merged k
+                LEFT JOIN telecom_sites ts ON LOWER(k.site_id) = LOWER(ts.site_id)
+                WHERE k.value IS NOT NULL
+                  AND k.kpi_name IN ({in_clause})
+                  {geo_where}
+                GROUP BY k.kpi_name, k.date
+                ORDER BY k.date
+            """, np)
+            _LOG.info("_ran_pull_per_date (no-date fallback): %d rows", len(rows))
     return rows
 
 
