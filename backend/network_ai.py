@@ -44,9 +44,10 @@ def _populate_schema_cache():
     if _schema_cache.get("populated"):
         return
     try:
-        # Discover KPI names
+        # Discover KPI names from kpi_data
         rows = _sql("SELECT DISTINCT kpi_name FROM kpi_data WHERE kpi_name IS NOT NULL ORDER BY kpi_name")
         _schema_cache["kpi_names_list"] = [r["kpi_name"] for r in rows] if rows else []
+        _schema_cache["kpi_data_has_data"] = bool(rows)
 
         # Discover max date for date substitution
         date_rows = _sql("SELECT MAX(date)::text AS max_date FROM kpi_data")
@@ -58,17 +59,69 @@ def _populate_schema_cache():
             mv_rows = _sql("SELECT MAX(date)::text AS max_date FROM mv_daily_site_kpi")
             if mv_rows and mv_rows[0].get("max_date"):
                 _schema_cache["mv_max_date"] = mv_rows[0]["max_date"]
+                _schema_cache["mv_has_data"] = True
+            else:
+                _schema_cache["mv_has_data"] = False
         except Exception:
-            pass
+            _schema_cache["mv_has_data"] = False
+
+        # Discover flexible_kpi_uploads data availability and dates
+        try:
+            flex_rows = _sql("""
+                SELECT kpi_type,
+                       COUNT(*) AS cnt,
+                       MAX(row_date)::text AS max_date,
+                       MIN(row_date)::text AS min_date
+                FROM flexible_kpi_uploads
+                WHERE kpi_type IS NOT NULL
+                GROUP BY kpi_type
+            """)
+            flex_info = {}
+            for r in (flex_rows or []):
+                flex_info[r["kpi_type"]] = {
+                    "count": r["cnt"],
+                    "max_date": r.get("max_date"),
+                    "min_date": r.get("min_date"),
+                }
+            _schema_cache["flex_kpi_info"] = flex_info
+            _schema_cache["flex_has_revenue"] = "revenue" in flex_info
+            _schema_cache["flex_has_core"] = "core" in flex_info
+            # Discover actual column names for revenue
+            if flex_info.get("revenue"):
+                col_rows = _sql("""
+                    SELECT DISTINCT column_name FROM flexible_kpi_uploads
+                    WHERE kpi_type='revenue' AND column_type='numeric'
+                    AND column_name IS NOT NULL
+                    ORDER BY column_name LIMIT 30
+                """)
+                _schema_cache["flex_revenue_columns"] = [r["column_name"] for r in col_rows] if col_rows else []
+            # Use flex dates as fallback when kpi_data is empty
+            if not _schema_cache.get("kpi_max_date"):
+                for kt in ("revenue", "core"):
+                    if flex_info.get(kt, {}).get("max_date"):
+                        _schema_cache["kpi_max_date"] = flex_info[kt]["max_date"]
+                        break
+        except Exception:
+            _schema_cache["flex_kpi_info"] = {}
+            _schema_cache["flex_has_revenue"] = False
+            _schema_cache["flex_has_core"] = False
 
         _schema_cache["populated"] = True
-        print(f"[AI-DEBUG] Schema cache populated: {len(_schema_cache.get('kpi_names_list', []))} KPIs, max_date={_schema_cache.get('kpi_max_date', 'N/A')}, mv_max_date={_schema_cache.get('mv_max_date', 'N/A')}", flush=True)
+        print(f"[AI-DEBUG] Schema cache populated: {len(_schema_cache.get('kpi_names_list', []))} KPIs, "
+              f"max_date={_schema_cache.get('kpi_max_date', 'N/A')}, "
+              f"mv_max_date={_schema_cache.get('mv_max_date', 'N/A')}, "
+              f"kpi_data_has_data={_schema_cache.get('kpi_data_has_data')}, "
+              f"mv_has_data={_schema_cache.get('mv_has_data')}, "
+              f"flex_has_revenue={_schema_cache.get('flex_has_revenue')}, "
+              f"flex_has_core={_schema_cache.get('flex_has_core')}", flush=True)
         _LOG.info("Schema cache populated: %d KPI names, max_date=%s",
                   len(_schema_cache.get("kpi_names_list", [])),
                   _schema_cache.get("kpi_max_date", "unknown"))
     except Exception as e:
         print(f"[AI-DEBUG] Schema cache FAILED to populate: {str(e)[:200]}", flush=True)
         _LOG.warning("Failed to populate schema cache: %s", e)
+        # Mark as populated even on failure to avoid retrying every request
+        _schema_cache["populated"] = True
 
 
 def refresh_materialized_views():
@@ -220,12 +273,52 @@ def ai_query():
     _kpi_max = _schema_cache.get("kpi_max_date", "unknown")
     _mv_max  = _schema_cache.get("mv_max_date", _kpi_max)
     _db_kpis = _schema_cache.get("kpi_names_list", [])
+    _kpi_data_has_data = _schema_cache.get("kpi_data_has_data", False)
+    _mv_has_data = _schema_cache.get("mv_has_data", False)
+    _flex_has_revenue = _schema_cache.get("flex_has_revenue", False)
+    _flex_has_core = _schema_cache.get("flex_has_core", False)
+    _flex_info = _schema_cache.get("flex_kpi_info", {})
+    _flex_rev_cols = _schema_cache.get("flex_revenue_columns", [])
+
     # Build a compact list of actual KPI names from the DB for the LLM
     _db_kpi_block = ""
     if _db_kpis:
         _db_kpi_block = "\n   Actual KPI names discovered in this database:\n"
         for _kn in _db_kpis[:60]:
             _db_kpi_block += f"   '{_kn}'\n"
+
+    # Build data availability section
+    _avail_lines = ["\n=== DATA AVAILABILITY (CRITICAL — read before generating SQL) ==="]
+    if _kpi_data_has_data:
+        _avail_lines.append(f"   kpi_data: HAS DATA (latest date: {_kpi_max})")
+    else:
+        _avail_lines.append("   kpi_data: EMPTY — do NOT query this table or mv_daily_site_kpi for RAN KPIs.")
+    if _mv_has_data:
+        _avail_lines.append(f"   mv_daily_site_kpi: HAS DATA (latest date: {_mv_max})")
+    else:
+        _avail_lines.append("   mv_daily_site_kpi: EMPTY — do NOT query this table.")
+    if _flex_has_revenue:
+        rev_info = _flex_info.get("revenue", {})
+        _avail_lines.append(f"   flexible_kpi_uploads (revenue): HAS DATA (rows: {rev_info.get('count', '?')}, dates: {rev_info.get('min_date', '?')} to {rev_info.get('max_date', '?')})")
+        if _flex_rev_cols:
+            _avail_lines.append(f"   Revenue column_name values: {_flex_rev_cols[:10]}")
+    else:
+        _avail_lines.append("   flexible_kpi_uploads (revenue): NO REVENUE DATA")
+    if _flex_has_core:
+        core_info = _flex_info.get("core", {})
+        _avail_lines.append(f"   flexible_kpi_uploads (core): HAS DATA (rows: {core_info.get('count', '?')}, dates: {core_info.get('min_date', '?')} to {core_info.get('max_date', '?')})")
+    else:
+        _avail_lines.append("   flexible_kpi_uploads (core): NO CORE KPI DATA")
+
+    if not _kpi_data_has_data and not _mv_has_data:
+        _avail_lines.append("")
+        _avail_lines.append("   ** WARNING: RAN KPI tables are empty. Queries for throughput, call drop rate,")
+        _avail_lines.append("   PRB utilization, handover, etc. will return 0 rows. Only revenue and core KPI")
+        _avail_lines.append("   queries from flexible_kpi_uploads will work. If user asks for RAN KPIs,")
+        _avail_lines.append("   respond with a message explaining that RAN KPI data has not been uploaded yet.")
+        _avail_lines.append("   For 'utilization' queries when kpi_data is empty, check if flexible_kpi_uploads")
+        _avail_lines.append("   has relevant data (e.g., kpi_type='core' AND column_name ILIKE '%util%').")
+    _data_avail_block = "\n".join(_avail_lines)
 
     SCHEMA_HINT = f"""
 Tables:
@@ -288,6 +381,7 @@ Tables:
      GROUP BY site_id
 
 5. revenue_data(site_id, total_revenue, date) — alternative revenue table (may not exist)
+{_data_avail_block}
 
 === CROSS-TABLE QUERIES (revenue + KPI data) ===
 Revenue is in flexible_kpi_uploads or revenue_data, NEVER in kpi_data.
@@ -328,13 +422,13 @@ User says "noise" / "interference" → 'Average NI of Carrier-'
 User says "revenue" / "income" / "earnings" / "ARPU" → flexible_kpi_uploads WHERE kpi_type='revenue'
 
 === DATE HANDLING — CRITICAL ===
-The latest date with data is {_kpi_max}. CURRENT_DATE may be far ahead of the actual data.
-- If user says "last 7 days", use: date >= '{_kpi_max}'::date - INTERVAL '7 days' AND date <= '{_kpi_max}'::date
-- If user says "last month", use: date >= '{_kpi_max}'::date - INTERVAL '1 month' AND date <= '{_kpi_max}'::date
-- If user doesn't specify a time range, default to last 7 days from {_kpi_max}.
+{"The latest date with data is " + _kpi_max + ". CURRENT_DATE may be far ahead of the actual data." if _kpi_max != "unknown" else "The latest date in kpi_data is UNKNOWN (table may be empty). For flexible_kpi_uploads, use: row_date >= (SELECT MAX(row_date) FROM flexible_kpi_uploads) - INTERVAL '7 days'."}
+{("- If user says 'last 7 days', use: date >= '" + _kpi_max + "'::date - INTERVAL '7 days' AND date <= '" + _kpi_max + "'::date") if _kpi_max != "unknown" else "- If user says 'last 7 days' and querying kpi_data/mv_daily_site_kpi, use: date >= (SELECT MAX(date) FROM mv_daily_site_kpi) - INTERVAL '7 days'"}
+{("- If user says 'last month', use: date >= '" + _kpi_max + "'::date - INTERVAL '1 month' AND date <= '" + _kpi_max + "'::date") if _kpi_max != "unknown" else "- If user says 'last month' and querying kpi_data/mv_daily_site_kpi, use subquery: date >= (SELECT MAX(date) FROM mv_daily_site_kpi) - INTERVAL '1 month'"}
+- If user doesn't specify a time range, default to last 7 days.
 - For mv_daily_site_kpi, use the same pattern with date column.
-- For flexible_kpi_uploads, use row_date instead of date.
-- NEVER use CURRENT_DATE — always anchor to '{_kpi_max}'::date (the latest actual data date).
+- For flexible_kpi_uploads, use row_date instead of date. Anchor with: row_date >= (SELECT MAX(row_date) FROM flexible_kpi_uploads) - INTERVAL '7 days'
+- {"NEVER use CURRENT_DATE — always anchor to '" + _kpi_max + "'::date (the latest actual data date)." if _kpi_max != "unknown" else "Use subqueries like (SELECT MAX(date) FROM table) to anchor date ranges dynamically."}
 """
 
     LLM_SYSTEM = f"""You are a telecom network analytics SQL generator. Your ONLY job is to convert the user's natural-language query into an EXACT, STRICT SQL query that fetches PRECISELY what was asked — nothing more, nothing less.
@@ -1029,6 +1123,38 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
             print(f"[AI-DEBUG] Fallback SQL also failed: {str(e2)[:200]}", flush=True)
             rows = []
 
+    # ── CTE partial-result recovery ──────────────────────────────────────────
+    # When a WITH ... SELECT query returns 0 rows (e.g. revenue JOIN kpi fails
+    # because kpi_data is empty), try extracting each CTE and running it alone
+    # so the user at least sees the data that IS available.
+    if not rows and sql.strip().upper().startswith("WITH"):
+        import re as _re_cte
+        cte_pattern = _re_cte.compile(
+            r"(\w+)\s+AS\s*\(\s*(SELECT\s.+?)\s*\)\s*(?:,|SELECT)",
+            _re_cte.IGNORECASE | _re_cte.DOTALL,
+        )
+        cte_matches = cte_pattern.findall(sql)
+        if cte_matches:
+            print(f"[AI-DEBUG] 0-row CTE query — attempting {len(cte_matches)} CTEs individually", flush=True)
+            for cte_name, cte_sql in cte_matches:
+                try:
+                    cte_sql_clean = _add_safety_limits(cte_sql.strip().rstrip(","), max_rows=100)
+                    partial = _sql_with_timeout(cte_sql_clean, timeout_sec=10)
+                    if partial:
+                        print(f"[AI-DEBUG] CTE '{cte_name}' returned {len(partial)} rows — using as partial result", flush=True)
+                        rows = partial
+                        ai_result["response"] = (
+                            f"The combined query returned no results because some data tables are empty. "
+                            f"Showing partial results from the '{cte_name}' portion of the query."
+                        )
+                        ai_result["title"] = f"Partial: {ai_result.get('title', cte_name)}"
+                        sql = cte_sql_clean
+                        break
+                    else:
+                        print(f"[AI-DEBUG] CTE '{cte_name}' also returned 0 rows", flush=True)
+                except Exception as cte_err:
+                    print(f"[AI-DEBUG] CTE '{cte_name}' failed: {str(cte_err)[:150]}", flush=True)
+
     rows = _downsample_for_chart(rows, max_points=300)
     columns = list(rows[0].keys()) if rows else []
     has_geo = any(r.get("lat") or r.get("latitude") for r in rows)
@@ -1041,6 +1167,21 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
     resp_text = ai_result.get("response", f"Found {len(rows)} results.")
     resp_title = ai_result.get("title", prompt[:70])
     resp_chart = ai_result.get("chart_type", ai_result.get("query_type", "bar"))
+
+    # ── When 0 rows returned, override the LLM's optimistic text ──────────
+    if not rows:
+        # Diagnose which tables are empty using cached info (no extra DB calls)
+        diag_parts = []
+        upper_sql = sql.upper()
+        if ("MV_DAILY_SITE_KPI" in upper_sql or "KPI_DATA" in upper_sql) and not _kpi_data_has_data:
+            diag_parts.append("RAN KPI data (kpi_data / mv_daily_site_kpi) tables are empty — please upload RAN KPI data")
+        if "FLEXIBLE_KPI" in upper_sql and not _flex_has_revenue and "REVENUE" in upper_sql:
+            diag_parts.append("Revenue data has not been uploaded yet")
+        if diag_parts:
+            resp_text = f"The query ran successfully but returned no results. Reason: {'; '.join(diag_parts)}."
+        else:
+            resp_text = "The query ran successfully but returned 0 rows. The site IDs, KPI names, or date range may not match any data in the database."
+        print(f"[AI-DEBUG] 0-row diagnosis: {diag_parts or 'no specific cause found'}", flush=True)
 
     if ai_session:
         try:
@@ -1069,7 +1210,7 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
         except Exception as e:
             _LOG.error("Failed to persist AI message: %s", e)
 
-    return jsonify({
+    result_json = {
         "response":      resp_text,
         "query_type":    ai_result.get("query_type", "bar"),
         "chart_type":    resp_chart,
@@ -1086,7 +1227,10 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
         "show_map":      has_geo or ai_result.get("show_map", False),
         "provider":      provider["provider"] if provider else "rule-based",
         "session_id":    ai_session.id if ai_session else None,
-    })
+    }
+    if not rows:
+        result_json["error"] = resp_text
+    return jsonify(result_json)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
