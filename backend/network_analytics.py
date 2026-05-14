@@ -204,7 +204,7 @@ def _ensure_kpi_data_merged_view():
             'site'               AS data_level,
             NULL::varchar        AS cell_id,
             NULL::varchar        AS cell_site_id
-        FROM kpi_data_merged k
+        FROM kpi_data k
         WHERE k.data_level = 'cell' AND k.value IS NOT NULL
           AND NOT EXISTS (
               SELECT 1 FROM kpi_data s
@@ -1053,11 +1053,12 @@ def _flex_kpi_trend(kpi_type: str, column_name: str) -> list[dict]:
 
 def _sql(query: str, params: dict = None, timeout_ms: int = 0) -> list[dict]:
     with db.engine.connect() as conn:
-        if timeout_ms > 0:
-            conn.execute(sa_text(f"SET LOCAL statement_timeout = '{timeout_ms}'"))
-        result = conn.execute(sa_text(query), params or {})
-        cols = list(result.keys())
-        return [dict(zip(cols, row)) for row in result.fetchall()]
+        with conn.begin():
+            if timeout_ms > 0:
+                conn.execute(sa_text(f"SET LOCAL statement_timeout = '{timeout_ms}'"))
+            result = conn.execute(sa_text(query), params or {})
+            cols = list(result.keys())
+            return [dict(zip(cols, row)) for row in result.fetchall()]
 
 
 _TS_COLS_CACHE: set[str] | None = None

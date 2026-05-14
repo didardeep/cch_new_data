@@ -735,10 +735,11 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
     # ── Helper functions ──────────────────────────────────────────────────────
     def _sql_with_timeout(query, timeout_sec=10):
         with db.engine.connect() as conn:
-            conn.execute(sa_text(f"SET LOCAL statement_timeout = '{timeout_sec * 1000}'"))
-            result = conn.execute(sa_text(query))
-            cols = list(result.keys())
-            return [dict(zip(cols, row)) for row in result.fetchall()]
+            with conn.begin():
+                conn.execute(sa_text(f"SET LOCAL statement_timeout = '{timeout_sec * 1000}'"))
+                result = conn.execute(sa_text(query))
+                cols = list(result.keys())
+                return [dict(zip(cols, row)) for row in result.fetchall()]
 
     def _add_safety_limits(sql, max_rows=500):
         """Cap or add LIMIT to prevent runaway queries."""
@@ -976,8 +977,21 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
         # If even rule-based can't produce SQL, return a helpful text response
         if not sql or not sql.strip().upper().startswith(("SELECT", "WITH")):
             print(f"[AI-DEBUG] Even rule-based produced no SQL. Returning text-only response.", flush=True)
+            text_resp = ai_result.get("response", "I couldn't generate a query for that. Try asking about a specific KPI like throughput, drop rate, or availability.")
+            # Save assistant message so conversation history is preserved
+            if ai_session:
+                try:
+                    assistant_msg = NetworkAiMessage(
+                        session_id=ai_session.id, role="assistant",
+                        content=text_resp,
+                        content_json={"chart_type": "text", "response": text_resp},
+                    )
+                    db.session.add(assistant_msg)
+                    db.session.commit()
+                except Exception as e:
+                    _LOG.error("Failed to persist text-only AI message: %s", e)
             return jsonify({
-                "response": ai_result.get("response", "I couldn't generate a query for that. Try asking about a specific KPI like throughput, drop rate, or availability."),
+                "response": text_resp,
                 "query_type": "text",
                 "chart_type": "text",
                 "title": "",
