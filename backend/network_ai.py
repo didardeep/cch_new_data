@@ -328,6 +328,26 @@ STRICTNESS RULES — FOLLOW THESE EXACTLY:
 6. Site IDs are EXACT — copy every character. NEVER truncate in SQL (only title has 60-char limit).
 7. ALWAYS: WHERE k.data_level='site' AND k.value IS NOT NULL
 8. JOIN telecom_sites only when you need zone/geo data.
+9. LIMIT must match the EXACT number the user requested (e.g. "top 10" = LIMIT 10, "5 worst" = LIMIT 5).
+10. For RANKING queries with MULTIPLE KPIs, use CASE WHEN pivot pattern:
+    Example: "top 10 sites with highest E-RAB Call Drop Rate_1 along with CSSR and DL PRB Utilization"
+    SELECT k.site_id,
+           AVG(CASE WHEN k.kpi_name = 'E-RAB Call Drop Rate_1' THEN k.value END) AS drop_rate,
+           AVG(CASE WHEN k.kpi_name = 'LTE Call Setup Success Rate' THEN k.value END) AS cssr,
+           AVG(CASE WHEN k.kpi_name = 'DL PRB Utilization (1BH)' THEN k.value END) AS dl_prb
+    FROM kpi_data k
+    WHERE k.data_level='site' AND k.value IS NOT NULL
+      AND k.kpi_name IN ('E-RAB Call Drop Rate_1','LTE Call Setup Success Rate','DL PRB Utilization (1BH)')
+    GROUP BY k.site_id
+    ORDER BY drop_rate DESC NULLS LAST LIMIT 10
+    → chart_type="bar", x_axis="site_id", y_axes=["drop_rate","cssr","dl_prb"]
+    NEVER use COALESCE(..., 0) — let NULL remain so the frontend shows "—".
+11. For THRESHOLD/CONDITIONAL queries ("where X > 1.5% or Y < 98.5%"), add HAVING:
+    HAVING AVG(CASE WHEN k.kpi_name='E-RAB Call Drop Rate_1' THEN k.value END) > 1.5
+       OR AVG(CASE WHEN k.kpi_name='LTE Call Setup Success Rate' THEN k.value END) < 98.5
+12. For REVENUE queries, use flexible_kpi_uploads table:
+    SELECT site_id, SUM(num_value) AS revenue FROM flexible_kpi_uploads
+    WHERE kpi_type='revenue' AND num_value IS NOT NULL GROUP BY site_id ORDER BY revenue DESC
 
 ═══════════════════════════════════════════════════════════
 CHART TYPE — MUST MATCH THE DATA SHAPE:
@@ -521,6 +541,38 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
             ai_result = _rule_based_query(prompt, time_filter, prev_context=None)
             provider  = {"provider": "rule-based-multisite"}
             _LOG.info("Multi-site trend intercepted before LLM: %s", _prompt_sites)
+
+    # 3. Multi-KPI ranking / threshold queries — rule-based handles these more
+    #    reliably than LLMs which often produce wrong SQL for EAV-schema pivots.
+    if not ai_result:
+        _EXACT_KPI_CHECK = [
+            'e-rab call drop rate', 'lte call setup success rate', 'lte rrc setup success rate',
+            'lte e-rab setup success rate', 'dl prb utilization', 'ul prb utilization',
+            'lte dl - cell ave throughput', 'lte dl - usr ave throughput',
+            'lte ul - cell ave throughput', 'lte ul - user ave throughput',
+            'average latency downlink', 'availability', 'volte traffic',
+            'ave rrc connected ue', 'max rrc connected ue', 'dl data total volume',
+            'csfb access success rate', 'lte intra-freq ho success rate',
+        ]
+        _exact_kpi_count = sum(1 for k in _EXACT_KPI_CHECK if k in _p_lower)
+        _has_threshold = bool(_re_pre.search(
+            r'(?:greater than|less than|more than|lower than|above|below|>|<)\s*\d', _p_lower
+        ))
+        _has_along_with = any(w in _p_lower for w in [
+            'along with', 'as well as', 'together with', 'and their',
+            'and also', 'show all', 'with their',
+        ])
+        _has_revenue = 'revenue' in _p_lower
+
+        if ((_exact_kpi_count >= 2)
+                or (_exact_kpi_count >= 1 and _has_threshold)
+                or (_exact_kpi_count >= 1 and _has_along_with)
+                or _has_revenue):
+            ai_result = _rule_based_query(prompt, time_filter, prev_context=None)
+            provider  = {"provider": "rule-based-multikpi"}
+            _LOG.info("Multi-KPI/threshold/revenue intercepted before LLM: "
+                      "exact_kpis=%d, threshold=%s, along_with=%s, revenue=%s",
+                      _exact_kpi_count, _has_threshold, _has_along_with, _has_revenue)
 
     for _prov in _providers:
         if ai_result:
@@ -1196,16 +1248,76 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
         'traffic':       ('DL Data Total Volume', 'dl_volume'),
         'connected':     ('Ave RRC Connected Ue', 'avg_rrc_ue'),
         'users':         ('Ave RRC Connected Ue', 'avg_rrc_ue'),
+        'user throughput': ('LTE DL - Usr Ave Throughput', 'dl_usr_tput'),
+        'usr throughput':  ('LTE DL - Usr Ave Throughput', 'dl_usr_tput'),
+        'user tput':       ('LTE DL - Usr Ave Throughput', 'dl_usr_tput'),
+        'utilization':     ('DL PRB Utilization (1BH)', 'dl_prb_util'),
+        'noise':           ('Average NI of Carrier-', 'noise_interference'),
+        'interference':    ('Average NI of Carrier-', 'noise_interference'),
+    }
+
+    # Exact KPI name → (db_name, alias) mapping (takes priority over keywords)
+    EXACT_KPI_NAMES = {
+        'e-rab call drop rate_1':           ('E-RAB Call Drop Rate_1', 'drop_rate'),
+        'e-rab call drop rate':             ('E-RAB Call Drop Rate_1', 'drop_rate'),
+        'lte call setup success rate':      ('LTE Call Setup Success Rate', 'cssr'),
+        'lte rrc setup success rate':       ('LTE RRC Setup Success Rate', 'rrc_sr'),
+        'lte e-rab setup success rate':     ('LTE E-RAB Setup Success Rate', 'erab_setup_sr'),
+        'csfb access success rate':         ('CSFB Access Success Rate', 'csfb_sr'),
+        'lte intra-freq ho success rate':   ('LTE Intra-Freq HO Success Rate', 'intra_ho_sr'),
+        'intra-enb ho success rate':        ('Intra-eNB HO Success Rate', 'intra_enb_ho_sr'),
+        'inter-enbx2ho success rate':       ('Inter-eNBX2HO Success Rate', 'inter_x2_ho_sr'),
+        'inter-enbs1ho success rate':       ('Inter-eNBS1HO Success Rate', 'inter_s1_ho_sr'),
+        'dl prb utilization (1bh)':         ('DL PRB Utilization (1BH)', 'dl_prb_util'),
+        'dl prb utilization':               ('DL PRB Utilization (1BH)', 'dl_prb_util'),
+        'ul prb utilization (1bh)':         ('UL PRB Utilization (1BH)', 'ul_prb_util'),
+        'ul prb utilization':               ('UL PRB Utilization (1BH)', 'ul_prb_util'),
+        'lte dl - cell ave throughput':     ('LTE DL - Cell Ave Throughput', 'dl_cell_tput'),
+        'lte ul - cell ave throughput':     ('LTE UL - Cell Ave Throughput', 'ul_cell_tput'),
+        'lte dl - usr ave throughput':      ('LTE DL - Usr Ave Throughput', 'dl_usr_tput'),
+        'lte ul - user ave throughput':     ('LTE UL - User Ave Throughput', 'ul_usr_tput'),
+        'average latency downlink':         ('Average Latency Downlink', 'avg_latency'),
+        'dl data total volume':             ('DL Data Total Volume', 'dl_volume'),
+        'ul data total volume':             ('UL Data Total Volume', 'ul_volume'),
+        'volte traffic erlang':             ('VoLTE Traffic Erlang', 'volte_erl'),
+        'volte traffic ul':                 ('VoLTE Traffic UL', 'volte_ul'),
+        'volte traffic dl':                 ('VoLTE Traffic DL', 'volte_dl'),
+        'ave rrc connected ue':             ('Ave RRC Connected Ue', 'avg_rrc_ue'),
+        'max rrc connected ue':             ('Max RRC Connected Ue', 'max_rrc_ue'),
+        'average act ue dl per cell':       ('Average Act UE DL Per Cell', 'avg_act_ue_dl'),
+        'average act ue ul per cell':       ('Average Act UE UL Per Cell', 'avg_act_ue_ul'),
+        'availability':                     ('Availability', 'availability'),
+        'average ni of carrier-':           ('Average NI of Carrier-', 'noise_interference'),
     }
 
     def _detect_kpis(text):
         found = []
         seen = set()
         t = text.lower()
+        # Track character ranges consumed by exact matches to avoid keyword overlaps
+        consumed_ranges = []
+        # First pass: exact KPI name matching (higher priority, avoids false positives)
+        for exact_name in sorted(EXACT_KPI_NAMES.keys(), key=len, reverse=True):
+            idx = t.find(exact_name)
+            if idx >= 0 and EXACT_KPI_NAMES[exact_name][0] not in seen:
+                found.append(EXACT_KPI_NAMES[exact_name])
+                seen.add(EXACT_KPI_NAMES[exact_name][0])
+                consumed_ranges.append((idx, idx + len(exact_name)))
+        # Second pass: keyword matching, but skip if the keyword only appears
+        # inside an already-consumed exact name range
         for kw in sorted(KPI_MAP.keys(), key=len, reverse=True):
-            if kw in t and KPI_MAP[kw][0] not in seen:
-                found.append(KPI_MAP[kw])
-                seen.add(KPI_MAP[kw][0])
+            if KPI_MAP[kw][0] in seen:
+                continue
+            # Find all occurrences of the keyword
+            kw_idx = t.find(kw)
+            while kw_idx >= 0:
+                # Check if this occurrence is outside all consumed ranges
+                inside_exact = any(s <= kw_idx and kw_idx + len(kw) <= e for s, e in consumed_ranges)
+                if not inside_exact:
+                    found.append(KPI_MAP[kw])
+                    seen.add(KPI_MAP[kw][0])
+                    break
+                kw_idx = t.find(kw, kw_idx + 1)
         return found
 
     def _extract_days(text):
@@ -1403,6 +1515,141 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
                   AND k.kpi_name IN ({in_clause})
                 GROUP BY k.site_id
                 ORDER BY {order_col} {order_dir} NULLS LAST LIMIT {N}"""
+
+    # ── Threshold extraction for conditional queries ─────────────────────────
+    def _extract_thresholds(text, kpis):
+        """Extract 'greater than X' / 'less than Y' conditions per KPI."""
+        thresholds = []
+        t = text.lower()
+        # Split on 'or' / 'and' to isolate each condition
+        conditions = re.split(r'\b(?:or|and)\b', t)
+        for cond in conditions:
+            cond = cond.strip()
+            if not cond:
+                continue
+            matched_kpi = None
+            # Try exact KPI name first
+            for exact_name in sorted(EXACT_KPI_NAMES.keys(), key=len, reverse=True):
+                if exact_name in cond:
+                    matched_kpi = EXACT_KPI_NAMES[exact_name]
+                    break
+            if not matched_kpi:
+                for kw in sorted(KPI_MAP.keys(), key=len, reverse=True):
+                    if kw in cond and KPI_MAP[kw] in kpis:
+                        matched_kpi = KPI_MAP[kw]
+                        break
+            if not matched_kpi:
+                continue
+            gt = re.search(r'(?:greater than|more than|above|over|>|exceeds?)\s*(\d+(?:\.\d+)?)', cond)
+            lt = re.search(r'(?:less than|lower than|below|under|<)\s*(\d+(?:\.\d+)?)', cond)
+            if gt:
+                thresholds.append((matched_kpi[0], matched_kpi[1], '>', float(gt.group(1))))
+            elif lt:
+                thresholds.append((matched_kpi[0], matched_kpi[1], '<', float(lt.group(1))))
+        return thresholds
+
+    # ── Dynamic multi-KPI handler ───────────────────────────────────────────
+    # When user explicitly mentions 2+ KPIs, build query with ALL of them
+    # instead of falling through to hardcoded keyword handlers.
+    if len(detected_kpis) >= 2 and not site_ids and not is_trend:
+        order_dir = "DESC"
+        label_prefix = "Top"
+        if any(w in p for w in ['worst', 'lowest', 'bottom', 'bad', 'poor']):
+            order_dir = "DESC"
+            label_prefix = "Worst"
+        elif any(w in p for w in ['best', 'highest', 'top']):
+            order_dir = "DESC"
+            label_prefix = "Top"
+
+        order_col = detected_kpis[0][1]
+
+        # Check for threshold conditions (e.g., "greater than 1.5%", "less than 98.5%")
+        thresholds = _extract_thresholds(p, detected_kpis)
+
+        if thresholds:
+            case_parts = []
+            kpi_names_for_in = []
+            for kpi_name, alias in detected_kpis[:5]:
+                case_parts.append(f"AVG(CASE WHEN k.kpi_name = '{kpi_name}' THEN k.value END) AS {alias}")
+                kpi_names_for_in.append(f"'{kpi_name}'")
+            cases = ",\n                       ".join(case_parts)
+            in_clause = ", ".join(kpi_names_for_in)
+            having_parts = []
+            for kpi_name, alias, op, val in thresholds:
+                having_parts.append(
+                    f"AVG(CASE WHEN k.kpi_name = '{kpi_name}' THEN k.value END) {op} {val}"
+                )
+            having = "HAVING " + "\n                       OR ".join(having_parts)
+            sql = f"""SELECT k.site_id, MAX(ts.zone) AS cluster,
+                       AVG(ts.latitude) AS lat, AVG(ts.longitude) AS lng,
+                       {cases}
+                    FROM kpi_data k {GEO_JOIN}
+                    WHERE k.data_level = 'site' AND k.value IS NOT NULL
+                      AND k.kpi_name IN ({in_clause})
+                    GROUP BY k.site_id
+                    {having}
+                    ORDER BY {order_col} {order_dir} NULLS LAST LIMIT {N}"""
+        else:
+            sql = _kd_site_query(detected_kpis[:5], order_col, order_dir)
+
+        kpi_labels = ", ".join(k[0] for k in detected_kpis[:5])
+        return {
+            "sql": sql,
+            "query_type": "bar", "chart_type": "bar",
+            "title": f"{label_prefix} {N} Sites — Multi-KPI",
+            "x_axis": "site_id",
+            "y_axes": [k[1] for k in detected_kpis[:5]],
+            "response": f"Showing {label_prefix.lower()} {N} sites for {kpi_labels}.",
+        }
+
+    # ── Revenue handler ─────────────────────────────────────────────────────
+    if 'revenue' in p:
+        # Check if a network KPI is also requested
+        net_kpis = [kpi for kpi in detected_kpis if kpi[0] not in ('revenue',)]
+        if net_kpis or any(w in p for w in ['prb', 'utilization', 'throughput', 'drop', 'congestion']):
+            kpi_name, alias = net_kpis[0] if net_kpis else ('DL PRB Utilization (1BH)', 'dl_prb_util')
+            charts = [
+                {
+                    "sql": f"""SELECT site_id, SUM(num_value) AS revenue
+                        FROM flexible_kpi_uploads
+                        WHERE kpi_type = 'revenue' AND num_value IS NOT NULL
+                        GROUP BY site_id
+                        ORDER BY revenue DESC NULLS LAST LIMIT {N}""",
+                    "chart_type": "bar",
+                    "title": f"Top {N} Revenue Sites",
+                    "x_axis": "site_id",
+                    "y_axes": ["revenue"],
+                },
+                {
+                    "sql": _kd_site_query([(kpi_name, alias)], alias, "DESC"),
+                    "chart_type": "bar",
+                    "title": f"Top {N} Sites — {kpi_name}",
+                    "x_axis": "site_id",
+                    "y_axes": [alias],
+                },
+            ]
+            return {
+                "multi_chart": True,
+                "charts": charts,
+                "sql": charts[0]["sql"],
+                "query_type": "multi_chart", "chart_type": "multi_chart",
+                "title": " & ".join(c["title"] for c in charts)[:80],
+                "x_axis": "site_id", "y_axes": ["revenue"],
+                "response": f"Showing top {N} sites by revenue and {kpi_name}.",
+            }
+        else:
+            rev_sql = f"""SELECT site_id, SUM(num_value) AS revenue
+                    FROM flexible_kpi_uploads
+                    WHERE kpi_type = 'revenue' AND num_value IS NOT NULL
+                    GROUP BY site_id
+                    ORDER BY revenue DESC NULLS LAST LIMIT {N}"""
+            return {
+                "sql": rev_sql,
+                "query_type": "bar", "chart_type": "bar",
+                "title": f"Top {N} Sites by Revenue",
+                "x_axis": "site_id", "y_axes": ["revenue"],
+                "response": f"Showing top {N} sites by revenue.",
+            }
 
     if 'rrc' in p or 'accessibility' in p:
         sql = _kd_site_query([("LTE RRC Setup Success Rate","lte_rrc_setup_sr"),("LTE E-RAB Setup Success Rate","erab_setup_sr"),("LTE Call Setup Success Rate","lte_call_setup_sr"),("DL PRB Utilization (1BH)","dl_prb_util")],"lte_rrc_setup_sr","ASC")
