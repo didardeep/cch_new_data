@@ -312,12 +312,15 @@ def ai_query():
 
     if not _kpi_data_has_data and not _mv_has_data:
         _avail_lines.append("")
-        _avail_lines.append("   ** WARNING: RAN KPI tables are empty. Queries for throughput, call drop rate,")
-        _avail_lines.append("   PRB utilization, handover, etc. will return 0 rows. Only revenue and core KPI")
-        _avail_lines.append("   queries from flexible_kpi_uploads will work. If user asks for RAN KPIs,")
-        _avail_lines.append("   respond with a message explaining that RAN KPI data has not been uploaded yet.")
-        _avail_lines.append("   For 'utilization' queries when kpi_data is empty, check if flexible_kpi_uploads")
-        _avail_lines.append("   has relevant data (e.g., kpi_type='core' AND column_name ILIKE '%util%').")
+        _avail_lines.append("   ** WARNING: RAN KPI tables (kpi_data, mv_daily_site_kpi) are EMPTY.")
+        _avail_lines.append("   IMPORTANT: You MUST still generate SQL. Do NOT refuse to generate SQL.")
+        _avail_lines.append("   - For queries that ONLY need RAN KPIs (throughput, drop rate, PRB, etc.):")
+        _avail_lines.append("     Generate the SQL anyway but set response to explain RAN data not uploaded yet.")
+        _avail_lines.append("   - For queries that mix RAN KPIs + revenue/core data:")
+        _avail_lines.append("     Generate SQL for ONLY the available parts (e.g., just the revenue query).")
+        _avail_lines.append("     Do NOT include JOINs to empty tables. Query only flexible_kpi_uploads.")
+        _avail_lines.append("   - For 'utilization' queries: check flexible_kpi_uploads for")
+        _avail_lines.append("     kpi_type='core' AND column_name ILIKE '%util%' as an alternative.")
     _data_avail_block = "\n".join(_avail_lines)
 
     SCHEMA_HINT = f"""
@@ -1129,16 +1132,36 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
     # so the user at least sees the data that IS available.
     if not rows and sql.strip().upper().startswith("WITH"):
         import re as _re_cte
-        cte_pattern = _re_cte.compile(
-            r"(\w+)\s+AS\s*\(\s*(SELECT\s.+?)\s*\)\s*(?:,|SELECT)",
-            _re_cte.IGNORECASE | _re_cte.DOTALL,
-        )
-        cte_matches = cte_pattern.findall(sql)
+
+        def _extract_ctes(full_sql):
+            """Extract CTE names and bodies using parenthesis counting."""
+            ctes = []
+            # Find all "name AS (" patterns
+            for m in _re_cte.finditer(r'(\w+)\s+AS\s*\(', full_sql, _re_cte.IGNORECASE):
+                name = m.group(1)
+                if name.upper() in ("SELECT", "WHERE", "FROM", "AND", "OR", "NOT"):
+                    continue
+                start = m.end()  # position after the opening (
+                depth = 1
+                i = start
+                while i < len(full_sql) and depth > 0:
+                    if full_sql[i] == '(':
+                        depth += 1
+                    elif full_sql[i] == ')':
+                        depth -= 1
+                    i += 1
+                if depth == 0:
+                    body = full_sql[start:i - 1].strip()
+                    if body.upper().startswith("SELECT"):
+                        ctes.append((name, body))
+            return ctes
+
+        cte_matches = _extract_ctes(sql)
         if cte_matches:
-            print(f"[AI-DEBUG] 0-row CTE query — attempting {len(cte_matches)} CTEs individually", flush=True)
+            print(f"[AI-DEBUG] 0-row CTE query — attempting {len(cte_matches)} CTEs individually: {[n for n,_ in cte_matches]}", flush=True)
             for cte_name, cte_sql in cte_matches:
                 try:
-                    cte_sql_clean = _add_safety_limits(cte_sql.strip().rstrip(","), max_rows=100)
+                    cte_sql_clean = _add_safety_limits(cte_sql.strip(), max_rows=100)
                     partial = _sql_with_timeout(cte_sql_clean, timeout_sec=10)
                     if partial:
                         print(f"[AI-DEBUG] CTE '{cte_name}' returned {len(partial)} rows — using as partial result", flush=True)
