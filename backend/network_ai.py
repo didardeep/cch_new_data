@@ -545,14 +545,6 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
             provider  = {"provider": "rule-based-multisite"}
             _LOG.info("Multi-site trend intercepted before LLM: %s", _prompt_sites)
 
-    # 3. Revenue queries only — LLM doesn't know flexible_kpi_uploads well,
-    #    so intercept these before LLM.  All other queries go to the LLM first;
-    #    the improved rule-based engine acts as fallback.
-    if not ai_result and 'revenue' in _p_lower:
-        ai_result = _rule_based_query(prompt, time_filter, prev_context=None)
-        provider  = {"provider": "rule-based-revenue"}
-        _LOG.info("Revenue query intercepted before LLM")
-
     for _prov in _providers:
         if ai_result:
             break
