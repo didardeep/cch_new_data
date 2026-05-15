@@ -495,6 +495,9 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
         _providers.append(("openai", openai_key))
 
     _LOG.info("AI providers available: %s", [p[0] for p in _providers])
+    if not _providers:
+        _LOG.warning("No LLM providers configured — will use rule-based engine only")
+    print(f"[AI] Providers: {[p[0] for p in _providers]}, prompt: {prompt[:80]}")
 
     # ── PRE-LLM INTERCEPTOR ────────────────────────────────────────────────────
     # Handle certain query patterns with rule-based logic BEFORE calling the LLM.
@@ -542,37 +545,13 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
             provider  = {"provider": "rule-based-multisite"}
             _LOG.info("Multi-site trend intercepted before LLM: %s", _prompt_sites)
 
-    # 3. Multi-KPI ranking / threshold queries — rule-based handles these more
-    #    reliably than LLMs which often produce wrong SQL for EAV-schema pivots.
-    if not ai_result:
-        _EXACT_KPI_CHECK = [
-            'e-rab call drop rate', 'lte call setup success rate', 'lte rrc setup success rate',
-            'lte e-rab setup success rate', 'dl prb utilization', 'ul prb utilization',
-            'lte dl - cell ave throughput', 'lte dl - usr ave throughput',
-            'lte ul - cell ave throughput', 'lte ul - user ave throughput',
-            'average latency downlink', 'availability', 'volte traffic',
-            'ave rrc connected ue', 'max rrc connected ue', 'dl data total volume',
-            'csfb access success rate', 'lte intra-freq ho success rate',
-        ]
-        _exact_kpi_count = sum(1 for k in _EXACT_KPI_CHECK if k in _p_lower)
-        _has_threshold = bool(_re_pre.search(
-            r'(?:greater than|less than|more than|lower than|above|below|>|<)\s*\d', _p_lower
-        ))
-        _has_along_with = any(w in _p_lower for w in [
-            'along with', 'as well as', 'together with', 'and their',
-            'and also', 'show all', 'with their',
-        ])
-        _has_revenue = 'revenue' in _p_lower
-
-        if ((_exact_kpi_count >= 2)
-                or (_exact_kpi_count >= 1 and _has_threshold)
-                or (_exact_kpi_count >= 1 and _has_along_with)
-                or _has_revenue):
-            ai_result = _rule_based_query(prompt, time_filter, prev_context=None)
-            provider  = {"provider": "rule-based-multikpi"}
-            _LOG.info("Multi-KPI/threshold/revenue intercepted before LLM: "
-                      "exact_kpis=%d, threshold=%s, along_with=%s, revenue=%s",
-                      _exact_kpi_count, _has_threshold, _has_along_with, _has_revenue)
+    # 3. Revenue queries only — LLM doesn't know flexible_kpi_uploads well,
+    #    so intercept these before LLM.  All other queries go to the LLM first;
+    #    the improved rule-based engine acts as fallback.
+    if not ai_result and 'revenue' in _p_lower:
+        ai_result = _rule_based_query(prompt, time_filter, prev_context=None)
+        provider  = {"provider": "rule-based-revenue"}
+        _LOG.info("Revenue query intercepted before LLM")
 
     for _prov in _providers:
         if ai_result:
@@ -633,10 +612,12 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
                     _LOG.info("AI query handled by OpenAI direct")
 
         except json.JSONDecodeError as je:
+            print(f"[AI] {ptype.upper()} returned bad JSON: {str(je)[:150]}")
             _LOG.warning("%s LLM returned bad JSON, using rule-based fallback: %s", ptype.upper(), str(je)[:100])
             continue
         except Exception as e:
             err_str = str(e).lower()
+            print(f"[AI] {ptype.upper()} error: {str(e)[:250]}")
             if "429" in str(e) or "quota" in err_str or "rate" in err_str or "resource_exhausted" in err_str:
                 _LOG.warning("%s quota/rate limit hit — skipping to rule-based", ptype.upper())
                 break
@@ -644,6 +625,8 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
             continue
 
     # ── Fallback: rule-based query engine ─────────────────────────────────────
+    if ai_result:
+        print(f"[AI] LLM succeeded via {provider.get('provider','?')}")
     if not ai_result:
         prev_context = None
         if ai_session and session_id:
@@ -659,6 +642,7 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
         ai_result = _rule_based_query(prompt, time_filter, prev_context=prev_context)
         if not provider:
             provider = {"provider": "rule-based"}
+        print(f"[AI] All LLM providers failed — using rule-based fallback")
         _LOG.info("AI query handled by rule-based fallback")
 
     # ── Helper functions ──────────────────────────────────────────────────────
