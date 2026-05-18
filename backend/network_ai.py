@@ -209,7 +209,11 @@ Tables:
 
 3. flexible_kpi_uploads(site_id, kpi_name, kpi_type, column_name, num_value, str_value)
    - kpi_type = 'core' for core KPIs: Authentication Success Rate, CPU Utilization, Attach Success Rate, PDP Bearer Setup Success Rate
-   - kpi_type = 'revenue' for revenue data
+   - kpi_type = 'revenue' for revenue data (EAV format: each site has MULTIPLE rows with different column_name values like 'Feb Total', 'Mar Total', 'OPEX', 'Utilization', 'Total Revenue', etc.)
+   - CRITICAL FOR REVENUE: To get actual total revenue per site, you MUST filter:
+       WHERE kpi_type='revenue' AND column_name ILIKE '%total%revenue%'
+     Use MAX(num_value) (NOT SUM) since 'Total Revenue' is already a pre-computed total.
+     Without this filter, you will get WRONG results by mixing monthly, OPEX, and utilization values.
 
 === Natural Language → KPI Mapping Guide ===
 User says "call drop" / "drop rate" / "CDR" / "call failure" → 'E-RAB Call Drop Rate_1'
@@ -224,6 +228,7 @@ User says "data volume" / "traffic volume" → 'DL Data Total Volume'
 User says "call setup" / "CSSR" → 'LTE Call Setup Success Rate'
 User says "RRC" / "accessibility" / "access" → 'LTE RRC Setup Success Rate'
 User says "noise" / "interference" → 'Average NI of Carrier-'
+User says "revenue" / "income" / "earnings" → flexible_kpi_uploads WHERE kpi_type='revenue' AND column_name ILIKE '%total%revenue%', use MAX(num_value) AS total_revenue
 User says "last 7 days" → AND k.date >= CURRENT_DATE - INTERVAL '7 days' AND k.date <= CURRENT_DATE
 User says "last month" → AND k.date >= CURRENT_DATE - INTERVAL '1 month' AND k.date <= CURRENT_DATE
 ALWAYS add AND k.date <= CURRENT_DATE when any date range is used, to exclude future data.
@@ -345,20 +350,25 @@ STRICTNESS RULES — FOLLOW THESE EXACTLY:
 11. For THRESHOLD/CONDITIONAL queries ("where X > 1.5% or Y < 98.5%"), add HAVING:
     HAVING AVG(CASE WHEN k.kpi_name='E-RAB Call Drop Rate_1' THEN k.value END) > 1.5
        OR AVG(CASE WHEN k.kpi_name='LTE Call Setup Success Rate' THEN k.value END) < 98.5
-12. For REVENUE-only queries, use flexible_kpi_uploads table:
-    SELECT site_id, SUM(num_value) AS revenue FROM flexible_kpi_uploads
-    WHERE kpi_type='revenue' AND num_value IS NOT NULL GROUP BY site_id ORDER BY revenue DESC
+12. For REVENUE-only queries, use flexible_kpi_uploads table.
+    ALWAYS filter by column_name ILIKE '%total%revenue%' to get the Total Revenue column.
+    Use MAX(num_value) (not SUM) since Total Revenue is already a pre-computed total per site:
+    SELECT site_id, MAX(num_value) AS total_revenue FROM flexible_kpi_uploads
+    WHERE kpi_type='revenue' AND num_value IS NOT NULL AND column_name ILIKE '%total%revenue%'
+    GROUP BY site_id ORDER BY total_revenue DESC
 13. For COMBINED revenue + network KPI queries ("sites with both high revenue and high utilization",
-    "revenue sites with high PRB"), use a SINGLE JOIN query — do NOT return two separate charts:
-    SELECT f.site_id, SUM(f.num_value) AS revenue,
+    "revenue sites with high PRB"), use a SINGLE JOIN query — do NOT return two separate charts.
+    ALWAYS filter flexible_kpi_uploads by column_name ILIKE '%total%revenue%' and use MAX:
+    SELECT f.site_id, MAX(f.num_value) AS total_revenue,
            AVG(CASE WHEN k.kpi_name = 'DL PRB Utilization (1BH)' THEN k.value END) AS dl_prb_util
     FROM flexible_kpi_uploads f
     JOIN kpi_data k ON LOWER(f.site_id) = LOWER(k.site_id)
       AND k.data_level = 'site' AND k.value IS NOT NULL
     WHERE f.kpi_type = 'revenue' AND f.num_value IS NOT NULL
+      AND f.column_name ILIKE '%total%revenue%'
     GROUP BY f.site_id
-    ORDER BY revenue DESC NULLS LAST LIMIT 5
-    → chart_type="bar", x_axis="site_id", y_axes=["revenue","dl_prb_util"]
+    ORDER BY total_revenue DESC NULLS LAST LIMIT 5
+    → chart_type="bar", x_axis="site_id", y_axes=["total_revenue","dl_prb_util"]
     CRITICAL: When user says "both", "and", "with", "along with" for revenue + KPI,
     always return ONE chart with a JOIN — never two separate charts.
     IMPORTANT: When mixing revenue (large numbers) with KPI percentages (0-100),
@@ -1642,7 +1652,7 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
             # Build CASE WHEN parts for all requested network KPIs
             case_parts = []
             kpi_in_parts = []
-            y_axes_list = ["revenue"]
+            y_axes_list = ["total_revenue"]
             for kn, al in (net_kpis if net_kpis else [(kpi_name, alias)]):
                 case_parts.append(
                     f"AVG(CASE WHEN k.kpi_name = '{kn}' THEN k.value END) AS {al}"
@@ -1652,15 +1662,16 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
             cases_sql = ",\n                       ".join(case_parts)
             in_clause = ", ".join(kpi_in_parts)
             combined_sql = f"""SELECT f.site_id,
-                       SUM(f.num_value) AS revenue,
+                       MAX(f.num_value) AS total_revenue,
                        {cases_sql}
                     FROM flexible_kpi_uploads f
                     JOIN kpi_data k ON LOWER(f.site_id) = LOWER(k.site_id)
                       AND k.data_level = 'site' AND k.value IS NOT NULL
                       AND k.kpi_name IN ({in_clause})
                     WHERE f.kpi_type = 'revenue' AND f.num_value IS NOT NULL
+                      AND f.column_name ILIKE '%total%revenue%'
                     GROUP BY f.site_id
-                    ORDER BY revenue DESC NULLS LAST LIMIT {N}"""
+                    ORDER BY total_revenue DESC NULLS LAST LIMIT {N}"""
             kpi_short = ", ".join(kn.replace("LTE ", "").replace("(1BH)", "").strip()
                                   for kn, _ in (net_kpis if net_kpis else [(kpi_name, alias)]))
             return {
@@ -1673,17 +1684,18 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
                 "response": f"Showing top {N} sites with both high revenue and {kpi_short}.",
             }
         else:
-            rev_sql = f"""SELECT site_id, SUM(num_value) AS revenue
+            rev_sql = f"""SELECT site_id, MAX(num_value) AS total_revenue
                     FROM flexible_kpi_uploads
                     WHERE kpi_type = 'revenue' AND num_value IS NOT NULL
+                      AND column_name ILIKE '%total%revenue%'
                     GROUP BY site_id
-                    ORDER BY revenue DESC NULLS LAST LIMIT {N}"""
+                    ORDER BY total_revenue DESC NULLS LAST LIMIT {N}"""
             return {
                 "sql": rev_sql,
                 "query_type": "bar", "chart_type": "bar",
                 "title": f"Top {N} Sites by Revenue",
-                "x_axis": "site_id", "y_axes": ["revenue"],
-                "response": f"Showing top {N} sites by revenue.",
+                "x_axis": "site_id", "y_axes": ["total_revenue"],
+                "response": f"Showing top {N} sites by total revenue.",
             }
 
     if 'rrc' in p or 'accessibility' in p:
