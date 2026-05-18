@@ -345,9 +345,22 @@ STRICTNESS RULES — FOLLOW THESE EXACTLY:
 11. For THRESHOLD/CONDITIONAL queries ("where X > 1.5% or Y < 98.5%"), add HAVING:
     HAVING AVG(CASE WHEN k.kpi_name='E-RAB Call Drop Rate_1' THEN k.value END) > 1.5
        OR AVG(CASE WHEN k.kpi_name='LTE Call Setup Success Rate' THEN k.value END) < 98.5
-12. For REVENUE queries, use flexible_kpi_uploads table:
+12. For REVENUE-only queries, use flexible_kpi_uploads table:
     SELECT site_id, SUM(num_value) AS revenue FROM flexible_kpi_uploads
     WHERE kpi_type='revenue' AND num_value IS NOT NULL GROUP BY site_id ORDER BY revenue DESC
+13. For COMBINED revenue + network KPI queries ("sites with both high revenue and high utilization",
+    "revenue sites with high PRB"), use a SINGLE JOIN query — do NOT return two separate charts:
+    SELECT f.site_id, SUM(f.num_value) AS revenue,
+           AVG(CASE WHEN k.kpi_name = 'DL PRB Utilization (1BH)' THEN k.value END) AS dl_prb_util
+    FROM flexible_kpi_uploads f
+    JOIN kpi_data k ON LOWER(f.site_id) = LOWER(k.site_id)
+      AND k.data_level = 'site' AND k.value IS NOT NULL
+    WHERE f.kpi_type = 'revenue' AND f.num_value IS NOT NULL
+    GROUP BY f.site_id
+    ORDER BY revenue DESC NULLS LAST LIMIT 5
+    → chart_type="bar", x_axis="site_id", y_axes=["revenue","dl_prb_util"]
+    CRITICAL: When user says "both", "and", "with", "along with" for revenue + KPI,
+    always return ONE chart with a JOIN — never two separate charts.
 
 ═══════════════════════════════════════════════════════════
 CHART TYPE — MUST MATCH THE DATA SHAPE:
@@ -524,14 +537,22 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
     _prompt_days  = _re_pre.search(r'last\s+(\d+)\s*days?', _p_lower)
 
     # 1. Follow-up detection — run rule-based BEFORE LLM so context is never lost
-    if _is_followup(_p_lower):
+    _followup_detected = _is_followup(_p_lower)
+    if _followup_detected:
         _prev_ctx = _get_prev_context_for_intercept()
         if _prev_ctx:
             _fu = _handle_followup(prompt, _p_lower, _prev_ctx, time_filter)
             if _fu:
                 ai_result = _fu
                 provider  = {"provider": "rule-based-followup"}
+                print(f"[AI] INTERCEPTED as follow-up (skipping LLM)")
                 _LOG.info("Follow-up intercepted before LLM: site-switch / chart-change / time-change")
+            else:
+                print(f"[AI] Follow-up detected but handler returned None — passing to LLM")
+        else:
+            print(f"[AI] Follow-up detected but no prev context — passing to LLM")
+    else:
+        print(f"[AI] Not a follow-up — will try LLM")
 
     # 2. Multi-site trend queries — rule-based reliably generates one chart per site
     #    with ALL requested KPIs, which LLMs often get wrong.
@@ -543,12 +564,17 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
         if _is_trend_pre:
             ai_result = _rule_based_query(prompt, time_filter, prev_context=None)
             provider  = {"provider": "rule-based-multisite"}
+            print(f"[AI] INTERCEPTED as multi-site trend (skipping LLM)")
             _LOG.info("Multi-site trend intercepted before LLM: %s", _prompt_sites)
+
+    if not ai_result:
+        print(f"[AI] Calling LLM providers: {[p[0] for p in _providers]}")
 
     for _prov in _providers:
         if ai_result:
             break
         ptype = _prov[0]
+        print(f"[AI] Trying {ptype}...")
         try:
             if ptype == "azure":
                 from openai import AzureOpenAI as _AzureOpenAI
@@ -834,21 +860,35 @@ def _is_followup(prompt_lower: str) -> bool:
         r'|\d+\s*(month|year|week)s?|this\s+(year|month|week)', p
     ))
 
+    # Words that signal a FRESH query — never treat as follow-up
+    _FRESH_QUERY_SIGNALS = {
+        'top', 'bottom', 'worst', 'best', 'highest', 'lowest',
+        'compare', 'comparison', 'zone', 'zones', 'cluster',
+        'all sites', 'network wide', 'network health', 'overall',
+        'show me', 'give me', 'list', 'find', 'which', 'what',
+        'how many', 'where', 'revenue', 'report',
+    }
+    has_fresh_signal = any(fs in p for fs in _FRESH_QUERY_SIGNALS)
+
     # 1. Truly self-contained: site + explicit time reference → always fresh
     if has_site and has_time_ref:
         return False
 
     # 2. Explicit ranking/network-wide → always fresh
-    if re.search(r'(top|bottom|worst|best)\s+\d+', p):
+    #    Match "top 10", "worst 5" AND "top sites", "worst sites", "best PRB"
+    if re.search(r'\b(top|bottom|worst|best|highest|lowest)\b', p):
         return False
 
     # 3. Multiple different site IDs → multi-site fresh query
-    #    (handled separately by the pre-LLM interceptor)
     _all_sites = re.findall(r'[a-z]{2,}[_\-][a-z]{2,}[_\-]\d{3,}', p)
     if len(_all_sites) >= 2:
         return False
 
-    # 4. Explicit modification keywords → definitely follow-up
+    # 4. Fresh-query signal words → always fresh
+    if has_fresh_signal:
+        return False
+
+    # 5. Explicit modification keywords → definitely follow-up
     #    Covers: "not cssr", "instead of", "only line", "switch to erab", etc.
     mod_keywords = [
         ' not ', 'instead', 'rather than', 'in place of',
@@ -856,11 +896,11 @@ def _is_followup(prompt_lower: str) -> bool:
         'switch to', 'change to', 'show as', 'display as', 'convert to',
         'the graph', 'the chart', 'this graph', 'this chart', 'that chart',
         'same', 'previous', 'last one', 'above', 'earlier',
-        'the data', 'the result', 'instead', 'rather', 'in place',
+        'the data', 'the result',
         'swap', 'replace', 'for this', 'for that',
         'scale', 'zoom', 'resize', 'bigger', 'smaller',
         'enlarge', 'expand', 'more days', 'fewer days', 'extend', 'shorten',
-        'add', 'also show', 'overlay', 'combine',
+        'also show', 'overlay', 'combine',
         'remove', 'hide', 'exclude', 'colour', 'color',
         'bar chart', 'line chart', 'pie chart', 'area chart',
         'line graph', 'bar graph',
@@ -869,15 +909,9 @@ def _is_followup(prompt_lower: str) -> bool:
     if any(kw in p for kw in mod_keywords):
         return True
 
-    # 5. Site-only (no KPI, no time) → site-switch follow-up
-    #    e.g. "show me SITE_A" / "i want to see for site id SITE_A"
-    _SITE_SWITCH_BLOCKERS = {'top', 'bottom', 'worst', 'best', 'compare', 'zone', 'all sites', 'network'}
+    # 6. Site-only (no KPI, no time) → site-switch follow-up
+    #    e.g. "i want to see for site id SITE_A"
     if has_site and not has_kpi and not has_time_ref:
-        if not any(nw in p for nw in _SITE_SWITCH_BLOCKERS):
-            return True
-
-    # 6. Very short prompts with no site and no KPI → vague continuation
-    if len(words) <= 5 and not has_kpi and not has_site:
         return True
 
     # 7. Polite one-word confirmations
@@ -885,11 +919,9 @@ def _is_followup(prompt_lower: str) -> bool:
              'please', 'thanks', 'thank you', 'good', 'nice', 'great'):
         return True
 
-    # 8. KPI-only prompt (no site, no time) → KPI switch on same site
-    if has_kpi and not has_site and not has_time_ref and len(words) <= 10:
-        _NEW_QUERY_BLOCKERS = {'top', 'bottom', 'worst', 'best', 'compare', 'zone', 'all sites', 'network wide', 'overall'}
-        if not any(nw in p for nw in _NEW_QUERY_BLOCKERS):
-            return True
+    # 8. Very short vague prompts (<=3 words, no KPI, no site) → continuation
+    if len(words) <= 3 and not has_kpi and not has_site:
+        return True
 
     return False
 
@@ -1580,38 +1612,43 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
 
     # ── Revenue handler ─────────────────────────────────────────────────────
     if 'revenue' in p:
-        # Check if a network KPI is also requested
+        # Check if a network KPI is also requested (combined intent)
         net_kpis = [kpi for kpi in detected_kpis if kpi[0] not in ('revenue',)]
         if net_kpis or any(w in p for w in ['prb', 'utilization', 'throughput', 'drop', 'congestion']):
+            # Combined revenue + network KPI → single JOIN query
+            # so the user sees sites that rank high on BOTH metrics
             kpi_name, alias = net_kpis[0] if net_kpis else ('DL PRB Utilization (1BH)', 'dl_prb_util')
-            charts = [
-                {
-                    "sql": f"""SELECT site_id, SUM(num_value) AS revenue
-                        FROM flexible_kpi_uploads
-                        WHERE kpi_type = 'revenue' AND num_value IS NOT NULL
-                        GROUP BY site_id
-                        ORDER BY revenue DESC NULLS LAST LIMIT {N}""",
-                    "chart_type": "bar",
-                    "title": f"Top {N} Revenue Sites",
-                    "x_axis": "site_id",
-                    "y_axes": ["revenue"],
-                },
-                {
-                    "sql": _kd_site_query([(kpi_name, alias)], alias, "DESC"),
-                    "chart_type": "bar",
-                    "title": f"Top {N} Sites — {kpi_name}",
-                    "x_axis": "site_id",
-                    "y_axes": [alias],
-                },
-            ]
+            # Build CASE WHEN parts for all requested network KPIs
+            case_parts = []
+            kpi_in_parts = []
+            y_axes_list = ["revenue"]
+            for kn, al in (net_kpis if net_kpis else [(kpi_name, alias)]):
+                case_parts.append(
+                    f"AVG(CASE WHEN k.kpi_name = '{kn}' THEN k.value END) AS {al}"
+                )
+                kpi_in_parts.append(f"'{kn}'")
+                y_axes_list.append(al)
+            cases_sql = ",\n                       ".join(case_parts)
+            in_clause = ", ".join(kpi_in_parts)
+            combined_sql = f"""SELECT f.site_id,
+                       SUM(f.num_value) AS revenue,
+                       {cases_sql}
+                    FROM flexible_kpi_uploads f
+                    JOIN kpi_data k ON LOWER(f.site_id) = LOWER(k.site_id)
+                      AND k.data_level = 'site' AND k.value IS NOT NULL
+                      AND k.kpi_name IN ({in_clause})
+                    WHERE f.kpi_type = 'revenue' AND f.num_value IS NOT NULL
+                    GROUP BY f.site_id
+                    ORDER BY revenue DESC NULLS LAST LIMIT {N}"""
+            kpi_short = ", ".join(kn.replace("LTE ", "").replace("(1BH)", "").strip()
+                                  for kn, _ in (net_kpis if net_kpis else [(kpi_name, alias)]))
             return {
-                "multi_chart": True,
-                "charts": charts,
-                "sql": charts[0]["sql"],
-                "query_type": "multi_chart", "chart_type": "multi_chart",
-                "title": " & ".join(c["title"] for c in charts)[:80],
-                "x_axis": "site_id", "y_axes": ["revenue"],
-                "response": f"Showing top {N} sites by revenue and {kpi_name}.",
+                "sql": combined_sql,
+                "query_type": "bar", "chart_type": "bar",
+                "title": f"Top {N} Sites — Revenue & {kpi_short}"[:60],
+                "x_axis": "site_id",
+                "y_axes": y_axes_list,
+                "response": f"Showing top {N} sites with both high revenue and {kpi_short}.",
             }
         else:
             rev_sql = f"""SELECT site_id, SUM(num_value) AS revenue
