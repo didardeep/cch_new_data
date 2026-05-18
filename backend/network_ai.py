@@ -361,6 +361,8 @@ STRICTNESS RULES — FOLLOW THESE EXACTLY:
     → chart_type="bar", x_axis="site_id", y_axes=["revenue","dl_prb_util"]
     CRITICAL: When user says "both", "and", "with", "along with" for revenue + KPI,
     always return ONE chart with a JOIN — never two separate charts.
+    IMPORTANT: When mixing revenue (large numbers) with KPI percentages (0-100),
+    include "chart_config": {{"dual_axis": true}} so the frontend renders two Y-axes.
 
 ═══════════════════════════════════════════════════════════
 CHART TYPE — MUST MATCH THE DATA SHAPE:
@@ -774,6 +776,25 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
         c for c in columns[1:5]
         if c not in ("lat", "lng", "latitude", "longitude", "site_id", "cell_id", "cluster", "region", "technology")
     ]
+
+    # ── Auto-detect dual-axis need (vastly different value scales) ───────────
+    chart_cfg = ai_result.get("chart_config") or {}
+    if not chart_cfg.get("dual_axis") and len(y_axes) >= 2 and rows:
+        try:
+            _maxes = []
+            for _yk in y_axes[:2]:
+                _vals = [abs(float(r[_yk])) for r in rows
+                         if r.get(_yk) is not None and not (isinstance(r[_yk], float) and math.isnan(r[_yk]))]
+                _maxes.append(max(_vals) if _vals else 0)
+            if _maxes[0] > 0 and _maxes[1] > 0:
+                _ratio = max(_maxes) / min(_maxes)
+                if _ratio > 50:
+                    chart_cfg["dual_axis"] = True
+                    ai_result["chart_config"] = chart_cfg
+                    _LOG.info("Auto-set dual_axis: ratio=%.0f (%s=%.1f, %s=%.1f)",
+                              _ratio, y_axes[0], _maxes[0], y_axes[1], _maxes[1])
+        except Exception:
+            pass
 
     resp_text = ai_result.get("response", f"Found {len(rows)} results.")
     resp_title = ai_result.get("title", prompt[:70])
@@ -1645,6 +1666,7 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
             return {
                 "sql": combined_sql,
                 "query_type": "bar", "chart_type": "bar",
+                "chart_config": {"dual_axis": True},
                 "title": f"Top {N} Sites — Revenue & {kpi_short}"[:60],
                 "x_axis": "site_id",
                 "y_axes": y_axes_list,
