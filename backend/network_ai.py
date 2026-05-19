@@ -264,8 +264,9 @@ Tables:
 3. flexible_kpi_uploads(site_id, kpi_name, kpi_type, column_name, num_value, str_value)
    Data is uploaded by admin — columns below are fetched LIVE from the database:
 {flex_columns}
-   - CRITICAL FOR REVENUE: You MUST filter column_name = 'revenue_total' to get total revenue:
-       WHERE kpi_type='revenue' AND column_name = 'revenue_total'
+   - CRITICAL FOR REVENUE: The total revenue column name varies per upload (e.g. 'revenue_total', 'Total Revenue').
+     You MUST match BOTH words using ILIKE:
+       WHERE kpi_type='revenue' AND column_name ILIKE '%revenue%' AND column_name ILIKE '%total%'
      Use MAX(num_value) (NOT SUM). Without this filter you get WRONG results.
 
 === Natural Language → KPI Mapping Guide ===
@@ -281,7 +282,7 @@ User says "data volume" / "traffic volume" → 'DL Data Total Volume'
 User says "call setup" / "CSSR" → 'LTE Call Setup Success Rate'
 User says "RRC" / "accessibility" / "access" → 'LTE RRC Setup Success Rate'
 User says "noise" / "interference" → 'Average NI of Carrier-'
-User says "revenue" / "income" / "earnings" → flexible_kpi_uploads WHERE kpi_type='revenue' AND column_name = 'revenue_total', use MAX(num_value) AS total_revenue
+User says "revenue" / "income" / "earnings" → flexible_kpi_uploads WHERE kpi_type='revenue' AND column_name ILIKE '%revenue%' AND column_name ILIKE '%total%', use MAX(num_value) AS total_revenue
 User says "last 7 days" → AND k.date >= CURRENT_DATE - INTERVAL '7 days' AND k.date <= CURRENT_DATE
 User says "last month" → AND k.date >= CURRENT_DATE - INTERVAL '1 month' AND k.date <= CURRENT_DATE
 ALWAYS add AND k.date <= CURRENT_DATE when any date range is used, to exclude future data.
@@ -405,21 +406,22 @@ STRICTNESS RULES — FOLLOW THESE EXACTLY:
     HAVING AVG(CASE WHEN k.kpi_name='E-RAB Call Drop Rate_1' THEN k.value END) > 1.5
        OR AVG(CASE WHEN k.kpi_name='LTE Call Setup Success Rate' THEN k.value END) < 98.5
 12. For REVENUE-only queries, use flexible_kpi_uploads table.
-    ALWAYS filter by column_name = 'revenue_total' to get Total Revenue.
-    Use MAX(num_value) (not SUM) since it is one value per site:
+    The total revenue column name varies (e.g. 'revenue_total', 'Total Revenue').
+    ALWAYS match BOTH words with ILIKE. Use MAX(num_value) (not SUM):
     SELECT site_id, MAX(num_value) AS total_revenue FROM flexible_kpi_uploads
-    WHERE kpi_type='revenue' AND num_value IS NOT NULL AND column_name = 'revenue_total'
+    WHERE kpi_type='revenue' AND num_value IS NOT NULL
+      AND column_name ILIKE '%revenue%' AND column_name ILIKE '%total%'
     GROUP BY site_id ORDER BY total_revenue DESC
 13. For COMBINED revenue + network KPI queries ("sites with both high revenue and high utilization",
     "revenue sites with high PRB"), use a SINGLE JOIN query — do NOT return two separate charts.
-    ALWAYS filter flexible_kpi_uploads by column_name = 'revenue_total' and use MAX:
+    ALWAYS filter with ILIKE for total revenue and use MAX:
     SELECT f.site_id, MAX(f.num_value) AS total_revenue,
            AVG(CASE WHEN k.kpi_name = 'DL PRB Utilization (1BH)' THEN k.value END) AS dl_prb_util
     FROM flexible_kpi_uploads f
     JOIN kpi_data k ON LOWER(f.site_id) = LOWER(k.site_id)
       AND k.data_level = 'site' AND k.value IS NOT NULL
     WHERE f.kpi_type = 'revenue' AND f.num_value IS NOT NULL
-      AND f.column_name = 'revenue_total'
+      AND f.column_name ILIKE '%revenue%' AND f.column_name ILIKE '%total%'
     GROUP BY f.site_id
     ORDER BY total_revenue DESC NULLS LAST LIMIT 5
     → chart_type="bar", x_axis="site_id", y_axes=["total_revenue","dl_prb_util"]
@@ -1723,7 +1725,8 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
                       AND k.data_level = 'site' AND k.value IS NOT NULL
                       AND k.kpi_name IN ({in_clause})
                     WHERE f.kpi_type = 'revenue' AND f.num_value IS NOT NULL
-                      AND f.column_name = 'revenue_total'
+                      AND f.column_name ILIKE '%%revenue%%'
+                      AND f.column_name ILIKE '%%total%%'
                     GROUP BY f.site_id
                     ORDER BY total_revenue DESC NULLS LAST LIMIT {N}"""
             kpi_short = ", ".join(kn.replace("LTE ", "").replace("(1BH)", "").strip()
@@ -1741,7 +1744,8 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
             rev_sql = f"""SELECT site_id, MAX(num_value) AS total_revenue
                     FROM flexible_kpi_uploads
                     WHERE kpi_type = 'revenue' AND num_value IS NOT NULL
-                      AND column_name = 'revenue_total'
+                      AND column_name ILIKE '%%revenue%%'
+                      AND column_name ILIKE '%%total%%'
                     GROUP BY site_id
                     ORDER BY total_revenue DESC NULLS LAST LIMIT {N}"""
             return {
