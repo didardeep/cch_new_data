@@ -57,6 +57,59 @@ def invalidate_schema_cache():
     _LOG.debug("invalidate_schema_cache: cleared")
 
 
+def _get_flex_schema_hint() -> str:
+    """Dynamically fetch column_name / kpi_name info from flexible_kpi_uploads."""
+    cache_key = "flex_schema_hint"
+    if cache_key in _schema_cache:
+        return _schema_cache[cache_key]
+    try:
+        with db.engine.connect() as conn:
+            # Get columns per kpi_type
+            rows = conn.execute(sa_text(
+                "SELECT kpi_type, column_name, column_type "
+                "FROM flexible_kpi_uploads "
+                "GROUP BY kpi_type, column_name, column_type "
+                "ORDER BY kpi_type, column_name"
+            )).fetchall()
+            # Get kpi_names per kpi_type (for core uploads with sheet names)
+            kpi_rows = conn.execute(sa_text(
+                "SELECT kpi_type, kpi_name "
+                "FROM flexible_kpi_uploads "
+                "WHERE kpi_name IS NOT NULL "
+                "GROUP BY kpi_type, kpi_name "
+                "ORDER BY kpi_type, kpi_name"
+            )).fetchall()
+        if not rows:
+            _schema_cache[cache_key] = ""
+            return ""
+        # Build per-kpi_type description
+        by_type = {}
+        for ktype, cname, ctype in rows:
+            by_type.setdefault(ktype, []).append((cname, ctype))
+        kpi_names_by_type = {}
+        for ktype, kname in kpi_rows:
+            kpi_names_by_type.setdefault(ktype, []).append(kname)
+
+        lines = []
+        for ktype in sorted(by_type):
+            cols = by_type[ktype]
+            num_cols = [c for c, t in cols if t == 'numeric']
+            txt_cols = [c for c, t in cols if t != 'numeric']
+            lines.append(f"   kpi_type = '{ktype}':")
+            if ktype in kpi_names_by_type:
+                lines.append(f"     kpi_name values: {', '.join(kpi_names_by_type[ktype])}")
+            if num_cols:
+                lines.append(f"     numeric columns (in num_value): {', '.join(num_cols)}")
+            if txt_cols:
+                lines.append(f"     text columns (in str_value): {', '.join(txt_cols)}")
+        hint = "\n".join(lines)
+        _schema_cache[cache_key] = hint
+        return hint
+    except Exception as exc:
+        _LOG.warning("_get_flex_schema_hint failed: %s", exc)
+        return ""
+
+
 # ─── Shared helpers (imported lazily from network_analytics) ─────────────────
 
 def _sql(query: str, params: dict = None) -> list:
@@ -168,6 +221,7 @@ def ai_query():
     provider = None
     ai_result = None
 
+    flex_columns = _get_flex_schema_hint()
     SCHEMA_HINT = """
 Tables:
 1. kpi_data(id, site_id, kpi_name, value, date, hour, data_level, cell_id, cell_site_id)
@@ -208,12 +262,11 @@ Tables:
    - zone column has values like zone names / cluster names
 
 3. flexible_kpi_uploads(site_id, kpi_name, kpi_type, column_name, num_value, str_value)
-   - kpi_type = 'core' for core KPIs: Authentication Success Rate, CPU Utilization, Attach Success Rate, PDP Bearer Setup Success Rate
-   - kpi_type = 'revenue' for revenue data (EAV format: each site has MULTIPLE rows with different column_name values like 'Feb Total', 'Mar Total', 'OPEX', 'Utilization', 'Total Revenue', etc.)
-   - CRITICAL FOR REVENUE: To get actual total revenue per site, you MUST filter:
-       WHERE kpi_type='revenue' AND column_name ILIKE '%total%revenue%'
-     Use MAX(num_value) (NOT SUM) since 'Total Revenue' is already a pre-computed total.
-     Without this filter, you will get WRONG results by mixing monthly, OPEX, and utilization values.
+   Data is uploaded by admin — columns below are fetched LIVE from the database:
+{flex_columns}
+   - CRITICAL FOR REVENUE: You MUST filter column_name = 'revenue_total' to get total revenue:
+       WHERE kpi_type='revenue' AND column_name = 'revenue_total'
+     Use MAX(num_value) (NOT SUM). Without this filter you get WRONG results.
 
 === Natural Language → KPI Mapping Guide ===
 User says "call drop" / "drop rate" / "CDR" / "call failure" → 'E-RAB Call Drop Rate_1'
@@ -228,11 +281,12 @@ User says "data volume" / "traffic volume" → 'DL Data Total Volume'
 User says "call setup" / "CSSR" → 'LTE Call Setup Success Rate'
 User says "RRC" / "accessibility" / "access" → 'LTE RRC Setup Success Rate'
 User says "noise" / "interference" → 'Average NI of Carrier-'
-User says "revenue" / "income" / "earnings" → flexible_kpi_uploads WHERE kpi_type='revenue' AND column_name ILIKE '%total%revenue%', use MAX(num_value) AS total_revenue
+User says "revenue" / "income" / "earnings" → flexible_kpi_uploads WHERE kpi_type='revenue' AND column_name = 'revenue_total', use MAX(num_value) AS total_revenue
 User says "last 7 days" → AND k.date >= CURRENT_DATE - INTERVAL '7 days' AND k.date <= CURRENT_DATE
 User says "last month" → AND k.date >= CURRENT_DATE - INTERVAL '1 month' AND k.date <= CURRENT_DATE
 ALWAYS add AND k.date <= CURRENT_DATE when any date range is used, to exclude future data.
 """
+    SCHEMA_HINT = SCHEMA_HINT.replace("{flex_columns}", flex_columns)
 
     LLM_SYSTEM = f"""You are a telecom network analytics SQL generator. Your ONLY job is to convert the user's natural-language query into an EXACT, STRICT SQL query that fetches PRECISELY what was asked — nothing more, nothing less.
 
@@ -351,21 +405,21 @@ STRICTNESS RULES — FOLLOW THESE EXACTLY:
     HAVING AVG(CASE WHEN k.kpi_name='E-RAB Call Drop Rate_1' THEN k.value END) > 1.5
        OR AVG(CASE WHEN k.kpi_name='LTE Call Setup Success Rate' THEN k.value END) < 98.5
 12. For REVENUE-only queries, use flexible_kpi_uploads table.
-    ALWAYS filter by column_name ILIKE '%total%revenue%' to get the Total Revenue column.
-    Use MAX(num_value) (not SUM) since Total Revenue is already a pre-computed total per site:
+    ALWAYS filter by column_name = 'revenue_total' to get Total Revenue.
+    Use MAX(num_value) (not SUM) since it is one value per site:
     SELECT site_id, MAX(num_value) AS total_revenue FROM flexible_kpi_uploads
-    WHERE kpi_type='revenue' AND num_value IS NOT NULL AND column_name ILIKE '%total%revenue%'
+    WHERE kpi_type='revenue' AND num_value IS NOT NULL AND column_name = 'revenue_total'
     GROUP BY site_id ORDER BY total_revenue DESC
 13. For COMBINED revenue + network KPI queries ("sites with both high revenue and high utilization",
     "revenue sites with high PRB"), use a SINGLE JOIN query — do NOT return two separate charts.
-    ALWAYS filter flexible_kpi_uploads by column_name ILIKE '%total%revenue%' and use MAX:
+    ALWAYS filter flexible_kpi_uploads by column_name = 'revenue_total' and use MAX:
     SELECT f.site_id, MAX(f.num_value) AS total_revenue,
            AVG(CASE WHEN k.kpi_name = 'DL PRB Utilization (1BH)' THEN k.value END) AS dl_prb_util
     FROM flexible_kpi_uploads f
     JOIN kpi_data k ON LOWER(f.site_id) = LOWER(k.site_id)
       AND k.data_level = 'site' AND k.value IS NOT NULL
     WHERE f.kpi_type = 'revenue' AND f.num_value IS NOT NULL
-      AND f.column_name ILIKE '%total%revenue%'
+      AND f.column_name = 'revenue_total'
     GROUP BY f.site_id
     ORDER BY total_revenue DESC NULLS LAST LIMIT 5
     → chart_type="bar", x_axis="site_id", y_axes=["total_revenue","dl_prb_util"]
@@ -1669,7 +1723,7 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
                       AND k.data_level = 'site' AND k.value IS NOT NULL
                       AND k.kpi_name IN ({in_clause})
                     WHERE f.kpi_type = 'revenue' AND f.num_value IS NOT NULL
-                      AND f.column_name ILIKE '%total%revenue%'
+                      AND f.column_name = 'revenue_total'
                     GROUP BY f.site_id
                     ORDER BY total_revenue DESC NULLS LAST LIMIT {N}"""
             kpi_short = ", ".join(kn.replace("LTE ", "").replace("(1BH)", "").strip()
@@ -1687,7 +1741,7 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
             rev_sql = f"""SELECT site_id, MAX(num_value) AS total_revenue
                     FROM flexible_kpi_uploads
                     WHERE kpi_type = 'revenue' AND num_value IS NOT NULL
-                      AND column_name ILIKE '%total%revenue%'
+                      AND column_name = 'revenue_total'
                     GROUP BY site_id
                     ORDER BY total_revenue DESC NULLS LAST LIMIT {N}"""
             return {
