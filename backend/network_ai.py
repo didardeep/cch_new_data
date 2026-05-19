@@ -635,6 +635,14 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
             print(f"[AI] INTERCEPTED as multi-site trend (skipping LLM)")
             _LOG.info("Multi-site trend intercepted before LLM: %s", _prompt_sites)
 
+    # 3. Revenue queries — rule-based always uses the correct Total Revenue column;
+    #    LLMs keep generating wrong SQL for revenue, so intercept here.
+    if not ai_result and 'revenue' in _p_lower:
+        ai_result = _rule_based_query(prompt, time_filter, prev_context=None)
+        provider  = {"provider": "rule-based-revenue"}
+        print(f"[AI] INTERCEPTED as revenue query (skipping LLM)")
+        _LOG.info("Revenue query intercepted before LLM")
+
     if not ai_result:
         print(f"[AI] Calling LLM providers: {[p[0] for p in _providers]}")
 
