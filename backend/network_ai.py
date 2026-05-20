@@ -110,6 +110,117 @@ def _get_flex_schema_hint() -> str:
         return ""
 
 
+def _get_db_kpi_names() -> list:
+    """Fetch and cache all distinct kpi_name values from kpi_data."""
+    cache_key = "db_kpi_names"
+    if cache_key in _schema_cache:
+        return _schema_cache[cache_key]
+    try:
+        with db.engine.connect() as conn:
+            rows = conn.execute(sa_text(
+                "SELECT DISTINCT kpi_name FROM kpi_data "
+                "WHERE kpi_name IS NOT NULL ORDER BY kpi_name"
+            )).fetchall()
+        names = [r[0] for r in rows]
+        _schema_cache[cache_key] = names
+        return names
+    except Exception as exc:
+        _LOG.warning("_get_db_kpi_names failed: %s", exc)
+        return []
+
+
+def _find_kpi(*patterns) -> str | None:
+    """Find a KPI name from DB that contains ALL given patterns (case-insensitive)."""
+    names = _get_db_kpi_names()
+    for name in names:
+        nl = name.lower()
+        if all(p.lower() in nl for p in patterns):
+            return name
+    return None
+
+
+def _build_dynamic_kpi_map() -> tuple:
+    """Build keyword→(db_name, alias) maps from actual DB KPI names.
+    Returns (KPI_MAP, EXACT_KPI_NAMES, kpi_names_for_prompt).
+    """
+    cache_key = "dynamic_kpi_map"
+    if cache_key in _schema_cache:
+        return _schema_cache[cache_key]
+
+    db_names = _get_db_kpi_names()
+
+    # Pattern definitions: (alias, search_patterns, keyword_triggers)
+    # search_patterns: used to find the actual kpi_name in DB
+    # keyword_triggers: words that map to this KPI in user queries
+    _PATTERNS = [
+        ("rrc_sr",          [["rrc", "setup", "success"]],           ["rrc", "accessibility"]),
+        ("cssr",            [["call setup", "success"]],             ["cssr", "call setup", "setup success"]),
+        ("erab_setup_sr",   [["e-rab", "setup", "success"]],        ["erab setup"]),
+        ("drop_rate",       [["drop", "rate"]],                      ["drop", "cdr", "call drop"]),
+        ("csfb_sr",         [["csfb", "success"]],                   ["csfb"]),
+        ("intra_ho_sr",     [["intra", "freq", "ho", "success"], ["intra-freq", "ho"]],  ["handover", "ho success", "hsr"]),
+        ("intra_enb_ho_sr", [["intra", "enb", "ho"]],               []),
+        ("inter_x2_ho_sr",  [["inter", "x2", "ho"], ["x2ho"]],      []),
+        ("inter_s1_ho_sr",  [["inter", "s1", "ho"], ["s1ho"]],      []),
+        ("dl_cell_tput",    [["dl", "cell", "throughput"]],          ["throughput", "tput", "speed", "mbps"]),
+        ("ul_cell_tput",    [["ul", "cell", "throughput"]],          []),
+        ("dl_usr_tput",     [["dl", "usr", "throughput"], ["dl", "user", "throughput"]], []),
+        ("ul_usr_tput",     [["ul", "user", "throughput"]],          []),
+        ("avg_latency",     [["latency", "downlink"], ["latency"]],  ["latency", "delay", "ping"]),
+        ("dl_volume",       [["dl", "data", "volume"]],              ["volume", "data volume"]),
+        ("ul_volume",       [["ul", "data", "volume"]],              []),
+        ("volte_erl",       [["volte", "erlang"]],                   ["volte"]),
+        ("volte_dl",        [["volte", "dl"], ["volte", "traffic", "dl"]], []),
+        ("volte_ul",        [["volte", "ul"], ["volte", "traffic", "ul"]], []),
+        ("avg_rrc_ue",      [["ave", "rrc", "connected"], ["average", "rrc", "connected"]], ["connected user", "rrc user"]),
+        ("max_rrc_ue",      [["max", "rrc", "connected"]],          []),
+        ("avg_act_ue_dl",   [["act", "ue", "dl"]],                  []),
+        ("avg_act_ue_ul",   [["act", "ue", "ul"]],                  []),
+        ("availability",    [["availability"]],                      ["availability", "uptime", "downtime"]),
+        ("noise",           [["ni", "carrier"], ["noise", "interference"]], ["noise", "interference"]),
+        ("dl_prb_util",     [["dl", "prb", "utilization"], ["dl prb"]], ["prb", "congestion", "utilization"]),
+        ("ul_prb_util",     [["ul", "prb", "utilization"], ["ul prb"]], []),
+    ]
+
+    kpi_map = {}       # keyword → (db_name, alias)
+    exact_map = {}     # lowercase full name → (db_name, alias)
+    found_kpis = []    # list of (db_name, alias) for prompt
+
+    for alias, search_pattern_groups, keywords in _PATTERNS:
+        # Try each search pattern group to find the actual KPI name in DB
+        db_name = None
+        for patterns in search_pattern_groups:
+            db_name = _find_kpi(*patterns)
+            if db_name:
+                break
+        if not db_name:
+            continue
+
+        found_kpis.append((db_name, alias))
+        exact_map[db_name.lower()] = (db_name, alias)
+
+        for kw in keywords:
+            if kw not in kpi_map:
+                kpi_map[kw] = (db_name, alias)
+
+    # Also add any DB KPI names not matched by patterns (so prompt shows them all)
+    matched_names = {k[0] for k in found_kpis}
+    for name in db_names:
+        if name not in matched_names:
+            safe_alias = name.lower().replace(" ", "_").replace("-", "_").replace("(", "").replace(")", "")[:30]
+            found_kpis.append((name, safe_alias))
+            exact_map[name.lower()] = (name, safe_alias)
+
+    # Build prompt-friendly KPI list
+    kpi_prompt_lines = []
+    for db_name, alias in found_kpis:
+        kpi_prompt_lines.append(f"   '{db_name}'")
+
+    result = (kpi_map, exact_map, kpi_prompt_lines)
+    _schema_cache[cache_key] = result
+    return result
+
+
 # ─── Shared helpers (imported lazily from network_analytics) ─────────────────
 
 def _sql(query: str, params: dict = None) -> list:
@@ -222,40 +333,17 @@ def ai_query():
     ai_result = None
 
     flex_columns = _get_flex_schema_hint()
-    SCHEMA_HINT = """
+    _dyn_kpi_map, _dyn_exact_map, _dyn_kpi_lines = _build_dynamic_kpi_map()
+    _kpi_list_str = "\n".join(_dyn_kpi_lines) if _dyn_kpi_lines else "   (no KPI data found)"
+
+    SCHEMA_HINT = f"""
 Tables:
 1. kpi_data(id, site_id, kpi_name, value, date, hour, data_level, cell_id, cell_site_id)
    - data_level = 'site' for site-level, 'cell' for cell-level
-   - IMPORTANT: kpi_name values are EXACT strings. Use these EXACTLY as listed below.
+   - IMPORTANT: kpi_name values are EXACT strings fetched LIVE from database. Use EXACTLY as listed:
 
-   === RAN KPI Names (EXACT values in kpi_name column) ===
-   'LTE RRC Setup Success Rate'        -- RRC success rate, accessibility
-   'LTE Call Setup Success Rate'        -- Call setup success, CSSR
-   'LTE E-RAB Setup Success Rate'       -- E-RAB setup
-   'E-RAB Call Drop Rate_1'             -- Call drop rate, CDR
-   'CSFB Access Success Rate'           -- CSFB fallback
-   'LTE Intra-Freq HO Success Rate'    -- Intra-frequency handover
-   'Intra-eNB HO Success Rate'         -- Intra-eNB handover
-   'Inter-eNBX2HO Success Rate'        -- Inter-eNB X2 handover
-   'Inter-eNBS1HO Success Rate'        -- Inter-eNB S1 handover
-   'LTE DL - Cell Ave Throughput'       -- DL cell throughput (Mbps)
-   'LTE UL - Cell Ave Throughput'       -- UL cell throughput
-   'LTE DL - Usr Ave Throughput'        -- DL user throughput (Mbps)
-   'LTE UL - User Ave Throughput'       -- UL user throughput
-   'Average Latency Downlink'           -- Latency (ms)
-   'DL Data Total Volume'               -- DL data volume (GB)
-   'UL Data Total Volume'               -- UL data volume
-   'VoLTE Traffic Erlang'               -- VoLTE traffic in Erlang
-   'VoLTE Traffic UL'                   -- VoLTE UL traffic
-   'VoLTE Traffic DL'                   -- VoLTE DL traffic
-   'Ave RRC Connected Ue'               -- Average connected users
-   'Max RRC Connected Ue'               -- Max connected users
-   'Average Act UE DL Per Cell'         -- Active DL users per cell
-   'Average Act UE UL Per Cell'         -- Active UL users per cell
-   'Availability'                       -- Site availability %
-   'Average NI of Carrier-'             -- Noise/interference
-   'DL PRB Utilization (1BH)'           -- DL PRB utilization %, congestion
-   'UL PRB Utilization (1BH)'           -- UL PRB utilization %
+   === KPI Names (EXACT values in kpi_name column — fetched from DB) ===
+{_kpi_list_str}
 
 2. telecom_sites(site_id, cell_id, latitude, longitude, zone)
    - JOIN: kpi_data k JOIN telecom_sites ts ON k.site_id = ts.site_id
@@ -270,24 +358,12 @@ Tables:
      Use MAX(num_value) (NOT SUM). Without this filter you get WRONG results.
 
 === Natural Language → KPI Mapping Guide ===
-User says "call drop" / "drop rate" / "CDR" / "call failure" → 'E-RAB Call Drop Rate_1'
-User says "throughput" / "speed" / "download speed" → 'LTE DL - Usr Ave Throughput' (user) or 'LTE DL - Cell Ave Throughput' (cell)
-User says "PRB" / "congestion" / "load" / "utilization" → 'DL PRB Utilization (1BH)'
-User says "availability" / "uptime" / "downtime" → 'Availability'
-User says "connected users" / "RRC users" / "active users" → 'Ave RRC Connected Ue'
-User says "handover" / "HO" → 'LTE Intra-Freq HO Success Rate'
-User says "VoLTE" / "voice" → 'VoLTE Traffic Erlang'
-User says "latency" / "delay" / "ping" → 'Average Latency Downlink'
-User says "data volume" / "traffic volume" → 'DL Data Total Volume'
-User says "call setup" / "CSSR" → 'LTE Call Setup Success Rate'
-User says "RRC" / "accessibility" / "access" → 'LTE RRC Setup Success Rate'
-User says "noise" / "interference" → 'Average NI of Carrier-'
 User says "revenue" / "income" / "earnings" → flexible_kpi_uploads WHERE kpi_type='revenue' AND column_name ILIKE '%revenue%' AND column_name ILIKE '%total%', use MAX(num_value) AS total_revenue
 User says "last 7 days" → AND k.date >= CURRENT_DATE - INTERVAL '7 days' AND k.date <= CURRENT_DATE
 User says "last month" → AND k.date >= CURRENT_DATE - INTERVAL '1 month' AND k.date <= CURRENT_DATE
 ALWAYS add AND k.date <= CURRENT_DATE when any date range is used, to exclude future data.
+IMPORTANT: Pick kpi_name from the EXACT list above. Do NOT invent or guess KPI names.
 """
-    SCHEMA_HINT = SCHEMA_HINT.replace("{flex_columns}", flex_columns)
 
     LLM_SYSTEM = f"""You are a telecom network analytics SQL generator. Your ONLY job is to convert the user's natural-language query into an EXACT, STRICT SQL query that fetches PRECISELY what was asked — nothing more, nothing less.
 
@@ -1326,72 +1402,9 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
     site_ids = re.findall(r'[A-Za-z]{2,}[_\-][A-Za-z]{2,}[_\-]\d{3,}', prompt)
     site_ids = list(dict.fromkeys(site_ids))
 
-    KPI_MAP = {
-        'cssr':          ('LTE Call Setup Success Rate', 'cssr'),
-        'call setup':    ('LTE Call Setup Success Rate', 'cssr'),
-        'rrc':           ('LTE RRC Setup Success Rate', 'rrc_sr'),
-        'erab':          ('E-RAB Call Drop Rate_1', 'drop_rate'),
-        'e-rab':         ('E-RAB Call Drop Rate_1', 'drop_rate'),
-        'e rab':         ('E-RAB Call Drop Rate_1', 'drop_rate'),
-        'drop':          ('E-RAB Call Drop Rate_1', 'drop_rate'),
-        'cdr':           ('E-RAB Call Drop Rate_1', 'drop_rate'),
-        'throughput':    ('LTE DL - Cell Ave Throughput', 'dl_tput'),
-        'tput':          ('LTE DL - Cell Ave Throughput', 'dl_tput'),
-        'dl throughput': ('LTE DL - Cell Ave Throughput', 'dl_tput'),
-        'speed':         ('LTE DL - Cell Ave Throughput', 'dl_tput'),
-        'prb':           ('DL PRB Utilization (1BH)', 'dl_prb'),
-        'congestion':    ('DL PRB Utilization (1BH)', 'dl_prb'),
-        'availability':  ('Availability', 'availability'),
-        'availab':       ('Availability', 'availability'),
-        'latency':       ('Average Latency Downlink', 'latency'),
-        'delay':         ('Average Latency Downlink', 'latency'),
-        'volte':         ('VoLTE Traffic Erlang', 'volte_erl'),
-        'handover':      ('LTE Intra-Freq HO Success Rate', 'ho_sr'),
-        'volume':        ('DL Data Total Volume', 'dl_volume'),
-        'traffic':       ('DL Data Total Volume', 'dl_volume'),
-        'connected':     ('Ave RRC Connected Ue', 'avg_rrc_ue'),
-        'users':         ('Ave RRC Connected Ue', 'avg_rrc_ue'),
-        'user throughput': ('LTE DL - Usr Ave Throughput', 'dl_usr_tput'),
-        'usr throughput':  ('LTE DL - Usr Ave Throughput', 'dl_usr_tput'),
-        'user tput':       ('LTE DL - Usr Ave Throughput', 'dl_usr_tput'),
-        'utilization':     ('DL PRB Utilization (1BH)', 'dl_prb_util'),
-        'noise':           ('Average NI of Carrier-', 'noise_interference'),
-        'interference':    ('Average NI of Carrier-', 'noise_interference'),
-    }
-
-    # Exact KPI name → (db_name, alias) mapping (takes priority over keywords)
-    EXACT_KPI_NAMES = {
-        'e-rab call drop rate_1':           ('E-RAB Call Drop Rate_1', 'drop_rate'),
-        'e-rab call drop rate':             ('E-RAB Call Drop Rate_1', 'drop_rate'),
-        'lte call setup success rate':      ('LTE Call Setup Success Rate', 'cssr'),
-        'lte rrc setup success rate':       ('LTE RRC Setup Success Rate', 'rrc_sr'),
-        'lte e-rab setup success rate':     ('LTE E-RAB Setup Success Rate', 'erab_setup_sr'),
-        'csfb access success rate':         ('CSFB Access Success Rate', 'csfb_sr'),
-        'lte intra-freq ho success rate':   ('LTE Intra-Freq HO Success Rate', 'intra_ho_sr'),
-        'intra-enb ho success rate':        ('Intra-eNB HO Success Rate', 'intra_enb_ho_sr'),
-        'inter-enbx2ho success rate':       ('Inter-eNBX2HO Success Rate', 'inter_x2_ho_sr'),
-        'inter-enbs1ho success rate':       ('Inter-eNBS1HO Success Rate', 'inter_s1_ho_sr'),
-        'dl prb utilization (1bh)':         ('DL PRB Utilization (1BH)', 'dl_prb_util'),
-        'dl prb utilization':               ('DL PRB Utilization (1BH)', 'dl_prb_util'),
-        'ul prb utilization (1bh)':         ('UL PRB Utilization (1BH)', 'ul_prb_util'),
-        'ul prb utilization':               ('UL PRB Utilization (1BH)', 'ul_prb_util'),
-        'lte dl - cell ave throughput':     ('LTE DL - Cell Ave Throughput', 'dl_cell_tput'),
-        'lte ul - cell ave throughput':     ('LTE UL - Cell Ave Throughput', 'ul_cell_tput'),
-        'lte dl - usr ave throughput':      ('LTE DL - Usr Ave Throughput', 'dl_usr_tput'),
-        'lte ul - user ave throughput':     ('LTE UL - User Ave Throughput', 'ul_usr_tput'),
-        'average latency downlink':         ('Average Latency Downlink', 'avg_latency'),
-        'dl data total volume':             ('DL Data Total Volume', 'dl_volume'),
-        'ul data total volume':             ('UL Data Total Volume', 'ul_volume'),
-        'volte traffic erlang':             ('VoLTE Traffic Erlang', 'volte_erl'),
-        'volte traffic ul':                 ('VoLTE Traffic UL', 'volte_ul'),
-        'volte traffic dl':                 ('VoLTE Traffic DL', 'volte_dl'),
-        'ave rrc connected ue':             ('Ave RRC Connected Ue', 'avg_rrc_ue'),
-        'max rrc connected ue':             ('Max RRC Connected Ue', 'max_rrc_ue'),
-        'average act ue dl per cell':       ('Average Act UE DL Per Cell', 'avg_act_ue_dl'),
-        'average act ue ul per cell':       ('Average Act UE UL Per Cell', 'avg_act_ue_ul'),
-        'availability':                     ('Availability', 'availability'),
-        'average ni of carrier-':           ('Average NI of Carrier-', 'noise_interference'),
-    }
+    # ── Dynamic KPI maps — built from actual DB kpi_names ──────────────────
+    KPI_MAP        = _dyn_kpi_map
+    EXACT_KPI_NAMES = _dyn_exact_map
 
     def _detect_kpis(text):
         found = []
@@ -1602,6 +1615,12 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
     if nums:
         N = min(int(nums[0]), 100)
 
+    # ── Detect user's ASC/DESC intent ────────────────────────────────────────
+    _wants_asc = any(w in p for w in ['lowest', 'bottom', 'least', 'minimum', 'worst', 'bad', 'poor'])
+    _wants_desc = any(w in p for w in ['highest', 'top', 'best', 'most', 'maximum'])
+    _user_order = "ASC" if (_wants_asc and not _wants_desc) else "DESC"
+    _user_label = "Bottom" if _user_order == "ASC" else "Top"
+
     def _kd_site_query(kpi_names_and_aliases, order_col, order_dir="DESC"):
         case_parts      = []
         kpi_names_for_in = []
@@ -1655,14 +1674,8 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
     # When user explicitly mentions 2+ KPIs, build query with ALL of them
     # instead of falling through to hardcoded keyword handlers.
     if len(detected_kpis) >= 2 and not site_ids and not is_trend:
-        order_dir = "DESC"
-        label_prefix = "Top"
-        if any(w in p for w in ['worst', 'lowest', 'bottom', 'bad', 'poor']):
-            order_dir = "DESC"
-            label_prefix = "Worst"
-        elif any(w in p for w in ['best', 'highest', 'top']):
-            order_dir = "DESC"
-            label_prefix = "Top"
+        order_dir = _user_order
+        label_prefix = _user_label
 
         order_col = detected_kpis[0][1]
 
@@ -1736,17 +1749,17 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
                       AND f.column_name ILIKE '%%revenue%%'
                       AND f.column_name ILIKE '%%total%%'
                     GROUP BY f.site_id
-                    ORDER BY total_revenue DESC NULLS LAST LIMIT {N}"""
+                    ORDER BY total_revenue {_user_order} NULLS LAST LIMIT {N}"""
             kpi_short = ", ".join(kn.replace("LTE ", "").replace("(1BH)", "").strip()
                                   for kn, _ in (net_kpis if net_kpis else [(kpi_name, alias)]))
             return {
                 "sql": combined_sql,
                 "query_type": "bar", "chart_type": "bar",
                 "chart_config": {"dual_axis": True},
-                "title": f"Top {N} Sites — Revenue & {kpi_short}"[:60],
+                "title": f"{_user_label} {N} Sites — Revenue & {kpi_short}"[:60],
                 "x_axis": "site_id",
                 "y_axes": y_axes_list,
-                "response": f"Showing top {N} sites with both high revenue and {kpi_short}.",
+                "response": f"Showing {_user_label.lower()} {N} sites with revenue and {kpi_short}.",
             }
         else:
             rev_sql = f"""SELECT site_id, MAX(num_value) AS total_revenue
@@ -1755,43 +1768,56 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
                       AND column_name ILIKE '%%revenue%%'
                       AND column_name ILIKE '%%total%%'
                     GROUP BY site_id
-                    ORDER BY total_revenue DESC NULLS LAST LIMIT {N}"""
+                    ORDER BY total_revenue {_user_order} NULLS LAST LIMIT {N}"""
             return {
                 "sql": rev_sql,
                 "query_type": "bar", "chart_type": "bar",
-                "title": f"Top {N} Sites by Revenue",
+                "title": f"{_user_label} {N} Sites by Revenue",
                 "x_axis": "site_id", "y_axes": ["total_revenue"],
-                "response": f"Showing top {N} sites by total revenue.",
+                "response": f"Showing {_user_label.lower()} {N} sites by total revenue.",
             }
 
     if 'rrc' in p or 'accessibility' in p:
-        sql = _kd_site_query([("LTE RRC Setup Success Rate","lte_rrc_setup_sr"),("LTE E-RAB Setup Success Rate","erab_setup_sr"),("LTE Call Setup Success Rate","lte_call_setup_sr"),("DL PRB Utilization (1BH)","dl_prb_util")],"lte_rrc_setup_sr","ASC")
-        return {"sql":sql,"query_type":"bar","title":f"RRC / Accessibility — Bottom {N}","x_axis":"site_id","y_axes":["lte_rrc_setup_sr","erab_setup_sr"],"response":f"Showing {N} sites with lowest RRC Setup Success Rate."}
+        _od = _user_order if (_wants_asc or _wants_desc) else "ASC"
+        _lb = _user_label if (_wants_asc or _wants_desc) else "Bottom"
+        sql = _kd_site_query([("LTE RRC Setup Success Rate","lte_rrc_setup_sr"),("LTE E-RAB Setup Success Rate","erab_setup_sr"),("LTE Call Setup Success Rate","lte_call_setup_sr"),("DL PRB Utilization (1BH)","dl_prb_util")],"lte_rrc_setup_sr",_od)
+        return {"sql":sql,"query_type":"bar","title":f"{_lb} {N} — RRC / Accessibility","x_axis":"site_id","y_axes":["lte_rrc_setup_sr","erab_setup_sr"],"response":f"Showing {_lb.lower()} {N} sites by RRC Setup Success Rate."}
 
     if 'volte' in p:
-        sql = _kd_site_query([("VoLTE Traffic Erlang","volte_traffic_erl"),("VoLTE Traffic DL","volte_dl"),("VoLTE Traffic UL","volte_ul")],"volte_traffic_erl","DESC")
-        return {"sql":sql,"query_type":"bar","title":f"Top {N} Sites — VoLTE Traffic","x_axis":"site_id","y_axes":["volte_traffic_erl"],"response":f"Showing {N} sites by VoLTE Erlang traffic."}
+        _od = _user_order if (_wants_asc or _wants_desc) else "DESC"
+        _lb = _user_label if (_wants_asc or _wants_desc) else "Top"
+        sql = _kd_site_query([("VoLTE Traffic Erlang","volte_traffic_erl"),("VoLTE Traffic DL","volte_dl"),("VoLTE Traffic UL","volte_ul")],"volte_traffic_erl",_od)
+        return {"sql":sql,"query_type":"bar","title":f"{_lb} {N} Sites — VoLTE Traffic","x_axis":"site_id","y_axes":["volte_traffic_erl"],"response":f"Showing {_lb.lower()} {N} sites by VoLTE Erlang traffic."}
 
     if 'handover' in p or ' ho ' in p or 'hsr' in p:
-        sql = _kd_site_query([("LTE Intra-Freq HO Success Rate","intra_freq_ho_sr"),("LTE RRC Setup Success Rate","lte_rrc_setup_sr"),("DL PRB Utilization (1BH)","dl_prb_util")],"intra_freq_ho_sr","ASC")
-        return {"sql":sql,"query_type":"bar","title":f"Bottom {N} — HO Success Rate","x_axis":"site_id","y_axes":["intra_freq_ho_sr"],"response":f"Showing {N} sites with worst Handover Success Rate."}
+        _od = _user_order if (_wants_asc or _wants_desc) else "ASC"
+        _lb = _user_label if (_wants_asc or _wants_desc) else "Bottom"
+        sql = _kd_site_query([("LTE Intra-Freq HO Success Rate","intra_freq_ho_sr"),("LTE RRC Setup Success Rate","lte_rrc_setup_sr"),("DL PRB Utilization (1BH)","dl_prb_util")],"intra_freq_ho_sr",_od)
+        return {"sql":sql,"query_type":"bar","title":f"{_lb} {N} — HO Success Rate","x_axis":"site_id","y_axes":["intra_freq_ho_sr"],"response":f"Showing {_lb.lower()} {N} sites by Handover Success Rate."}
 
     if 'drop' in p or 'cdr' in p:
-        sql = _kd_site_query([("E-RAB Call Drop Rate_1","erab_drop_rate"),("DL PRB Utilization (1BH)","dl_prb_util"),("LTE DL - Cell Ave Throughput","dl_cell_tput")],"erab_drop_rate","DESC")
-        return {"sql":sql,"query_type":"bar","title":f"Top {N} Call Drop Offenders","x_axis":"site_id","y_axes":["erab_drop_rate","dl_prb_util"],"response":f"Showing {N} sites with highest E-RAB call drop rate."}
+        _od = _user_order if (_wants_asc or _wants_desc) else "DESC"
+        _lb = _user_label if (_wants_asc or _wants_desc) else "Top"
+        sql = _kd_site_query([("E-RAB Call Drop Rate_1","erab_drop_rate"),("DL PRB Utilization (1BH)","dl_prb_util"),("LTE DL - Cell Ave Throughput","dl_cell_tput")],"erab_drop_rate",_od)
+        return {"sql":sql,"query_type":"bar","title":f"{_lb} {N} — Call Drop Rate","x_axis":"site_id","y_axes":["erab_drop_rate","dl_prb_util"],"response":f"Showing {_lb.lower()} {N} sites by E-RAB call drop rate."}
 
     if 'prb' in p or 'congestion' in p or 'congested' in p or 'overload' in p:
-        sql = _kd_site_query([("DL PRB Utilization (1BH)","dl_prb_util"),("UL PRB Utilization (1BH)","ul_prb_util"),("LTE DL - Cell Ave Throughput","dl_cell_tput"),("Ave RRC Connected Ue","avg_rrc_ue")],"dl_prb_util","DESC")
-        return {"sql":sql,"query_type":"bar","title":f"Top {N} Congested Sites (PRB)","x_axis":"site_id","y_axes":["dl_prb_util","ul_prb_util","dl_cell_tput"],"response":f"Showing top {N} sites by DL PRB Utilization."}
+        _od = _user_order if (_wants_asc or _wants_desc) else "DESC"
+        _lb = _user_label if (_wants_asc or _wants_desc) else "Top"
+        sql = _kd_site_query([("DL PRB Utilization (1BH)","dl_prb_util"),("UL PRB Utilization (1BH)","ul_prb_util"),("LTE DL - Cell Ave Throughput","dl_cell_tput"),("Ave RRC Connected Ue","avg_rrc_ue")],"dl_prb_util",_od)
+        return {"sql":sql,"query_type":"bar","title":f"{_lb} {N} — PRB Utilization","x_axis":"site_id","y_axes":["dl_prb_util","ul_prb_util","dl_cell_tput"],"response":f"Showing {_lb.lower()} {N} sites by DL PRB Utilization."}
 
     if 'throughput' in p or 'tput' in p or 'speed' in p or 'mbps' in p:
-        order = "ASC" if any(w in p for w in ['worst','low','bad','poor']) else "DESC"
-        sql = _kd_site_query([("LTE DL - Cell Ave Throughput","dl_cell_tput"),("LTE UL - Cell Ave Throughput","ul_cell_tput"),("DL PRB Utilization (1BH)","dl_prb_util")],"dl_cell_tput",order)
-        return {"sql":sql,"query_type":"bar","title":f"{'Bottom' if order=='ASC' else 'Top'} {N} — DL Throughput","x_axis":"site_id","y_axes":["dl_cell_tput","ul_cell_tput"],"response":f"{'Worst' if order=='ASC' else 'Best'} {N} sites by throughput."}
+        _od = _user_order if (_wants_asc or _wants_desc) else "DESC"
+        _lb = _user_label if (_wants_asc or _wants_desc) else "Top"
+        sql = _kd_site_query([("LTE DL - Cell Ave Throughput","dl_cell_tput"),("LTE UL - Cell Ave Throughput","ul_cell_tput"),("DL PRB Utilization (1BH)","dl_prb_util")],"dl_cell_tput",_od)
+        return {"sql":sql,"query_type":"bar","title":f"{_lb} {N} — DL Throughput","x_axis":"site_id","y_axes":["dl_cell_tput","ul_cell_tput"],"response":f"Showing {_lb.lower()} {N} sites by throughput."}
 
     if 'cssr' in p or 'call setup' in p or 'setup success' in p:
-        sql = _kd_site_query([("LTE Call Setup Success Rate","lte_cssr"),("LTE E-RAB Setup Success Rate","erab_setup_sr"),("E-RAB Call Drop Rate_1","erab_drop_rate")],"lte_cssr","ASC")
-        return {"sql":sql,"query_type":"bar","title":f"Bottom {N} — Call Setup Success","x_axis":"site_id","y_axes":["lte_cssr","erab_setup_sr"],"response":f"Showing {N} sites with lowest CSSR."}
+        _od = _user_order if (_wants_asc or _wants_desc) else "ASC"
+        _lb = _user_label if (_wants_asc or _wants_desc) else "Bottom"
+        sql = _kd_site_query([("LTE Call Setup Success Rate","lte_cssr"),("LTE E-RAB Setup Success Rate","erab_setup_sr"),("E-RAB Call Drop Rate_1","erab_drop_rate")],"lte_cssr",_od)
+        return {"sql":sql,"query_type":"bar","title":f"{_lb} {N} — Call Setup Success","x_axis":"site_id","y_axes":["lte_cssr","erab_setup_sr"],"response":f"Showing {_lb.lower()} {N} sites by CSSR."}
 
     if 'zone' in p or 'cluster' in p or 'cbd' in p or 'urban' in p or 'compar' in p:
         return {"sql":f"""SELECT ts.zone AS cluster, COUNT(DISTINCT k.site_id) AS sites,
@@ -1806,23 +1832,31 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
                 "query_type":"bar","title":"Zone-wise KPI Comparison","x_axis":"cluster","y_axes":["avg_prb","avg_tput","avg_drop"],"response":"Zone-level KPI comparison."}
 
     if 'availab' in p or 'downtime' in p or 'uptime' in p:
-        sql = _kd_site_query([("Availability","availability"),("DL PRB Utilization (1BH)","dl_prb_util")],"availability","ASC")
-        return {"sql":sql,"query_type":"bar","title":"Sites with Lowest Availability","x_axis":"site_id","y_axes":["availability"],"response":"Sites with lowest availability."}
+        _od = _user_order if (_wants_asc or _wants_desc) else "ASC"
+        _lb = _user_label if (_wants_asc or _wants_desc) else "Bottom"
+        sql = _kd_site_query([("Availability","availability"),("DL PRB Utilization (1BH)","dl_prb_util")],"availability",_od)
+        return {"sql":sql,"query_type":"bar","title":f"{_lb} {N} — Availability","x_axis":"site_id","y_axes":["availability"],"response":f"Showing {_lb.lower()} {N} sites by availability."}
 
     if 'latency' in p or 'delay' in p or 'ping' in p:
-        sql = _kd_site_query([("Average Latency Downlink","avg_latency"),("LTE DL - Usr Ave Throughput","dl_usr_tput")],"avg_latency","DESC")
-        return {"sql":sql,"query_type":"bar","title":f"Top {N} High Latency Sites","x_axis":"site_id","y_axes":["avg_latency"],"response":f"Showing {N} sites with highest latency."}
+        _od = _user_order if (_wants_asc or _wants_desc) else "DESC"
+        _lb = _user_label if (_wants_asc or _wants_desc) else "Top"
+        sql = _kd_site_query([("Average Latency Downlink","avg_latency"),("LTE DL - Usr Ave Throughput","dl_usr_tput")],"avg_latency",_od)
+        return {"sql":sql,"query_type":"bar","title":f"{_lb} {N} — Latency","x_axis":"site_id","y_axes":["avg_latency"],"response":f"Showing {_lb.lower()} {N} sites by latency."}
 
     if 'volume' in p or 'data volume' in p:
-        sql = _kd_site_query([("DL Data Total Volume","dl_volume"),("UL Data Total Volume","ul_volume"),("DL PRB Utilization (1BH)","dl_prb_util")],"dl_volume","DESC")
-        return {"sql":sql,"query_type":"bar","title":f"Top {N} by Data Volume","x_axis":"site_id","y_axes":["dl_volume","ul_volume"],"response":f"Showing {N} sites with highest data volume."}
+        _od = _user_order if (_wants_asc or _wants_desc) else "DESC"
+        _lb = _user_label if (_wants_asc or _wants_desc) else "Top"
+        sql = _kd_site_query([("DL Data Total Volume","dl_volume"),("UL Data Total Volume","ul_volume"),("DL PRB Utilization (1BH)","dl_prb_util")],"dl_volume",_od)
+        return {"sql":sql,"query_type":"bar","title":f"{_lb} {N} by Data Volume","x_axis":"site_id","y_axes":["dl_volume","ul_volume"],"response":f"Showing {_lb.lower()} {N} sites by data volume."}
 
     if 'user' in p or 'ue' in p or 'connected' in p:
-        sql = _kd_site_query([("Ave RRC Connected Ue","avg_rrc_ue"),("Max RRC Connected Ue","max_rrc_ue"),("DL PRB Utilization (1BH)","dl_prb_util")],"avg_rrc_ue","DESC")
-        return {"sql":sql,"query_type":"bar","title":f"Top {N} by Connected Users","x_axis":"site_id","y_axes":["avg_rrc_ue","max_rrc_ue"],"response":f"Showing {N} sites with most users."}
+        _od = _user_order if (_wants_asc or _wants_desc) else "DESC"
+        _lb = _user_label if (_wants_asc or _wants_desc) else "Top"
+        sql = _kd_site_query([("Ave RRC Connected Ue","avg_rrc_ue"),("Max RRC Connected Ue","max_rrc_ue"),("DL PRB Utilization (1BH)","dl_prb_util")],"avg_rrc_ue",_od)
+        return {"sql":sql,"query_type":"bar","title":f"{_lb} {N} by Connected Users","x_axis":"site_id","y_axes":["avg_rrc_ue","max_rrc_ue"],"response":f"Showing {_lb.lower()} {N} sites by connected users."}
 
-    sql = _kd_site_query([("DL PRB Utilization (1BH)","dl_prb_util"),("LTE DL - Cell Ave Throughput","dl_cell_tput"),("E-RAB Call Drop Rate_1","erab_drop_rate"),("LTE RRC Setup Success Rate","lte_rrc_setup_sr")],"dl_prb_util","DESC")
-    return {"sql":sql,"query_type":"bar","title":f"Top {N} Sites by PRB Utilization","x_axis":"site_id","y_axes":["dl_prb_util","dl_cell_tput","erab_drop_rate"],"response":f"Top {N} sites by PRB utilization."}
+    sql = _kd_site_query([("DL PRB Utilization (1BH)","dl_prb_util"),("LTE DL - Cell Ave Throughput","dl_cell_tput"),("E-RAB Call Drop Rate_1","erab_drop_rate"),("LTE RRC Setup Success Rate","lte_rrc_setup_sr")],"dl_prb_util",_user_order)
+    return {"sql":sql,"query_type":"bar","title":f"{_user_label} {N} Sites by PRB Utilization","x_axis":"site_id","y_axes":["dl_prb_util","dl_cell_tput","erab_drop_rate"],"response":f"{_user_label} {N} sites by PRB utilization."}
 
 
 def _rule_based_legacy(p: str, time_filter: str) -> dict:
