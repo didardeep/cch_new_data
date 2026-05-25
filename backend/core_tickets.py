@@ -1879,7 +1879,19 @@ def run_core_hourly_job(now: datetime | None = None,
 # Scheduler — runs every 60 seconds, fires the job at MM:55 of each hour and
 # also on startup to back-fill any missed hours.
 # ─────────────────────────────────────────────────────────────────────────────
+# Module-level guard so the scheduler thread can never start twice
+# in the same process (which would print every heartbeat / fire line
+# twice). Triggered by Flask debug-mode worker forks, socketio thread
+# duplication, or accidental double-registration in app.py.
+_SCHEDULER_STARTED = False
+
 def schedule_core_hourly_job(app):
+    global _SCHEDULER_STARTED
+    if _SCHEDULER_STARTED:
+        _LOG.warning("[CORE JOB] schedule_core_hourly_job called a second time — ignoring (already running)")
+        print(">>> [CORE JOB] scheduler already running, skipping duplicate start")
+        return
+    _SCHEDULER_STARTED = True
     import threading, time
 
     def _loop():
@@ -3552,11 +3564,10 @@ def upload_core_thresholds():
             summary[match] = {"sheet": sheet, "skipped": "missing kpi_name column"}
             continue
 
-        # Replace prior overrides for this component_type
-        try:
-            db.session.query(CoreKpiThreshold).filter_by(component_type=match).delete()
-        except Exception:
-            db.session.rollback()
+        # UPSERT mode — for thresholds we keep one row per
+        # (component_type, kpi_name) so an upload UPDATES the existing
+        # threshold rather than blindly appending duplicate rows that would
+        # violate the unique constraint.
 
         rows_added = 0
         unmatched = []
@@ -3580,21 +3591,24 @@ def upload_core_thresholds():
             canonical = _resolve_kpi_name(match, kpi_v) or kpi_v
             cfg_default = KPI_RANGES.get(match, {}).get(canonical, {})
 
-            row_obj = CoreKpiThreshold(
-                component_type=match,
-                kpi_name=canonical,
-                direction=inferred["direction"] or cfg_default.get("direction") or "higher_is_better",
-                normal_low=inferred["normal_low"] if inferred["normal_low"] is not None else cfg_default.get("normal_low"),
-                normal_high=inferred["normal_high"] if inferred["normal_high"] is not None else cfg_default.get("normal_high"),
-                degrade_low=inferred["degrade_low"],
-                degrade_high=inferred["degrade_high"],
-                critical_low=inferred["critical_low"] if inferred["critical_low"] is not None else cfg_default.get("critical_low"),
-                critical_high=inferred["critical_high"] if inferred["critical_high"] is not None else cfg_default.get("critical_high"),
-                unit=unit_v or cfg_default.get("unit") or "",
-                color=cfg_default.get("color") or "#64748b",
-                upload_batch=batch,
-            )
-            db.session.add(row_obj)
+            # UPSERT — if a threshold row already exists for this (component_type,
+            # kpi_name) update it in place; otherwise insert a new row.
+            existing = (CoreKpiThreshold.query
+                        .filter_by(component_type=match, kpi_name=canonical)
+                        .first())
+            target = existing or CoreKpiThreshold(component_type=match, kpi_name=canonical)
+            target.direction = inferred["direction"] or cfg_default.get("direction") or "higher_is_better"
+            target.normal_low = inferred["normal_low"] if inferred["normal_low"] is not None else (existing.normal_low if existing else cfg_default.get("normal_low"))
+            target.normal_high = inferred["normal_high"] if inferred["normal_high"] is not None else (existing.normal_high if existing else cfg_default.get("normal_high"))
+            target.degrade_low = inferred["degrade_low"] if inferred["degrade_low"] is not None else (existing.degrade_low if existing else None)
+            target.degrade_high = inferred["degrade_high"] if inferred["degrade_high"] is not None else (existing.degrade_high if existing else None)
+            target.critical_low = inferred["critical_low"] if inferred["critical_low"] is not None else (existing.critical_low if existing else cfg_default.get("critical_low"))
+            target.critical_high = inferred["critical_high"] if inferred["critical_high"] is not None else (existing.critical_high if existing else cfg_default.get("critical_high"))
+            target.unit = unit_v or (existing.unit if existing else None) or cfg_default.get("unit") or ""
+            target.color = (existing.color if existing else None) or cfg_default.get("color") or "#64748b"
+            target.upload_batch = batch
+            if not existing:
+                db.session.add(target)
             rows_added += 1
             if not KPI_RANGES.get(match, {}).get(canonical):
                 unmatched.append(kpi_v)
@@ -3736,12 +3750,9 @@ def upload_core_parameters():
         if not comp_cols:
             comp_cols = [c for c in df.columns if c not in fixed_cols and c is not None]
 
-        # Replace previous parameters for this component_type (atomic)
-        try:
-            db.session.query(CoreParameter).filter_by(component_type=match).delete()
-        except Exception:
-            db.session.rollback()
-
+        # APPEND mode — previous parameters for this component_type are kept.
+        # New rows are added on top. To start fresh, use the "Delete" button
+        # exposed in the admin UI (DELETE /api/admin/delete-core-parameters).
         rows_added = 0
         for _, row in df.iterrows():
             kpi_v = (str(row[kpi_col]).strip() if kpi_col and row[kpi_col] is not None else "") if kpi_col else ""
@@ -3780,6 +3791,57 @@ def upload_core_parameters():
         summary[match] = {"sheet": sheet, "rows": rows_added, "components": comp_cols}
 
     return jsonify({"success": True, "total_inserted": total_inserted, "by_component": summary, "batch": batch})
+
+
+@core_tickets_bp.route("/api/admin/delete-core-parameters", methods=["DELETE"])
+@jwt_required()
+def delete_core_parameters():
+    """Delete uploaded core parameters. ?component_type=MME deletes one
+    component's rows; without it deletes everything."""
+    user = _user_or_none()
+    if not user or user.role == "customer":
+        return jsonify({"error": "Forbidden"}), 403
+    component_type = (request.args.get("component_type") or "").upper().strip()
+    try:
+        if component_type:
+            n = (CoreParameter.query
+                 .filter(db.func.upper(db.func.trim(CoreParameter.component_type)) == component_type)
+                 .delete(synchronize_session=False))
+        else:
+            n = CoreParameter.query.delete(synchronize_session=False)
+        db.session.commit()
+        print(f"[CORE PARAM DELETE] {user.role}:{user.name} deleted {n} rows "
+              f"(component_type={component_type or 'ALL'})")
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+    return jsonify({"deleted": n, "component_type": component_type or "ALL"})
+
+
+@core_tickets_bp.route("/api/admin/delete-core-thresholds", methods=["DELETE"])
+@jwt_required()
+def delete_core_thresholds():
+    """Delete uploaded KPI thresholds (DB-side overrides). With no filter,
+    deletes everything (defaults from KPI_RANGES still apply)."""
+    user = _user_or_none()
+    if not user or user.role == "customer":
+        return jsonify({"error": "Forbidden"}), 403
+    component_type = (request.args.get("component_type") or "").upper().strip()
+    try:
+        if component_type:
+            n = (CoreKpiThreshold.query
+                 .filter(db.func.upper(db.func.trim(CoreKpiThreshold.component_type)) == component_type)
+                 .delete(synchronize_session=False))
+        else:
+            n = CoreKpiThreshold.query.delete(synchronize_session=False)
+        db.session.commit()
+        _bust_threshold_cache()
+        print(f"[CORE THRESHOLD DELETE] {user.role}:{user.name} deleted {n} rows "
+              f"(component_type={component_type or 'ALL'})")
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"error": str(e)}), 500
+    return jsonify({"deleted": n, "component_type": component_type or "ALL"})
 
 
 @core_tickets_bp.route("/api/admin/core-parameters/status", methods=["GET"])

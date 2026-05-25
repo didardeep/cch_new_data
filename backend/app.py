@@ -7261,18 +7261,14 @@ def admin_upload_core_component_kpi():
     except Exception:
         pass
 
-    # Delete only this component's data (not all components)
-    try:
-        with db.engine.connect() as conn:
-            if _upload_comp_type:
-                conn.execute(text("DELETE FROM core_component_kpi WHERE component_type = :ct"), {"ct": _upload_comp_type})
-                app.logger.info(f"Deleted existing {_upload_comp_type} data before upload")
-            else:
-                conn.execute(text("DELETE FROM core_component_kpi"))
-                app.logger.info("Deleted ALL core component data (could not detect specific component type)")
-            conn.commit()
-    except Exception:
-        pass
+    # APPEND mode — previous core_component_kpi rows for this component_type
+    # are kept. New rows from this upload are appended on top. The operator
+    # can wipe via the "Delete" button in the admin UI
+    # (DELETE /api/admin/delete-core-component-kpi?component_type=…).
+    if _upload_comp_type:
+        app.logger.info(f"Appending {_upload_comp_type} rows on top of existing data (no pre-delete)")
+    else:
+        app.logger.info("Appending core component rows on top of existing data (no pre-delete)")
 
     def _detect_comp_type_from_id(comp_id):
         """Extract component type from component ID like MME1 → MME, SGW2 → SGW."""
@@ -7602,17 +7598,43 @@ def admin_core_component_kpi_status():
 def admin_delete_core_component_kpi():
     """Delete core component KPI data. Optional ?component_type=MME to delete only one component."""
     user = User.query.get(int(get_jwt_identity()))
-    if not user or user.role not in ("admin", "cto"):
-        return jsonify({"error": "Unauthorized"}), 403
+    if not user:
+        return jsonify({"error": "Unauthorized — no user found for this token"}), 403
+    # Allow any authenticated employee role (admin/cto/manager/human_agent).
+    # Customers are still rejected.
+    if user.role == "customer":
+        return jsonify({
+            "error": "Forbidden — customers cannot delete core KPI data",
+            "your_role": user.role,
+        }), 403
     comp_type = request.args.get("component_type", "").strip().upper()
+    print(f"[CORE DELETE] {user.role}:{user.name} requested delete of "
+          f"core_component_kpi (component_type={comp_type or 'ALL'})")
+    valid_types = ("MME", "SGW", "PGW", "HSS", "PCRF")
+    if comp_type and comp_type not in valid_types:
+        return jsonify({"error": f"Invalid component_type '{comp_type}'. Must be one of {valid_types}."}), 400
     try:
-        with db.engine.connect() as conn:
-            if comp_type and comp_type in ("MME", "SGW", "PGW", "HSS", "PCRF"):
-                r = conn.execute(text("DELETE FROM core_component_kpi WHERE component_type = :ct"), {"ct": comp_type})
-            else:
-                r = conn.execute(text("DELETE FROM core_component_kpi"))
-            conn.commit()
-            deleted = r.rowcount
+        # Use the session so it commits cleanly and any error reaches us.
+        if comp_type:
+            r = db.session.execute(
+                text("DELETE FROM core_component_kpi WHERE component_type = :ct"),
+                {"ct": comp_type},
+            )
+        else:
+            r = db.session.execute(text("DELETE FROM core_component_kpi"))
+        deleted = r.rowcount or 0
+        db.session.commit()
+        print(f"[CORE DELETE] Successfully deleted {deleted} rows "
+              f"(component_type={comp_type or 'ALL'})")
+    except Exception as e:
+        db.session.rollback()
+        import traceback as _tb
+        _tb.print_exc()
+        print(f"[CORE DELETE] FAILED: {e}")
+        return jsonify({"error": f"Delete failed: {type(e).__name__}: {e}",
+                        "component_type": comp_type or "ALL"}), 500
+    try:
+        clear_analytics_cache()
     except Exception:
         deleted = 0
     clear_analytics_cache()

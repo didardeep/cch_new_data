@@ -856,7 +856,29 @@ export default function DataUpload() {
                       {uploadingCore === comp.type ? 'Uploading…' : `Upload ${comp.type} KPIs`}
                     </button>
                     <button className="btn btn-sm" disabled={deletingCore === comp.type || !cs?.rows}
-                      onClick={async () => { if (!window.confirm(`Delete ALL ${comp.type} KPI data?`)) return; setDeletingCore(comp.type); try { const token = localStorage.getItem('token'); await fetch(`${API_BASE}/api/admin/delete-core-component-kpi?component_type=${comp.type}`, { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } }); fetchCoreCompStatusByType(); fetchCoreCompStatus(); setSuccess(`${comp.type} data deleted.`); } catch {} setDeletingCore(''); }}
+                      onClick={async () => {
+                        if (!window.confirm(`Delete ALL ${comp.type} KPI data?`)) return;
+                        setDeletingCore(comp.type);
+                        setError(''); setSuccess('');
+                        try {
+                          const token = getToken();
+                          const resp = await fetch(`${API_BASE}/api/admin/delete-core-component-kpi?component_type=${comp.type}`, {
+                            method: 'DELETE',
+                            headers: { Authorization: `Bearer ${token}` },
+                          });
+                          const d = await resp.json().catch(() => ({}));
+                          if (!resp.ok) {
+                            setError(`${comp.type} delete failed: ${d.error || resp.statusText} (HTTP ${resp.status})`);
+                          } else {
+                            setSuccess(`${comp.type}: deleted ${d.deleted ?? 0} rows.`);
+                            await fetchCoreCompStatusByType();
+                            await fetchCoreCompStatus();
+                          }
+                        } catch (e) {
+                          setError(`${comp.type} delete failed: ${e.message || String(e)}`);
+                        }
+                        setDeletingCore('');
+                      }}
                       style={{ background: '#dc2626', color: '#fff', border: 'none', borderRadius: 6, padding: '5px 12px', fontSize: 11, fontWeight: 600, cursor: !cs?.rows ? 'not-allowed' : 'pointer', opacity: !cs?.rows ? 0.5 : 1 }}>
                       {deletingCore === comp.type ? 'Deleting…' : `Delete ${comp.type}`}
                     </button>
@@ -1189,7 +1211,18 @@ export default function DataUpload() {
         <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
           <input type="file" accept=".xlsx,.xlsm" onChange={e => setCoreThrFile(e.target.files[0] || null)} style={{ fontSize: 13 }} />
           <button className="btn btn-primary btn-sm" onClick={uploadCoreThresholds} disabled={!coreThrFile || uploadingCoreThr}>
-            {uploadingCoreThr ? 'Uploading…' : 'Upload Thresholds'}
+            {uploadingCoreThr ? 'Uploading…' : 'Upload Thresholds (UPSERT)'}
+          </button>
+          <button className="btn btn-sm" onClick={async () => {
+            if (!window.confirm('Delete ALL uploaded KPI thresholds? (Built-in defaults will still apply.)')) return;
+            try {
+              const token = getToken();
+              await fetch(`${API_BASE}/api/admin/delete-core-thresholds`, { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } });
+              fetchCoreThrStatus();
+              setSuccess('All thresholds deleted.');
+            } catch (e) { setError(String(e)); }
+          }} style={{ background: '#dc2626', color: '#fff', border: 'none', borderRadius: 6, padding: '6px 14px', fontSize: 12, fontWeight: 600, cursor: 'pointer' }}>
+            Delete All Thresholds
           </button>
         </div>
         {coreThrStatus?.by_component && Object.keys(coreThrStatus.by_component).length > 0 && (
@@ -1240,7 +1273,18 @@ export default function DataUpload() {
         <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
           <input type="file" accept=".xlsx,.xlsm" onChange={e => setCoreParamFile(e.target.files[0] || null)} style={{ fontSize: 13 }} />
           <button className="btn btn-primary btn-sm" onClick={uploadCoreParameters} disabled={!coreParamFile || uploadingCoreParam}>
-            {uploadingCoreParam ? 'Uploading…' : 'Upload Core Parameters'}
+            {uploadingCoreParam ? 'Uploading…' : 'Upload Core Parameters (APPEND)'}
+          </button>
+          <button className="btn btn-sm" onClick={async () => {
+            if (!window.confirm('Delete ALL uploaded core parameters?')) return;
+            try {
+              const token = getToken();
+              await fetch(`${API_BASE}/api/admin/delete-core-parameters`, { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } });
+              fetchCoreParamStatus();
+              setSuccess('All core parameters deleted.');
+            } catch (e) { setError(String(e)); }
+          }} style={{ background: '#dc2626', color: '#fff', border: 'none', borderRadius: 6, padding: '6px 14px', fontSize: 12, fontWeight: 600, cursor: 'pointer' }}>
+            Delete All Parameters
           </button>
         </div>
 
