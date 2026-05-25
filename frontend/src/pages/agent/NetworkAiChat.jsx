@@ -333,6 +333,28 @@ function InlineChart({result,T,chartId}) {
         </ResponsiveContainer>);
     }
 
+    // DUAL-AXIS BAR — when chart_config.dual_axis is set (values with very different scales)
+    if(ctype==='bar'&&cfg.dual_axis&&yKeys.length>=2){
+      const lVals=data.map(r=>parseFloat(r[yKeys[0]])).filter(v=>!isNaN(v));
+      const rVals=data.map(r=>parseFloat(r[yKeys[1]])).filter(v=>!isNaN(v));
+      const domainOf=vals=>{if(!vals.length)return[0,'auto'];const mn=Math.min(...vals),mx=Math.max(...vals),rng=mx-mn||1,p=rng*.1;return[Math.max(0,Math.floor((mn-p)*100)/100),Math.ceil((mx+p)*100)/100];};
+      const fmtBig=v=>v>=1e6?(v/1e6).toFixed(1)+'M':v>=1e3?(v/1e3).toFixed(0)+'K':f(v,1);
+      return(
+        <ResponsiveContainer width="100%" height={h+20}>
+          <BarChart data={data} margin={{top:5,right:55,left:15,bottom:40}}>
+            <CartesianGrid strokeDasharray="3 3" stroke={T.border} vertical={false}/>
+            <XAxis dataKey={xKey} tick={{fontSize:8,fill:T.muted}} axisLine={false} tickLine={false} angle={-35} textAnchor="end" tickFormatter={shortLbl}/>
+            <YAxis yAxisId="left" tick={{fontSize:9,fill:T.muted}} axisLine={false} tickLine={false} width={55} domain={domainOf(lVals)} tickFormatter={fmtBig} label={yKeys[0]?{value:keyLabel(yKeys[0]).slice(0,18),angle:-90,position:'insideLeft',fontSize:8,fill:T.muted,dx:-8}:undefined}/>
+            <YAxis yAxisId="right" orientation="right" tick={{fontSize:9,fill:T.muted}} axisLine={false} tickLine={false} width={45} domain={domainOf(rVals)} tickFormatter={v=>f(v,1)} label={yKeys[1]?{value:keyLabel(yKeys[1]).slice(0,18),angle:90,position:'insideRight',fontSize:8,fill:T.muted,dx:8}:undefined}/>
+            <Tooltip content={<TipC/>} cursor={{fill:T.kpmgBlue+'0a'}}/>
+            {yKeys.slice(0,2).map((k,i)=>(
+              <Bar key={k} yAxisId={i===0?'left':'right'} dataKey={k} name={keyLabel(k)} radius={[6,6,0,0]} fill={PAL[i%PAL.length]} barSize={18} animationDuration={1200} animationEasing="ease-in-out"/>
+            ))}
+            <Legend iconType="circle" iconSize={7} wrapperStyle={{fontSize:10}}/>
+          </BarChart>
+        </ResponsiveContainer>);
+    }
+
     // BAR
     const isHorizontal=data.length>8||typeof data[0]?.[xKey]==='string';
     if(isHorizontal){

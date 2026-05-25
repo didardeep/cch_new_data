@@ -179,6 +179,136 @@ def _ensure_kpi_indexes():
         pass
 
 
+def _ensure_kpi_data_merged_view():
+    """Create the kpi_data_merged materialized view if it does not exist.
+
+    app.py also creates this during startup. Keeping this helper here lets
+    network_ai and upload hooks refresh the view without importing app.py and
+    creating a circular dependency.
+    """
+    ddl = """
+        CREATE MATERIALIZED VIEW IF NOT EXISTS kpi_data_merged AS
+        SELECT id, site_id, site_abs_id, kpi_name, date, hour, value,
+               data_level, cell_id, cell_site_id
+        FROM kpi_data
+        WHERE data_level = 'site'
+        UNION ALL
+        SELECT
+            MIN(k.id)            AS id,
+            k.site_id,
+            MAX(k.site_abs_id)   AS site_abs_id,
+            k.kpi_name,
+            k.date,
+            0                    AS hour,
+            AVG(k.value)         AS value,
+            'site'               AS data_level,
+            NULL::varchar        AS cell_id,
+            NULL::varchar        AS cell_site_id
+        FROM kpi_data k
+        WHERE k.data_level = 'cell' AND k.value IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM kpi_data s
+              WHERE s.site_id    = k.site_id
+                AND s.kpi_name   = k.kpi_name
+                AND s.date       = k.date
+                AND s.data_level = 'site'
+          )
+        GROUP BY k.site_id, k.kpi_name, k.date
+        WITH DATA
+    """
+    idx_ddls = [
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_kdm_id ON kpi_data_merged (id)",
+        "CREATE INDEX IF NOT EXISTS idx_kdm_site_kpi_date ON kpi_data_merged (site_id, kpi_name, date)",
+        "CREATE INDEX IF NOT EXISTS idx_kdm_kpi_date ON kpi_data_merged (kpi_name, date) WHERE value IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS idx_kdm_level_kpi_date ON kpi_data_merged (data_level, kpi_name, date)",
+    ]
+    try:
+        with db.engine.connect() as conn:
+            conn.execute(sa_text(ddl))
+            conn.commit()
+            for idx in idx_ddls:
+                try:
+                    conn.execute(sa_text(idx))
+                    conn.commit()
+                except Exception as exc:
+                    _LOG.warning("kpi_data_merged index setup skipped: %s", exc)
+    except Exception as exc:
+        _LOG.warning("kpi_data_merged materialized view setup skipped: %s", exc)
+
+
+def refresh_kpi_data_merged():
+    """Refresh the merged KPI materialized view, best-effort."""
+    _ensure_kpi_data_merged_view()
+    try:
+        with db.engine.connect() as conn:
+            conn.execute(sa_text("REFRESH MATERIALIZED VIEW CONCURRENTLY kpi_data_merged"))
+            conn.commit()
+    except Exception:
+        try:
+            with db.engine.connect() as conn:
+                conn.execute(sa_text("REFRESH MATERIALIZED VIEW kpi_data_merged"))
+                conn.commit()
+        except Exception as exc:
+            _LOG.warning("kpi_data_merged refresh skipped: %s", exc)
+    clear_analytics_cache()
+
+
+def _ensure_kpi_data_stats_table():
+    """Create a compact KPI inventory table used by startup/upload hooks."""
+    ddl = """
+        CREATE TABLE IF NOT EXISTS kpi_data_stats (
+            data_level   VARCHAR(10) NOT NULL,
+            kpi_name     VARCHAR(100) NOT NULL,
+            row_count    BIGINT NOT NULL DEFAULT 0,
+            site_count   BIGINT NOT NULL DEFAULT 0,
+            cell_count   BIGINT NOT NULL DEFAULT 0,
+            date_from    DATE,
+            date_to      DATE,
+            updated_at   TIMESTAMP NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (data_level, kpi_name)
+        )
+    """
+    try:
+        with db.engine.connect() as conn:
+            conn.execute(sa_text(ddl))
+            conn.commit()
+    except Exception as exc:
+        _LOG.warning("kpi_data_stats table setup skipped: %s", exc)
+
+
+def upsert_kpi_data_stats():
+    """Refresh KPI inventory stats after KPI upload/delete operations."""
+    _ensure_kpi_data_stats_table()
+    try:
+        with db.engine.connect() as conn:
+            conn.execute(sa_text("TRUNCATE TABLE kpi_data_stats"))
+            conn.execute(sa_text("""
+                INSERT INTO kpi_data_stats (
+                    data_level, kpi_name, row_count, site_count, cell_count,
+                    date_from, date_to, updated_at
+                )
+                SELECT
+                    COALESCE(data_level, 'site') AS data_level,
+                    kpi_name,
+                    COUNT(*) AS row_count,
+                    COUNT(DISTINCT site_id) AS site_count,
+                    COUNT(DISTINCT CASE
+                        WHEN data_level = 'cell' AND cell_id IS NOT NULL AND cell_id <> ''
+                        THEN site_id || ':' || cell_id
+                    END) AS cell_count,
+                    MIN(date) AS date_from,
+                    MAX(date) AS date_to,
+                    NOW() AS updated_at
+                FROM kpi_data
+                WHERE kpi_name IS NOT NULL
+                GROUP BY COALESCE(data_level, 'site'), kpi_name
+            """))
+            conn.commit()
+    except Exception as exc:
+        _LOG.warning("kpi_data_stats refresh skipped: %s", exc)
+    clear_analytics_cache()
+
+
 def _cache_key(prefix: str, params: dict) -> str:
     raw = json.dumps(params, sort_keys=True)
     return f"{prefix}:{hashlib.md5(raw.encode()).hexdigest()}"
@@ -923,11 +1053,12 @@ def _flex_kpi_trend(kpi_type: str, column_name: str) -> list[dict]:
 
 def _sql(query: str, params: dict = None, timeout_ms: int = 0) -> list[dict]:
     with db.engine.connect() as conn:
-        if timeout_ms > 0:
-            conn.execute(sa_text(f"SET LOCAL statement_timeout = '{timeout_ms}'"))
-        result = conn.execute(sa_text(query), params or {})
-        cols = list(result.keys())
-        return [dict(zip(cols, row)) for row in result.fetchall()]
+        with conn.begin():
+            if timeout_ms > 0:
+                conn.execute(sa_text(f"SET LOCAL statement_timeout = '{timeout_ms}'"))
+            result = conn.execute(sa_text(query), params or {})
+            cols = list(result.keys())
+            return [dict(zip(cols, row)) for row in result.fetchall()]
 
 
 _TS_COLS_CACHE: set[str] | None = None
@@ -2455,7 +2586,7 @@ def _ran_pull_per_site(filters, kpi_names, start, end):
                MAX(ts.zone)      AS zone,
                AVG(ts.latitude)  AS lat,
                AVG(ts.longitude) AS lng
-        FROM kpi_data k
+        FROM kpi_data_merged k
         LEFT JOIN telecom_sites ts ON LOWER(k.site_id) = LOWER(ts.site_id)
         WHERE k.value IS NOT NULL
           AND k.kpi_name IN ({in_clause})
@@ -2464,23 +2595,60 @@ def _ran_pull_per_site(filters, kpi_names, start, end):
         GROUP BY k.site_id, k.kpi_name
     """, params, timeout_ms=10000)
     _LOG.info("_ran_pull_per_site: %d rows window=%s→%s", len(rows), start, end)
-    if not rows and date_cond:
-        # Fallback: no date window
-        np = {k: v for k, v in params.items() if k not in ("_r_start", "_r_end")}
-        rows = _sql(f"""
-            SELECT k.site_id, k.kpi_name,
-                   AVG(k.value)      AS v,
-                   MAX(ts.zone)      AS zone,
-                   AVG(ts.latitude)  AS lat,
-                   AVG(ts.longitude) AS lng
-            FROM kpi_data k
-            LEFT JOIN telecom_sites ts ON LOWER(k.site_id) = LOWER(ts.site_id)
-            WHERE k.value IS NOT NULL
-              AND k.kpi_name IN ({in_clause})
-              {geo_where}
-            GROUP BY k.site_id, k.kpi_name
-        """, np)
-        _LOG.info("_ran_pull_per_site (no-date fallback): %d rows", len(rows))
+    if date_cond:
+        present = {r.get("kpi_name") for r in rows}
+        missing = [n for n in kpi_names if n not in present]
+        if rows and missing:
+            fp = dict(geo_params)
+            fph = []
+            for i, n in enumerate(missing):
+                key = f"_rfkn{i}"
+                fp[key] = n
+                fph.append(f":{key}")
+            fp["_rf_days"] = max(1, int((end - start).days))
+            fin = ",".join(fph)
+            fallback_rows = _sql(f"""
+                WITH latest AS (
+                    SELECT kpi_name, MAX(date) AS mx
+                    FROM kpi_data_merged
+                    WHERE kpi_name IN ({fin}) AND value IS NOT NULL
+                    GROUP BY kpi_name
+                )
+                SELECT k.site_id, k.kpi_name,
+                       AVG(k.value)      AS v,
+                       MAX(ts.zone)      AS zone,
+                       AVG(ts.latitude)  AS lat,
+                       AVG(ts.longitude) AS lng
+                FROM kpi_data_merged k
+                JOIN latest l ON l.kpi_name = k.kpi_name
+                LEFT JOIN telecom_sites ts ON LOWER(k.site_id) = LOWER(ts.site_id)
+                WHERE k.value IS NOT NULL
+                  AND k.kpi_name IN ({fin})
+                  AND k.date >= l.mx - (:_rf_days * INTERVAL '1 day')
+                  AND k.date <= l.mx
+                  {geo_where}
+                GROUP BY k.site_id, k.kpi_name
+            """, fp, timeout_ms=10000)
+            rows.extend(fallback_rows)
+            _LOG.info("_ran_pull_per_site (per-kpi fallback): %d rows for %d missing KPIs",
+                      len(fallback_rows), len(missing))
+        elif not rows:
+            # Fallback: no date window
+            np = {k: v for k, v in params.items() if k not in ("_r_start", "_r_end")}
+            rows = _sql(f"""
+                SELECT k.site_id, k.kpi_name,
+                       AVG(k.value)      AS v,
+                       MAX(ts.zone)      AS zone,
+                       AVG(ts.latitude)  AS lat,
+                       AVG(ts.longitude) AS lng
+                FROM kpi_data_merged k
+                LEFT JOIN telecom_sites ts ON LOWER(k.site_id) = LOWER(ts.site_id)
+                WHERE k.value IS NOT NULL
+                  AND k.kpi_name IN ({in_clause})
+                  {geo_where}
+                GROUP BY k.site_id, k.kpi_name
+            """, np)
+            _LOG.info("_ran_pull_per_site (no-date fallback): %d rows", len(rows))
     return rows
 
 
@@ -2503,7 +2671,7 @@ def _ran_pull_per_date(filters, kpi_names, start, end):
         date_cond = " AND k.date >= :_r_start AND k.date <= :_r_end"
     rows = _sql(f"""
         SELECT k.kpi_name, k.date::text AS date, AVG(k.value) AS v
-        FROM kpi_data k
+        FROM kpi_data_merged k
         LEFT JOIN telecom_sites ts ON LOWER(k.site_id) = LOWER(ts.site_id)
         WHERE k.value IS NOT NULL
           AND k.kpi_name IN ({in_clause})
@@ -2513,19 +2681,54 @@ def _ran_pull_per_date(filters, kpi_names, start, end):
         ORDER BY k.date
     """, params, timeout_ms=10000)
     _LOG.info("_ran_pull_per_date: %d rows window=%s→%s", len(rows), start, end)
-    if not rows and date_cond:
-        np = {k: v for k, v in params.items() if k not in ("_r_start", "_r_end")}
-        rows = _sql(f"""
-            SELECT k.kpi_name, k.date::text AS date, AVG(k.value) AS v
-            FROM kpi_data k
-            LEFT JOIN telecom_sites ts ON LOWER(k.site_id) = LOWER(ts.site_id)
-            WHERE k.value IS NOT NULL
-              AND k.kpi_name IN ({in_clause})
-              {geo_where}
-            GROUP BY k.kpi_name, k.date
-            ORDER BY k.date
-        """, np)
-        _LOG.info("_ran_pull_per_date (no-date fallback): %d rows", len(rows))
+    if date_cond:
+        present = {r.get("kpi_name") for r in rows}
+        missing = [n for n in kpi_names if n not in present]
+        if rows and missing:
+            fp = dict(geo_params)
+            fph = []
+            for i, n in enumerate(missing):
+                key = f"_rdfkn{i}"
+                fp[key] = n
+                fph.append(f":{key}")
+            fp["_rdf_days"] = max(1, int((end - start).days))
+            fin = ",".join(fph)
+            fallback_rows = _sql(f"""
+                WITH latest AS (
+                    SELECT kpi_name, MAX(date) AS mx
+                    FROM kpi_data_merged
+                    WHERE kpi_name IN ({fin}) AND value IS NOT NULL
+                    GROUP BY kpi_name
+                )
+                SELECT k.kpi_name, k.date::text AS date, AVG(k.value) AS v
+                FROM kpi_data_merged k
+                JOIN latest l ON l.kpi_name = k.kpi_name
+                LEFT JOIN telecom_sites ts ON LOWER(k.site_id) = LOWER(ts.site_id)
+                WHERE k.value IS NOT NULL
+                  AND k.kpi_name IN ({fin})
+                  AND k.date >= l.mx - (:_rdf_days * INTERVAL '1 day')
+                  AND k.date <= l.mx
+                  {geo_where}
+                GROUP BY k.kpi_name, k.date
+                ORDER BY k.date
+            """, fp, timeout_ms=10000)
+            rows.extend(fallback_rows)
+            rows.sort(key=lambda r: r.get("date") or "")
+            _LOG.info("_ran_pull_per_date (per-kpi fallback): %d rows for %d missing KPIs",
+                      len(fallback_rows), len(missing))
+        elif not rows:
+            np = {k: v for k, v in params.items() if k not in ("_r_start", "_r_end")}
+            rows = _sql(f"""
+                SELECT k.kpi_name, k.date::text AS date, AVG(k.value) AS v
+                FROM kpi_data_merged k
+                LEFT JOIN telecom_sites ts ON LOWER(k.site_id) = LOWER(ts.site_id)
+                WHERE k.value IS NOT NULL
+                  AND k.kpi_name IN ({in_clause})
+                  {geo_where}
+                GROUP BY k.kpi_name, k.date
+                ORDER BY k.date
+            """, np)
+            _LOG.info("_ran_pull_per_date (no-date fallback): %d rows", len(rows))
     return rows
 
 
