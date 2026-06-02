@@ -654,65 +654,16 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
     _LOG.info("AI providers available: %s", [p[0] for p in _providers])
     if not _providers:
         _LOG.warning("No LLM providers configured — will use rule-based engine only")
+        print("[AI] WARNING: No LLM providers! Set OPENAI_API_KEY in .env")
     print(f"[AI] Providers: {[p[0] for p in _providers]}, prompt: {prompt[:80]}")
+    if not openai_key:
+        print("[AI] NOTE: OPENAI_API_KEY not set — add it to .env for OpenAI fallback")
 
     # ── PRE-LLM INTERCEPTOR ────────────────────────────────────────────────────
-    # Handle certain query patterns with rule-based logic BEFORE calling the LLM.
-    # This ensures follow-ups (site switch, time change, chart type) and
-    # multi-site trend queries are handled correctly and consistently,
-    # regardless of which LLM provider is configured.
-    import re as _re_pre
-
-    def _get_prev_context_for_intercept():
-        """Load the most recent assistant message's content_json from the session."""
-        if not (ai_session and session_id):
-            return None
-        try:
-            last_asst = (NetworkAiMessage.query
-                         .filter_by(session_id=session_id, role="assistant")
-                         .order_by(NetworkAiMessage.created_at.desc())
-                         .first())
-            return last_asst.content_json if last_asst else None
-        except Exception:
-            return None
-
+    # Only revenue is intercepted — everything else goes to LLM.
     _p_lower = prompt.lower().strip()
-    _prompt_sites = _re_pre.findall(r'[A-Za-z]{2,}[_\-][A-Za-z]{2,}[_\-]\d{3,}', prompt)
-    _prompt_days  = _re_pre.search(r'last\s+(\d+)\s*days?', _p_lower)
 
-    # 1. Follow-up detection — run rule-based BEFORE LLM so context is never lost
-    _followup_detected = _is_followup(_p_lower)
-    if _followup_detected:
-        _prev_ctx = _get_prev_context_for_intercept()
-        if _prev_ctx:
-            _fu = _handle_followup(prompt, _p_lower, _prev_ctx, time_filter)
-            if _fu:
-                ai_result = _fu
-                provider  = {"provider": "rule-based-followup"}
-                print(f"[AI] INTERCEPTED as follow-up (skipping LLM)")
-                _LOG.info("Follow-up intercepted before LLM: site-switch / chart-change / time-change")
-            else:
-                print(f"[AI] Follow-up detected but handler returned None — passing to LLM")
-        else:
-            print(f"[AI] Follow-up detected but no prev context — passing to LLM")
-    else:
-        print(f"[AI] Not a follow-up — will try LLM")
-
-    # 2. Multi-site trend queries — rule-based reliably generates one chart per site
-    #    with ALL requested KPIs, which LLMs often get wrong.
-    if not ai_result and len(_prompt_sites) >= 2:
-        _is_trend_pre = (
-            bool(_prompt_days) or
-            any(w in _p_lower for w in ('trend', 'over time', 'history', 'daily', 'last'))
-        )
-        if _is_trend_pre:
-            ai_result = _rule_based_query(prompt, time_filter, prev_context=None)
-            provider  = {"provider": "rule-based-multisite"}
-            print(f"[AI] INTERCEPTED as multi-site trend (skipping LLM)")
-            _LOG.info("Multi-site trend intercepted before LLM: %s", _prompt_sites)
-
-    # 3. Revenue queries — rule-based always uses the correct Total Revenue column;
-    #    LLMs keep generating wrong SQL for revenue, so intercept here.
+    # Revenue queries — rule-based always uses the correct Total Revenue column;
     if not ai_result and 'revenue' in _p_lower:
         ai_result = _rule_based_query(prompt, time_filter, prev_context=None)
         provider  = {"provider": "rule-based-revenue"}
@@ -1403,8 +1354,9 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
     site_ids = list(dict.fromkeys(site_ids))
 
     # ── Dynamic KPI maps — built from actual DB kpi_names ──────────────────
-    KPI_MAP        = _dyn_kpi_map
-    EXACT_KPI_NAMES = _dyn_exact_map
+    _dkm, _dem, _ = _build_dynamic_kpi_map()
+    KPI_MAP        = _dkm
+    EXACT_KPI_NAMES = _dem
 
     def _detect_kpis(text):
         found = []
