@@ -185,7 +185,8 @@ function InlineChart({result,T,chartId}) {
   if(!result) return null;
 
   // ── Show empty/error state instead of silently returning null ──────────
-  if(!result.data?.length) {
+  // But if we have a summary, render the summary even without data
+  if(!result.data?.length && !result.summary) {
     return (
       <ChartEmptyState
         T={T}
@@ -196,7 +197,7 @@ function InlineChart({result,T,chartId}) {
     );
   }
 
-  const {title,data:rawData=[],columns=[],x_axis,y_axes,response,row_count,chart_type,query_type,chart_config,provider,sql}=result;
+  const {title,data:rawData=[],columns=[],x_axis,y_axes,response,row_count,chart_type,query_type,chart_config,provider,sql,summary,response_type}=result;
   const xKey=x_axis||columns[0]||'';
   const SKIP_COLS=new Set(['lat','lng','latitude','longitude','site_id','cell_id','cluster','region','zone','technology','color','status','kpi_name']);
 
@@ -390,62 +391,87 @@ function InlineChart({result,T,chartId}) {
       </ResponsiveContainer>);
   };
 
+  const isSummaryOnly = response_type === 'summary';
+  const showSummary = summary && (response_type === 'summary' || response_type === 'both');
+
   return(
     <div style={{marginTop:8}}>
-      {/* Title bar */}
-      <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:6}}>
-        <div style={{fontSize:12,fontWeight:700,color:T.text}}>{title}</div>
-        <div style={{display:'flex',gap:5}}>
-          <span style={{fontSize:9,padding:'2px 7px',borderRadius:8,background:T.kpmgBlue+'18',color:T.kpmgBlue,fontWeight:600}}>{row_count} records</span>
-          <span style={{fontSize:9,padding:'2px 7px',borderRadius:8,background:T.purple+'18',color:T.purple,fontWeight:600}}>{ctype}</span>
-          {provider&&<span style={{fontSize:9,padding:'2px 7px',borderRadius:8,background:T.teal+'18',color:T.teal,fontWeight:600}}>{provider}</span>}
+      {/* Summary text bubble (shown above chart for "both", or alone for "summary") */}
+      {showSummary&&(
+        <div style={{
+          background:T.surface2,
+          border:`1px solid ${T.border}`,
+          borderRadius:12,
+          padding:'12px 16px',
+          marginBottom:10,
+          fontSize:12,
+          lineHeight:1.7,
+          color:T.text,
+          whiteSpace:'pre-wrap',
+          borderLeft:`4px solid ${T.kpmgBlue}`,
+        }}>
+          <div style={{fontSize:9,fontWeight:700,color:T.kpmgBlue,textTransform:'uppercase',marginBottom:6,letterSpacing:0.5}}>AI Assessment</div>
+          {summary}
         </div>
-      </div>
+      )}
 
-      {/* KPI stat cards */}
-      {stats.length>0&&(
-        <div style={{display:'grid',gridTemplateColumns:`repeat(${Math.min(stats.length,5)},1fr)`,gap:6,marginBottom:8}}>
-          {stats.map(({k,label,avg,max,min,color})=>(
-            <div key={k} style={{...card(T),padding:'8px 10px',borderTop:`3px solid ${color}`}}>
-              <div style={{fontSize:7.5,fontWeight:700,color:T.muted,textTransform:'uppercase',marginBottom:3,lineHeight:1.3}}>{label}</div>
-              <div style={{fontSize:16,fontWeight:800,color:T.text,fontFamily:"'IBM Plex Mono',monospace"}}>{f(avg,1)}</div>
-              <div style={{display:'flex',gap:8,marginTop:3}}>
-                <span style={{fontSize:8,color:T.green}}>↑ {f(max,1)}</span>
-                <span style={{fontSize:8,color:T.red}}>↓ {f(min,1)}</span>
+      {/* For summary-only, skip the chart/table entirely */}
+      {!isSummaryOnly&&(<>
+        {/* Title bar */}
+        <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:6}}>
+          <div style={{fontSize:12,fontWeight:700,color:T.text}}>{title}</div>
+          <div style={{display:'flex',gap:5}}>
+            <span style={{fontSize:9,padding:'2px 7px',borderRadius:8,background:T.kpmgBlue+'18',color:T.kpmgBlue,fontWeight:600}}>{row_count} records</span>
+            <span style={{fontSize:9,padding:'2px 7px',borderRadius:8,background:T.purple+'18',color:T.purple,fontWeight:600}}>{ctype}</span>
+            {provider&&<span style={{fontSize:9,padding:'2px 7px',borderRadius:8,background:T.teal+'18',color:T.teal,fontWeight:600}}>{provider}</span>}
+          </div>
+        </div>
+
+        {/* KPI stat cards */}
+        {stats.length>0&&(
+          <div style={{display:'grid',gridTemplateColumns:`repeat(${Math.min(stats.length,5)},1fr)`,gap:6,marginBottom:8}}>
+            {stats.map(({k,label,avg,max,min,color})=>(
+              <div key={k} style={{...card(T),padding:'8px 10px',borderTop:`3px solid ${color}`}}>
+                <div style={{fontSize:7.5,fontWeight:700,color:T.muted,textTransform:'uppercase',marginBottom:3,lineHeight:1.3}}>{label}</div>
+                <div style={{fontSize:16,fontWeight:800,color:T.text,fontFamily:"'IBM Plex Mono',monospace"}}>{f(avg,1)}</div>
+                <div style={{display:'flex',gap:8,marginTop:3}}>
+                  <span style={{fontSize:8,color:T.green}}>↑ {f(max,1)}</span>
+                  <span style={{fontSize:8,color:T.red}}>↓ {f(min,1)}</span>
+                </div>
               </div>
-            </div>
-          ))}
-        </div>
-      )}
+            ))}
+          </div>
+        )}
 
-      {/* Chart / Table toggle */}
-      <div style={{display:'flex',justifyContent:'flex-end',marginBottom:4}}>
-        <button onClick={()=>setShowTable(t=>!t)} style={{padding:'3px 10px',borderRadius:12,fontSize:9.5,fontWeight:600,background:showTable?T.kpmgBlue:'transparent',color:showTable?'#fff':T.textSub,border:`1px solid ${showTable?T.kpmgBlue:T.border}`,cursor:'pointer'}}>
-          {showTable?'Chart':'Table'}
-        </button>
-      </div>
+        {/* Chart / Table toggle */}
+        <div style={{display:'flex',justifyContent:'flex-end',marginBottom:4}}>
+          <button onClick={()=>setShowTable(t=>!t)} style={{padding:'3px 10px',borderRadius:12,fontSize:9.5,fontWeight:600,background:showTable?T.kpmgBlue:'transparent',color:showTable?'#fff':T.textSub,border:`1px solid ${showTable?T.kpmgBlue:T.border}`,cursor:'pointer'}}>
+            {showTable?'Chart':'Table'}
+          </button>
+        </div>
 
-      {showTable?(
-        <div style={{overflowX:'auto',maxHeight:300,overflowY:'auto'}}>
-          <table style={{width:'100%',borderCollapse:'collapse',fontSize:10}}>
-            <thead style={{position:'sticky',top:0,zIndex:1}}>
-              <tr style={{background:T.surface2}}>
-                {columns.map(h=><th key={h} style={{padding:'5px 7px',textAlign:'center',borderBottom:`2px solid ${T.border}`,color:T.muted,fontWeight:700,fontSize:8.5,textTransform:'uppercase',whiteSpace:'nowrap'}}>{h}</th>)}
-              </tr>
-            </thead>
-            <tbody>
-              {data.slice(0,100).map((row,i)=>(
-                <tr key={i} style={{borderBottom:`1px solid ${T.border}`,background:i%2===0?T.surface2:'transparent'}}>
-                  {columns.map(c=><td key={c} style={{padding:'3px 7px',textAlign:'center',fontFamily:"'IBM Plex Mono',monospace",fontSize:9.5}}>{row[c]==null?'—':typeof row[c]==='number'?f(row[c],2):String(row[c])}</td>)}
-                </tr>))}
-            </tbody>
-          </table>
-        </div>
-      ):(
-        <div style={{boxShadow:'0 4px 20px rgba(0,51,141,0.08)',borderRadius:10,overflow:'hidden'}}>
-          {renderChart()}
-        </div>
-      )}
+        {showTable?(
+          <div style={{overflowX:'auto',maxHeight:300,overflowY:'auto'}}>
+            <table style={{width:'100%',borderCollapse:'collapse',fontSize:10}}>
+              <thead style={{position:'sticky',top:0,zIndex:1}}>
+                <tr style={{background:T.surface2}}>
+                  {columns.map(h=><th key={h} style={{padding:'5px 7px',textAlign:'center',borderBottom:`2px solid ${T.border}`,color:T.muted,fontWeight:700,fontSize:8.5,textTransform:'uppercase',whiteSpace:'nowrap'}}>{h}</th>)}
+                </tr>
+              </thead>
+              <tbody>
+                {data.slice(0,100).map((row,i)=>(
+                  <tr key={i} style={{borderBottom:`1px solid ${T.border}`,background:i%2===0?T.surface2:'transparent'}}>
+                    {columns.map(c=><td key={c} style={{padding:'3px 7px',textAlign:'center',fontFamily:"'IBM Plex Mono',monospace",fontSize:9.5}}>{row[c]==null?'—':typeof row[c]==='number'?f(row[c],2):String(row[c])}</td>)}
+                  </tr>))}
+              </tbody>
+            </table>
+          </div>
+        ):(
+          <div style={{boxShadow:'0 4px 20px rgba(0,51,141,0.08)',borderRadius:10,overflow:'hidden'}}>
+            {renderChart()}
+          </div>
+        )}
+      </>)}
 
       {sql&&(
         <details style={{marginTop:6}}>
@@ -670,16 +696,34 @@ export default function NetworkAiChat() {
 
                       <div style={{fontSize:12.5,lineHeight:1.65,whiteSpace:'pre-wrap'}}>{m.content}</div>
 
-                      {/* Multi-chart: render ALL charts including ones with no data */}
-                      {m.role==='assistant'&&m.payload&&m.payload.chart_type==='multi_chart'&&m.payload.charts?.length>0&&(
-                        m.payload.charts.map((chart,ci)=>(
+                      {/* Multi-chart summary + charts */}
+                      {m.role==='assistant'&&m.payload&&m.payload.chart_type==='multi_chart'&&m.payload.charts?.length>0&&(<>
+                        {m.payload.summary&&(
+                          <div style={{
+                            background:T.surface2,
+                            border:`1px solid ${T.border}`,
+                            borderRadius:12,
+                            padding:'12px 16px',
+                            marginTop:10,
+                            marginBottom:6,
+                            fontSize:12,
+                            lineHeight:1.7,
+                            color:T.text,
+                            whiteSpace:'pre-wrap',
+                            borderLeft:`4px solid ${T.kpmgBlue}`,
+                          }}>
+                            <div style={{fontSize:9,fontWeight:700,color:T.kpmgBlue,textTransform:'uppercase',marginBottom:6,letterSpacing:0.5}}>AI Assessment</div>
+                            {m.payload.summary}
+                          </div>
+                        )}
+                        {m.payload.response_type!=='summary'&&m.payload.charts.map((chart,ci)=>(
                           <div key={ci} style={{marginTop:ci===0?10:16}}>
                             <InlineChart result={chart} T={T} chartId={`mc${m.id}_${ci}`}/>
                           </div>
-                        ))
-                      )}
-                      {/* Single chart */}
-                      {m.role==='assistant'&&m.payload&&m.payload.chart_type!=='multi_chart'&&(m.payload.data?.length>0||m.payload.error)&&(
+                        ))}
+                      </>)}
+                      {/* Single chart (or summary-only) */}
+                      {m.role==='assistant'&&m.payload&&m.payload.chart_type!=='multi_chart'&&(m.payload.data?.length>0||m.payload.error||m.payload.summary)&&(
                         <InlineChart result={m.payload} T={T}/>
                       )}
 

@@ -507,6 +507,32 @@ STRICTNESS RULES — FOLLOW THESE EXACTLY:
     include "chart_config": {{"dual_axis": true}} so the frontend renders two Y-axes.
 
 ═══════════════════════════════════════════════════════════
+RESPONSE TYPE — DECIDE WHAT THE USER WANTS:
+═══════════════════════════════════════════════════════════
+
+Every response MUST include "response_type" and "intent":
+
+- "chart"   → User wants a chart/table (e.g. "top 10 sites by drop rate", "show me PRB trend")
+- "summary" → User wants a TEXT assessment, NOT a chart (e.g. "how is the network in Zone A?",
+               "what is the health of site X?", "give me a status report", "summarize network performance")
+- "both"    → User wants BOTH a chart AND a written assessment (e.g. "show me the trend and explain it",
+               "chart the top 10 and summarize the issues")
+
+**Keywords that signal response_type = "summary":**
+  how is, how's, what is the status, what is the health, network health,
+  summarize, summary, assessment, report, overview, tell me about, describe,
+  how are things, what's going on, situation
+
+**Keywords that signal response_type = "chart":**
+  show, top, bottom, worst, best, plot, chart, graph, trend, compare, list
+
+If BOTH kinds of keywords appear, use "both".
+When in doubt, default to "chart".
+
+"intent" is a SHORT phrase describing what the user asked (e.g. "network health Zone A",
+"top 10 sites by drop rate", "PRB trend last 30 days").
+
+═══════════════════════════════════════════════════════════
 CHART TYPE — MUST MATCH THE DATA SHAPE:
 ═══════════════════════════════════════════════════════════
 
@@ -519,12 +545,32 @@ CHART TYPE — MUST MATCH THE DATA SHAPE:
 - "radar"    → Multi-KPI profile, few sites
 
 ═══════════════════════════════════════════════════════════
+SQL FOR SUMMARY/HEALTH QUERIES:
+═══════════════════════════════════════════════════════════
+
+Even for "summary" response_type, you MUST still generate a valid SQL query to fetch the
+data that will be summarized. For health/status queries:
+
+- If a zone/cluster is mentioned: fetch avg of key KPIs for sites in that zone
+  Example: SELECT k.site_id,
+    AVG(CASE WHEN k.kpi_name = '<drop_rate_kpi>' THEN k.value END) AS drop_rate,
+    AVG(CASE WHEN k.kpi_name = '<cssr_kpi>' THEN k.value END) AS cssr
+  FROM kpi_data k JOIN telecom_sites ts ON k.site_id = ts.site_id
+  WHERE k.data_level='site' AND k.value IS NOT NULL AND ts.cluster ILIKE '%<zone>%'
+  GROUP BY k.site_id ORDER BY drop_rate DESC NULLS LAST LIMIT 20
+
+- If a site is mentioned: fetch recent KPI values for that site
+- If generic "network health": fetch network-wide avg of top KPIs
+
+═══════════════════════════════════════════════════════════
 RESPONSE FORMAT:
 ═══════════════════════════════════════════════════════════
 
 **For SINGLE chart:**
 {{
   "sql": "SELECT ...",
+  "response_type": "chart|summary|both",
+  "intent": "short description of user intent",
   "title": "Short title (max 60 chars)",
   "response": "1-2 sentence description",
   "chart_type": "line|bar|composed|area|pie|scatter|radar",
@@ -537,6 +583,8 @@ RESPONSE FORMAT:
 **For MULTI-PART queries (different sites, or incompatible time ranges/units):**
 {{
   "multi_chart": true,
+  "response_type": "chart|summary|both",
+  "intent": "short description of user intent",
   "title": "Overall title (max 80 chars)",
   "response": "1-2 sentences describing all charts",
   "charts": [
@@ -579,6 +627,11 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
 
     def _parse_ai_result(raw_text):
         parsed = json.loads(_strip_json(raw_text))
+        # ── Extract response_type and intent (new summary feature) ──
+        if "response_type" not in parsed:
+            parsed["response_type"] = "chart"
+        if "intent" not in parsed:
+            parsed["intent"] = prompt[:80]
         if parsed.get("multi_chart") and parsed.get("charts"):
             if "title" not in parsed:
                 parsed["title"] = prompt[:70]
@@ -622,6 +675,91 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
                     _LOG.info("Fixed truncated site ID in SQL: '%s' → '%s'", truncated, correct_id)
                     sql = fixed
         return sql
+
+    # ── SUMMARY GENERATION — second LLM call to turn rows into prose ──────────
+    def _generate_summary(rows_data, columns_list, user_intent, title_str):
+        """
+        Makes a second LLM call to turn SQL result rows into a concise
+        natural-language summary. Returns the summary string, or None on failure.
+        """
+        if not rows_data:
+            return "No data was returned for this query."
+
+        # Truncate to first 30 rows to keep token usage low
+        sample = rows_data[:30]
+        data_str = json.dumps(sample, default=str)
+
+        summary_system = (
+            "You are a telecom network analyst. The user asked: \"{intent}\"\n"
+            "Below is the SQL result (columns: {cols}).\n"
+            "Write a concise 3-6 sentence assessment in plain English:\n"
+            "- Highlight the best and worst performers.\n"
+            "- Note any KPIs breaching typical thresholds "
+            "(e.g. drop rate > 1%, CSSR < 99%, PRB utilization > 70%).\n"
+            "- End with a one-line recommendation.\n"
+            "Do NOT output JSON — just plain text."
+        ).format(intent=user_intent, cols=", ".join(columns_list))
+
+        summary_user = f"Data ({len(rows_data)} rows, showing first {len(sample)}):\n{data_str}"
+
+        summary_messages = [
+            {"role": "system", "content": summary_system},
+            {"role": "user", "content": summary_user},
+        ]
+
+        # Try available providers in order
+        for _prov in _providers:
+            ptype = _prov[0]
+            try:
+                if ptype == "azure":
+                    from openai import AzureOpenAI as _AzureOpenAI
+                    _sc = _AzureOpenAI(
+                        api_key=_prov[1], api_version=_prov[4],
+                        azure_endpoint=_prov[2], timeout=20.0,
+                    )
+                    _sr = _sc.chat.completions.create(
+                        model=_prov[3], messages=summary_messages,
+                        temperature=0.2, max_tokens=500,
+                    )
+                    txt = _sr.choices[0].message.content
+                    if txt and txt.strip():
+                        _LOG.info("Summary generated via Azure")
+                        return txt.strip()
+
+                elif ptype == "gemini":
+                    from openai import OpenAI as _OpenAI
+                    _sc = _OpenAI(
+                        api_key=_prov[1],
+                        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+                        timeout=20.0,
+                    )
+                    _sr = _sc.chat.completions.create(
+                        model=_prov[2], messages=summary_messages,
+                        temperature=0.2, max_tokens=500,
+                    )
+                    txt = _sr.choices[0].message.content
+                    if txt and txt.strip():
+                        _LOG.info("Summary generated via Gemini")
+                        return txt.strip()
+
+                elif ptype == "openai":
+                    from openai import OpenAI as _OpenAI2
+                    _sc = _OpenAI2(api_key=_prov[1], timeout=20.0)
+                    _sr = _sc.chat.completions.create(
+                        model="gpt-4o-mini", messages=summary_messages,
+                        temperature=0.2, max_tokens=500,
+                    )
+                    txt = _sr.choices[0].message.content
+                    if txt and txt.strip():
+                        _LOG.info("Summary generated via OpenAI")
+                        return txt.strip()
+
+            except Exception as e:
+                _LOG.warning("Summary generation failed via %s: %s", ptype, str(e)[:150])
+                continue
+
+        _LOG.warning("All providers failed for summary generation")
+        return None
 
     user_prompt = f"User query: {prompt}"
     if filters.get("cluster"):
@@ -815,6 +953,20 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
 
         resp_text = ai_result.get("response", f"Here are {len(charts_out)} charts.")
         resp_title = ai_result.get("title", prompt[:70])
+        _resp_type = ai_result.get("response_type", "chart")
+        _intent = ai_result.get("intent", prompt[:80])
+
+        # ── Generate summary for multi-chart if response_type is summary/both ──
+        mc_summary = None
+        if _resp_type in ("summary", "both"):
+            # Combine all chart rows for the summary
+            all_mc_rows = []
+            all_mc_cols = set()
+            for ce in charts_out:
+                all_mc_rows.extend(ce.get("data", []))
+                all_mc_cols.update(ce.get("columns", []))
+            mc_summary = _generate_summary(all_mc_rows, list(all_mc_cols), _intent, resp_title)
+            print(f"[AI] Multi-chart summary generated: {bool(mc_summary)}")
 
         if ai_session:
             try:
@@ -822,10 +974,12 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
                     ai_session.title = (resp_title or prompt[:60])[:200]
                 assistant_msg = NetworkAiMessage(
                     session_id=ai_session.id, role="assistant",
-                    content=resp_text,
+                    content=mc_summary or resp_text,
                     content_json={
                         "title": resp_title, "chart_type": "multi_chart",
                         "charts": charts_out, "response": resp_text,
+                        "summary": mc_summary,
+                        "response_type": _resp_type,
                         "provider": provider["provider"] if provider else "rule-based",
                     },
                 )
@@ -843,6 +997,8 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
             "data":         [],
             "columns":      [],
             "row_count":    sum(c["row_count"] for c in charts_out),
+            "summary":      mc_summary,
+            "response_type": _resp_type,
             "provider":     provider["provider"] if provider else "rule-based",
             "session_id":   ai_session.id if ai_session else None,
         })
@@ -900,6 +1056,14 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
     resp_text = ai_result.get("response", f"Found {len(rows)} results.")
     resp_title = ai_result.get("title", prompt[:70])
     resp_chart = ai_result.get("chart_type", ai_result.get("query_type", "bar"))
+    _resp_type = ai_result.get("response_type", "chart")
+    _intent = ai_result.get("intent", prompt[:80])
+
+    # ── Generate summary for single chart if response_type is summary/both ──
+    sc_summary = None
+    if _resp_type in ("summary", "both"):
+        sc_summary = _generate_summary(safe_rows, columns, _intent, resp_title)
+        print(f"[AI] Single-chart summary generated: {bool(sc_summary)}")
 
     if ai_session:
         try:
@@ -908,7 +1072,7 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
             assistant_msg = NetworkAiMessage(
                 session_id=ai_session.id,
                 role="assistant",
-                content=resp_text,
+                content=sc_summary or resp_text,
                 content_json={
                     "title": resp_title,
                     "data": safe_rows,
@@ -919,6 +1083,8 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
                     "chart_config": ai_result.get("chart_config", {}),
                     "row_count": len(rows),
                     "sql": sql,
+                    "summary": sc_summary,
+                    "response_type": _resp_type,
                     "provider": provider["provider"] if provider else "rule-based",
                     "response": resp_text,
                 },
@@ -943,6 +1109,8 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
         "filter_update": ai_result.get("filter_update", {}),
         "tab":           ai_result.get("tab"),
         "show_map":      has_geo or ai_result.get("show_map", False),
+        "summary":       sc_summary,
+        "response_type": _resp_type,
         "provider":      provider["provider"] if provider else "rule-based",
         "session_id":    ai_session.id if ai_session else None,
     })
