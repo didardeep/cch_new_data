@@ -11,6 +11,7 @@ Mount in app.py:
 """
 
 import os
+import re
 import json
 import math
 import logging
@@ -24,6 +25,14 @@ from models import db, User, NetworkAiSession, NetworkAiMessage
 
 _LOG = logging.getLogger("network_ai")
 NETWORK_AI_VERSION = "2025-03-26-v5"  # bump this to confirm new file is loaded
+
+# ── Optional KPI threshold hints ─────────────────────────────────────────────
+# Populate with real numbers when available.  Format:
+#   "KPI Name": {"direction": "higher_is_better"|"lower_is_better",
+#                 "healthy": ">= 99.5", "warning": "98-99.5", "critical": "< 98"}
+# When this dict is non-empty, the entries are injected into the LLM prompt as
+# authoritative overrides; otherwise the model uses its own telecom knowledge.
+KPI_THRESHOLD_HINTS: dict = {}
 
 # ─────────────────────────────────────────────────────────────────────────────
 network_ai_bp = Blueprint("network_ai", __name__)
@@ -247,6 +256,97 @@ def _ensure_ai_session_tables():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Follow-up query rewriter — resolves pronouns / ellipsis BEFORE SQL generation
+# ─────────────────────────────────────────────────────────────────────────────
+_FOLLOWUP_RE = re.compile(
+    r'\b(there|that|those|this|it|same|also|instead|what about|now show|and )\b',
+    re.IGNORECASE,
+)
+
+
+def _rewrite_followup(prompt, recent_user_prompts, last_assistant_json, providers):
+    """Make one cheap LLM call to rewrite a terse follow-up into a
+    self-contained question.  Returns the rewritten string, or the
+    original *prompt* on any failure so the main flow is never blocked.
+    """
+    # Build the user-content payload
+    parts = []
+    for i, uq in enumerate(recent_user_prompts[-4:], 1):
+        parts.append(f"Q{i}: {uq}")
+
+    if last_assistant_json:
+        title = last_assistant_json.get("title", "")
+        # Extract SQL — handle both single and multi_chart
+        if last_assistant_json.get("charts"):
+            sqls = [ch.get("sql", "") for ch in last_assistant_json["charts"] if ch.get("sql")]
+            sql_str = " | ".join(s[:300] for s in sqls)
+        else:
+            sql_str = (last_assistant_json.get("sql") or "")[:300]
+        parts.append(f"Previous chart: {title} | SQL: {sql_str}")
+
+    parts.append(f"Current message: {prompt}")
+
+    rewrite_system = (
+        "You rewrite a telecom analyst's latest message into ONE fully self-contained "
+        "question by resolving pronouns and ellipsis (\"there\", \"that site/cell\", "
+        "\"those\", \"and last week?\", \"what about X\", \"also show Y\", \"as a bar "
+        "chart\") using the prior turns. Carry forward any detail the user did NOT "
+        "change — site_id, cell_id, KPI(s), and time window — from the most recent "
+        "question and the previous chart's SQL. Output ONLY the rewritten question, "
+        "no explanation, no quotes. If the message is already self-contained (has "
+        "site/KPI/time), return it unchanged."
+    )
+
+    messages = [
+        {"role": "system", "content": rewrite_system},
+        {"role": "user", "content": "\n".join(parts)},
+    ]
+
+    for _prov in providers:
+        ptype = _prov[0]
+        try:
+            if ptype == "azure":
+                from openai import AzureOpenAI as _AzureOpenAI
+                cli = _AzureOpenAI(
+                    api_key=_prov[1], api_version=_prov[4],
+                    azure_endpoint=_prov[2], timeout=10.0,
+                )
+                resp = cli.chat.completions.create(
+                    model=_prov[3], messages=messages,
+                    temperature=0, max_tokens=200,
+                )
+            elif ptype == "gemini":
+                from openai import OpenAI as _OpenAI
+                cli = _OpenAI(
+                    api_key=_prov[1],
+                    base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+                    timeout=10.0,
+                )
+                resp = cli.chat.completions.create(
+                    model=_prov[2], messages=messages,
+                    temperature=0, max_tokens=200,
+                )
+            elif ptype == "openai":
+                from openai import OpenAI as _OpenAI2
+                cli = _OpenAI2(api_key=_prov[1], timeout=10.0)
+                resp = cli.chat.completions.create(
+                    model="gpt-4o-mini", messages=messages,
+                    temperature=0, max_tokens=200,
+                )
+            else:
+                continue
+
+            txt = resp.choices[0].message.content
+            if txt and txt.strip():
+                return txt.strip()
+        except Exception as exc:
+            _LOG.warning("_rewrite_followup failed via %s: %s", ptype, str(exc)[:150])
+            continue
+
+    return prompt
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # POST /api/network/ai-query
 # ─────────────────────────────────────────────────────────────────────────────
 @network_ai_bp.route("/api/network/ai-query", methods=["POST"])
@@ -328,6 +428,19 @@ def ai_query():
         else:
             ai_session = None
 
+    # ── Fetch last assistant content_json (used by rewrite + rule-based) ──────
+    _last_assistant_json = None
+    if ai_session and session_id:
+        try:
+            _last_asst_msg = (NetworkAiMessage.query
+                              .filter_by(session_id=session_id, role="assistant")
+                              .order_by(NetworkAiMessage.created_at.desc())
+                              .first())
+            if _last_asst_msg and _last_asst_msg.content_json:
+                _last_assistant_json = _last_asst_msg.content_json
+        except Exception:
+            pass
+
     # ── Try LLM providers ─────────────────────────────────────────────────────
     provider = None
     ai_result = None
@@ -335,6 +448,15 @@ def ai_query():
     flex_columns = _get_flex_schema_hint()
     _dyn_kpi_map, _dyn_exact_map, _dyn_kpi_lines = _build_dynamic_kpi_map()
     _kpi_list_str = "\n".join(_dyn_kpi_lines) if _dyn_kpi_lines else "   (no KPI data found)"
+
+    # Build optional authoritative threshold block for the prompt
+    if KPI_THRESHOLD_HINTS:
+        _thresh_lines = ["Authoritative thresholds (use these when a KPI matches; otherwise use your own judgement):"]
+        for _kn, _kv in KPI_THRESHOLD_HINTS.items():
+            _thresh_lines.append(f"  - {_kn}: direction={_kv.get('direction','')}, healthy={_kv.get('healthy','')}, warning={_kv.get('warning','')}, critical={_kv.get('critical','')}")
+        _threshold_block = "\n".join(_thresh_lines)
+    else:
+        _threshold_block = ""
 
     SCHEMA_HINT = f"""
 Tables:
@@ -507,30 +629,44 @@ STRICTNESS RULES — FOLLOW THESE EXACTLY:
     include "chart_config": {{"dual_axis": true}} so the frontend renders two Y-axes.
 
 ═══════════════════════════════════════════════════════════
-RESPONSE TYPE — DECIDE WHAT THE USER WANTS:
+RESPONSE TYPE — INFER FROM USER INTENT:
 ═══════════════════════════════════════════════════════════
 
-Every response MUST include "response_type" and "intent":
+Every response MUST include "response_type" and "intent".
+Decide response_type by reasoning about what would best ANSWER the user, in ANY language
+or phrasing (English, Hindi, Hinglish). Do not rely on specific trigger words — infer intent.
+When a request fits more than one type, prefer the richest useful answer (e.g. an assessment
+that also needs numbers → "both").
 
-- "chart"   → User wants a chart/table (e.g. "top 10 sites by drop rate", "show me PRB trend")
-- "summary" → User wants a TEXT assessment, NOT a chart (e.g. "how is the network in Zone A?",
-               "what is the health of site X?", "give me a status report", "summarize network performance")
-- "both"    → User wants BOTH a chart AND a written assessment (e.g. "show me the trend and explain it",
-               "chart the top 10 and summarize the issues")
+Allowed response_type values:
 
-**Keywords that signal response_type = "summary":**
-  how is, how's, what is the status, what is the health, network health,
-  summarize, summary, assessment, report, overview, tell me about, describe,
-  how are things, what's going on, situation
+- "chart"   : user wants to SEE data visually (trends, comparisons across sites/time).
+               e.g. "plot CSSR for site X over 2 weeks"
+- "summary" : user wants an ASSESSMENT / judgement of how something is doing.
+               e.g. "is site X healthy?"
+- "both"    : user wants the numbers visualized AND an assessment.
+- "metric"  : user wants a SPECIFIC FACT or figure — a small result best conveyed as a
+               sentence rather than a chart. e.g. "what was the average throughput for site X yesterday"
+               → Still generate SQL. Return response_type="metric".
+- "clarify" : the intent is real but UNDERSPECIFIED — no resolvable site/cell/zone AND no KPI
+               AND no scope. Return {{"response_type":"clarify","intent":"...","clarify_question":"<one short question>"}}, NO sql.
+- "info"    : a definition or capability question; no data lookup needed.
+               Return {{"response_type":"info","intent":"...","info_text":"<short answer>"}}, NO sql.
+- "decline" : not about this network/KPI data, or unsafe/destructive.
+               Return {{"response_type":"decline","intent":"...","decline_reason":"<one polite sentence>"}}, NO sql.
 
-**Keywords that signal response_type = "chart":**
-  show, top, bottom, worst, best, plot, chart, graph, trend, compare, list
-
-If BOTH kinds of keywords appear, use "both".
-When in doubt, default to "chart".
-
-"intent" is a SHORT phrase describing what the user asked (e.g. "network health Zone A",
+"intent" is always a SHORT phrase describing the user's ask (e.g. "network health Zone A",
 "top 10 sites by drop rate", "PRB trend last 30 days").
+
+═══════════════════════════════════════════════════════════
+KPI HEALTH JUDGEMENT:
+═══════════════════════════════════════════════════════════
+
+When assessing whether a KPI value is healthy, use your telecom domain knowledge.
+Key principle: some KPIs are good when HIGH (e.g. CSSR, availability, handover success rate)
+and bad when LOW; others are good when LOW (e.g. drop rate, latency) and bad when HIGH.
+Infer the direction from the KPI name and meaning rather than relying on a lookup table.
+{_threshold_block}
 
 ═══════════════════════════════════════════════════════════
 CHART TYPE — MUST MATCH THE DATA SHAPE:
@@ -545,11 +681,16 @@ CHART TYPE — MUST MATCH THE DATA SHAPE:
 - "radar"    → Multi-KPI profile, few sites
 
 ═══════════════════════════════════════════════════════════
-SQL FOR SUMMARY/HEALTH QUERIES:
+SQL FOR SUMMARY / HEALTH / METRIC QUERIES:
 ═══════════════════════════════════════════════════════════
 
-Even for "summary" response_type, you MUST still generate a valid SQL query to fetch the
-data that will be summarized. For health/status queries:
+For "summary", "both", and "metric" response_types you MUST still generate a valid SQL query
+to fetch the data. For health/status queries:
+
+- PREFER the site_kpi_summary table when available — it has precomputed health_label,
+  health_score, is_anomaly, and site_tier columns with the most recent date(s).
+  Example: SELECT * FROM site_kpi_summary WHERE site_id = '<SITE>' ORDER BY date DESC LIMIT 5
+  Fall back to kpi_data only for KPIs not present in site_kpi_summary.
 
 - If a zone/cluster is mentioned: fetch avg of key KPIs for sites in that zone
   Example: SELECT k.site_id,
@@ -566,10 +707,10 @@ data that will be summarized. For health/status queries:
 RESPONSE FORMAT:
 ═══════════════════════════════════════════════════════════
 
-**For SINGLE chart:**
+**For chart / summary / both / metric (with SQL):**
 {{
   "sql": "SELECT ...",
-  "response_type": "chart|summary|both",
+  "response_type": "chart|summary|both|metric",
   "intent": "short description of user intent",
   "title": "Short title (max 60 chars)",
   "response": "1-2 sentence description",
@@ -578,6 +719,15 @@ RESPONSE FORMAT:
   "y_axes": ["metric_col"],
   "chart_config": {{"x_label":"","y_label":"","threshold":null,"threshold_dir":"above|below","color_scheme":"sequential"}},
   "filter_update": {{}}
+}}
+
+**For clarify / info / decline (NO SQL):**
+{{
+  "response_type": "clarify|info|decline",
+  "intent": "...",
+  "clarify_question": "...",  // only for clarify
+  "info_text": "...",          // only for info
+  "decline_reason": "..."     // only for decline
 }}
 
 **For MULTI-PART queries (different sites, or incompatible time ranges/units):**
@@ -627,14 +777,26 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
 
     def _parse_ai_result(raw_text):
         parsed = json.loads(_strip_json(raw_text))
-        # ── Extract response_type and intent (new summary feature) ──
+        # ── Extract response_type and intent ──
         if "response_type" not in parsed:
             parsed["response_type"] = "chart"
         if "intent" not in parsed:
-            parsed["intent"] = prompt[:80]
+            parsed["intent"] = effective_prompt[:80]
+
+        # ── No-SQL response types: clarify / info / decline ──
+        _rt = parsed["response_type"]
+        if _rt in ("clarify", "info", "decline"):
+            # Build a human-readable response from the type-specific field
+            parsed.setdefault("response",
+                parsed.get("clarify_question")
+                or parsed.get("info_text")
+                or parsed.get("decline_reason")
+                or "I couldn't determine what to do.")
+            return parsed
+
         if parsed.get("multi_chart") and parsed.get("charts"):
             if "title" not in parsed:
-                parsed["title"] = prompt[:70]
+                parsed["title"] = effective_prompt[:70]
             if "response" not in parsed:
                 parsed["response"] = parsed.get("title", "Results")
             for chart in parsed["charts"]:
@@ -645,7 +807,7 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
         parsed["chart_type"] = ct
         parsed["query_type"] = ct
         if "title" not in parsed:
-            parsed["title"] = prompt[:60]
+            parsed["title"] = effective_prompt[:60]
         if "response" not in parsed:
             parsed["response"] = parsed.get("title", "Results")
         if "x_axis" not in parsed:
@@ -660,7 +822,7 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
 
     def _fix_site_ids_in_sql(sql: str) -> str:
         import re
-        prompt_site_ids = re.findall(r'[A-Za-z]{2,}[_\-][A-Za-z]{2,}[_\-]\d{3,}', prompt)
+        prompt_site_ids = re.findall(r'[A-Za-z]{2,}[_\-][A-Za-z]{2,}[_\-]\d{3,}', effective_prompt)
         if not prompt_site_ids:
             return sql
         for correct_id in prompt_site_ids:
@@ -689,16 +851,26 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
         sample = rows_data[:30]
         data_str = json.dumps(sample, default=str)
 
+        _summary_thresh = ""
+        if KPI_THRESHOLD_HINTS:
+            _tl = ["Authoritative thresholds (override your defaults when a KPI matches):"]
+            for _kn, _kv in KPI_THRESHOLD_HINTS.items():
+                _tl.append(f"  {_kn}: healthy={_kv.get('healthy','')}, warning={_kv.get('warning','')}, critical={_kv.get('critical','')}")
+            _summary_thresh = "\n" + "\n".join(_tl) + "\n"
+
         summary_system = (
             "You are a telecom network analyst. The user asked: \"{intent}\"\n"
             "Below is the SQL result (columns: {cols}).\n"
             "Write a concise 3-6 sentence assessment in plain English:\n"
             "- Highlight the best and worst performers.\n"
-            "- Note any KPIs breaching typical thresholds "
-            "(e.g. drop rate > 1%, CSSR < 99%, PRB utilization > 70%).\n"
+            "- Judge whether each KPI value is healthy using your telecom domain knowledge.\n"
+            "  Key principle: some KPIs are good when HIGH (CSSR, availability, HO success)\n"
+            "  and bad when LOW; others are good when LOW (drop rate, latency) and bad when HIGH.\n"
+            "  Infer the direction from the KPI name/meaning.\n"
+            "{thresh}"
             "- End with a one-line recommendation.\n"
             "Do NOT output JSON — just plain text."
-        ).format(intent=user_intent, cols=", ".join(columns_list))
+        ).format(intent=user_intent, cols=", ".join(columns_list), thresh=_summary_thresh)
 
         summary_user = f"Data ({len(rows_data)} rows, showing first {len(sample)}):\n{data_str}"
 
@@ -761,6 +933,81 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
         _LOG.warning("All providers failed for summary generation")
         return None
 
+    # ── METRIC ANSWER — turn a small SQL result into 1-3 plain sentences ─────
+    def _metric_answer(rows_data, columns_list, user_intent):
+        """One cheap LLM call to verbalise a small metric result."""
+        if not rows_data:
+            return "No data was returned for this query."
+        sample = rows_data[:10]
+        data_str = json.dumps(sample, default=str)
+
+        _metric_thresh = ""
+        if KPI_THRESHOLD_HINTS:
+            _tl = ["Authoritative thresholds (override your defaults when a KPI matches):"]
+            for _kn, _kv in KPI_THRESHOLD_HINTS.items():
+                _tl.append(f"  {_kn}: healthy={_kv.get('healthy','')}, critical={_kv.get('critical','')}")
+            _metric_thresh = "\n" + "\n".join(_tl) + "\n"
+
+        sys_msg = (
+            "You are a telecom network analyst. The user asked: \"{intent}\"\n"
+            "Below is a small SQL result (columns: {cols}).\n"
+            "Write 1-3 plain-English sentences that cite the exact numbers.\n"
+            "If a value looks unhealthy, note that using your telecom domain knowledge "
+            "(some KPIs are good when high, others when low — infer from the name).\n"
+            "{thresh}"
+            "Do NOT output JSON — just plain text."
+        ).format(intent=user_intent, cols=", ".join(columns_list), thresh=_metric_thresh)
+
+        msgs = [
+            {"role": "system", "content": sys_msg},
+            {"role": "user", "content": f"Data ({len(sample)} rows):\n{data_str}"},
+        ]
+
+        for _prov in _providers:
+            ptype = _prov[0]
+            try:
+                if ptype == "azure":
+                    from openai import AzureOpenAI as _AzureOpenAI
+                    _sc = _AzureOpenAI(
+                        api_key=_prov[1], api_version=_prov[4],
+                        azure_endpoint=_prov[2], timeout=15.0,
+                    )
+                    _sr = _sc.chat.completions.create(
+                        model=_prov[3], messages=msgs,
+                        temperature=0.2, max_tokens=250,
+                    )
+                elif ptype == "gemini":
+                    from openai import OpenAI as _OpenAI
+                    _sc = _OpenAI(
+                        api_key=_prov[1],
+                        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+                        timeout=15.0,
+                    )
+                    _sr = _sc.chat.completions.create(
+                        model=_prov[2], messages=msgs,
+                        temperature=0.2, max_tokens=250,
+                    )
+                elif ptype == "openai":
+                    from openai import OpenAI as _OpenAI2
+                    _sc = _OpenAI2(api_key=_prov[1], timeout=15.0)
+                    _sr = _sc.chat.completions.create(
+                        model="gpt-4o-mini", messages=msgs,
+                        temperature=0.2, max_tokens=250,
+                    )
+                else:
+                    continue
+                txt = _sr.choices[0].message.content
+                if txt and txt.strip():
+                    _LOG.info("Metric answer generated via %s", ptype)
+                    return txt.strip()
+            except Exception as exc:
+                _LOG.warning("_metric_answer failed via %s: %s", ptype, str(exc)[:150])
+                continue
+
+        # Fallback: just stringify the first row
+        r = rows_data[0]
+        return ", ".join(f"{k}: {v}" for k, v in r.items() if v is not None)
+
     user_prompt = f"User query: {prompt}"
     if filters.get("cluster"):
         user_prompt += f"\nActive filter — Zone: {filters['cluster']}"
@@ -797,13 +1044,44 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
     if not openai_key:
         print("[AI] NOTE: OPENAI_API_KEY not set — add it to .env for OpenAI fallback")
 
+    # ── Follow-up rewrite step ────────────────────────────────────────────────
+    # Resolve pronouns / ellipsis BEFORE SQL generation so the LLM receives a
+    # fully self-contained question.  Only runs when the prompt looks like a
+    # terse follow-up (short or contains pronoun/ellipsis patterns).
+    _has_prior_assistant = any(h["role"] == "assistant" for h in conversation_history)
+    _is_followup_prompt = (
+        session_id is not None
+        and _has_prior_assistant
+        and (len(prompt.split()) <= 6 or bool(_FOLLOWUP_RE.search(prompt)))
+    )
+
+    if _is_followup_prompt:
+        _recent_user_prompts = [
+            h["content"] for h in conversation_history if h["role"] == "user"
+        ]
+        effective_prompt = _rewrite_followup(
+            prompt, _recent_user_prompts, _last_assistant_json, _providers,
+        )
+        _LOG.info("Rewrite: %r -> %r", prompt, effective_prompt)
+    else:
+        effective_prompt = prompt
+
+    # Rebuild the LLM user message with effective_prompt so the SQL-generation
+    # LLM sees the rewritten (self-contained) question.
+    user_prompt = f"User query: {effective_prompt}"
+    if filters.get("cluster"):
+        user_prompt += f"\nActive filter — Zone: {filters['cluster']}"
+    if filters.get("time_range") and filters["time_range"] != "24h":
+        user_prompt += f"\nActive filter — Time range: {filters['time_range']}"
+    llm_messages[-1] = {"role": "user", "content": user_prompt}
+
     # ── PRE-LLM INTERCEPTOR ────────────────────────────────────────────────────
     # Only revenue is intercepted — everything else goes to LLM.
-    _p_lower = prompt.lower().strip()
+    _p_lower = effective_prompt.lower().strip()
 
     # Revenue queries — rule-based always uses the correct Total Revenue column;
     if not ai_result and 'revenue' in _p_lower:
-        ai_result = _rule_based_query(prompt, time_filter, prev_context=None)
+        ai_result = _rule_based_query(effective_prompt, time_filter, prev_context=None)
         provider  = {"provider": "rule-based-revenue"}
         print(f"[AI] INTERCEPTED as revenue query (skipping LLM)")
         _LOG.info("Revenue query intercepted before LLM")
@@ -887,18 +1165,7 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
     if ai_result:
         print(f"[AI] LLM succeeded via {provider.get('provider','?')}")
     if not ai_result:
-        prev_context = None
-        if ai_session and session_id:
-            try:
-                last_asst = (NetworkAiMessage.query
-                             .filter_by(session_id=session_id, role="assistant")
-                             .order_by(NetworkAiMessage.created_at.desc())
-                             .first())
-                if last_asst and last_asst.content_json:
-                    prev_context = last_asst.content_json
-            except Exception:
-                pass
-        ai_result = _rule_based_query(prompt, time_filter, prev_context=prev_context)
+        ai_result = _rule_based_query(effective_prompt, time_filter, prev_context=_last_assistant_json)
         if not provider:
             provider = {"provider": "rule-based"}
         print(f"[AI] All LLM providers failed — using rule-based fallback")
@@ -918,6 +1185,94 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
         if isinstance(v, float) and math.isnan(v): return None
         try:    return float(v)
         except: return str(v)
+
+    # ── ROUTE by response_type ────────────────────────────────────────────────
+    _rt = ai_result.get("response_type", "chart")
+
+    # clarify / info / decline → return text, skip SQL entirely
+    if _rt in ("clarify", "info", "decline"):
+        resp_text = (ai_result.get("clarify_question")
+                     or ai_result.get("info_text")
+                     or ai_result.get("decline_reason")
+                     or ai_result.get("response", ""))
+        _intent = ai_result.get("intent", effective_prompt[:80])
+
+        if ai_session:
+            try:
+                if ai_session.title == "New Chat":
+                    ai_session.title = (_intent or effective_prompt[:60])[:200]
+                db.session.add(NetworkAiMessage(
+                    session_id=ai_session.id, role="assistant",
+                    content=resp_text,
+                    content_json={
+                        "response_type": _rt, "intent": _intent,
+                        "response": resp_text,
+                        "provider": provider["provider"] if provider else "rule-based",
+                    },
+                ))
+                db.session.commit()
+            except Exception as e:
+                _LOG.error("Failed to persist AI message: %s", e)
+
+        return jsonify({
+            "response":      resp_text,
+            "response_type": _rt,
+            "intent":        _intent,
+            "chart_type":    None,
+            "data":          [],
+            "columns":       [],
+            "row_count":     0,
+            "provider":      provider["provider"] if provider else "rule-based",
+            "session_id":    ai_session.id if ai_session else None,
+        })
+
+    # metric → run SQL, then verbalise with _metric_answer
+    if _rt == "metric":
+        sql = ai_result.get("sql", "")
+        _intent = ai_result.get("intent", effective_prompt[:80])
+        rows = []
+        if sql and sql.strip().upper().startswith("SELECT"):
+            try:
+                rows = _sql_with_timeout(sql, timeout_sec=15)
+            except Exception as e:
+                _LOG.warning("Metric SQL failed: %s — SQL: %s", e, sql[:200])
+        columns = list(rows[0].keys()) if rows else []
+        safe_rows = [{k: _serial(v) for k, v in r.items()} for r in rows]
+        resp_text = _metric_answer(safe_rows, columns, _intent)
+        resp_title = ai_result.get("title", effective_prompt[:60])
+
+        if ai_session:
+            try:
+                if ai_session.title == "New Chat":
+                    ai_session.title = (resp_title or effective_prompt[:60])[:200]
+                db.session.add(NetworkAiMessage(
+                    session_id=ai_session.id, role="assistant",
+                    content=resp_text,
+                    content_json={
+                        "response_type": "metric", "intent": _intent,
+                        "title": resp_title, "response": resp_text,
+                        "data": safe_rows, "columns": columns,
+                        "sql": sql,
+                        "provider": provider["provider"] if provider else "rule-based",
+                    },
+                ))
+                db.session.commit()
+            except Exception as e:
+                _LOG.error("Failed to persist AI message: %s", e)
+
+        return jsonify({
+            "response":      resp_text,
+            "response_type": "metric",
+            "intent":        _intent,
+            "title":         resp_title,
+            "chart_type":    "table",
+            "data":          safe_rows,
+            "columns":       columns,
+            "row_count":     len(rows),
+            "sql":           sql,
+            "provider":      provider["provider"] if provider else "rule-based",
+            "session_id":    ai_session.id if ai_session else None,
+        })
 
     # ── MULTI-CHART: execute each chart's SQL separately ───────────────────────
     if ai_result.get("multi_chart") and ai_result.get("charts"):
@@ -952,9 +1307,9 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
             charts_out.append(chart_entry)
 
         resp_text = ai_result.get("response", f"Here are {len(charts_out)} charts.")
-        resp_title = ai_result.get("title", prompt[:70])
+        resp_title = ai_result.get("title", effective_prompt[:70])
         _resp_type = ai_result.get("response_type", "chart")
-        _intent = ai_result.get("intent", prompt[:80])
+        _intent = ai_result.get("intent", effective_prompt[:80])
 
         # ── Generate summary for multi-chart if response_type is summary/both ──
         mc_summary = None
@@ -971,7 +1326,7 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
         if ai_session:
             try:
                 if ai_session.title == "New Chat":
-                    ai_session.title = (resp_title or prompt[:60])[:200]
+                    ai_session.title = (resp_title or effective_prompt[:60])[:200]
                 assistant_msg = NetworkAiMessage(
                     session_id=ai_session.id, role="assistant",
                     content=mc_summary or resp_text,
@@ -1013,7 +1368,7 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
     except Exception as e:
         _LOG.warning("AI SQL execution failed: %s — SQL: %s", e, sql[:200])
         try:
-            fallback = _rule_based_query(prompt, time_filter)
+            fallback = _rule_based_query(effective_prompt, time_filter)
             sql2 = fallback.get("sql", "")
             if sql2 and sql2.strip().upper().startswith("SELECT"):
                 rows = _sql_with_timeout(sql2, timeout_sec=10)
@@ -1054,10 +1409,10 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
             pass
 
     resp_text = ai_result.get("response", f"Found {len(rows)} results.")
-    resp_title = ai_result.get("title", prompt[:70])
+    resp_title = ai_result.get("title", effective_prompt[:70])
     resp_chart = ai_result.get("chart_type", ai_result.get("query_type", "bar"))
     _resp_type = ai_result.get("response_type", "chart")
-    _intent = ai_result.get("intent", prompt[:80])
+    _intent = ai_result.get("intent", effective_prompt[:80])
 
     # ── Generate summary for single chart if response_type is summary/both ──
     sc_summary = None
@@ -1068,7 +1423,7 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
     if ai_session:
         try:
             if ai_session.title == "New Chat":
-                ai_session.title = (resp_title or prompt[:60])[:200]
+                ai_session.title = (resp_title or effective_prompt[:60])[:200]
             assistant_msg = NetworkAiMessage(
                 session_id=ai_session.id,
                 role="assistant",

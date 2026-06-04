@@ -682,7 +682,7 @@ export default function NetworkAiChat() {
                   <div key={m.id} style={{display:'flex',justifyContent:m.role==='user'?'flex-end':'flex-start',marginBottom:16,animation:'fadeIn .3s ease'}}>
                     <div style={{
                       maxWidth:m.role==='user'?'55%':'92%',
-                      minWidth:m.role==='assistant'&&(m.payload?.data?.length>0||m.payload?.charts?.length>0)?'min(680px,100%)':undefined,
+                      minWidth:m.role==='assistant'&&!['metric','info','clarify','decline'].includes(m.payload?.response_type)&&(m.payload?.data?.length>0||m.payload?.charts?.length>0)?'min(680px,100%)':undefined,
                       padding:m.role==='user'?'10px 16px':'14px 18px',
                       borderRadius:m.role==='user'?'18px 18px 4px 18px':'18px 18px 18px 4px',
                       background:m.role==='user'?`linear-gradient(135deg,${T.kpmgBlue},${T.blue2})`:T.surface,
@@ -722,8 +722,28 @@ export default function NetworkAiChat() {
                           </div>
                         ))}
                       </>)}
+                      {/* metric / info / clarify / decline — text-only bubble (metric may include a small table) */}
+                      {m.role==='assistant'&&m.payload&&['metric','info','clarify','decline'].includes(m.payload.response_type)&&(
+                        <>
+                          {m.payload.response_type==='metric'&&m.payload.data?.length>0&&(
+                            <div style={{overflowX:'auto',maxHeight:200,overflowY:'auto',marginTop:8,borderRadius:8,border:`1px solid ${T.border}`}}>
+                              <table style={{width:'100%',borderCollapse:'collapse',fontSize:10}}>
+                                <thead><tr style={{background:T.surface2}}>
+                                  {m.payload.columns?.map(h=><th key={h} style={{padding:'4px 7px',textAlign:'center',borderBottom:`2px solid ${T.border}`,color:T.muted,fontWeight:700,fontSize:8.5,textTransform:'uppercase',whiteSpace:'nowrap'}}>{h}</th>)}
+                                </tr></thead>
+                                <tbody>
+                                  {m.payload.data.slice(0,20).map((row,i)=>(
+                                    <tr key={i} style={{borderBottom:`1px solid ${T.border}`,background:i%2===0?T.surface2:'transparent'}}>
+                                      {m.payload.columns?.map(c=><td key={c} style={{padding:'3px 7px',textAlign:'center',fontFamily:"'IBM Plex Mono',monospace",fontSize:9.5}}>{row[c]==null?'—':typeof row[c]==='number'?f(row[c],2):String(row[c])}</td>)}
+                                    </tr>))}
+                                </tbody>
+                              </table>
+                            </div>
+                          )}
+                        </>
+                      )}
                       {/* Single chart (or summary-only) */}
-                      {m.role==='assistant'&&m.payload&&m.payload.chart_type!=='multi_chart'&&(m.payload.data?.length>0||m.payload.error||m.payload.summary)&&(
+                      {m.role==='assistant'&&m.payload&&!['metric','info','clarify','decline'].includes(m.payload.response_type)&&m.payload.chart_type!=='multi_chart'&&(m.payload.data?.length>0||m.payload.error||m.payload.summary)&&(
                         <InlineChart result={m.payload} T={T}/>
                       )}
 
