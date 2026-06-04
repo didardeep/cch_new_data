@@ -638,6 +638,13 @@ or phrasing (English, Hindi, Hinglish). Do not rely on specific trigger words �
 When a request fits more than one type, prefer the richest useful answer (e.g. an assessment
 that also needs numbers → "both").
 
+CRITICAL RULES for response_type:
+- Any query with a TIME RANGE (last N days, last week, etc.) for a specific site/KPI → "chart" (NOT summary, NOT metric).
+- "show", "plot", "trend", "graph" + site + KPI → always "chart".
+- Follow-up queries that change site/time/KPI of a previous CHART → "chart".
+- Only use "summary" when the user explicitly asks for an assessment WITHOUT wanting to see the data plotted.
+- When unsure between "chart" and "summary", default to "chart".
+
 Allowed response_type values:
 
 - "chart"   : user wants to SEE data visually (trends, comparisons across sites/time).
@@ -645,9 +652,13 @@ Allowed response_type values:
 - "summary" : user wants an ASSESSMENT / judgement of how something is doing.
                e.g. "is site X healthy?"
 - "both"    : user wants the numbers visualized AND an assessment.
-- "metric"  : user wants a SPECIFIC FACT or figure — a small result best conveyed as a
-               sentence rather than a chart. e.g. "what was the average throughput for site X yesterday"
+- "metric"  : user wants a SINGLE SPECIFIC FACT or number — a one-row / one-value answer
+               best conveyed as a sentence, NOT a time series or comparison.
+               e.g. "what was the average throughput for site X yesterday"
                → Still generate SQL. Return response_type="metric".
+               IMPORTANT: If the query involves a TIME RANGE (multiple days/weeks), a TREND,
+               or the word "show"/"plot"/"chart", it is a "chart", NOT a "metric".
+               "metric" is ONLY for single-point lookups (one value, one day, one aggregate).
 - "clarify" : the intent is real but UNDERSPECIFIED — no resolvable site/cell/zone AND no KPI
                AND no scope. Return {{"response_type":"clarify","intent":"...","clarify_question":"<one short question>"}}, NO sql.
 - "info"    : a definition or capability question; no data lookup needed.
@@ -1063,8 +1074,10 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
             prompt, _recent_user_prompts, _last_assistant_json, _providers,
         )
         _LOG.info("Rewrite: %r -> %r", prompt, effective_prompt)
+        print(f"[AI] Rewrite: '{prompt}' -> '{effective_prompt}'")
     else:
         effective_prompt = prompt
+        print(f"[AI] No rewrite needed (is_followup={_is_followup_prompt})")
 
     # Rebuild the LLM user message with effective_prompt so the SQL-generation
     # LLM sees the rewritten (self-contained) question.
@@ -1163,7 +1176,7 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
 
     # ── Fallback: rule-based query engine ─────────────────────────────────────
     if ai_result:
-        print(f"[AI] LLM succeeded via {provider.get('provider','?')}")
+        print(f"[AI] LLM succeeded via {provider.get('provider','?')}, response_type={ai_result.get('response_type')}, has_sql={bool(ai_result.get('sql'))}")
     if not ai_result:
         ai_result = _rule_based_query(effective_prompt, time_filter, prev_context=_last_assistant_json)
         if not provider:
