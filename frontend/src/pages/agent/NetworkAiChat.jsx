@@ -391,10 +391,10 @@ function InlineChart({result,T,chartId}) {
       </ResponsiveContainer>);
   };
 
-  const [showAssessment,setShowAssessment]=useState(true);
+  const [showAssessment,setShowAssessment]=useState(response_type==='both');
   const isSummaryOnly = response_type === 'summary';
-  // For "both" show a collapsible assessment; for "summary"-only the chat bubble already has the text
-  const hasAssessmentBox = summary && response_type === 'both';
+  // For "both"/"chart" show a collapsible assessment; for "summary"-only the chat bubble already has the text
+  const hasAssessmentBox = summary && (response_type === 'both' || response_type === 'chart');
 
   return(
     <div style={{marginTop:8}}>
@@ -717,8 +717,8 @@ export default function NetworkAiChat() {
 
                       {/* Multi-chart summary + charts */}
                       {m.role==='assistant'&&m.payload&&m.payload.chart_type==='multi_chart'&&m.payload.charts?.length>0&&(<>
-                        {m.payload.summary&&m.payload.response_type==='both'&&(
-                          <details open style={{marginTop:10,marginBottom:6}}>
+                        {m.payload.summary&&(m.payload.response_type==='both'||m.payload.response_type==='chart')&&(
+                          <details open={m.payload.response_type==='both'} style={{marginTop:10,marginBottom:6}}>
                             <summary style={{fontSize:9.5,fontWeight:700,color:T.kpmgBlue,textTransform:'uppercase',letterSpacing:0.4,cursor:'pointer',marginBottom:4}}>AI Assessment</summary>
                             <div style={{
                               background:T.surface2,

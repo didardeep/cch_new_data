@@ -392,6 +392,8 @@ def ai_query():
                 else:
                     cj = m.content_json or {}
                     context_parts = [m.content]
+                    if cj.get("response_type"):
+                        context_parts.append(f"[response_type: {cj['response_type']}]")
 
                     if cj.get("chart_type") == "multi_chart" and cj.get("charts"):
                         for i, ch in enumerate(cj["charts"], 1):
@@ -1324,9 +1326,9 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
         _resp_type = ai_result.get("response_type", "chart")
         _intent = ai_result.get("intent", effective_prompt[:80])
 
-        # ── Generate summary for multi-chart if response_type is summary/both ──
+        # ── Generate summary for multi-chart (all data-bearing response types) ──
         mc_summary = None
-        if _resp_type in ("summary", "both"):
+        if _resp_type in ("chart", "summary", "both"):
             # Combine all chart rows for the summary
             all_mc_rows = []
             all_mc_cols = set()
@@ -1348,6 +1350,7 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
                         "charts": charts_out, "response": resp_text,
                         "summary": mc_summary,
                         "response_type": _resp_type,
+                        "intent": _intent,
                         "provider": provider["provider"] if provider else "rule-based",
                     },
                 )
@@ -1427,9 +1430,9 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
     _resp_type = ai_result.get("response_type", "chart")
     _intent = ai_result.get("intent", effective_prompt[:80])
 
-    # ── Generate summary for single chart if response_type is summary/both ──
+    # ── Generate summary for single chart (all data-bearing response types) ──
     sc_summary = None
-    if _resp_type in ("summary", "both"):
+    if _resp_type in ("chart", "summary", "both") and safe_rows:
         sc_summary = _generate_summary(safe_rows, columns, _intent, resp_title)
         print(f"[AI] Single-chart summary generated: {bool(sc_summary)}")
 
@@ -1453,6 +1456,7 @@ Respond ONLY with valid JSON (no markdown, no code fences, no extra text)."""
                     "sql": sql,
                     "summary": sc_summary,
                     "response_type": _resp_type,
+                    "intent": _intent,
                     "provider": provider["provider"] if provider else "rule-based",
                     "response": resp_text,
                 },
