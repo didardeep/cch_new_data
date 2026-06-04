@@ -708,7 +708,12 @@ export default function NetworkAiChat() {
                         {m.role==='user'?'You':'AI Assistant'}
                       </div>
 
-                      <div style={{fontSize:12.5,lineHeight:1.65,whiteSpace:'pre-wrap'}}>{m.content}</div>
+                      <div style={{fontSize:12.5,lineHeight:1.65,whiteSpace:'pre-wrap'}}>
+                        {/* For "both" with a summary, show only the title in the bubble — full assessment is in the collapsible box */}
+                        {m.role==='assistant'&&m.payload?.response_type==='both'&&m.payload?.summary
+                          ? (m.payload.title||'Here are the results.')
+                          : m.content}
+                      </div>
 
                       {/* Multi-chart summary + charts */}
                       {m.role==='assistant'&&m.payload&&m.payload.chart_type==='multi_chart'&&m.payload.charts?.length>0&&(<>
