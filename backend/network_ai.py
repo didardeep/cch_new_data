@@ -259,7 +259,7 @@ def _ensure_ai_session_tables():
 # Follow-up query rewriter — resolves pronouns / ellipsis BEFORE SQL generation
 # ─────────────────────────────────────────────────────────────────────────────
 _FOLLOWUP_RE = re.compile(
-    r'\b(there|that|those|this|it|same|also|instead|what about|now show|and )\b',
+    r'\b(there|that|those|this|it|same|also|instead|what about|now show|and |cell level|per cell)\b',
     re.IGNORECASE,
 )
 
@@ -463,7 +463,12 @@ def ai_query():
     SCHEMA_HINT = f"""
 Tables:
 1. kpi_data(id, site_id, kpi_name, value, date, hour, data_level, cell_id, cell_site_id)
-   - data_level = 'site' for site-level, 'cell' for cell-level
+   - data_level = 'site' for site-level aggregates, 'cell' for per-cell granularity
+   - CRITICAL: ALWAYS filter on data_level:
+       Site queries  → WHERE k.data_level = 'site'
+       Cell queries  → WHERE k.data_level = 'cell'
+   - For cell queries, cell_id column holds the cell name/identifier.
+     A site can have multiple cells. cell_site_id is an alternative cell identifier.
    - IMPORTANT: kpi_name values are EXACT strings fetched LIVE from database. Use EXACTLY as listed:
 
    === KPI Names (EXACT values in kpi_name column — fetched from DB) ===
@@ -487,6 +492,29 @@ User says "last 7 days" → AND k.date >= CURRENT_DATE - INTERVAL '7 days' AND k
 User says "last month" → AND k.date >= CURRENT_DATE - INTERVAL '1 month' AND k.date <= CURRENT_DATE
 ALWAYS add AND k.date <= CURRENT_DATE when any date range is used, to exclude future data.
 IMPORTANT: Pick kpi_name from the EXACT list above. Do NOT invent or guess KPI names.
+
+=== CELL-LEVEL vs SITE-LEVEL QUERIES ===
+- Default to site-level (data_level='site') unless the user explicitly mentions "cell", "cell id",
+  "cell level", "per cell", or provides a specific cell_id / cell name.
+- User says "cell <ID>" / "cell_id <ID>" / "for cell <name>" → cell-level query:
+    WHERE k.data_level = 'cell' AND k.cell_id = '<ID>'
+    OR: WHERE k.data_level = 'cell' AND (k.cell_id ILIKE '%<ID>%' OR k.cell_site_id ILIKE '%<ID>%')
+- "cells of site X" / "cell level for site X" / "per cell for site X":
+    WHERE k.data_level = 'cell' AND k.site_id = '<SITE>'
+    → GROUP BY k.cell_id to get per-cell breakdown
+- "worst cells" / "top cells" / "cell ranking":
+    WHERE k.data_level = 'cell'
+    → GROUP BY k.site_id, k.cell_id  ORDER BY ... LIMIT N
+    Include k.cell_id AND k.site_id in SELECT and GROUP BY.
+- Cell trend: same as site trend but with data_level='cell' and cell_id filter.
+  Example for a specific cell:
+    SELECT k.date::text AS date, AVG(k.value) AS avg_val
+    FROM kpi_data k
+    WHERE k.data_level = 'cell' AND k.cell_id = '<CELL_ID>'
+      AND k.kpi_name = '<KPI>' AND k.value IS NOT NULL
+    GROUP BY k.date ORDER BY k.date
+- IMPORTANT: cell_id values are free-form strings (not always following the site_id pattern).
+  Use ILIKE for fuzzy matching when the user provides a partial cell name.
 """
 
     LLM_SYSTEM = f"""You are a telecom network analytics SQL generator. Your ONLY job is to convert the user's natural-language query into an EXACT, STRICT SQL query that fetches PRECISELY what was asked — nothing more, nothing less.
@@ -536,10 +564,16 @@ Follow-up patterns and how to handle them:
 6. VAGUE / AMBIGUOUS — "yes", "ok", "show more", short prompts with no new site/KPI
    → Re-run the previous SQL with the same parameters.
 
+7. CELL SWITCH — "show for cell X" / "what about cell ABC" / "cell level for this site"
+   → Switch to data_level='cell'. If a cell_id is given, filter on it.
+   → If user says "cell level" without a cell_id, show per-cell breakdown for the same site.
+   → Keep same KPI(s) and time range from previous query.
+
 **IMPORTANT RULES for follow-ups:**
 - ALWAYS inherit site_id from previous SQL if the user doesn't mention a new one.
 - ALWAYS inherit the time range (INTERVAL) from previous SQL if not specified.
 - ALWAYS inherit kpi_name(s) from previous SQL if the user doesn't mention a new KPI.
+- ALWAYS inherit data_level from previous SQL if the user doesn't change it (site→cell or cell→site).
 - If the current prompt is completely self-contained (has site ID + KPI + time range), treat it as a FRESH query.
 - A prompt like "i want to see for site id X" with NO new KPI mentioned = SITE SWITCH → inherit all KPIs.
 
@@ -1604,6 +1638,30 @@ def _handle_followup(prompt_orig: str, p: str, prev: dict, time_filter: str) -> 
     if not prev_sql and not prev_charts:
         return None
 
+    # ── Detect cell-level intent in follow-up ────────────────────────────────
+    _is_cell_query = bool(re.search(r'\bcell[\s_-]*(level|id|name)?\b', p))
+    # Inherit data_level from previous SQL if user doesn't change it
+    _prev_was_cell = "data_level = 'cell'" in prev_sql
+    if not _is_cell_query and _prev_was_cell:
+        _is_cell_query = True  # inherit cell context
+    _data_level = "'cell'" if _is_cell_query else "'site'"
+
+    # Extract cell_id from user prompt
+    _cell_id_match = re.search(
+        r'(?:cell[\s_-]*(?:id|name)?[\s:=]*)["\']?([A-Za-z0-9][A-Za-z0-9_\-]{2,})["\']?',
+        prompt_orig, re.IGNORECASE,
+    )
+    _cell_ids = []
+    if _cell_id_match:
+        _cid = _cell_id_match.group(1).strip()
+        if _cid.lower() not in ('level', 'for', 'the', 'of', 'in', 'id', 'name', 'data', 'site', 'ids'):
+            _cell_ids = [_cid]
+    # Also inherit cell_id from previous SQL
+    if not _cell_ids and _prev_was_cell:
+        _prev_cell_ids = re.findall(r"cell_id\s*(?:ILIKE\s*'%|=\s*')([^'%]+)", prev_sql)
+        if _prev_cell_ids:
+            _cell_ids = [_prev_cell_ids[0]]
+
     # Extract context from main SQL
     prev_sites    = re.findall(r"site_id\s*=\s*'([^']+)'", prev_sql)
     prev_kpi_names = re.findall(r"kpi_name\s*=\s*'([^']+)'", prev_sql)
@@ -1694,7 +1752,7 @@ def _handle_followup(prompt_orig: str, p: str, prev: dict, time_filter: str) -> 
                 "sql": f"""SELECT k.date::text AS date, AVG(k.value) AS {alias}
                     FROM kpi_data k
                     WHERE k.kpi_name = '{kpi_name}' AND k.site_id = '{site}'
-                      AND k.data_level = 'site' AND k.value IS NOT NULL {date_clause}
+                      AND k.data_level = {_data_level} AND k.value IS NOT NULL {date_clause}
                     GROUP BY k.date ORDER BY k.date""",
                 "query_type": "line", "chart_type": "line",
                 "title": f"{kpi_name} — {site} (last {days}d)",
@@ -1709,7 +1767,7 @@ def _handle_followup(prompt_orig: str, p: str, prev: dict, time_filter: str) -> 
                        AVG(k.value) AS value, '{kpi_name}' AS kpi_name
                 FROM kpi_data k
                 WHERE k.kpi_name = '{kpi_name}' AND k.site_id = '{site}'
-                  AND k.data_level = 'site' AND k.value IS NOT NULL {date_clause}
+                  AND k.data_level = {_data_level} AND k.value IS NOT NULL {date_clause}
                 GROUP BY k.date, k.site_id""")
             kpi_short = " & ".join(
                 k.replace("LTE ", "").replace("E-RAB ", "")[:18]
@@ -1733,7 +1791,7 @@ def _handle_followup(prompt_orig: str, p: str, prev: dict, time_filter: str) -> 
             "sql": f"""SELECT k.date::text AS date, AVG(k.value) AS {alias}
                 FROM kpi_data k
                 WHERE k.kpi_name = '{kpi_name}' AND k.site_id = '{site}'
-                  AND k.data_level = 'site' AND k.value IS NOT NULL {date_clause}
+                  AND k.data_level = {_data_level} AND k.value IS NOT NULL {date_clause}
                 GROUP BY k.date ORDER BY k.date""",
             "query_type": "line", "chart_type": "line",
             "title": f"{kpi_name} — {site} (last {days}d)",
@@ -1843,14 +1901,14 @@ def _handle_followup(prompt_orig: str, p: str, prev: dict, time_filter: str) -> 
                        AVG(k.value) AS value, '{prev_kpi}' AS kpi_name
                 FROM kpi_data k
                 WHERE k.kpi_name = '{prev_kpi}' AND k.site_id = '{site}'
-                  AND k.data_level = 'site' AND k.value IS NOT NULL {date_clause}
+                  AND k.data_level = {_data_level} AND k.value IS NOT NULL {date_clause}
                 GROUP BY k.date, k.site_id
             UNION ALL
             SELECT k.date::text AS date, k.site_id,
                        AVG(k.value) AS value, '{kpi_name}' AS kpi_name
                 FROM kpi_data k
                 WHERE k.kpi_name = '{kpi_name}' AND k.site_id = '{site}'
-                  AND k.data_level = 'site' AND k.value IS NOT NULL {date_clause}
+                  AND k.data_level = {_data_level} AND k.value IS NOT NULL {date_clause}
                 GROUP BY k.date, k.site_id
             ORDER BY date"""
             return {
@@ -1892,6 +1950,21 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
 
     site_ids = re.findall(r'[A-Za-z]{2,}[_\-][A-Za-z]{2,}[_\-]\d{3,}', prompt)
     site_ids = list(dict.fromkeys(site_ids))
+
+    # ── Detect cell-level intent ─────────────────────────────────────────────
+    _is_cell_query = bool(re.search(r'\bcell[\s_-]*(level|id|name)?\b', p))
+    # Extract cell_id: "cell <ID>", "cell_id <ID>", "cell id <ID>"
+    _cell_id_match = re.search(
+        r'(?:cell[\s_-]*(?:id|name)?[\s:=]*)["\']?([A-Za-z0-9][A-Za-z0-9_\-]{2,})["\']?',
+        prompt, re.IGNORECASE,
+    )
+    _cell_ids = []
+    if _cell_id_match:
+        _cid = _cell_id_match.group(1).strip()
+        # Avoid matching keywords like "level", "for", "the", etc.
+        if _cid.lower() not in ('level', 'for', 'the', 'of', 'in', 'id', 'name', 'data', 'site', 'ids'):
+            _cell_ids = [_cid]
+    _data_level = "'cell'" if _is_cell_query else "'site'"
 
     # ── Dynamic KPI maps — built from actual DB kpi_names ──────────────────
     _dkm, _dem, _ = _build_dynamic_kpi_map()
@@ -1974,7 +2047,7 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
                     "sql": f"""SELECT k.date::text AS date, AVG(k.value) AS {alias}
                         FROM kpi_data k
                         WHERE k.kpi_name = '{kpi_name}' AND k.site_id = '{site}'
-                          AND k.data_level = 'site' AND k.value IS NOT NULL {date_clause}
+                          AND k.data_level = {_data_level} AND k.value IS NOT NULL {date_clause}
                         GROUP BY k.date ORDER BY k.date""",
                     "chart_type": "line",
                     "title": f"{kpi_name} — {site}" + (f" (last {days}d)" if days else ""),
@@ -1990,7 +2063,7 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
                                AVG(k.value) AS value, '{kpi_name}' AS kpi_name
                         FROM kpi_data k
                         WHERE k.kpi_name = '{kpi_name}' AND k.site_id = '{site}'
-                          AND k.data_level = 'site' AND k.value IS NOT NULL {date_clause}
+                          AND k.data_level = {_data_level} AND k.value IS NOT NULL {date_clause}
                         GROUP BY k.date, k.site_id"""
                     )
                 kpi_labels = " & ".join(
@@ -2036,7 +2109,7 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
                 "sql": f"""SELECT k.date::text AS date, AVG(k.value) AS {alias}
                     FROM kpi_data k
                     WHERE k.kpi_name = '{kpi_name}' AND k.site_id = '{site}'
-                      AND k.data_level = 'site' AND k.value IS NOT NULL {date_clause}
+                      AND k.data_level = {_data_level} AND k.value IS NOT NULL {date_clause}
                     GROUP BY k.date ORDER BY k.date""",
                 "query_type": "line", "chart_type": "line",
                 "title": f"{kpi_name} — {site}" + (f" (last {days}d)" if days else ""),
@@ -2057,7 +2130,7 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
                        AVG(k.value) AS value, '{kpi_name}' AS kpi_name
                 FROM kpi_data k
                 WHERE k.kpi_name = '{kpi_name}' AND k.site_id = '{site}'
-                  AND k.data_level = 'site' AND k.value IS NOT NULL {date_clause}
+                  AND k.data_level = {_data_level} AND k.value IS NOT NULL {date_clause}
                 GROUP BY k.date, k.site_id""")
             return {
                 "sql": "\nUNION ALL\n".join(parts_sql) + "\nORDER BY date",
@@ -2072,15 +2145,16 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
         cases = ", ".join(f"AVG(CASE WHEN k.kpi_name = '{kn}' THEN k.value END) AS {al}" for kn, al in detected_kpis[:5])
         in_cl = ", ".join(f"'{kn}'" for kn, _ in detected_kpis[:5])
         return {
-            "sql": f"""SELECT k.site_id, {cases}
+            "sql": f"""SELECT k.site_id, {'k.cell_id, ' if _is_cell_query else ''}{cases}
                 FROM kpi_data k
-                WHERE k.site_id = '{site}' AND k.data_level = 'site' AND k.value IS NOT NULL
+                WHERE k.site_id = '{site}' AND k.data_level = {_data_level} AND k.value IS NOT NULL
                   AND k.kpi_name IN ({in_cl})
-                GROUP BY k.site_id""",
+                  {("AND k.cell_id ILIKE '%" + _cell_ids[0] + "%'") if _cell_ids else ''}
+                GROUP BY k.site_id{', k.cell_id' if _is_cell_query else ''}""",
             "query_type": "bar", "chart_type": "bar",
-            "title": f"KPIs for {site}",
-            "x_axis": "site_id", "y_axes": [al for _, al in detected_kpis[:5]],
-            "response": f"Showing requested KPIs for site {site}.",
+            "title": f"KPIs for {'cell ' + _cell_ids[0] if _cell_ids else 'site ' + site}",
+            "x_axis": "cell_id" if _is_cell_query else "site_id", "y_axes": [al for _, al in detected_kpis[:5]],
+            "response": f"Showing requested KPIs for {'cell ' + _cell_ids[0] if _cell_ids else 'site ' + site}.",
         }
 
     if is_trend and detected_kpis:
@@ -2093,13 +2167,14 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
             "sql": f"""SELECT k.date::text AS date, AVG(k.value) AS {alias},
                        MIN(k.value) AS min_val, MAX(k.value) AS max_val
                 FROM kpi_data k
-                WHERE k.kpi_name = '{kpi_name}' AND k.data_level = 'site'
+                WHERE k.kpi_name = '{kpi_name}' AND k.data_level = {_data_level}
                   AND k.value IS NOT NULL {date_clause}
+                  {("AND k.cell_id ILIKE '%" + _cell_ids[0] + "%'") if _cell_ids else ''}
                 GROUP BY k.date ORDER BY k.date LIMIT 60""",
             "query_type": "line", "chart_type": "line",
-            "title": f"{kpi_name} Daily Trend",
+            "title": f"{kpi_name} Daily Trend" + (f" — cell {_cell_ids[0]}" if _cell_ids else ""),
             "x_axis": "date", "y_axes": [alias, "min_val", "max_val"],
-            "response": f"Daily trend of {kpi_name} across the network.",
+            "response": f"Daily trend of {kpi_name}" + (f" for cell {_cell_ids[0]}." if _cell_ids else " across the network."),
         }
 
     N    = 10
@@ -2121,13 +2196,15 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
             kpi_names_for_in.append(f"'{kpi_name}'")
         cases     = ",\n                   ".join(case_parts)
         in_clause = ", ".join(kpi_names_for_in)
-        return f"""SELECT k.site_id, MAX(ts.zone) AS cluster,
+        _cell_select = ", k.cell_id" if _is_cell_query else ""
+        _cell_group = ", k.cell_id" if _is_cell_query else ""
+        return f"""SELECT k.site_id{_cell_select}, MAX(ts.zone) AS cluster,
                        AVG(ts.latitude) AS lat, AVG(ts.longitude) AS lng,
                        {cases}
                 FROM kpi_data k {GEO_JOIN}
-                WHERE k.data_level = 'site' AND k.value IS NOT NULL
+                WHERE k.data_level = {_data_level} AND k.value IS NOT NULL
                   AND k.kpi_name IN ({in_clause})
-                GROUP BY k.site_id
+                GROUP BY k.site_id{_cell_group}
                 ORDER BY {order_col} {order_dir} NULLS LAST LIMIT {N}"""
 
     # ── Threshold extraction for conditional queries ─────────────────────────
@@ -2188,13 +2265,15 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
                     f"AVG(CASE WHEN k.kpi_name = '{kpi_name}' THEN k.value END) {op} {val}"
                 )
             having = "HAVING " + "\n                       OR ".join(having_parts)
-            sql = f"""SELECT k.site_id, MAX(ts.zone) AS cluster,
+            _cell_s = ", k.cell_id" if _is_cell_query else ""
+            _cell_g = ", k.cell_id" if _is_cell_query else ""
+            sql = f"""SELECT k.site_id{_cell_s}, MAX(ts.zone) AS cluster,
                        AVG(ts.latitude) AS lat, AVG(ts.longitude) AS lng,
                        {cases}
                     FROM kpi_data k {GEO_JOIN}
-                    WHERE k.data_level = 'site' AND k.value IS NOT NULL
+                    WHERE k.data_level = {_data_level} AND k.value IS NOT NULL
                       AND k.kpi_name IN ({in_clause})
-                    GROUP BY k.site_id
+                    GROUP BY k.site_id{_cell_g}
                     {having}
                     ORDER BY {order_col} {order_dir} NULLS LAST LIMIT {N}"""
         else:
@@ -2235,7 +2314,7 @@ def _rule_based_query(prompt: str, time_filter: str = '1=1', prev_context: dict 
                        {cases_sql}
                     FROM flexible_kpi_uploads f
                     JOIN kpi_data k ON LOWER(f.site_id) = LOWER(k.site_id)
-                      AND k.data_level = 'site' AND k.value IS NOT NULL
+                      AND k.data_level = {_data_level} AND k.value IS NOT NULL
                       AND k.kpi_name IN ({in_clause})
                     WHERE f.kpi_type = 'revenue' AND f.num_value IS NOT NULL
                       AND f.column_name ILIKE '%%revenue%%'
