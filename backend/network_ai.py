@@ -750,6 +750,29 @@ to fetch the data. For health/status queries:
 - If a site is mentioned: fetch recent KPI values for that site
 - If generic "network health": fetch network-wide avg of top KPIs
 
+**CELL-LEVEL SQL examples** (use data_level='cell' whenever user mentions "cell"):
+
+  Per-cell breakdown for a site:
+    SELECT k.cell_id, k.site_id,
+      AVG(CASE WHEN k.kpi_name = '<KPI>' THEN k.value END) AS kpi_val
+    FROM kpi_data k
+    WHERE k.data_level = 'cell' AND k.site_id = '<SITE>' AND k.value IS NOT NULL
+    GROUP BY k.cell_id, k.site_id ORDER BY kpi_val DESC
+
+  Specific cell trend:
+    SELECT k.date::text AS date, AVG(k.value) AS avg_val
+    FROM kpi_data k
+    WHERE k.data_level = 'cell' AND k.cell_id ILIKE '%<CELL_ID>%'
+      AND k.kpi_name = '<KPI>' AND k.value IS NOT NULL
+    GROUP BY k.date ORDER BY k.date
+
+  Worst cells ranking:
+    SELECT k.site_id, k.cell_id,
+      AVG(CASE WHEN k.kpi_name = '<drop_kpi>' THEN k.value END) AS drop_rate
+    FROM kpi_data k
+    WHERE k.data_level = 'cell' AND k.value IS NOT NULL
+    GROUP BY k.site_id, k.cell_id ORDER BY drop_rate DESC NULLS LAST LIMIT 10
+
 ═══════════════════════════════════════════════════════════
 RESPONSE FORMAT:
 ═══════════════════════════════════════════════════════════
