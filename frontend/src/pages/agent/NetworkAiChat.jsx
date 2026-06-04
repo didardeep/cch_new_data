@@ -391,28 +391,42 @@ function InlineChart({result,T,chartId}) {
       </ResponsiveContainer>);
   };
 
+  const [showAssessment,setShowAssessment]=useState(true);
   const isSummaryOnly = response_type === 'summary';
-  const showSummary = summary && (response_type === 'summary' || response_type === 'both');
+  // For "both" show a collapsible assessment; for "summary"-only the chat bubble already has the text
+  const hasAssessmentBox = summary && response_type === 'both';
 
   return(
     <div style={{marginTop:8}}>
-      {/* Summary text bubble (shown above chart for "both", or alone for "summary") */}
-      {showSummary&&(
-        <div style={{
-          background:T.surface2,
-          border:`1px solid ${T.border}`,
-          borderRadius:12,
-          padding:'12px 16px',
-          marginBottom:10,
-          fontSize:12,
-          lineHeight:1.7,
-          color:T.text,
-          whiteSpace:'pre-wrap',
-          borderLeft:`4px solid ${T.kpmgBlue}`,
-        }}>
-          <div style={{fontSize:9,fontWeight:700,color:T.kpmgBlue,textTransform:'uppercase',marginBottom:6,letterSpacing:0.5}}>AI Assessment</div>
-          {summary}
-        </div>
+      {/* Collapsible AI Assessment — only for "both" (summary-only text lives in the chat bubble) */}
+      {hasAssessmentBox&&(
+        <>
+          <button onClick={()=>setShowAssessment(s=>!s)} style={{
+            display:'flex',alignItems:'center',gap:5,
+            padding:'4px 10px',borderRadius:10,fontSize:9.5,fontWeight:700,
+            background:T.kpmgBlue+'14',color:T.kpmgBlue,border:'none',cursor:'pointer',marginBottom:6,
+            textTransform:'uppercase',letterSpacing:0.4,
+          }}>
+            <span style={{transform:showAssessment?'rotate(90deg)':'rotate(0deg)',transition:'transform .15s',fontSize:10}}>&#9654;</span>
+            AI Assessment
+          </button>
+          {showAssessment&&(
+            <div style={{
+              background:T.surface2,
+              border:`1px solid ${T.border}`,
+              borderRadius:12,
+              padding:'12px 16px',
+              marginBottom:10,
+              fontSize:12,
+              lineHeight:1.7,
+              color:T.text,
+              whiteSpace:'pre-wrap',
+              borderLeft:`4px solid ${T.kpmgBlue}`,
+            }}>
+              {summary}
+            </div>
+          )}
+        </>
       )}
 
       {/* For summary-only, skip the chart/table entirely */}
@@ -698,23 +712,23 @@ export default function NetworkAiChat() {
 
                       {/* Multi-chart summary + charts */}
                       {m.role==='assistant'&&m.payload&&m.payload.chart_type==='multi_chart'&&m.payload.charts?.length>0&&(<>
-                        {m.payload.summary&&(
-                          <div style={{
-                            background:T.surface2,
-                            border:`1px solid ${T.border}`,
-                            borderRadius:12,
-                            padding:'12px 16px',
-                            marginTop:10,
-                            marginBottom:6,
-                            fontSize:12,
-                            lineHeight:1.7,
-                            color:T.text,
-                            whiteSpace:'pre-wrap',
-                            borderLeft:`4px solid ${T.kpmgBlue}`,
-                          }}>
-                            <div style={{fontSize:9,fontWeight:700,color:T.kpmgBlue,textTransform:'uppercase',marginBottom:6,letterSpacing:0.5}}>AI Assessment</div>
-                            {m.payload.summary}
-                          </div>
+                        {m.payload.summary&&m.payload.response_type==='both'&&(
+                          <details open style={{marginTop:10,marginBottom:6}}>
+                            <summary style={{fontSize:9.5,fontWeight:700,color:T.kpmgBlue,textTransform:'uppercase',letterSpacing:0.4,cursor:'pointer',marginBottom:4}}>AI Assessment</summary>
+                            <div style={{
+                              background:T.surface2,
+                              border:`1px solid ${T.border}`,
+                              borderRadius:12,
+                              padding:'12px 16px',
+                              fontSize:12,
+                              lineHeight:1.7,
+                              color:T.text,
+                              whiteSpace:'pre-wrap',
+                              borderLeft:`4px solid ${T.kpmgBlue}`,
+                            }}>
+                              {m.payload.summary}
+                            </div>
+                          </details>
                         )}
                         {m.payload.response_type!=='summary'&&m.payload.charts.map((chart,ci)=>(
                           <div key={ci} style={{marginTop:ci===0?10:16}}>
