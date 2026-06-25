@@ -3237,6 +3237,10 @@ def cto_overview():
     if user.role != "cto":
         return jsonify({"error": "Unauthorized"}), 403
 
+    cached = _cache_get("cto_overview")
+    if cached:
+        return jsonify(cached)
+
     # Resolution rate
     total = ChatSession.query.count() or 1
     resolved = ChatSession.query.filter_by(status="resolved").count()
@@ -3266,7 +3270,7 @@ def cto_overview():
     except Exception:
         pass
 
-    return jsonify({
+    result = {
         "resolution_rate": resolution_rate,
         "avg_rating": round(float(avg_rating), 1),
         "total_customers": User.query.filter_by(role="customer").count(),
@@ -3275,7 +3279,9 @@ def cto_overview():
         "monthly_trends": [{"month": m[0].isoformat() if m[0] else "", "count": m[1]} for m in monthly],
         "worst_cell_tickets": worst_cell_count,
         "overutilized_tickets": overutilized_count,
-    })
+    }
+    _cache_set("cto_overview", result)
+    return jsonify(result)
 
 
 def _require_cto_user():
@@ -3475,6 +3481,10 @@ def cto_map_data():
     if not user:
         return jsonify({"error": "Unauthorized"}), 403
 
+    cached = _cache_get("cto_map_data")
+    if cached:
+        return jsonify(cached)
+
     sites = TelecomSite.query.with_entities(
         TelecomSite.site_id,
         TelecomSite.latitude,
@@ -3485,7 +3495,7 @@ def cto_map_data():
         TelecomSite.solution,
     ).all()
 
-    return jsonify({
+    result = {
         "sites": [
             {
                 "site_id": site.site_id,
@@ -3504,7 +3514,9 @@ def cto_map_data():
                 float(site.longitude) != 0
             )
         ]
-    })
+    }
+    _cache_set("cto_map_data", result)
+    return jsonify(result)
 
 
 @app.route("/api/cto/ticket-heatmap", methods=["GET"])
@@ -5111,17 +5123,36 @@ def cto_operational_kpi():
     if not user:
         return jsonify({"error": "Unauthorized"}), 403
 
-    tickets = Ticket.query.all()
-    total_tickets = len(tickets)
-    resolved_tickets = [t for t in tickets if t.status == "resolved"]
-    sla_breaches = len([t for t in tickets if t.sla_breached and t.status != "resolved"])
+    cached = _cache_get("cto_operational_kpi")
+    if cached:
+        return jsonify(cached)
+
+    now_utc = datetime.now(timezone.utc)
+    period_days = 7
+    period_start = now_utc - timedelta(days=period_days)
+    prev_period_start = period_start - timedelta(days=period_days)
+
+    # ── Aggregate counts via SQL (no Ticket.query.all()) ──────────────────
+    total_tickets = db.session.query(db.func.count(Ticket.id)).scalar() or 0
+
+    sla_breaches = db.session.query(db.func.count(Ticket.id)).filter(
+        Ticket.sla_breached == True,
+        Ticket.status != "resolved",
+    ).scalar() or 0
+
     sla_compliance = round(((total_tickets - sla_breaches) / total_tickets) * 100, 1) if total_tickets else 0
 
-    resolution_hours = []
-    for ticket in resolved_tickets:
-        if ticket.created_at and ticket.resolved_at:
-            resolution_hours.append((ticket.resolved_at - ticket.created_at).total_seconds() / 3600)
-    avg_resolution_time = round(sum(resolution_hours) / len(resolution_hours), 2) if resolution_hours else 0
+    # ── Avg resolution time via SQL extract ───────────────────────────────
+    avg_res_raw = db.session.query(
+        db.func.avg(
+            db.func.extract("epoch", Ticket.resolved_at - Ticket.created_at)
+        )
+    ).filter(
+        Ticket.status == "resolved",
+        Ticket.resolved_at.isnot(None),
+        Ticket.created_at.isnot(None),
+    ).scalar() or 0
+    avg_resolution_time = round(float(avg_res_raw) / 3600, 2)
 
     csat_raw = db.session.query(db.func.avg(Feedback.rating)).filter(Feedback.rating > 0).scalar() or 0
     csat = round(float(csat_raw), 2)
@@ -5135,26 +5166,25 @@ def cto_operational_kpi():
     ).outerjoin(Ticket, Ticket.assigned_to == User.id).filter(User.role == "human_agent").group_by(User.name).all()
     workload_data = [{"agent": name or "Unassigned", "tickets": count} for name, count in agent_workload]
 
-    escalated_count = len([t for t in tickets if t.status in ("escalated", "manager_escalated")])
+    escalated_count = db.session.query(db.func.count(Ticket.id)).filter(
+        Ticket.status.in_(("escalated", "manager_escalated"))
+    ).scalar() or 0
     escalation_rate = round((escalated_count / total_tickets) * 100, 1) if total_tickets else 0
 
     breach_alerts = SlaAlert.query.filter_by(recipient_role="cto").count()
 
-    # ── Critical incidents: active tickets sorted by SLA urgency ────────────
-    now_utc = datetime.now(timezone.utc)
+    # ── Critical incidents: active tickets sorted by SLA deadline ─────────
+    active_with_sla = db.session.query(Ticket).filter(
+        Ticket.status != "resolved",
+        Ticket.sla_deadline.isnot(None),
+    ).order_by(Ticket.sla_deadline.asc()).limit(10).all()
 
-    def _sla_remaining(t):
+    critical_incidents = []
+    for t in active_with_sla:
         dl = t.sla_deadline
         if dl.tzinfo is None:
             dl = dl.replace(tzinfo=timezone.utc)
-        return (dl - now_utc).total_seconds()
-
-    active_with_sla = [t for t in tickets if t.status not in ("resolved",) and t.sla_deadline]
-    critical_sorted = sorted(active_with_sla, key=_sla_remaining)[:10]
-
-    critical_incidents = []
-    for t in critical_sorted:
-        rem = _sla_remaining(t)
+        rem = (dl - now_utc).total_seconds()
         abs_s = abs(rem)
         h = int(abs_s // 3600)
         m = int((abs_s % 3600) // 60)
@@ -5177,55 +5207,59 @@ def cto_operational_kpi():
             "resolution_notes": t.resolution_notes or "",
         })
 
-    # ── Escalation trend: last 7 days daily escalated-ticket counts ─────────
-    escalation_trend = []
-    for i in range(7):
-        day_start = (now_utc - timedelta(days=6 - i)).replace(hour=0, minute=0, second=0, microsecond=0)
-        day_end = day_start + timedelta(days=1)
-        count = sum(
-            1 for t in tickets
-            if t.status in ("escalated", "manager_escalated") and t.created_at and
-            day_start <= (t.created_at.replace(tzinfo=timezone.utc) if t.created_at.tzinfo is None else t.created_at) < day_end
-        )
-        escalation_trend.append(count)
+    # ── Escalation trend: last 7 days via SQL GROUP BY ────────────────────
+    seven_days_ago = now_utc - timedelta(days=7)
+    esc_daily = db.session.query(
+        db.func.date_trunc("day", Ticket.created_at).label("day"),
+        db.func.count(Ticket.id),
+    ).filter(
+        Ticket.status.in_(("escalated", "manager_escalated")),
+        Ticket.created_at >= seven_days_ago,
+    ).group_by("day").order_by("day").all()
 
-    # ── Ticket growth % vs previous period ────────────────────────────────
-    period_days = 7
-    period_start = now_utc - timedelta(days=period_days)
-    prev_period_start = period_start - timedelta(days=period_days)
+    esc_by_day = {row[0].date(): row[1] for row in esc_daily if row[0]}
+    escalation_trend = [esc_by_day.get((now_utc - timedelta(days=6 - i)).date(), 0) for i in range(7)]
 
-    def _in_range(t, start, end):
-        if not t.created_at:
-            return False
-        ca = t.created_at.replace(tzinfo=timezone.utc) if t.created_at.tzinfo is None else t.created_at
-        return start <= ca < end
+    # ── Period comparisons via SQL ────────────────────────────────────────
+    current_period_count = db.session.query(db.func.count(Ticket.id)).filter(
+        Ticket.created_at >= period_start, Ticket.created_at < now_utc,
+    ).scalar() or 0
 
-    current_period_count = sum(1 for t in tickets if _in_range(t, period_start, now_utc))
-    prev_period_count = sum(1 for t in tickets if _in_range(t, prev_period_start, period_start))
-    ticket_growth_pct = round(((current_period_count - prev_period_count) / prev_period_count) * 100, 1) if prev_period_count else 0.0
+    prev_period_count = db.session.query(db.func.count(Ticket.id)).filter(
+        Ticket.created_at >= prev_period_start, Ticket.created_at < period_start,
+    ).scalar() or 0
 
-    # ── Resolution time change vs previous period ─────────────────────────
-    prev_resolved = [t for t in tickets if t.status == "resolved" and t.created_at and t.resolved_at and _in_range(t, prev_period_start, period_start)]
-    prev_res_hours = [(t.resolved_at - t.created_at).total_seconds() / 3600 for t in prev_resolved if t.resolved_at and t.created_at]
-    prev_avg_res = round(sum(prev_res_hours) / len(prev_res_hours), 2) if prev_res_hours else 0
+    ticket_growth_pct = round(
+        ((current_period_count - prev_period_count) / prev_period_count) * 100, 1
+    ) if prev_period_count else 0.0
+
+    prev_avg_res_raw = db.session.query(
+        db.func.avg(db.func.extract("epoch", Ticket.resolved_at - Ticket.created_at))
+    ).filter(
+        Ticket.status == "resolved",
+        Ticket.resolved_at.isnot(None),
+        Ticket.created_at >= prev_period_start,
+        Ticket.created_at < period_start,
+    ).scalar() or 0
+    prev_avg_res = round(float(prev_avg_res_raw) / 3600, 2)
     resolution_change = round(avg_resolution_time - prev_avg_res, 2)
 
-    # ── Escalation rate change vs previous period ─────────────────────────
-    prev_escalated = sum(1 for t in tickets if t.status in ("escalated", "manager_escalated") and _in_range(t, prev_period_start, period_start))
+    prev_escalated = db.session.query(db.func.count(Ticket.id)).filter(
+        Ticket.status.in_(("escalated", "manager_escalated")),
+        Ticket.created_at >= prev_period_start, Ticket.created_at < period_start,
+    ).scalar() or 0
     prev_esc_rate = round((prev_escalated / prev_period_count) * 100, 1) if prev_period_count else 0.0
     escalation_rate_change = round(escalation_rate - prev_esc_rate, 1)
 
-    # ── Highest breach category ───────────────────────────────────────────
-    breach_by_category = {}
-    for t in tickets:
-        if t.sla_breached:
-            cat = t.category or "General"
-            breach_by_category[cat] = breach_by_category.get(cat, 0) + 1
-    top_breach_category = max(breach_by_category, key=breach_by_category.get) if breach_by_category else ""
+    # ── Top breach category via SQL ───────────────────────────────────────
+    breach_cat_row = db.session.query(
+        Ticket.category, db.func.count(Ticket.id)
+    ).filter(Ticket.sla_breached == True).group_by(Ticket.category).order_by(
+        db.func.count(Ticket.id).desc()
+    ).first()
+    top_breach_category = breach_cat_row[0] if breach_cat_row else ""
 
-    # ── Escalation commentary (dynamic) ───────────────────────────────────
-    esc_this_week = sum(escalation_trend[-7:])
-    esc_prev_week = sum(escalation_trend[:7]) if len(escalation_trend) >= 14 else 0
+    # ── Escalation commentary ─────────────────────────────────────────────
     if escalation_rate == 0:
         esc_comment = "No escalations recorded in the current period."
     elif escalation_rate_change < -1:
@@ -5235,7 +5269,7 @@ def cto_operational_kpi():
     else:
         esc_comment = "Escalation rate is stable compared to last period."
 
-    return jsonify({
+    result = {
         "summary": {
             "total_tickets": total_tickets,
             "sla_compliance": sla_compliance,
@@ -5254,7 +5288,9 @@ def cto_operational_kpi():
         "agent_workload": workload_data,
         "critical_incidents": critical_incidents,
         "escalation_trend": escalation_trend,
-    })
+    }
+    _cache_set("cto_operational_kpi", result)
+    return jsonify(result)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
