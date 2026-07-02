@@ -6,46 +6,62 @@ import 'leaflet/dist/leaflet.css';
 import { apiGet } from '../../api';
 
 const DEFAULT_MAP_CENTER = [12.5657, 104.9910];
+const CHUNK_SIZE = 300;   // markers added per batch
+const CHUNK_DELAY = 50;   // ms between batches
 
+/* ── Helpers ──────────────────────────────────────────────── */
 function statusColor(status) {
-  const normalized = String(status || 'active').toLowerCase();
-  if (normalized === 'down' || normalized === 'off_air') return '#dc2626';
-  if (normalized === 'alarm' || normalized === 'warning') return '#f59e0b';
+  const n = String(status || 'active').toLowerCase();
+  if (n === 'down' || n === 'off_air') return '#dc2626';
+  if (n === 'alarm' || n === 'warning') return '#f59e0b';
   return '#16a34a';
 }
 
 function statusLabel(status) {
-  const normalized = String(status || 'active').toLowerCase();
-  if (normalized === 'on_air') return 'Active';
-  if (normalized === 'off_air') return 'Down';
-  if (normalized === 'alarm') return 'Alarm';
-  if (normalized === 'warning') return 'Warning';
-  return normalized.replace(/_/g, ' ');
+  const n = String(status || 'active').toLowerCase();
+  if (n === 'on_air') return 'Active';
+  if (n === 'off_air') return 'Down';
+  if (n === 'alarm') return 'Alarm';
+  if (n === 'warning') return 'Warning';
+  return n.replace(/_/g, ' ');
 }
 
-function createSiteIcon(status) {
+/* Icon cache — at most ~5 unique L.divIcon objects total */
+const _iconCache = {};
+function getSiteIcon(status) {
+  const key = String(status || 'active').toLowerCase();
+  if (_iconCache[key]) return _iconCache[key];
   const color = statusColor(status);
-  const normalized = String(status || '').toLowerCase();
-  const isAlert = ['down', 'off_air', 'alarm', 'warning'].includes(normalized);
-  return L.divIcon({
+  const isAlert = ['down', 'off_air', 'alarm', 'warning'].includes(key);
+  _iconCache[key] = L.divIcon({
     className: 'cto-site-marker',
     html: `<div class="${isAlert ? 'cto-marker-alert' : ''}" style="width:18px;height:18px;border-radius:999px;background:${color};border:2.5px solid #fff;box-shadow:0 2px 12px ${color}99,0 0 0 4px ${color}33"></div>`,
     iconSize: [18, 18],
     iconAnchor: [9, 9],
   });
+  return _iconCache[key];
 }
 
+/* Cluster icon factory — defined once outside component */
+function clusterIconFn(cluster) {
+  const count = cluster.getChildCount();
+  const size = count >= 100 ? 28 : count >= 10 ? 24 : 20;
+  return L.divIcon({
+    html: `<div style="width:${size}px;height:${size}px;border-radius:50%;background:#002266;color:#fff;border:2px solid #fff;box-shadow:0 2px 8px rgba(0,34,102,0.45);display:flex;align-items:center;justify-content:center;font-size:${count >= 100 ? 9 : 10}px;font-weight:700;font-family:sans-serif;">${count}</div>`,
+    className: 'cto-cluster-icon',
+    iconSize: [size, size],
+    iconAnchor: [size / 2, size / 2],
+  });
+}
+
+/* ── Map sub-components ───────────────────────────────────── */
 function MapBounds({ sites }) {
   const map = useMap();
   useEffect(() => {
     if (!map) return;
-    const valid = (sites || []).filter(s => {
-      const la = Number(s.lat), lo = Number(s.lng);
-      return Number.isFinite(la) && Number.isFinite(lo) && la !== 0 && lo !== 0;
-    });
-    if (!valid.length) { map.setView(DEFAULT_MAP_CENTER, 6); return; }
+    if (!sites.length) { map.setView(DEFAULT_MAP_CENTER, 6); return; }
     try {
-      const bounds = L.latLngBounds(valid.map(s => [Number(s.lat), Number(s.lng)]));
+      const bounds = L.latLngBounds(sites.map(s => [Number(s.lat), Number(s.lng)]));
       if (bounds.isValid()) map.fitBounds(bounds, { padding: [28, 28], maxZoom: 12 });
     } catch (_) { /* ignore */ }
   }, [map, sites]);
@@ -71,53 +87,68 @@ function FlyToSite({ target }) {
   return null;
 }
 
+/* Each chunk is memoized — renders exactly once, never re-renders */
+const SiteChunk = memo(function SiteChunk({ chunk }) {
+  return chunk.map((site) => (
+    <Marker
+      key={`${site.site_id}-${site.lat}-${site.lng}`}
+      position={[site.lat, site.lng]}
+      icon={getSiteIcon(site.status)}
+    >
+      <Tooltip direction="top" offset={[0, -10]}>{site.site_id}</Tooltip>
+      <Popup>
+        <div style={{ minWidth: 220 }}>
+          <div style={{ fontWeight: 700, color: '#00338D', marginBottom: 6 }}>{site.site_id}</div>
+          <div style={{ fontSize: 12, color: '#475569', marginBottom: 2 }}>Zone: {site.zone || 'N/A'}</div>
+          <div style={{ fontSize: 12, color: '#475569', marginBottom: 2 }}>Status: {statusLabel(site.status) || 'Active'}</div>
+          <div style={{ fontSize: 12, color: '#475569', marginBottom: 2 }}>Lat: {Number(site.lat).toFixed(6)}</div>
+          <div style={{ fontSize: 12, color: '#475569', marginBottom: 2 }}>Lng: {Number(site.lng).toFixed(6)}</div>
+          {site.alarm ? <div style={{ fontSize: 12, color: '#b45309', marginTop: 6 }}><strong>Alarm:</strong> {site.alarm}</div> : null}
+          {site.solution ? <div style={{ fontSize: 12, color: '#475569', marginTop: 6 }}><strong>Solution:</strong> {site.solution}</div> : null}
+        </div>
+      </Popup>
+    </Marker>
+  ));
+});
+
+/* Wraps MarkerClusterGroup + progressive chunk reveal */
 const SiteMarkers = memo(function SiteMarkers({ sites }) {
-  const markers = useMemo(
-    () =>
-      sites.map((site) => (
-        <Marker
-          key={`${site.site_id}-${site.lat}-${site.lng}`}
-          position={[site.lat, site.lng]}
-          icon={createSiteIcon(site.status)}
-        >
-          <Tooltip direction="top" offset={[0, -10]}>{site.site_id}</Tooltip>
-          <Popup>
-            <div style={{ minWidth: 220 }}>
-              <div style={{ fontWeight: 700, color: '#00338D', marginBottom: 6 }}>{site.site_id}</div>
-              <div style={{ fontSize: 12, color: '#475569', marginBottom: 2 }}>Zone: {site.zone || 'N/A'}</div>
-              <div style={{ fontSize: 12, color: '#475569', marginBottom: 2 }}>Status: {statusLabel(site.status) || 'Active'}</div>
-              <div style={{ fontSize: 12, color: '#475569', marginBottom: 2 }}>Lat: {Number(site.lat).toFixed(6)}</div>
-              <div style={{ fontSize: 12, color: '#475569', marginBottom: 2 }}>Lng: {Number(site.lng).toFixed(6)}</div>
-              {site.alarm ? <div style={{ fontSize: 12, color: '#b45309', marginTop: 6 }}><strong>Alarm:</strong> {site.alarm}</div> : null}
-              {site.solution ? <div style={{ fontSize: 12, color: '#475569', marginTop: 6 }}><strong>Solution:</strong> {site.solution}</div> : null}
-            </div>
-          </Popup>
-        </Marker>
-      )),
-    [sites]
-  );
+  /* Split into stable chunks once when sites change */
+  const chunks = useMemo(() => {
+    const result = [];
+    for (let i = 0; i < sites.length; i += CHUNK_SIZE) {
+      result.push(sites.slice(i, i + CHUNK_SIZE));
+    }
+    return result;
+  }, [sites]);
+
+  /* Reveal one more chunk every CHUNK_DELAY ms */
+  const [visibleChunks, setVisibleChunks] = useState(1);
+
+  useEffect(() => {
+    setVisibleChunks(1); // reset when sites change
+  }, [chunks]);
+
+  useEffect(() => {
+    if (visibleChunks >= chunks.length) return;
+    const id = setTimeout(() => setVisibleChunks(c => c + 1), CHUNK_DELAY);
+    return () => clearTimeout(id);
+  }, [visibleChunks, chunks.length]);
 
   return (
     <MarkerClusterGroup
       chunkedLoading
       disableClusteringAtZoom={18}
-      iconCreateFunction={(cluster) => {
-        const count = cluster.getChildCount();
-        const size = count >= 100 ? 28 : count >= 10 ? 24 : 20;
-        return L.divIcon({
-          html: `<div style="width:${size}px;height:${size}px;border-radius:50%;background:#002266;color:#fff;border:2px solid #fff;box-shadow:0 2px 8px rgba(0,34,102,0.45);display:flex;align-items:center;justify-content:center;font-size:${count >= 100 ? 9 : 10}px;font-weight:700;font-family:sans-serif;">${count}</div>`,
-          className: 'cto-cluster-icon',
-          iconSize: [size, size],
-          iconAnchor: [size / 2, size / 2],
-        });
-      }}
+      iconCreateFunction={clusterIconFn}
     >
-      {markers}
+      {chunks.slice(0, visibleChunks).map((chunk, idx) => (
+        <SiteChunk key={idx} chunk={chunk} />
+      ))}
     </MarkerClusterGroup>
   );
 });
 
-/* ── Ticket density color (green → yellow → red) ─────────── */
+/* ── Ticket density helpers ───────────────────────────────── */
 function ticketBubbleColor(count, max) {
   const ratio = Math.min(1, count / Math.max(max, 1));
   if (ratio < 0.33) return '#10b981';
@@ -125,13 +156,14 @@ function ticketBubbleColor(count, max) {
   return '#ef4444';
 }
 
+/* ── Main component ───────────────────────────────────────── */
 export default function CTOMap() {
-  const [sites, setSites]         = useState([]);
-  const [loading, setLoading]     = useState(true);
-  const [query, setQuery]         = useState('');
-  const [flyTo, setFlyTo]         = useState(null);
+  const [sites, setSites]           = useState([]);
+  const [loading, setLoading]       = useState(true);
+  const [query, setQuery]           = useState('');
+  const [flyTo, setFlyTo]           = useState(null);
   const [ticketData, setTicketData] = useState(null);
-  const [viewMode, setViewMode]   = useState('sites');
+  const [viewMode, setViewMode]     = useState('sites');
 
   useEffect(() => {
     let mounted = true;
@@ -156,15 +188,10 @@ export default function CTOMap() {
   }, []);
 
   const averageCenter = useMemo(() => {
-    const valid = (sites || []).filter(s => {
-      const la = Number(s.lat), lo = Number(s.lng);
-      return Number.isFinite(la) && Number.isFinite(lo) && la !== 0 && lo !== 0;
-    });
-    if (!valid.length) return DEFAULT_MAP_CENTER;
-    const sum = valid.reduce((acc, s) => ({ lat: acc.lat + Number(s.lat), lng: acc.lng + Number(s.lng) }), { lat: 0, lng: 0 });
-    const c = [sum.lat / valid.length, sum.lng / valid.length];
-    if (!Number.isFinite(c[0]) || !Number.isFinite(c[1])) return DEFAULT_MAP_CENTER;
-    return c;
+    if (!sites.length) return DEFAULT_MAP_CENTER;
+    const sum = sites.reduce((acc, s) => ({ lat: acc.lat + Number(s.lat), lng: acc.lng + Number(s.lng) }), { lat: 0, lng: 0 });
+    const c = [sum.lat / sites.length, sum.lng / sites.length];
+    return (Number.isFinite(c[0]) && Number.isFinite(c[1])) ? c : DEFAULT_MAP_CENTER;
   }, [sites]);
 
   const maxTickets = useMemo(() => {
@@ -312,13 +339,7 @@ export default function CTOMap() {
                 key={s.state}
                 center={[s.lat, s.lng]}
                 radius={radius}
-                pathOptions={{
-                  fillColor: color,
-                  fillOpacity: 0.55,
-                  color: color,
-                  weight: 2.5,
-                  opacity: 0.85,
-                }}
+                pathOptions={{ fillColor: color, fillOpacity: 0.55, color, weight: 2.5, opacity: 0.85 }}
               >
                 <Tooltip direction="top" offset={[0, -radius]} sticky>
                   <div style={{ minWidth: 160 }}>
@@ -349,7 +370,7 @@ export default function CTOMap() {
             );
           })}
 
-          {/* Site markers on sites view */}
+          {/* Site markers — progressively rendered in chunks */}
           {viewMode === 'sites' && <SiteMarkers sites={sites} />}
         </MapContainer>
       </div>

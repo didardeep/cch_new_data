@@ -608,15 +608,29 @@ function GradientDefs() {
 export default function BusinessKPI() {
   const [rawData,    setRawData]    = useState(null);
   const [refreshing, setRefreshing] = useState(false);
+  const [error,      setError]      = useState(null);
 
-  const load = () => {
+  const load = (forceRefresh = false) => {
     setRefreshing(true);
-    apiGet('/api/cto/business-kpi')
+    setError(null);
+    const url = forceRefresh ? '/api/cto/business-kpi?refresh=1' : '/api/cto/business-kpi';
+    apiGet(url)
       .then((resp) => { setRawData(resp); setRefreshing(false); })
-      .catch(()    => { setRefreshing(false); });
+      .catch((err) => { setError(err?.message || 'Failed to load Business KPI data'); setRefreshing(false); });
   };
 
   useEffect(() => { load(); }, []);
+
+  if (error) return (
+    <div style={{ padding: 40, textAlign: 'center' }}>
+      <AlertTriangle size={36} color="#dc2626" style={{ marginBottom: 12 }} />
+      <div style={{ fontSize: 16, fontWeight: 600, color: '#dc2626', marginBottom: 8 }}>Failed to load Business KPI</div>
+      <div style={{ fontSize: 13, color: '#64748b', marginBottom: 16 }}>{error}</div>
+      <button onClick={() => load(true)} style={{ padding: '8px 20px', borderRadius: 8, border: 'none', background: '#002266', color: '#fff', cursor: 'pointer', fontWeight: 600 }}>
+        Retry
+      </button>
+    </div>
+  );
 
   if (!rawData) return <div className="page-loader"><div className="spinner" /></div>;
 
@@ -630,6 +644,10 @@ export default function BusinessKPI() {
   const kpi      = deriveKpis(rawData);
   const summary  = kpi.summary;
   const trend    = kpi.trend;           // [{date, users, revenue, arpu}, ...]
+
+  // ── Empty data check ───────────────────────────────────────
+  const hasNoData = (!rawData?.revenue_rows?.length && !rawData?.users_rows?.length);
+  const hasEmptyMonths = !hasNoData && kpi.months?.length === 0;
 
   // Backend authoritative summary (falls back to frontend derivation if absent)
   const beSummary = rawData?.summary_kpis || {};
@@ -737,7 +755,7 @@ export default function BusinessKPI() {
             Period: <strong style={{ color: 'var(--text)' }}>{periodLabel}</strong>
           </p>
         </div>
-        <button onClick={load} disabled={refreshing} style={{
+        <button onClick={() => load(true)} disabled={refreshing} style={{
           display: 'flex', alignItems: 'center', gap: 6,
           padding: '8px 16px', background: 'var(--bg-card)',
           border: '1px solid var(--border)', borderRadius: 10,
@@ -749,6 +767,22 @@ export default function BusinessKPI() {
           Refresh
         </button>
       </motion.div>
+
+      {/* ── Warning if no data ────────────────────────────────── */}
+      {(hasNoData || hasEmptyMonths) && (
+        <div style={{
+          padding: '14px 20px', marginBottom: 16, borderRadius: 10,
+          background: '#fef3c7', border: '1px solid #f59e0b',
+          display: 'flex', alignItems: 'center', gap: 10,
+        }}>
+          <AlertTriangle size={18} color="#b45309" />
+          <span style={{ fontSize: 13, color: '#92400e', fontWeight: 600 }}>
+            {hasNoData
+              ? 'No Business KPI data found. Please upload Revenue and Business (Users) data from the Admin Data Upload page.'
+              : 'Data exists but no monthly columns were detected. Check that column names include month labels (e.g. "Feb Total", "Mar Avg").'}
+          </span>
+        </div>
+      )}
 
       {/* ── KPI Cards (4-column) ─────────────────────────────── */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 16, marginBottom: 24 }}>

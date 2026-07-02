@@ -4419,14 +4419,16 @@ def cto_business_kpi():
     Users from FlexibleKpiUpload(kpi_type='business') or KpiData('Site Users').
     Revenue from FlexibleKpiUpload(kpi_type='revenue') or KpiData('Site Revenue').
     Merges both sources by site_id.
+    Pass ?refresh=1 to bypass cache.
     """
     user = _require_cto_user()
     if not user:
         return jsonify({"error": "Unauthorized"}), 403
 
-    cached = _cache_get("business_kpi")
-    if cached:
-        return jsonify(cached)
+    if request.args.get("refresh") != "1":
+        cached = _cache_get("business_kpi")
+        if cached:
+            return jsonify(cached)
 
     return _business_kpi_merged()
 
@@ -4565,6 +4567,16 @@ def _business_kpi_merged():
     rev_raw = _load_kpi_rows("revenue")
     biz_raw = _load_kpi_rows("business")
 
+    # ── Diagnostic: if both empty, check what kpi_types exist ──
+    if not rev_raw and not biz_raw:
+        diag = db.session.execute(db.text(
+            "SELECT kpi_type, COUNT(*) FROM flexible_kpi_uploads GROUP BY kpi_type"
+        )).fetchall()
+        print(f"[BUSINESS KPI] WARNING: no rows for revenue or business. "
+              f"Existing kpi_types in DB: {[(r[0], r[1]) for r in diag]}")
+    else:
+        print(f"[BUSINESS KPI] raw rows loaded: revenue={len(rev_raw)}, business={len(biz_raw)}")
+
     # ────────────────────────────────────────────────────────────────────────
     # 3.  DISCOVER COLUMN NAMES (from distinct column_name values)
     # ────────────────────────────────────────────────────────────────────────
@@ -4646,6 +4658,14 @@ def _business_kpi_merged():
           f"user_month_map={user_month_map}, "
           f"opex_single={opex_single_col!r}, opex_months={opex_month_cols}, "
           f"util_col={util_col!r}, total_rev_col={total_rev_col!r}")
+
+    # ── Diagnostic: warn when no monthly columns detected ──
+    if rev_raw and not rev_month_map:
+        print(f"[BUSINESS KPI] WARNING: revenue rows exist ({len(rev_raw)}) but "
+              f"no monthly columns detected! Numeric columns found: {sorted(rev_numeric_cols)}")
+    if biz_raw and not user_month_map:
+        print(f"[BUSINESS KPI] WARNING: business rows exist ({len(biz_raw)}) but "
+              f"no monthly user columns detected! Numeric columns found: {sorted(biz_numeric_cols)}")
 
     # ────────────────────────────────────────────────────────────────────────
     # 4.  PIVOT RAW ROWS → per-site dicts
